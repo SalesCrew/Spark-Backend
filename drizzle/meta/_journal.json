@@ -1,0 +1,90 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1776413391450,
+      "tag": "0000_graceful_ronan",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1776415000000,
+      "tag": "0001_table_security",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1776417000000,
+      "tag": "0002_supabase_auth_id_text",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1776419095864,
+      "tag": "0003_markets_table",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1776420000000,
+      "tag": "0004_markets_identity_normalization",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1776421000000,
+      "tag": "0005_markets_security",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1776422211385,
+      "tag": "0006_markets_active_identity_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1776423632642,
+      "tag": "0007_ordinary_sasquatch",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1776425000000,
+      "tag": "0008_markets_security_restrict",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1776427000000,
+      "tag": "0009_fragebogen_creation_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1776470000000,
+      "tag": "0010_fragebogen_hardening_constraints",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1776680000000,
+      "tag": "0011_fragebogen_spezial_items",
+      "breakpoints": true
+    }
+  ]
+}
