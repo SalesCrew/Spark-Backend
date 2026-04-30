@@ -16,10 +16,22 @@ import { timeTrackingRouter } from "./routes/time-tracking.js";
 
 function createApp() {
   const app = express();
+  const normalizeOrigin = (value: string) => value.trim().replace(/\/+$/, "");
+  const allowedOrigins = env.CORS_ORIGIN.split(",")
+    .map((entry) => normalizeOrigin(entry))
+    .filter((entry) => entry.length > 0);
 
   app.use(
     cors({
-      origin: env.CORS_ORIGIN,
+      origin: (origin, callback) => {
+        if (!origin) {
+          callback(null, true);
+          return;
+        }
+        const normalizedOrigin = normalizeOrigin(origin);
+        const allowed = allowedOrigins.some((entry) => entry === normalizedOrigin);
+        callback(null, allowed);
+      },
       credentials: true,
     }),
   );
