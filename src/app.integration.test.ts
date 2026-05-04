@@ -592,6 +592,102 @@ test("admin zeiterfassung days returns canonical timeline with fahrtzeit and que
   }
 });
 
+test("admin zeiterfassung splits zusatz around pause windows chronologically", async (t) => {
+  if (!(await ensureDbReadyForAdminZeiterfassungTests())) {
+    t.skip("admin zeiterfassung prerequisite tables missing");
+    return;
+  }
+  const [gmUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(1);
+  if (!gmUser?.id) {
+    t.skip("No active GM user available for split timeline test.");
+    return;
+  }
+
+  const workDate = "2099-01-16";
+  const dayStart = new Date("2099-01-16T09:00:00.000Z");
+  const dayEnd = new Date("2099-01-16T14:00:00.000Z");
+  const zusatzStart = new Date("2099-01-16T10:00:00.000Z");
+  const zusatzEnd = new Date("2099-01-16T13:00:00.000Z");
+  const pauseStart = new Date("2099-01-16T11:00:00.000Z");
+  const pauseEnd = new Date("2099-01-16T12:00:00.000Z");
+
+  const insertedDayId = randomUUID();
+  const insertedPauseId = randomUUID();
+  const insertedExtraId = randomUUID();
+
+  await db.insert(gmDaySessions).values({
+    id: insertedDayId,
+    gmUserId: gmUser.id,
+    workDate,
+    timezone: "UTC",
+    status: "submitted",
+    dayStartedAt: dayStart,
+    dayEndedAt: dayEnd,
+    startKm: 3000,
+    endKm: 3060,
+    isStartKmCompleted: true,
+    isEndKmCompleted: true,
+    submittedAt: dayEnd,
+  });
+  await db.insert(gmDaySessionPauses).values({
+    id: insertedPauseId,
+    daySessionId: insertedDayId,
+    gmUserId: gmUser.id,
+    pauseStartedAt: pauseStart,
+    pauseEndedAt: pauseEnd,
+  });
+  await db.insert(timeTrackingEntries).values({
+    id: insertedExtraId,
+    gmUserId: gmUser.id,
+    activityType: "arztbesuch",
+    startAt: zusatzStart,
+    endAt: zusatzEnd,
+    status: "submitted",
+    submittedAt: zusatzEnd,
+  });
+
+  enableTestAuthBypass();
+  setTestBypassRole("admin");
+  const app = createApp();
+  try {
+    const res = await request(app).get(
+      `/admin/zeiterfassung/days?from=${workDate}&to=${workDate}&timezone=UTC&includeLive=true&gmUserIds=${gmUser.id}`,
+    );
+    assert.equal(res.status, 200);
+    const sessions = Array.isArray(res.body?.sessions) ? res.body.sessions : [];
+    const dayPayload = sessions.find((row: { id?: string }) => row.id === insertedDayId);
+    assert.ok(dayPayload);
+    const middleSegments = (dayPayload.timeline as Array<{ kind: string; start: string; end: string; title?: string }>).filter(
+      (segment) => segment.kind === "zusatzzeit" || segment.kind === "pause",
+    );
+    assert.deepEqual(
+      middleSegments.map((segment) => [segment.kind, segment.start, segment.end, segment.title ?? ""]),
+      [
+        ["zusatzzeit", "10:00", "11:00", "Arztbesuch"],
+        ["pause", "11:00", "12:00", "Pause"],
+        ["zusatzzeit", "12:00", "13:00", "Arztbesuch"],
+      ],
+    );
+  } finally {
+    await db
+      .update(gmDaySessionPauses)
+      .set({ isDeleted: true, deletedAt: new Date(), updatedAt: new Date() })
+      .where(eq(gmDaySessionPauses.id, insertedPauseId));
+    await db
+      .update(timeTrackingEntries)
+      .set({ isDeleted: true, deletedAt: new Date(), updatedAt: new Date() })
+      .where(eq(timeTrackingEntries.id, insertedExtraId));
+    await db
+      .update(gmDaySessions)
+      .set({ isDeleted: true, deletedAt: new Date(), updatedAt: new Date() })
+      .where(eq(gmDaySessions.id, insertedDayId));
+  }
+});
+
 test("admin zeiterfassung gm aggregates include live visibility and strict KPI totals", async (t) => {
   if (!(await ensureDbReadyForAdminZeiterfassungTests())) {
     t.skip("admin zeiterfassung prerequisite tables missing");

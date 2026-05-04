@@ -155,6 +155,83 @@ function clampAction(action: BaseAction, dayStartAt: Date, dayEndAt: Date): Base
   return { ...action, startAt, endAt };
 }
 
+function compareActionsByTime(a: BaseAction, b: BaseAction): number {
+  const startDiff = a.startAt.getTime() - b.startAt.getTime();
+  if (startDiff !== 0) return startDiff;
+  const endDiff = a.endAt.getTime() - b.endAt.getTime();
+  if (endDiff !== 0) return endDiff;
+  return a.id.localeCompare(b.id);
+}
+
+function subtractPauseWindowsFromInterval(
+  startAt: Date,
+  endAt: Date,
+  pauseWindows: Array<{ startAt: Date; endAt: Date }>,
+): Array<{ startAt: Date; endAt: Date }> {
+  let remaining = [{ startAt, endAt }];
+  for (const pauseWindow of pauseWindows) {
+    if (remaining.length === 0) break;
+    const nextRemaining: Array<{ startAt: Date; endAt: Date }> = [];
+    for (const segment of remaining) {
+      const overlapStartMs = Math.max(segment.startAt.getTime(), pauseWindow.startAt.getTime());
+      const overlapEndMs = Math.min(segment.endAt.getTime(), pauseWindow.endAt.getTime());
+      if (overlapEndMs <= overlapStartMs) {
+        nextRemaining.push(segment);
+        continue;
+      }
+      if (segment.startAt.getTime() < overlapStartMs) {
+        nextRemaining.push({
+          startAt: segment.startAt,
+          endAt: new Date(overlapStartMs),
+        });
+      }
+      if (overlapEndMs < segment.endAt.getTime()) {
+        nextRemaining.push({
+          startAt: new Date(overlapEndMs),
+          endAt: segment.endAt,
+        });
+      }
+    }
+    remaining = nextRemaining;
+  }
+  return remaining.filter((segment) => segment.endAt.getTime() > segment.startAt.getTime());
+}
+
+function splitZusatzIntervalsByPauseOverlaps(actions: BaseAction[]): BaseAction[] {
+  const sorted = [...actions].sort(compareActionsByTime);
+  const pauseWindows = sorted
+    .filter((action): action is BaseAction & { kind: "pause" } => action.kind === "pause")
+    .map((pause) => ({ startAt: pause.startAt, endAt: pause.endAt }));
+
+  const splitActions: BaseAction[] = [];
+  for (const action of sorted) {
+    if (action.kind !== "zusatzzeit") {
+      splitActions.push(action);
+      continue;
+    }
+    const segments = subtractPauseWindowsFromInterval(action.startAt, action.endAt, pauseWindows);
+    if (segments.length === 0) continue;
+    if (
+      segments.length === 1 &&
+      segments[0]?.startAt.getTime() === action.startAt.getTime() &&
+      segments[0]?.endAt.getTime() === action.endAt.getTime()
+    ) {
+      splitActions.push(action);
+      continue;
+    }
+    segments.forEach((segment, index) => {
+      splitActions.push({
+        ...action,
+        id: `${action.id}::seg:${index + 1}`,
+        startAt: segment.startAt,
+        endAt: segment.endAt,
+      });
+    });
+  }
+
+  return splitActions.sort(compareActionsByTime);
+}
+
 function formatExtraLabel(subtype: string | undefined): string {
   if (!subtype) return "Zusatzzeit";
   return EXTRA_LABELS[subtype] ?? subtype;
@@ -178,17 +255,12 @@ function getIsoWeekFromYmd(ymd: string): number {
 
 function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
   const sortedActions = [...input.actions]
-    .sort((a, b) => {
-      const startDiff = a.startAt.getTime() - b.startAt.getTime();
-      if (startDiff !== 0) return startDiff;
-      const endDiff = a.endAt.getTime() - b.endAt.getTime();
-      if (endDiff !== 0) return endDiff;
-      return a.id.localeCompare(b.id);
-    })
+    .sort(compareActionsByTime)
     .map((action) => clampAction(action, input.startAt, input.endAt))
     .filter((action): action is BaseAction => Boolean(action));
+  const canonicalActions = splitZusatzIntervalsByPauseOverlaps(sortedActions);
 
-  const entries: SessionEntry[] = sortedActions.map((action) => ({
+  const entries: SessionEntry[] = canonicalActions.map((action) => ({
     id: action.id,
     kind: action.kind,
     startTime: toHm(action.startAt, input.timezone),
@@ -207,8 +279,8 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
   const dayStartLabel = toHm(input.startAt, input.timezone);
   const dayEndLabel = toHm(input.endAt, input.timezone);
 
-  if (sortedActions.length > 0) {
-    const first = sortedActions[0];
+  if (canonicalActions.length > 0) {
+    const first = canonicalActions[0];
     if (first) {
       const anfahrtDuration = diffMinutesAtLeastOne(input.startAt, first.startAt);
       if (anfahrtDuration > 0) {
@@ -223,11 +295,11 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
     }
   }
 
-  for (let index = 0; index < sortedActions.length; index += 1) {
-    const current = sortedActions[index];
+  for (let index = 0; index < canonicalActions.length; index += 1) {
+    const current = canonicalActions[index];
     if (!current) continue;
     if (index > 0) {
-      const prev = sortedActions[index - 1];
+      const prev = canonicalActions[index - 1];
       if (!prev) continue;
       const gap = diffMinutesAtLeastOne(prev.endAt, current.startAt);
       if (gap > 0) {
@@ -265,8 +337,8 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
     timeline.push(timelineSegment);
   }
 
-  if (sortedActions.length > 0 && input.status !== "started") {
-    const last = sortedActions[sortedActions.length - 1];
+  if (canonicalActions.length > 0 && input.status !== "started") {
+    const last = canonicalActions[canonicalActions.length - 1];
     if (!last) {
       // no-op
     } else {
@@ -376,7 +448,9 @@ export {
   buildGmAggregates,
   formatExtraLabel,
   resolvePrimaryQuestionnaireType,
+  splitZusatzIntervalsByPauseOverlaps,
   toYmdInTimezone,
   type AggregatePayload,
+  type BaseAction,
   type DaySessionPayload,
 };

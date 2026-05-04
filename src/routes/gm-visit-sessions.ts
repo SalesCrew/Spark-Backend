@@ -5,6 +5,7 @@ import {
   finalizeBonusForSubmittedVisitSessionTx,
   readGmActiveBonusSummary,
 } from "../lib/bonus-finalizer.js";
+import { ensureAndGetGmKpiCache, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { db } from "../lib/db.js";
 import { ensureStartedDaySession } from "../lib/day-session.js";
@@ -2617,6 +2618,15 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
         error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
       });
     }
+    try {
+      await recomputeGmKpiCache(gmUserId);
+    } catch (kpiError) {
+      console.error("[gm-visit-sessions] gm kpi recompute failed after submit commit", {
+        sessionId: session.id,
+        gmUserId,
+        error: kpiError instanceof Error ? kpiError.message : String(kpiError),
+      });
+    }
 
     res.status(200).json({ ok: true, sessionId: session.id, status: "submitted" });
   } catch (error) {
@@ -2632,6 +2642,20 @@ gmVisitSessionsRouter.get("/gm/bonus-summary", async (req: AuthedRequest, res, n
       return;
     }
     const summary = await readGmActiveBonusSummary(gmUserId, new Date());
+    res.status(200).json(summary);
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.get("/gm/kpi-summary", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    const summary = await ensureAndGetGmKpiCache(gmUserId);
     res.status(200).json(summary);
   } catch (error) {
     next(error);

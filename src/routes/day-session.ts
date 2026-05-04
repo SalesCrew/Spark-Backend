@@ -1,6 +1,7 @@
 import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
+import { splitZusatzIntervalsByPauseOverlaps, type BaseAction } from "../lib/admin-zeiterfassung.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { DEFAULT_TIMEZONE, getCurrentDaySessionForUser, toYmdInTimezone } from "../lib/day-session.js";
@@ -69,6 +70,11 @@ type SubmissionItem = {
   timeText: string;
 };
 
+type SubmissionItemWithSort = SubmissionItem & {
+  sortStartAt: string;
+  sortEndAt: string;
+};
+
 function serializePause(row: typeof gmDaySessionPauses.$inferSelect) {
   return {
     id: row.id,
@@ -86,6 +92,10 @@ function toHm(iso: string): string {
     minute: "2-digit",
     hour12: false,
   }).format(new Date(iso));
+}
+
+function toRangeText(startIso: string, endIso: string): string {
+  return `${toHm(startIso)} - ${toHm(endIso)}`;
 }
 
 function formatActivityLabel(activityType: string): string {
@@ -264,6 +274,7 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
       db
         .select({
           id: visitSessions.id,
+          startedAt: visitSessions.startedAt,
           submittedAt: visitSessions.submittedAt,
           marketName: markets.name,
         })
@@ -274,16 +285,19 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
             eq(visitSessions.gmUserId, gmUserId),
             eq(visitSessions.isDeleted, false),
             eq(visitSessions.status, "submitted"),
-            isNotNull(visitSessions.submittedAt),
-            sql`${visitSessions.submittedAt} >= ${dayStartExpr}`,
-            sql`${visitSessions.submittedAt} < ${dayEndExpr}`,
+            isNotNull(visitSessions.startedAt),
+            sql`${visitSessions.startedAt} >= ${dayStartExpr}`,
+            sql`${visitSessions.startedAt} < ${dayEndExpr}`,
           ),
         )
-        .orderBy(desc(visitSessions.submittedAt)),
+        .orderBy(desc(visitSessions.startedAt)),
       db
         .select({
           id: timeTrackingEntries.id,
+          startAt: timeTrackingEntries.startAt,
+          endAt: timeTrackingEntries.endAt,
           submittedAt: timeTrackingEntries.submittedAt,
+          status: timeTrackingEntries.status,
           activityType: timeTrackingEntries.activityType,
           marketName: markets.name,
         })
@@ -293,13 +307,13 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
           and(
             eq(timeTrackingEntries.gmUserId, gmUserId),
             eq(timeTrackingEntries.isDeleted, false),
-            eq(timeTrackingEntries.status, "submitted"),
-            isNotNull(timeTrackingEntries.submittedAt),
-            sql`${timeTrackingEntries.submittedAt} >= ${dayStartExpr}`,
-            sql`${timeTrackingEntries.submittedAt} < ${dayEndExpr}`,
+            sql`${timeTrackingEntries.status} in ('submitted','draft')`,
+            isNotNull(timeTrackingEntries.startAt),
+            sql`${timeTrackingEntries.startAt} >= ${dayStartExpr}`,
+            sql`${timeTrackingEntries.startAt} < ${dayEndExpr}`,
           ),
         )
-        .orderBy(desc(timeTrackingEntries.submittedAt)),
+        .orderBy(desc(timeTrackingEntries.startAt)),
       db
         .select({
           id: gmDaySessionPauses.id,
@@ -319,7 +333,7 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
         .orderBy(desc(gmDaySessionPauses.pauseStartedAt)),
     ]);
 
-    const items: SubmissionItem[] = [];
+    const items: SubmissionItemWithSort[] = [];
     for (const row of dayRows) {
       if (!row.submittedAt) continue;
       const submittedIso = row.submittedAt.toISOString();
@@ -329,46 +343,84 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
         submittedAt: submittedIso,
         label: "Tag gespeichert",
         timeText: toHm(submittedIso),
+        sortStartAt: submittedIso,
+        sortEndAt: submittedIso,
       });
     }
     for (const row of visitRows) {
-      if (!row.submittedAt) continue;
-      const submittedIso = row.submittedAt.toISOString();
+      if (!row.startedAt) continue;
+      const startIso = row.startedAt.toISOString();
+      const endIso = row.submittedAt?.toISOString() ?? startIso;
       items.push({
         id: row.id,
         kind: "markt",
-        submittedAt: submittedIso,
+        submittedAt: row.submittedAt?.toISOString() ?? endIso,
         label: row.marketName?.trim() || "Marktbesuch",
-        timeText: toHm(submittedIso),
+        timeText: toRangeText(startIso, endIso),
+        sortStartAt: startIso,
+        sortEndAt: endIso,
+      });
+    }
+    const overlapActions: BaseAction[] = [];
+    for (const row of pauseRows) {
+      const endAt = row.pauseEndedAt ?? now;
+      if (endAt.getTime() <= row.pauseStartedAt.getTime()) continue;
+      overlapActions.push({
+        id: row.id,
+        kind: "pause",
+        startAt: row.pauseStartedAt,
+        endAt,
       });
     }
     for (const row of zusatzRows) {
-      if (!row.submittedAt) continue;
-      const submittedIso = row.submittedAt.toISOString();
-      const baseLabel = formatActivityLabel(row.activityType);
-      items.push({
+      if (!row.startAt) continue;
+      const endAt = row.endAt ?? row.submittedAt ?? now;
+      if (!endAt || endAt.getTime() <= row.startAt.getTime()) continue;
+      overlapActions.push({
         id: row.id,
-        kind: "zusatz",
-        submittedAt: submittedIso,
-        label: row.marketName?.trim() ? `${baseLabel} - ${row.marketName}` : baseLabel,
-        timeText: toHm(submittedIso),
+        kind: "zusatzzeit",
+        startAt: row.startAt,
+        endAt,
+        subtype: row.activityType,
+        ...(row.marketName ? { marketName: row.marketName } : {}),
       });
     }
-    for (const row of pauseRows) {
-      const effectiveEnd = row.pauseEndedAt ?? now;
-      const endIso = effectiveEnd.toISOString();
-      const startIso = row.pauseStartedAt.toISOString();
+    const splitOverlapActions = splitZusatzIntervalsByPauseOverlaps(overlapActions);
+    for (const action of splitOverlapActions) {
+      const startIso = action.startAt.toISOString();
+      const endIso = action.endAt.toISOString();
+      if (action.kind === "pause") {
+        items.push({
+          id: action.id,
+          kind: "pause",
+          submittedAt: endIso,
+          label: "Pause",
+          timeText: toRangeText(startIso, endIso),
+          sortStartAt: startIso,
+          sortEndAt: endIso,
+        });
+        continue;
+      }
+      const baseLabel = formatActivityLabel(action.subtype ?? "zusatzzeit");
       items.push({
-        id: row.id,
-        kind: "pause",
+        id: action.id,
+        kind: "zusatz",
         submittedAt: endIso,
-        label: "Pause",
-        timeText: `${toHm(startIso)} - ${toHm(endIso)}`,
+        label: action.marketName?.trim() ? `${baseLabel} - ${action.marketName}` : baseLabel,
+        timeText: toRangeText(startIso, endIso),
+        sortStartAt: startIso,
+        sortEndAt: endIso,
       });
     }
 
-    items.sort((a, b) => b.submittedAt.localeCompare(a.submittedAt));
-    res.status(200).json({ items });
+    items.sort((a, b) => {
+      const startDiff = a.sortStartAt.localeCompare(b.sortStartAt);
+      if (startDiff !== 0) return startDiff;
+      const endDiff = a.sortEndAt.localeCompare(b.sortEndAt);
+      if (endDiff !== 0) return endDiff;
+      return a.id.localeCompare(b.id);
+    });
+    res.status(200).json({ items: items.map(({ sortStartAt: _sortStartAt, sortEndAt: _sortEndAt, ...item }) => item) });
   } catch (error) {
     next(error);
   }

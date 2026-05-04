@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, ilike, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, ilike, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
@@ -206,6 +206,13 @@ const createMarketSchema = z
   })
   .strict();
 
+const normalizeRegionsSchema = z
+  .object({
+    batchSize: z.coerce.number().int().min(100).max(2000).optional().default(500),
+    reportLimit: z.coerce.number().int().min(1).max(500).optional().default(200),
+  })
+  .strict();
+
 const listQuerySchema = z
   .object({
     q: z.string().optional(),
@@ -230,6 +237,50 @@ function normalizeOptionalText(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const normalized = value.trim();
   return normalized.length > 0 ? normalized : null;
+}
+
+const CANONICAL_REGIONS = ["Nord", "West", "Ost", "Süd"] as const;
+type CanonicalRegion = (typeof CANONICAL_REGIONS)[number];
+
+const REGION_ALIASES = new Map<string, CanonicalRegion>([
+  ["nord", "Nord"],
+  ["norden", "Nord"],
+  ["north", "Nord"],
+  ["west", "West"],
+  ["westen", "West"],
+  ["ost", "Ost"],
+  ["osten", "Ost"],
+  ["east", "Ost"],
+  ["sud", "Süd"],
+  ["sued", "Süd"],
+  ["sueden", "Süd"],
+  ["south", "Süd"],
+]);
+
+type RegionNormalizationResult =
+  | { ok: true; canonical: CanonicalRegion; raw: string; token: string }
+  | { ok: false; raw: string; token: string };
+
+function normalizeRegionToken(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/ä/g, "ae")
+    .replace(/ö/g, "oe")
+    .replace(/ü/g, "ue")
+    .replace(/ß/g, "ss")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z]/g, "");
+}
+
+function normalizeRegionValue(input: unknown): RegionNormalizationResult {
+  const raw = typeof input === "string" ? input.trim() : "";
+  const token = normalizeRegionToken(raw);
+  if (!token) return { ok: false, raw, token };
+  const canonical = REGION_ALIASES.get(token);
+  if (!canonical) return { ok: false, raw, token };
+  return { ok: true, canonical, raw, token };
 }
 
 function normalizeIdentity(value: unknown): string | null {
@@ -1155,6 +1206,8 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         const sampleText = String(draft.name ?? draft.city ?? row.find((c) => c?.trim()) ?? "");
         const hasDraftIdentity = Boolean(draft.standardMarketNumber || draft.cokeMasterNumber || draft.flexNumber);
         const hasDraftVisibles = Boolean(draft.name && (draft.postalCode || draft.city) && draft.region);
+        const normalizedDraftRegion =
+          draft.region != null ? normalizeRegionValue(String(draft.region)) : null;
 
         const stdIdentity = normalizeIdentity(draft.standardMarketNumber);
         const cokeIdentity = normalizeIdentity(draft.cokeMasterNumber);
@@ -1179,6 +1232,19 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
               missingFields,
               missingFieldKeys,
               fetchedFields,
+            });
+          }
+          continue;
+        }
+
+        if (normalizedDraftRegion && !normalizedDraftRegion.ok) {
+          summary.skipped += 1;
+          if (summary.skippedReasons.length < 50) {
+            summary.skippedReasons.push({
+              row: rowNum,
+              reason: `Region konnte nicht normalisiert werden (${normalizedDraftRegion.raw || "leer"})`,
+              sample: sampleText,
+              draft,
             });
           }
           continue;
@@ -1235,7 +1301,10 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
               address: draft.address != null ? String(draft.address) : matched.address,
               postalCode: draft.postalCode != null ? String(draft.postalCode) : matched.postalCode,
               city: draft.city != null ? String(draft.city) : matched.city,
-              region: draft.region != null ? String(draft.region) : matched.region,
+              region:
+                draft.region != null && normalizedDraftRegion?.ok
+                  ? normalizedDraftRegion.canonical
+                  : matched.region,
               emEh:
                 draft.emEh != null ? (normalizeOptionalText(String(draft.emEh)) ?? "") : matched.emEh,
               employee:
@@ -1286,7 +1355,10 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             pending.address = draft.address != null ? String(draft.address) : pending.address;
             pending.postalCode = draft.postalCode != null ? String(draft.postalCode) : pending.postalCode;
             pending.city = draft.city != null ? String(draft.city) : pending.city;
-            pending.region = draft.region != null ? String(draft.region) : pending.region;
+            pending.region =
+              draft.region != null && normalizedDraftRegion?.ok
+                ? normalizedDraftRegion.canonical
+                : pending.region;
             pending.emEh = draft.emEh != null ? (normalizeOptionalText(String(draft.emEh)) ?? "") : pending.emEh;
             pending.employee =
               draft.employee != null ? (normalizeOptionalText(String(draft.employee)) ?? "") : pending.employee;
@@ -1333,7 +1405,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             address: String(draft.address ?? ""),
             postalCode: String(draft.postalCode ?? ""),
             city: String(draft.city ?? ""),
-            region: String(draft.region ?? ""),
+            region: normalizedDraftRegion?.ok ? normalizedDraftRegion.canonical : String(draft.region ?? ""),
             emEh: normalizeOptionalText(String(draft.emEh ?? "")) ?? "",
             employee: normalizeOptionalText(String(draft.employee ?? "")) ?? "",
             currentGmName: "",
@@ -1411,6 +1483,13 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
     }
 
     const payload = parsed.data;
+    const normalizedRegion = payload.region != null ? normalizeRegionValue(payload.region) : null;
+    if (normalizedRegion && !normalizedRegion.ok) {
+      res.status(400).json({
+        error: `Unbekannte Region "${normalizedRegion.raw || payload.region}". Erlaubt: ${CANONICAL_REGIONS.join(", ")}.`,
+      });
+      return;
+    }
     const [updated] = await db
       .update(markets)
       .set({
@@ -1426,7 +1505,7 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         address: payload.address,
         postalCode: payload.postalCode,
         city: payload.city,
-        region: payload.region,
+        region: normalizedRegion?.ok ? normalizedRegion.canonical : payload.region,
         emEh: payload.emEh != null ? (normalizeOptionalText(payload.emEh) ?? "") : undefined,
         employee:
           payload.employee != null ? (normalizeOptionalText(payload.employee) ?? "") : undefined,
@@ -1477,6 +1556,13 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
       return;
     }
     const payload = parsed.data;
+    const normalizedRegion = normalizeRegionValue(payload.region);
+    if (!normalizedRegion.ok) {
+      res.status(400).json({
+        error: `Unbekannte Region "${normalizedRegion.raw || payload.region}". Erlaubt: ${CANONICAL_REGIONS.join(", ")}.`,
+      });
+      return;
+    }
     const [created] = await db
       .insert(markets)
       .values({
@@ -1488,7 +1574,7 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
         address: payload.address,
         postalCode: payload.postalCode,
         city: payload.city,
-        region: payload.region,
+        region: normalizedRegion.canonical,
         emEh: normalizeOptionalText(payload.emEh) ?? "",
         employee: normalizeOptionalText(payload.employee) ?? "",
         currentGmName: normalizeOptionalText(payload.currentGmName) ?? "",
@@ -1540,6 +1626,104 @@ adminMarketsRouter.patch("/:id/delete", async (req: AuthedRequest, res, next) =>
       return;
     }
     res.status(200).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminMarketsRouter.post("/normalize-regions", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = normalizeRegionsSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültiger Normalize-Request." });
+      return;
+    }
+    const { batchSize, reportLimit } = parsed.data;
+    let cursorId: string | null = null;
+    let processedCount = 0;
+    let updatedCount = 0;
+    let unmatchedCount = 0;
+    type RegionBatchRow = { id: string; name: string; region: string };
+    const unmatched: Array<{ marketId: string; marketName: string; region: string; normalizedToken: string }> =
+      [];
+
+    while (true) {
+      let batch: RegionBatchRow[] = [];
+      if (cursorId) {
+        batch = await db
+          .select({
+            id: markets.id,
+            name: markets.name,
+            region: markets.region,
+          })
+          .from(markets)
+          .where(and(eq(markets.isDeleted, false), gt(markets.id, cursorId)))
+          .orderBy(asc(markets.id))
+          .limit(batchSize);
+      } else {
+        batch = await db
+          .select({
+            id: markets.id,
+            name: markets.name,
+            region: markets.region,
+          })
+          .from(markets)
+          .where(eq(markets.isDeleted, false))
+          .orderBy(asc(markets.id))
+          .limit(batchSize);
+      }
+      if (batch.length === 0) break;
+
+      processedCount += batch.length;
+      const updatesByCanonical = new Map<CanonicalRegion, string[]>();
+
+      for (const row of batch) {
+        const normalized = normalizeRegionValue(row.region);
+        if (!normalized.ok) {
+          unmatchedCount += 1;
+          if (unmatched.length < reportLimit) {
+            unmatched.push({
+              marketId: row.id,
+              marketName: row.name,
+              region: row.region,
+              normalizedToken: normalized.token,
+            });
+          }
+          continue;
+        }
+        if (normalized.canonical === row.region) continue;
+        const ids = updatesByCanonical.get(normalized.canonical) ?? [];
+        ids.push(row.id);
+        updatesByCanonical.set(normalized.canonical, ids);
+      }
+
+      for (const [canonicalRegion, ids] of updatesByCanonical.entries()) {
+        if (ids.length === 0) continue;
+        const changed = await db
+          .update(markets)
+          .set({
+            region: canonicalRegion,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(markets.isDeleted, false), inArray(markets.id, ids)))
+          .returning({ id: markets.id });
+        updatedCount += changed.length;
+      }
+
+      cursorId = batch[batch.length - 1]?.id ?? null;
+      if (!cursorId) break;
+    }
+
+    const unchangedCount = Math.max(0, processedCount - updatedCount - unmatchedCount);
+    res.status(200).json({
+      ok: true,
+      processedCount,
+      updatedCount,
+      unchangedCount,
+      unmatchedCount,
+      unmatched,
+      allowedRegions: CANONICAL_REGIONS,
+    });
   } catch (err) {
     next(err);
   }

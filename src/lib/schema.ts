@@ -358,6 +358,32 @@ export const ippRecalcQueue = pgTable(
   ],
 );
 
+export const gmKpiCache = pgTable(
+  "gm_kpi_cache",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    ippAllTimeAvg: numeric("ipp_all_time_avg", { precision: 12, scale: 4 }).notNull().default("0"),
+    ippSampleCount: integer("ipp_sample_count").notNull().default(0),
+    bonusCumulativeEur: numeric("bonus_cumulative_eur", { precision: 14, scale: 2 }).notNull().default("0"),
+    lastComputedAt: timestamp("last_computed_at", { withTimezone: true }).defaultNow().notNull(),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("gm_kpi_cache_gm_user_active_unique")
+      .on(table.gmUserId)
+      .where(sql`${table.isDeleted} = false`),
+    index("gm_kpi_cache_gm_user_idx").on(table.gmUserId),
+    index("gm_kpi_cache_last_computed_idx").on(table.lastComputedAt),
+    index("gm_kpi_cache_deleted_idx").on(table.isDeleted),
+  ],
+);
+
 export const photoTags = pgTable(
   "photo_tags",
   {

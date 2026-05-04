@@ -1,6 +1,7 @@
 import { and, eq, gte, inArray, isNotNull, lt } from "drizzle-orm";
 import { env } from "../config/env.js";
 import { db, sql as pgSql } from "./db.js";
+import { recomputeGmKpiCacheForMarketPeriod } from "./gm-kpi-cache.js";
 import { computeMarketIppForPeriod } from "./ipp.js";
 import { refreshRedMonthCalendarConfig } from "./red-month-calendar.js";
 import { getRedPeriodForDate, getRedPeriodLabel, getRedYear, startOfDay } from "./red-monat.js";
@@ -349,6 +350,11 @@ async function processRecalcQueue(now: Date): Promise<number> {
         contributingQuestionCount: computed.contributingQuestionCount,
         questionRowsSnapshot: computed.questionRows as Array<Record<string, unknown>>,
       });
+      await recomputeGmKpiCacheForMarketPeriod({
+        marketId: item.marketId,
+        redPeriodStart: item.redPeriodStart,
+        redPeriodEnd: item.redPeriodEnd,
+      });
       await db
         .update(ippRecalcQueue)
         .set({
@@ -415,6 +421,11 @@ export async function runIppFinalizerOnce(now = new Date()): Promise<FinalizerRu
           sourceSubmissionCount: computed.sourceSubmissionCount,
           contributingQuestionCount: computed.contributingQuestionCount,
           questionRowsSnapshot: computed.questionRows as Array<Record<string, unknown>>,
+        });
+        await recomputeGmKpiCacheForMarketPeriod({
+          marketId,
+          redPeriodStart: toYmd(period.start),
+          redPeriodEnd: toYmd(period.end),
         });
         rowsFinalized += 1;
       }
