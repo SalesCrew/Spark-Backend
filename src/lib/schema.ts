@@ -122,6 +122,7 @@ export const markets = pgTable(
     infoFlag: boolean("info_flag").notNull().default(false),
     infoNote: text("info_note").notNull().default(""),
     universeMarket: boolean("universe_market").notNull().default(false),
+    isActive: boolean("is_active").notNull().default(true),
     importSourceFileName: text("import_source_file_name").notNull().default(""),
     importedAt: timestamp("imported_at", { withTimezone: true }).defaultNow().notNull(),
     plannedToId: uuid("planned_to_id"),
@@ -143,6 +144,7 @@ export const markets = pgTable(
     index("markets_city_idx").on(table.city),
     index("markets_postal_code_idx").on(table.postalCode),
     index("markets_current_gm_name_idx").on(table.currentGmName),
+    index("markets_active_idx").on(table.isActive),
     index("markets_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -886,6 +888,33 @@ export const fragebogenMainSpezialItems = pgTable(
     index("fragebogen_main_spezial_items_fb_idx").on(table.fragebogenId),
     index("fragebogen_main_spezial_items_order_idx").on(table.fragebogenId, table.orderIndex),
     index("fragebogen_main_spezial_items_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const questionAnswerHistory = pgTable(
+  "question_answer_history",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    questionId: uuid("question_id").references(() => questionBankShared.id, { onDelete: "set null" }),
+    fragebogenId: uuid("fragebogen_id").references(() => fragebogenMain.id, { onDelete: "set null" }),
+    spezialItemId: uuid("spezial_item_id").references(() => fragebogenMainSpezialItems.id, { onDelete: "set null" }),
+    changeKind: text("change_kind").notNull(),
+    previousQuestionType: questionTypeEnum("previous_question_type"),
+    nextQuestionType: questionTypeEnum("next_question_type"),
+    previousAnswerState: jsonb("previous_answer_state").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    nextAnswerState: jsonb("next_answer_state").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    changedAt: timestamp("changed_at", { withTimezone: true }).defaultNow().notNull(),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("question_answer_history_change_kind_ck", sql`${table.changeKind} in ('type_change','answer_edit')`),
+    index("question_answer_history_question_changed_idx").on(table.questionId, table.changedAt),
+    index("question_answer_history_fragebogen_changed_idx").on(table.fragebogenId, table.changedAt),
+    index("question_answer_history_spezial_changed_idx").on(table.spezialItemId, table.changedAt),
+    index("question_answer_history_deleted_idx").on(table.isDeleted),
   ],
 );
 

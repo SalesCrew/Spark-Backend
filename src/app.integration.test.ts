@@ -27,6 +27,7 @@ import {
   questionAttachments,
   questionPhotoTags,
   questionBankShared,
+  questionAnswerHistory,
   photoTags,
   questionRules,
   questionRuleTargets,
@@ -86,6 +87,8 @@ let checkedAdminZeiterfassungReadiness = false;
 let dbHasAdminZeiterfassungTables = false;
 let checkedPraemienReadiness = false;
 let dbHasPraemienTables = false;
+let checkedQuestionAnswerHistoryReadiness = false;
+let dbHasQuestionAnswerHistoryTable = false;
 
 async function ensureDbReadyForFragebogenTests(): Promise<boolean> {
   if (checkedDbReadiness) return dbHasFragebogenTables;
@@ -94,6 +97,16 @@ async function ensureDbReadyForFragebogenTests(): Promise<boolean> {
   dbHasFragebogenTables = Boolean(row?.module_main);
   checkedDbReadiness = true;
   return dbHasFragebogenTables;
+}
+
+async function ensureDbReadyForQuestionAnswerHistoryTests(): Promise<boolean> {
+  if (checkedQuestionAnswerHistoryReadiness) return dbHasQuestionAnswerHistoryTable;
+  const result = await sql<{ question_answer_history: string | null }[]>`
+    select to_regclass('public.question_answer_history') as question_answer_history
+  `;
+  dbHasQuestionAnswerHistoryTable = Boolean(result[0]?.question_answer_history);
+  checkedQuestionAnswerHistoryReadiness = true;
+  return dbHasQuestionAnswerHistoryTable;
 }
 
 async function ensureDbReadyForCampaignTests(): Promise<boolean> {
@@ -1884,6 +1897,133 @@ test("fragebogen update soft-deletes old module links and spezial rows", async (
 
   await request(app).patch(`/admin/fragebogen/main/${fragebogenId}/delete`).send({});
   await request(app).patch(`/admin/modules/main/${moduleId}/delete`).send({});
+});
+
+test("shared question type change writes answer history entry", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForFragebogenTests())) {
+    t.skip("Fragebogen tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  if (!(await ensureDbReadyForQuestionAnswerHistoryTests())) {
+    t.skip("question_answer_history table is not present in the configured DATABASE_URL.");
+    return;
+  }
+  const app = createApp();
+  const uniq = `it-question-history-${Date.now()}`;
+
+  const createRes = await request(app).post("/admin/questions").send({
+    type: "single",
+    text: `History ${uniq}`,
+    required: true,
+    config: { options: ["A", "B"] },
+    rules: [],
+    scoring: { A: { ipp: 1, boni: 2 }, B: { ipp: 0, boni: 0 } },
+  });
+  assert.equal(createRes.status, 201);
+  const questionId = createRes.body.question?.id as string;
+  assert.ok(questionId);
+
+  const beforeVisitAnswers = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(visitAnswers)
+    .where(and(eq(visitAnswers.questionId, questionId), eq(visitAnswers.isDeleted, false)));
+
+  const patchRes = await request(app).patch(`/admin/questions/${questionId}`).send({
+    type: "multiple",
+    text: `History ${uniq}`,
+    required: true,
+    config: { options: ["A", "B", "C"] },
+    rules: [],
+    scoring: { A: { ipp: 1, boni: 2 }, B: { ipp: 0, boni: 0 }, C: { ipp: 0, boni: 1 } },
+  });
+  assert.equal(patchRes.status, 200);
+
+  const rows = await db
+    .select()
+    .from(questionAnswerHistory)
+    .where(and(eq(questionAnswerHistory.questionId, questionId), eq(questionAnswerHistory.isDeleted, false)));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.changeKind, "type_change");
+  assert.equal(rows[0]?.previousQuestionType, "single");
+  assert.equal(rows[0]?.nextQuestionType, "multiple");
+
+  const afterVisitAnswers = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(visitAnswers)
+    .where(and(eq(visitAnswers.questionId, questionId), eq(visitAnswers.isDeleted, false)));
+  assert.equal(afterVisitAnswers[0]?.count ?? 0, beforeVisitAnswers[0]?.count ?? 0);
+});
+
+test("spezialfrage answer edits write answer history entry", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForFragebogenTests())) {
+    t.skip("Fragebogen tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  if (!(await ensureDbReadyForQuestionAnswerHistoryTests())) {
+    t.skip("question_answer_history table is not present in the configured DATABASE_URL.");
+    return;
+  }
+  const app = createApp();
+  const uniq = `it-spezial-history-${Date.now()}`;
+
+  const createFragebogenRes = await request(app).post("/admin/fragebogen/main").send({
+    name: `FB ${uniq}`,
+    description: "",
+    moduleIds: [],
+    scheduleType: "always",
+    status: "inactive",
+    nurEinmalAusfuellbar: false,
+    sectionKeywords: ["standard"],
+    spezialfragen: [
+      {
+        type: "single",
+        text: `Spezial ${uniq}`,
+        required: true,
+        config: { options: ["Ja", "Nein"] },
+        rules: [],
+        scoring: { Ja: { boni: 1 } },
+      },
+    ],
+  });
+  assert.equal(createFragebogenRes.status, 201);
+  const fragebogenId = createFragebogenRes.body.fragebogen?.id as string;
+  const spezialId = createFragebogenRes.body.fragebogen?.spezialfragen?.[0]?.id as string;
+  assert.ok(fragebogenId);
+  assert.ok(spezialId);
+
+  const patchRes = await request(app).patch(`/admin/fragebogen/main/${fragebogenId}`).send({
+    name: `FB ${uniq}`,
+    description: "",
+    moduleIds: [],
+    scheduleType: "always",
+    status: "inactive",
+    nurEinmalAusfuellbar: false,
+    sectionKeywords: ["standard"],
+    spezialfragen: [
+      {
+        id: spezialId,
+        type: "single",
+        text: `Spezial ${uniq}`,
+        required: true,
+        config: { options: ["Ja", "Nein", "Vielleicht"] },
+        rules: [],
+        scoring: { Ja: { boni: 1 }, Vielleicht: { boni: 2 } },
+      },
+    ],
+  });
+  assert.equal(patchRes.status, 200);
+
+  const historyRows = await db
+    .select()
+    .from(questionAnswerHistory)
+    .where(and(eq(questionAnswerHistory.fragebogenId, fragebogenId), eq(questionAnswerHistory.isDeleted, false)));
+  assert.equal(historyRows.length, 1);
+  assert.equal(historyRows[0]?.changeKind, "answer_edit");
+  assert.equal(historyRows[0]?.spezialItemId, spezialId);
+
+  await request(app).patch(`/admin/fragebogen/main/${fragebogenId}/delete`).send({});
 });
 
 test("module question chains stay module-scoped and duplicate with module", async (t) => {

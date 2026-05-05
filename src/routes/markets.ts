@@ -176,6 +176,7 @@ const updateMarketSchema = z
     infoFlag: z.boolean().optional(),
     infoNote: z.string().optional(),
     universeMarket: z.boolean().optional(),
+    isActive: z.boolean().optional(),
     importSourceFileName: z.string().optional(),
     importedAt: z.string().datetime().optional(),
     plannedToId: z.string().uuid().nullable().optional(),
@@ -200,6 +201,7 @@ const createMarketSchema = z
     infoFlag: z.boolean().optional().default(false),
     infoNote: z.string().optional().default(""),
     universeMarket: z.boolean().optional().default(false),
+    isActive: z.boolean().optional().default(true),
     importSourceFileName: z.string().optional().default(""),
     importedAt: z.string().datetime().optional(),
     plannedToId: z.string().uuid().nullable().optional(),
@@ -396,6 +398,7 @@ function mapMarketRow(row: typeof markets.$inferSelect) {
     infoFlag: row.infoFlag,
     infoNote: row.infoNote,
     universeMarket: row.universeMarket,
+    isActive: row.isActive,
     importSourceFileName: row.importSourceFileName,
     importedAt: row.importedAt.toISOString(),
     plannedToId: row.plannedToId,
@@ -1364,6 +1367,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
               draft.employee != null ? (normalizeOptionalText(String(draft.employee)) ?? "") : pending.employee;
             pending.universeMarket =
               draft.universeMarket != null ? Boolean(draft.universeMarket) : pending.universeMarket;
+            pending.isActive = pending.isActive ?? true;
             pending.visitFrequencyPerYear =
               draft.visitFrequencyPerYear != null
                 ? Number(draft.visitFrequencyPerYear)
@@ -1413,6 +1417,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             infoFlag: Boolean(draft.infoFlag ?? false),
             infoNote: "",
             universeMarket: Boolean(draft.universeMarket ?? false),
+            isActive: true,
             importSourceFileName: payload.fileName,
             importedAt,
             isDeleted: false,
@@ -1517,6 +1522,7 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         infoFlag: payload.infoFlag,
         infoNote: payload.infoNote,
         universeMarket: payload.universeMarket,
+        isActive: payload.isActive,
         importSourceFileName: payload.importSourceFileName,
         importedAt: payload.importedAt ? new Date(payload.importedAt) : undefined,
         plannedToId: payload.plannedToId,
@@ -1582,6 +1588,7 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
         infoFlag: payload.infoFlag,
         infoNote: payload.infoNote,
         universeMarket: payload.universeMarket,
+        isActive: payload.isActive,
         importSourceFileName: payload.importSourceFileName,
         importedAt: payload.importedAt ? new Date(payload.importedAt) : new Date(),
         plannedToId: payload.plannedToId ?? null,

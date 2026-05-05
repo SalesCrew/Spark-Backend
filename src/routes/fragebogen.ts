@@ -22,6 +22,7 @@ import {
   markets,
   photoTags,
   questionAttachments,
+  questionAnswerHistory,
   questionBankShared,
   questionMatrix,
   questionPhotoTags,
@@ -121,8 +122,16 @@ type UiFragebogen = z.infer<typeof fragebogenSchema>;
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 type DbLike = typeof db | DbTx;
 type AnyTable = any;
+type AnswerHistoryChangeKind = "type_change" | "answer_edit";
+type AnswerStateSnapshot = {
+  questionType: UiQuestion["type"];
+  config: Record<string, unknown>;
+  scoring: UiQuestion["scoring"];
+};
 let checkedModuleQuestionChainsReadiness = false;
 let hasModuleQuestionChainsTable = false;
+let checkedQuestionAnswerHistoryReadiness = false;
+let hasQuestionAnswerHistoryTable = false;
 
 class DomainValidationError extends Error {
   constructor(message: string) {
@@ -139,6 +148,16 @@ async function ensureModuleQuestionChainsReady(): Promise<boolean> {
   hasModuleQuestionChainsTable = Boolean(result[0]?.module_question_chains);
   checkedModuleQuestionChainsReadiness = true;
   return hasModuleQuestionChainsTable;
+}
+
+async function ensureQuestionAnswerHistoryReady(): Promise<boolean> {
+  if (checkedQuestionAnswerHistoryReadiness) return hasQuestionAnswerHistoryTable;
+  const result = await pgSql<{ question_answer_history: string | null }[]>`
+    select to_regclass('public.question_answer_history') as question_answer_history
+  `;
+  hasQuestionAnswerHistoryTable = Boolean(result[0]?.question_answer_history);
+  checkedQuestionAnswerHistoryReadiness = true;
+  return hasQuestionAnswerHistoryTable;
 }
 
 function getScopeParam(params: Record<string, string | undefined>): Scope {
@@ -368,6 +387,65 @@ function sanitizeQuestionConfig(config: Record<string, unknown>) {
   return next;
 }
 
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => sortJsonValue(entry));
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+    return Object.fromEntries(entries.map(([key, entry]) => [key, sortJsonValue(entry)]));
+  }
+  return value;
+}
+
+function extractAnswerState(
+  questionType: UiQuestion["type"],
+  config: Record<string, unknown>,
+  scoring: UiQuestion["scoring"],
+): AnswerStateSnapshot {
+  const answerConfig = { ...(config ?? {}) };
+  delete answerConfig.images;
+  return {
+    questionType,
+    config: sortJsonValue(answerConfig) as Record<string, unknown>,
+    scoring: sortJsonValue(scoring ?? {}) as UiQuestion["scoring"],
+  };
+}
+
+function hasAnswerStateChanged(prev: AnswerStateSnapshot, next: AnswerStateSnapshot): boolean {
+  return JSON.stringify(prev) !== JSON.stringify(next);
+}
+
+async function insertQuestionAnswerHistoryTx(
+  tx: DbTx,
+  input: {
+    now: Date;
+    changeKind: AnswerHistoryChangeKind;
+    questionId: string | null;
+    fragebogenId: string | null;
+    spezialItemId: string | null;
+    previous: AnswerStateSnapshot;
+    next: AnswerStateSnapshot;
+  },
+) {
+  if (!(await ensureQuestionAnswerHistoryReady())) return;
+  await tx.insert(questionAnswerHistory).values({
+    questionId: input.questionId,
+    fragebogenId: input.fragebogenId,
+    spezialItemId: input.spezialItemId,
+    changeKind: input.changeKind,
+    previousQuestionType: input.previous.questionType,
+    nextQuestionType: input.next.questionType,
+    previousAnswerState: input.previous as unknown as Record<string, unknown>,
+    nextAnswerState: input.next as unknown as Record<string, unknown>,
+    changedAt: input.now,
+    isDeleted: false,
+    deletedAt: null,
+    createdAt: input.now,
+    updatedAt: input.now,
+  });
+}
+
 function normalizeAndRemapRuleRef(
   ref: string | undefined,
   idMap: Map<string, string>,
@@ -577,6 +655,11 @@ async function upsertModuleQuestionChainsTx(
 
 async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen: UiQuestion[]) {
   const now = new Date();
+  const existingRows = await tx
+    .select()
+    .from(fragebogenMainSpezialItems)
+    .where(and(eq(fragebogenMainSpezialItems.fragebogenId, fragebogenId), eq(fragebogenMainSpezialItems.isDeleted, false)));
+  const existingById = new Map(existingRows.map((row) => [row.id, row]));
   await tx
     .update(fragebogenMainSpezialItems)
     .set({
@@ -619,6 +702,26 @@ async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen
     if (tagIds.length > 0) {
       ensureAllUuids(tagIds, "Foto-Tag");
       await ensurePhotoTagsActive(tx, tagIds);
+    }
+    const existing = parsed.id && isUuid(parsed.id) ? existingById.get(parsed.id) : undefined;
+    if (existing) {
+      const previous = extractAnswerState(
+        existing.questionType as UiQuestion["type"],
+        (existing.config ?? {}) as Record<string, unknown>,
+        (existing.scoring ?? {}) as UiQuestion["scoring"],
+      );
+      const next = extractAnswerState(parsed.type, parsed.config ?? {}, parsed.scoring ?? {});
+      if (hasAnswerStateChanged(previous, next)) {
+        await insertQuestionAnswerHistoryTx(tx, {
+          now,
+          changeKind: previous.questionType === next.questionType ? "answer_edit" : "type_change",
+          questionId: null,
+          fragebogenId,
+          spezialItemId: existing.id,
+          previous,
+          next,
+        });
+      }
     }
     rows.push({
       fragebogenId,
@@ -834,7 +937,27 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
   await ensureQuestionRefsExist(tx, referencedIds);
   await ensurePhotoTagsActive(tx, tagIds);
 
+  const previousQuestion =
+    questionId && isUuid(questionId)
+      ? (await fetchQuestionsByIds(tx, [questionId])).get(questionId) ?? null
+      : null;
+
   const cleanConfig = sanitizeQuestionConfig(config);
+  if (previousQuestion && questionId) {
+    const previous = extractAnswerState(previousQuestion.type, previousQuestion.config ?? {}, previousQuestion.scoring ?? {});
+    const next = extractAnswerState(parsed.type, cleanConfig, parsed.scoring ?? {});
+    if (hasAnswerStateChanged(previous, next)) {
+      await insertQuestionAnswerHistoryTx(tx, {
+        now,
+        changeKind: previous.questionType === next.questionType ? "answer_edit" : "type_change",
+        questionId,
+        fragebogenId: null,
+        spezialItemId: null,
+        previous,
+        next,
+      });
+    }
+  }
   if (questionId) {
     await tx
       .update(questionBankShared)
