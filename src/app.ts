@@ -4,6 +4,7 @@ import { env } from "./config/env.js";
 import { adminUsersRouter } from "./routes/admin-users.js";
 import { adminCampaignsRouter } from "./routes/campaigns.js";
 import { adminZeiterfassungRouter } from "./routes/admin-zeiterfassung.js";
+import { adminLagerRouter } from "./routes/admin-lager.js";
 import { authRouter } from "./routes/auth.js";
 import { daySessionRouter } from "./routes/day-session.js";
 import { adminFragebogenRouter } from "./routes/fragebogen.js";
@@ -53,6 +54,7 @@ function createApp() {
   app.use("/red-month", redMonthRouter);
   app.use("/admin/users", adminUsersRouter);
   app.use("/admin/markets", adminMarketsRouter);
+  app.use("/admin", adminLagerRouter);
   app.use("/admin", adminFragebogenRouter);
   app.use("/admin", adminCampaignsRouter);
   app.use("/admin", adminIppRouter);
