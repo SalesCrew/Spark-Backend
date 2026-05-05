@@ -149,6 +149,26 @@ export const markets = pgTable(
   ],
 );
 
+export const lager = pgTable(
+  "lager",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    name: text("name").notNull(),
+    address: text("address").notNull(),
+    postalCode: text("postal_code").notNull(),
+    city: text("city").notNull(),
+    gmUserId: uuid("gm_user_id").references(() => users.id, { onDelete: "set null" }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("lager_gm_user_idx").on(table.gmUserId),
+    index("lager_deleted_idx").on(table.isDeleted),
+  ],
+);
+
 export const authAuditLogs = pgTable(
   "auth_audit_logs",
   {
@@ -1514,6 +1534,8 @@ export type UserRow = typeof users.$inferSelect;
 export type NewUserRow = typeof users.$inferInsert;
 export type MarketRow = typeof markets.$inferSelect;
 export type NewMarketRow = typeof markets.$inferInsert;
+export type LagerRow = typeof lager.$inferSelect;
+export type NewLagerRow = typeof lager.$inferInsert;
 export type CampaignRow = typeof campaigns.$inferSelect;
 export type NewCampaignRow = typeof campaigns.$inferInsert;
 export type CampaignMarketAssignmentHistoryRow = typeof campaignMarketAssignmentHistory.$inferSelect;
