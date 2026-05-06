@@ -7,7 +7,6 @@ import { lager, users } from "../lib/schema.js";
 
 const createLagerSchema = z
   .object({
-    name: z.string().min(1),
     address: z.string().min(1),
     postalCode: z.string().min(1),
     city: z.string().min(1),
@@ -24,7 +23,6 @@ adminLagerRouter.get("/lager", async (_req, res, next) => {
     const rows = await db
       .select({
         id: lager.id,
-        name: lager.name,
         address: lager.address,
         postalCode: lager.postalCode,
         city: lager.city,
@@ -37,12 +35,11 @@ adminLagerRouter.get("/lager", async (_req, res, next) => {
       .from(lager)
       .leftJoin(users, eq(users.id, lager.gmUserId))
       .where(eq(lager.isDeleted, false))
-      .orderBy(asc(lager.name), asc(lager.city));
+      .orderBy(asc(lager.city), asc(lager.address));
 
     res.status(200).json({
       lagers: rows.map((row) => ({
         id: row.id,
-        name: row.name,
         address: row.address,
         postalCode: row.postalCode,
         city: row.city,
@@ -66,7 +63,6 @@ adminLagerRouter.post("/lager", async (req, res, next) => {
     }
 
     const payload = parsed.data;
-    const normalizedName = payload.name.trim();
     const normalizedAddress = payload.address.trim();
     const normalizedPostalCode = payload.postalCode.trim();
     const normalizedCity = payload.city.trim();
@@ -89,7 +85,6 @@ adminLagerRouter.post("/lager", async (req, res, next) => {
       .where(
         and(
           eq(lager.isDeleted, false),
-          sql`lower(${lager.name}) = lower(${normalizedName})`,
           sql`lower(${lager.address}) = lower(${normalizedAddress})`,
           sql`lower(${lager.postalCode}) = lower(${normalizedPostalCode})`,
           sql`lower(${lager.city}) = lower(${normalizedCity})`,
@@ -104,7 +99,6 @@ adminLagerRouter.post("/lager", async (req, res, next) => {
     const [created] = await db
       .insert(lager)
       .values({
-        name: normalizedName,
         address: normalizedAddress,
         postalCode: normalizedPostalCode,
         city: normalizedCity,
@@ -131,7 +125,6 @@ adminLagerRouter.post("/lager", async (req, res, next) => {
     res.status(201).json({
       lager: {
         id: created.id,
-        name: created.name,
         address: created.address,
         postalCode: created.postalCode,
         city: created.city,
