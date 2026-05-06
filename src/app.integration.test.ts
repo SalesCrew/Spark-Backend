@@ -2293,7 +2293,8 @@ test("campaign market assignment add/remove uses soft delete", async (t) => {
   const [assignment] = await db
     .select()
     .from(campaignMarketAssignments)
-    .where(eq(campaignMarketAssignments.campaignId, campaignId));
+    .where(and(eq(campaignMarketAssignments.campaignId, campaignId), eq(campaignMarketAssignments.isDeleted, false)))
+    .limit(1);
   assert.ok(assignment);
   assert.equal(assignment?.isDeleted, false);
 
@@ -2375,6 +2376,407 @@ test("campaign assignment endpoint persists gmUserId", async (t) => {
   assert.equal(row?.gmUserId, gmUser.id);
 
   await request(app).patch(`/admin/campaigns/${campaignId}/delete`).send({});
+});
+
+test("campaign create aggregates repeated same market+gm assignments into visit target count", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForCampaignTests())) {
+    t.skip("Campaign tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const [gmUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(1);
+  if (!gmUser?.id) {
+    t.skip("No active GM user available for aggregation test.");
+    return;
+  }
+  const app = createApp();
+  const marketsRes = await request(app).get("/markets");
+  assert.equal(marketsRes.status, 200);
+  const marketId = marketsRes.body.markets?.[0]?.id as string | undefined;
+  if (!marketId) {
+    t.skip("No markets available for aggregation test.");
+    return;
+  }
+
+  const createRes = await request(app).post("/admin/campaigns").send({
+    name: `Campaign Aggregate ${Date.now()}`,
+    section: "standard",
+    status: "inactive",
+    scheduleType: "always",
+    assignments: [
+      { marketId, gmUserId: gmUser.id },
+      { marketId, gmUserId: gmUser.id },
+      { marketId, gmUserId: gmUser.id },
+    ],
+  });
+  assert.equal(createRes.status, 201);
+  const campaignId = createRes.body.campaign?.id as string;
+
+  const responseAssignments = (createRes.body.campaign?.assignments ?? []).filter(
+    (assignment: { marketId: string; gmUserId: string | null }) =>
+      assignment.marketId === marketId && assignment.gmUserId === gmUser.id,
+  );
+  assert.equal(responseAssignments.length, 1);
+  assert.equal(responseAssignments[0]?.visitTargetCount, 3);
+  assert.equal(responseAssignments[0]?.currentVisitsCount, 0);
+
+  const dbRows = await db
+    .select({
+      gmUserId: campaignMarketAssignments.gmUserId,
+      visitTargetCount: campaignMarketAssignments.visitTargetCount,
+      currentVisitsCount: campaignMarketAssignments.currentVisitsCount,
+    })
+    .from(campaignMarketAssignments)
+    .where(
+      and(
+        eq(campaignMarketAssignments.campaignId, campaignId),
+        eq(campaignMarketAssignments.marketId, marketId),
+        eq(campaignMarketAssignments.isDeleted, false),
+      ),
+    );
+  assert.equal(dbRows.length, 1);
+  assert.equal(dbRows[0]?.gmUserId, gmUser.id);
+  assert.equal(dbRows[0]?.visitTargetCount, 3);
+  assert.equal(dbRows[0]?.currentVisitsCount, 0);
+
+  await request(app).patch(`/admin/campaigns/${campaignId}/delete`).send({});
+});
+
+test("campaign create keeps separate rows for same market with different GMs", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForCampaignTests())) {
+    t.skip("Campaign tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const gmUsers = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(2);
+  if (gmUsers.length < 2) {
+    t.skip("Two active GM users are required for split assignment test.");
+    return;
+  }
+  const app = createApp();
+  const marketsRes = await request(app).get("/markets");
+  assert.equal(marketsRes.status, 200);
+  const marketId = marketsRes.body.markets?.[0]?.id as string | undefined;
+  if (!marketId) {
+    t.skip("No markets available for split assignment test.");
+    return;
+  }
+
+  const createRes = await request(app).post("/admin/campaigns").send({
+    name: `Campaign Split ${Date.now()}`,
+    section: "standard",
+    status: "inactive",
+    scheduleType: "always",
+    assignments: [
+      { marketId, gmUserId: gmUsers[0].id },
+      { marketId, gmUserId: gmUsers[1].id },
+    ],
+  });
+  assert.equal(createRes.status, 201);
+  const campaignId = createRes.body.campaign?.id as string;
+
+  const dbRows = await db
+    .select({
+      gmUserId: campaignMarketAssignments.gmUserId,
+      visitTargetCount: campaignMarketAssignments.visitTargetCount,
+    })
+    .from(campaignMarketAssignments)
+    .where(
+      and(
+        eq(campaignMarketAssignments.campaignId, campaignId),
+        eq(campaignMarketAssignments.marketId, marketId),
+        eq(campaignMarketAssignments.isDeleted, false),
+      ),
+    );
+  assert.equal(dbRows.length, 2);
+  const gmIds = new Set(dbRows.map((row) => row.gmUserId));
+  assert.equal(gmIds.has(gmUsers[0].id), true);
+  assert.equal(gmIds.has(gmUsers[1].id), true);
+  assert.equal(dbRows.every((row) => row.visitTargetCount === 1), true);
+
+  await request(app).patch(`/admin/campaigns/${campaignId}/delete`).send({});
+});
+
+test("campaign create ignores marketIds fallback when explicit assignments are present", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForCampaignTests())) {
+    t.skip("Campaign tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const [gmUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(1);
+  if (!gmUser?.id) {
+    t.skip("No active GM user available for mixed payload test.");
+    return;
+  }
+  const app = createApp();
+  const marketsRes = await request(app).get("/markets");
+  assert.equal(marketsRes.status, 200);
+  const marketId = marketsRes.body.markets?.[0]?.id as string | undefined;
+  if (!marketId) {
+    t.skip("No markets available for mixed payload test.");
+    return;
+  }
+
+  const createRes = await request(app).post("/admin/campaigns").send({
+    name: `Campaign Mixed Payload ${Date.now()}`,
+    section: "standard",
+    status: "inactive",
+    scheduleType: "always",
+    marketIds: [marketId],
+    assignments: [{ marketId, gmUserId: gmUser.id, visitTargetCount: 2 }],
+  });
+  assert.equal(createRes.status, 201);
+  const campaignId = createRes.body.campaign?.id as string;
+
+  const dbRows = await db
+    .select({
+      gmUserId: campaignMarketAssignments.gmUserId,
+      visitTargetCount: campaignMarketAssignments.visitTargetCount,
+    })
+    .from(campaignMarketAssignments)
+    .where(
+      and(
+        eq(campaignMarketAssignments.campaignId, campaignId),
+        eq(campaignMarketAssignments.marketId, marketId),
+        eq(campaignMarketAssignments.isDeleted, false),
+      ),
+    );
+  assert.equal(dbRows.length, 1);
+  assert.equal(dbRows[0]?.gmUserId, gmUser.id);
+  assert.equal(dbRows[0]?.visitTargetCount, 2);
+
+  await request(app).patch(`/admin/campaigns/${campaignId}/delete`).send({});
+});
+
+test("campaign assignment endpoint is safe for parallel increments on same market+gm", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForCampaignTests())) {
+    t.skip("Campaign tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const [gmUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(1);
+  if (!gmUser?.id) {
+    t.skip("No active GM user available for parallel increment test.");
+    return;
+  }
+
+  const app = createApp();
+  const marketsRes = await request(app).get("/markets");
+  assert.equal(marketsRes.status, 200);
+  const marketId = marketsRes.body.markets?.[0]?.id as string | undefined;
+  if (!marketId) {
+    t.skip("No markets available for parallel increment test.");
+    return;
+  }
+
+  const createRes = await request(app).post("/admin/campaigns").send({
+    name: `Campaign Parallel ${Date.now()}`,
+    section: "standard",
+    status: "inactive",
+    scheduleType: "always",
+    marketIds: [],
+  });
+  assert.equal(createRes.status, 201);
+  const campaignId = createRes.body.campaign?.id as string;
+
+  const [firstAssign, secondAssign] = await Promise.all([
+    request(app).post(`/admin/campaigns/${campaignId}/markets`).send({
+      assignments: [{ marketId, gmUserId: gmUser.id }],
+    }),
+    request(app).post(`/admin/campaigns/${campaignId}/markets`).send({
+      assignments: [{ marketId, gmUserId: gmUser.id }],
+    }),
+  ]);
+  assert.equal(firstAssign.status, 200);
+  assert.equal(secondAssign.status, 200);
+
+  const dbRows = await db
+    .select({
+      id: campaignMarketAssignments.id,
+      visitTargetCount: campaignMarketAssignments.visitTargetCount,
+    })
+    .from(campaignMarketAssignments)
+    .where(
+      and(
+        eq(campaignMarketAssignments.campaignId, campaignId),
+        eq(campaignMarketAssignments.marketId, marketId),
+        eq(campaignMarketAssignments.gmUserId, gmUser.id),
+        eq(campaignMarketAssignments.isDeleted, false),
+      ),
+    );
+  assert.equal(dbRows.length, 1);
+  assert.equal(dbRows[0]?.visitTargetCount, 2);
+
+  await request(app).patch(`/admin/campaigns/${campaignId}/delete`).send({});
+});
+
+test("campaign market delete removes all GM assignment rows for the same market", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForCampaignTests())) {
+    t.skip("Campaign tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const gmUsers = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(2);
+  if (gmUsers.length < 2) {
+    t.skip("Two active GM users are required for delete semantics test.");
+    return;
+  }
+  const app = createApp();
+  const marketsRes = await request(app).get("/markets");
+  assert.equal(marketsRes.status, 200);
+  const marketId = marketsRes.body.markets?.[0]?.id as string | undefined;
+  if (!marketId) {
+    t.skip("No markets available for delete semantics test.");
+    return;
+  }
+
+  const createRes = await request(app).post("/admin/campaigns").send({
+    name: `Campaign Delete All Rows ${Date.now()}`,
+    section: "standard",
+    status: "inactive",
+    scheduleType: "always",
+    assignments: [
+      { marketId, gmUserId: gmUsers[0].id },
+      { marketId, gmUserId: gmUsers[1].id },
+    ],
+  });
+  assert.equal(createRes.status, 201);
+  const campaignId = createRes.body.campaign?.id as string;
+
+  const removeRes = await request(app).patch(`/admin/campaigns/${campaignId}/markets/${marketId}/delete`).send({});
+  assert.equal(removeRes.status, 200);
+  assert.equal(removeRes.body.removed, true);
+
+  const activeRows = await db
+    .select({ id: campaignMarketAssignments.id })
+    .from(campaignMarketAssignments)
+    .where(
+      and(
+        eq(campaignMarketAssignments.campaignId, campaignId),
+        eq(campaignMarketAssignments.marketId, marketId),
+        eq(campaignMarketAssignments.isDeleted, false),
+      ),
+    );
+  assert.equal(activeRows.length, 0);
+
+  await request(app).patch(`/admin/campaigns/${campaignId}/delete`).send({});
+});
+
+test("campaign migrate merges visit target counts when destination already has same market+gm", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForCampaignTests())) {
+    t.skip("Campaign tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const [gmUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(1);
+  if (!gmUser?.id) {
+    t.skip("No active GM user available for migrate count merge test.");
+    return;
+  }
+  const app = createApp();
+  const marketsRes = await request(app).get("/markets");
+  assert.equal(marketsRes.status, 200);
+  const marketId = marketsRes.body.markets?.[0]?.id as string | undefined;
+  if (!marketId) {
+    t.skip("No markets available for migrate count merge test.");
+    return;
+  }
+  const uniq = `migrate-merge-${Date.now()}`;
+
+  const source = await request(app).post("/admin/campaigns").send({
+    name: `Source ${uniq}`,
+    section: "standard",
+    status: "active",
+    scheduleType: "always",
+    assignments: [{ marketId, gmUserId: gmUser.id, visitTargetCount: 2 }],
+  });
+  assert.equal(source.status, 201);
+  const sourceId = source.body.campaign?.id as string;
+
+  const target = await request(app).post("/admin/campaigns").send({
+    name: `Target ${uniq}`,
+    section: "standard",
+    status: "active",
+    scheduleType: "always",
+    marketIds: [],
+  });
+  assert.equal(target.status, 201);
+  const targetId = target.body.campaign?.id as string;
+  const now = new Date();
+  await db.insert(campaignMarketAssignments).values({
+    campaignId: targetId,
+    marketId,
+    gmUserId: gmUser.id,
+    visitTargetCount: 3,
+    currentVisitsCount: 0,
+    assignedAt: now,
+    assignedByUserId: null,
+    isDeleted: false,
+    deletedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  const migrateRes = await request(app).post(`/admin/campaigns/${targetId}/markets/migrate`).send({
+    moves: [{ marketId, fromCampaignId: sourceId, gmUserId: gmUser.id }],
+  });
+  assert.equal(migrateRes.status, 200);
+
+  const sourceActiveRows = await db
+    .select({ id: campaignMarketAssignments.id })
+    .from(campaignMarketAssignments)
+    .where(
+      and(
+        eq(campaignMarketAssignments.campaignId, sourceId),
+        eq(campaignMarketAssignments.marketId, marketId),
+        eq(campaignMarketAssignments.isDeleted, false),
+      ),
+    );
+  assert.equal(sourceActiveRows.length, 0);
+
+  const targetRows = await db
+    .select({
+      gmUserId: campaignMarketAssignments.gmUserId,
+      visitTargetCount: campaignMarketAssignments.visitTargetCount,
+    })
+    .from(campaignMarketAssignments)
+    .where(
+      and(
+        eq(campaignMarketAssignments.campaignId, targetId),
+        eq(campaignMarketAssignments.marketId, marketId),
+        eq(campaignMarketAssignments.gmUserId, gmUser.id),
+        eq(campaignMarketAssignments.isDeleted, false),
+      ),
+    );
+  assert.equal(targetRows.length, 1);
+  assert.equal(targetRows[0]?.visitTargetCount, 5);
+
+  await request(app).patch(`/admin/campaigns/${sourceId}/delete`).send({});
+  await request(app).patch(`/admin/campaigns/${targetId}/delete`).send({});
 });
 
 test("campaign create blocks same-section overlapping market assignment with 409", async (t) => {

@@ -153,7 +153,6 @@ export const lager = pgTable(
   "lager",
   {
     id: uuid("id").defaultRandom().primaryKey(),
-    name: text("name").notNull(),
     address: text("address").notNull(),
     postalCode: text("postal_code").notNull(),
     city: text("city").notNull(),
@@ -209,6 +208,7 @@ export const campaigns = pgTable("campaigns", {
 export const campaignMarketAssignments = pgTable(
   "campaign_market_assignments",
   {
+    id: uuid("id").defaultRandom().primaryKey(),
     campaignId: uuid("campaign_id")
       .notNull()
       .references(() => campaigns.id, { onDelete: "cascade" }),
@@ -217,6 +217,8 @@ export const campaignMarketAssignments = pgTable(
       .references(() => markets.id, { onDelete: "cascade" }),
     assignedAt: timestamp("assigned_at", { withTimezone: true }).defaultNow().notNull(),
     gmUserId: uuid("gm_user_id").references(() => users.id, { onDelete: "set null" }),
+    visitTargetCount: integer("visit_target_count").notNull().default(1),
+    currentVisitsCount: integer("current_visits_count").notNull().default(0),
     assignedByUserId: uuid("assigned_by_user_id").references(() => users.id, { onDelete: "set null" }),
     isDeleted: boolean("is_deleted").notNull().default(false),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
@@ -224,7 +226,14 @@ export const campaignMarketAssignments = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
-    primaryKey({ columns: [table.campaignId, table.marketId] }),
+    check("campaign_market_assignments_visit_target_count_ck", sql`${table.visitTargetCount} >= 1`),
+    check("campaign_market_assignments_current_visits_count_ck", sql`${table.currentVisitsCount} >= 0`),
+    uniqueIndex("campaign_market_assignments_campaign_market_gm_active_unique")
+      .on(table.campaignId, table.marketId, table.gmUserId)
+      .where(sql`${table.isDeleted} = false and ${table.gmUserId} is not null`),
+    uniqueIndex("campaign_market_assignments_campaign_market_unassigned_active_unique")
+      .on(table.campaignId, table.marketId)
+      .where(sql`${table.isDeleted} = false and ${table.gmUserId} is null`),
     index("campaign_market_assignments_market_idx").on(table.marketId),
     index("campaign_market_assignments_gm_deleted_idx").on(table.gmUserId, table.isDeleted),
     index("campaign_market_assignments_campaign_deleted_idx").on(table.campaignId, table.isDeleted),

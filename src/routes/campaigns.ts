@@ -33,6 +33,7 @@ const campaignAssignmentSchema = z
     marketId: z.string().uuid(),
     gmUserId: z.string().uuid().nullable().optional(),
     gmNameRaw: z.string().optional(),
+    visitTargetCount: z.coerce.number().int().min(1).optional(),
   })
   .strict();
 
@@ -245,12 +246,14 @@ type CampaignAssignmentInput = {
   marketId: string;
   gmUserId: string | null;
   gmNameRaw?: string;
+  visitTargetCount: number;
 };
 
 type CampaignAssignmentDraftInput = {
   marketId: string;
   gmUserId?: string | null | undefined;
   gmNameRaw?: string | undefined;
+  visitTargetCount?: number | undefined;
 };
 
 type CampaignScheduleWindow = {
@@ -273,14 +276,38 @@ function windowsOverlap(left: CampaignScheduleWindow, right: CampaignScheduleWin
 
 function normalizeAssignments(input: { marketIds?: string[]; assignments?: CampaignAssignmentDraftInput[] }) {
   const normalized = new Map<string, CampaignAssignmentInput>();
-  for (const marketId of input.marketIds ?? []) {
-    normalized.set(marketId, { marketId, gmUserId: null });
+  const assignmentInput = input.assignments ?? [];
+  const hasExplicitAssignments = assignmentInput.length > 0;
+
+  if (!hasExplicitAssignments) {
+    for (const marketId of input.marketIds ?? []) {
+      const key = `${marketId}:__unassigned__`;
+      const existing = normalized.get(key);
+      if (existing) {
+        existing.visitTargetCount += 1;
+        continue;
+      }
+      normalized.set(key, { marketId, gmUserId: null, visitTargetCount: 1 });
+    }
   }
-  for (const assignment of input.assignments ?? []) {
+
+  for (const assignment of assignmentInput) {
     if (!assignment.marketId) continue;
-    normalized.set(assignment.marketId, {
+    const gmUserId = assignment.gmUserId ?? null;
+    const key = `${assignment.marketId}:${gmUserId ?? "__unassigned__"}`;
+    const count = assignment.visitTargetCount ?? 1;
+    const existing = normalized.get(key);
+    if (existing) {
+      existing.visitTargetCount += count;
+      if (assignment.gmNameRaw) {
+        existing.gmNameRaw = assignment.gmNameRaw;
+      }
+      continue;
+    }
+    normalized.set(key, {
       marketId: assignment.marketId,
-      gmUserId: assignment.gmUserId ?? null,
+      gmUserId,
+      visitTargetCount: count,
       ...(assignment.gmNameRaw ? { gmNameRaw: assignment.gmNameRaw } : {}),
     });
   }
@@ -473,13 +500,21 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
     .orderBy(desc(campaignFragebogenHistory.changedAt));
 
   const marketIdsByCampaign = new Map<string, string[]>();
-  const assignmentRowsByCampaign = new Map<string, Array<{ marketId: string; gmUserId: string | null }>>();
+  const assignmentRowsByCampaign = new Map<
+    string,
+    Array<{ marketId: string; gmUserId: string | null; visitTargetCount: number; currentVisitsCount: number }>
+  >();
   for (const row of assignments) {
     const current = marketIdsByCampaign.get(row.campaignId) ?? [];
     current.push(row.marketId);
     marketIdsByCampaign.set(row.campaignId, current);
     const assignmentRows = assignmentRowsByCampaign.get(row.campaignId) ?? [];
-    assignmentRows.push({ marketId: row.marketId, gmUserId: row.gmUserId ?? null });
+    assignmentRows.push({
+      marketId: row.marketId,
+      gmUserId: row.gmUserId ?? null,
+      visitTargetCount: row.visitTargetCount,
+      currentVisitsCount: row.currentVisitsCount,
+    });
     assignmentRowsByCampaign.set(row.campaignId, assignmentRows);
   }
 
@@ -575,11 +610,13 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
     scheduleType: row.scheduleType,
     startDate: row.startDate ? String(row.startDate) : null,
     endDate: row.endDate ? String(row.endDate) : null,
-    marketIds: marketIdsByCampaign.get(row.id) ?? [],
+    marketIds: normalizeUnique(marketIdsByCampaign.get(row.id) ?? []),
     assignments: (assignmentRowsByCampaign.get(row.id) ?? []).map((assignment) => ({
       marketId: assignment.marketId,
       gmUserId: assignment.gmUserId,
       gmName: assignment.gmUserId ? (gmNameById.get(assignment.gmUserId) ?? null) : null,
+      visitTargetCount: assignment.visitTargetCount,
+      currentVisitsCount: assignment.currentVisitsCount,
     })),
     history: (historyByCampaign.get(row.id) ?? []).map((historyRow) => ({
       id: historyRow.id,
@@ -590,6 +627,62 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }));
+}
+
+type DbTransaction = Parameters<typeof db.transaction>[0] extends (tx: infer T) => unknown ? T : never;
+
+async function mergeCampaignAssignment(
+  tx: DbTransaction,
+  input: {
+    campaignId: string;
+    marketId: string;
+    gmUserId: string | null;
+    visitTargetCountDelta: number;
+    now: Date;
+    auditUserId: string | null;
+  },
+) {
+  const gmFilter =
+    input.gmUserId === null
+      ? isNull(campaignMarketAssignments.gmUserId)
+      : eq(campaignMarketAssignments.gmUserId, input.gmUserId);
+
+  await tx.execute(sql`SELECT ${campaigns.id} FROM ${campaigns} WHERE ${campaigns.id} = ${input.campaignId} FOR UPDATE`);
+
+  const updated = await tx
+    .update(campaignMarketAssignments)
+    .set({
+      visitTargetCount: sql`${campaignMarketAssignments.visitTargetCount} + ${input.visitTargetCountDelta}`,
+      assignedAt: input.now,
+      assignedByUserId: input.auditUserId,
+      isDeleted: false,
+      deletedAt: null,
+      updatedAt: input.now,
+    })
+    .where(
+      and(
+        eq(campaignMarketAssignments.campaignId, input.campaignId),
+        eq(campaignMarketAssignments.marketId, input.marketId),
+        gmFilter,
+        eq(campaignMarketAssignments.isDeleted, false),
+      ),
+    )
+    .returning({ id: campaignMarketAssignments.id });
+  if (updated.length > 0) return;
+
+  await tx.insert(campaignMarketAssignments).values({
+    campaignId: input.campaignId,
+    marketId: input.marketId,
+    gmUserId: input.gmUserId,
+    visitTargetCount: input.visitTargetCountDelta,
+    currentVisitsCount: 0,
+    assignedAt: input.now,
+    assignedByUserId: input.auditUserId,
+    isDeleted: false,
+    deletedAt: null,
+    createdAt: input.now,
+    updatedAt: input.now,
+  });
 }
 
 async function buildCampaignMarketVisitSummaries(campaignId: string) {
@@ -1116,6 +1209,8 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
             campaignId: created.id,
             marketId: assignment.marketId,
             gmUserId: assignment.gmUserId,
+            visitTargetCount: assignment.visitTargetCount,
+            currentVisitsCount: 0,
             assignedAt: now,
             assignedByUserId: auditUserId,
             isDeleted: false,
@@ -1220,6 +1315,7 @@ adminCampaignsRouter.patch("/campaigns/:id", async (req: AuthedRequest, res, nex
         assignments: activeAssignments.map((assignment) => ({
           marketId: assignment.marketId,
           gmUserId: assignment.gmUserId ?? null,
+          visitTargetCount: 1,
         })),
       });
       if (conflicts.length > 0) {
@@ -1363,30 +1459,14 @@ adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, r
       if (!campaignRow) throw new CampaignDomainError("campaign_not_found", 404, "Kampagne nicht gefunden.");
 
       for (const assignment of assignments) {
-        await tx
-          .insert(campaignMarketAssignments)
-          .values({
-            campaignId,
-            marketId: assignment.marketId,
-            gmUserId: assignment.gmUserId,
-            assignedAt: now,
-            assignedByUserId: auditUserId,
-            isDeleted: false,
-            deletedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          })
-          .onConflictDoUpdate({
-            target: [campaignMarketAssignments.campaignId, campaignMarketAssignments.marketId],
-            set: {
-              gmUserId: assignment.gmUserId,
-              assignedAt: now,
-              assignedByUserId: auditUserId,
-              isDeleted: false,
-              deletedAt: null,
-              updatedAt: now,
-            },
-          });
+        await mergeCampaignAssignment(tx, {
+          campaignId,
+          marketId: assignment.marketId,
+          gmUserId: assignment.gmUserId,
+          visitTargetCountDelta: assignment.visitTargetCount,
+          now,
+          auditUserId,
+        });
       }
     });
 
@@ -1427,19 +1507,20 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
       return;
     }
 
-    const movesByMarket = new Map<
+    const movesByKey = new Map<
       string,
       { marketId: string; fromCampaignId: string; gmUserId: string | null; reason: string | undefined }
     >();
     for (const move of parsed.data.moves) {
-      movesByMarket.set(move.marketId, {
+      const key = `${move.marketId}:${move.fromCampaignId}`;
+      movesByKey.set(key, {
         marketId: move.marketId,
         fromCampaignId: move.fromCampaignId,
         gmUserId: move.gmUserId ?? null,
         reason: move.reason,
       });
     }
-    const moves = Array.from(movesByMarket.values());
+    const moves = Array.from(movesByKey.values());
     const marketIds = moves.map((move) => move.marketId);
     await ensureMarketsExist(marketIds);
     await ensureGmUsersExist(moves.map((move) => move.gmUserId));
@@ -1469,7 +1550,7 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
         startDate: targetCampaign.startDate ? String(targetCampaign.startDate) : null,
         endDate: targetCampaign.endDate ? String(targetCampaign.endDate) : null,
       },
-      assignments: moves.map((move) => ({ marketId: move.marketId, gmUserId: move.gmUserId })),
+      assignments: moves.map((move) => ({ marketId: move.marketId, gmUserId: move.gmUserId, visitTargetCount: 1 })),
     });
     const conflictsByKey = new Map(conflicts.map((conflict) => [`${conflict.marketId}:${conflict.existingCampaignId}`, conflict]));
     for (const move of moves) {
@@ -1487,11 +1568,13 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
     const auditUserId = await resolveAuditUserId(req.authUser?.appUserId);
     await db.transaction(async (tx) => {
       for (const move of moves) {
-        const [oldAssignment] = await tx
+        const oldAssignments = await tx
           .select({
+            id: campaignMarketAssignments.id,
             campaignId: campaignMarketAssignments.campaignId,
             marketId: campaignMarketAssignments.marketId,
             gmUserId: campaignMarketAssignments.gmUserId,
+            visitTargetCount: campaignMarketAssignments.visitTargetCount,
           })
           .from(campaignMarketAssignments)
           .where(
@@ -1500,9 +1583,8 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
               eq(campaignMarketAssignments.marketId, move.marketId),
               eq(campaignMarketAssignments.isDeleted, false),
             ),
-          )
-          .limit(1);
-        if (!oldAssignment) {
+          );
+        if (oldAssignments.length === 0) {
           throw new CampaignDomainError(
             "invalid_payload",
             409,
@@ -1510,6 +1592,7 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
           );
         }
 
+        const oldAssignmentIds = oldAssignments.map((assignment) => assignment.id);
         await tx
           .update(campaignMarketAssignments)
           .set({
@@ -1517,52 +1600,32 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
             deletedAt: now,
             updatedAt: now,
           })
-          .where(
-            and(
-              eq(campaignMarketAssignments.campaignId, move.fromCampaignId),
-              eq(campaignMarketAssignments.marketId, move.marketId),
-              eq(campaignMarketAssignments.isDeleted, false),
-            ),
-          );
+          .where(inArray(campaignMarketAssignments.id, oldAssignmentIds));
 
-        const nextGmUserId = move.gmUserId ?? oldAssignment.gmUserId ?? null;
-        await tx
-          .insert(campaignMarketAssignments)
-          .values({
+        for (const oldAssignment of oldAssignments) {
+          const nextGmUserId = move.gmUserId ?? oldAssignment.gmUserId ?? null;
+          await mergeCampaignAssignment(tx, {
             campaignId,
             marketId: move.marketId,
             gmUserId: nextGmUserId,
-            assignedAt: now,
-            assignedByUserId: auditUserId,
-            isDeleted: false,
-            deletedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          })
-          .onConflictDoUpdate({
-            target: [campaignMarketAssignments.campaignId, campaignMarketAssignments.marketId],
-            set: {
-              gmUserId: nextGmUserId,
-              assignedAt: now,
-              assignedByUserId: auditUserId,
-              isDeleted: false,
-              deletedAt: null,
-              updatedAt: now,
-            },
+            visitTargetCountDelta: oldAssignment.visitTargetCount,
+            now,
+            auditUserId,
           });
 
-        await tx.insert(campaignMarketAssignmentHistory).values({
-          marketId: move.marketId,
-          section: targetCampaign.section,
-          fromCampaignId: move.fromCampaignId,
-          toCampaignId: campaignId,
-          fromGmUserId: oldAssignment.gmUserId ?? null,
-          toGmUserId: nextGmUserId,
-          migratedByUserId: auditUserId,
-          migratedAt: now,
-          reason: move.reason ?? "campaign_overlap_resolution",
-          createdAt: now,
-        });
+          await tx.insert(campaignMarketAssignmentHistory).values({
+            marketId: move.marketId,
+            section: targetCampaign.section,
+            fromCampaignId: move.fromCampaignId,
+            toCampaignId: campaignId,
+            fromGmUserId: oldAssignment.gmUserId ?? null,
+            toGmUserId: nextGmUserId,
+            migratedByUserId: auditUserId,
+            migratedAt: now,
+            reason: move.reason ?? "campaign_overlap_resolution",
+            createdAt: now,
+          });
+        }
       }
     });
 
@@ -1599,6 +1662,8 @@ adminCampaignsRouter.patch("/campaigns/:id/markets/:marketId/delete", async (req
       return;
     }
     const now = new Date();
+    // Removing a market from a campaign is market-scoped: all active assignment rows
+    // for this campaign+market are soft-deleted, regardless of GM.
     const removed = await db
       .update(campaignMarketAssignments)
       .set({ isDeleted: true, deletedAt: now, updatedAt: now })
