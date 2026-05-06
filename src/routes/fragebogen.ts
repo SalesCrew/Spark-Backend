@@ -416,6 +416,24 @@ function hasAnswerStateChanged(prev: AnswerStateSnapshot, next: AnswerStateSnaps
   return JSON.stringify(prev) !== JSON.stringify(next);
 }
 
+function needsIppRecalcForQuestionChange(
+  previousQuestion: UiQuestion | null,
+  nextQuestion: UiQuestion,
+): boolean {
+  if (!previousQuestion) return false;
+  const previous = extractAnswerState(
+    previousQuestion.type,
+    previousQuestion.config ?? {},
+    previousQuestion.scoring ?? {},
+  );
+  const next = extractAnswerState(
+    nextQuestion.type,
+    sanitizeQuestionConfig((nextQuestion.config ?? {}) as Record<string, unknown>),
+    nextQuestion.scoring ?? {},
+  );
+  return hasAnswerStateChanged(previous, next);
+}
+
 async function insertQuestionAnswerHistoryTx(
   tx: DbTx,
   input: {
@@ -1538,11 +1556,22 @@ adminFragebogenRouter.post("/modules/:scope", async (req, res, next) => {
       const questionIdMap = new Map<string, string>();
       const savedQuestionRows: Array<{ sourceQuestion: UiQuestion; persistedQuestionId: string }> = [];
       const questionChainInputs: Array<{ questionId: string; chains?: string[] }> = [];
+      const existingQuestionIds = payload.questions
+        .map((question) => question.id)
+        .filter((questionId): questionId is string => isUuid(questionId));
+      const previousQuestionsById =
+        existingQuestionIds.length > 0
+          ? await fetchQuestionsByIds(tx, existingQuestionIds)
+          : new Map<string, UiQuestion>();
       for (const question of payload.questions) {
         const saved = await upsertQuestionGraphTx(tx, { ...question, rules: [] });
         if (saved.id) {
           questionIds.push(saved.id);
-          affectedQuestionIds.push(saved.id);
+          const previousQuestion =
+            question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
+          if (needsIppRecalcForQuestionChange(previousQuestion, question)) {
+            affectedQuestionIds.push(saved.id);
+          }
           if (question.id) {
             questionIdMap.set(question.id, saved.id);
           }
@@ -1660,11 +1689,22 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
       const questionIdMap = new Map<string, string>();
       const savedQuestionRows: Array<{ sourceQuestion: UiQuestion; persistedQuestionId: string }> = [];
       const questionChainInputs: Array<{ questionId: string; chains?: string[] }> = [];
+      const existingQuestionIds = parsed.data.questions
+        .map((question) => question.id)
+        .filter((questionId): questionId is string => isUuid(questionId));
+      const previousQuestionsById =
+        existingQuestionIds.length > 0
+          ? await fetchQuestionsByIds(tx, existingQuestionIds)
+          : new Map<string, UiQuestion>();
       for (const question of parsed.data.questions) {
         const saved = await upsertQuestionGraphTx(tx, { ...question, rules: [] });
         if (saved.id) {
           questionIds.push(saved.id);
-          affectedQuestionIds.push(saved.id);
+          const previousQuestion =
+            question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
+          if (needsIppRecalcForQuestionChange(previousQuestion, question)) {
+            affectedQuestionIds.push(saved.id);
+          }
           if (question.id) {
             questionIdMap.set(question.id, saved.id);
           }
