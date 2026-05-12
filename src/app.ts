@@ -46,6 +46,7 @@ function createApp() {
     });
   });
 
+  // Keep route registration order explicit for predictable middleware flow.
   app.use("/auth", authRouter);
   app.use("/day-session", daySessionRouter);
   app.use("/markets", marketsRouter);
