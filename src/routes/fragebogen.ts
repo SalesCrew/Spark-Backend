@@ -2,6 +2,15 @@ import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { type NextFunction, type Request, type Response, Router } from "express";
 import { z } from "zod";
 import { db, sql as pgSql } from "../lib/db.js";
+import {
+  aggregateHighVolumeLoad,
+  getRequestLogMeta,
+  logAction,
+  logger,
+  markErrorAsLogged,
+  serializeError,
+  startActionTimer,
+} from "../lib/logger.js";
 import { enqueueIppRecalcForQuestionScoringChanges } from "../lib/ipp-finalizer.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
@@ -33,6 +42,26 @@ import {
 
 const adminFragebogenRouter = Router();
 adminFragebogenRouter.use(requireAuth(["admin"]));
+adminFragebogenRouter.use((req, res, next) => {
+  if (req.method.toUpperCase() === "GET") {
+    next();
+    return;
+  }
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "fragebogen_action_completed", {
+      req,
+      action: "fragebogen_mutation",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const isUuid = (value: string | undefined | null): value is string => Boolean(value && uuidRegex.test(value));
@@ -432,6 +461,52 @@ function needsIppRecalcForQuestionChange(
     nextQuestion.scoring ?? {},
   );
   return hasAnswerStateChanged(previous, next);
+}
+
+function normalizeRulesForComparison(rules: UiQuestion["rules"] = []) {
+  return rules.map((rule) => ({
+    triggerQuestionId: rule.triggerQuestionId ?? "",
+    operator: rule.operator ?? "equals",
+    triggerValue: rule.triggerValue ?? "",
+    triggerValueMax: rule.triggerValueMax ?? "",
+    action: rule.action ?? "hide",
+    targetQuestionIds: Array.from(new Set(rule.targetQuestionIds ?? [])),
+  }));
+}
+
+function questionGraphSnapshotForComparison(question: UiQuestion) {
+  return {
+    type: question.type,
+    text: question.text,
+    required: question.required,
+    config: sortJsonValue(
+      sanitizeQuestionConfig((question.config ?? {}) as Record<string, unknown>),
+    ) as Record<string, unknown>,
+    scoring: sortJsonValue(question.scoring ?? {}) as UiQuestion["scoring"],
+    rules: sortJsonValue(normalizeRulesForComparison(question.rules ?? [])),
+  };
+}
+
+function needsQuestionGraphUpdate(
+  previousQuestion: UiQuestion | null,
+  nextQuestion: UiQuestion,
+): boolean {
+  if (!previousQuestion) return true;
+  const previousSnapshot = questionGraphSnapshotForComparison(previousQuestion);
+  const nextSnapshot = questionGraphSnapshotForComparison(nextQuestion);
+  return JSON.stringify(previousSnapshot) !== JSON.stringify(nextSnapshot);
+}
+
+function normalizeChainsForComparison(chains?: string[]): string[] {
+  return normalizeChainDbNames(chains).sort((left, right) => left.localeCompare(right));
+}
+
+function areStringArraysEqual(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
 }
 
 async function insertQuestionAnswerHistoryTx(
@@ -1511,6 +1586,18 @@ adminFragebogenRouter.get("/modules/:scope", async (req, res, next) => {
   try {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
     const modules = await fetchModulesUi(scope);
+    const requestUser = req as Request & {
+      authUser?: { appUserId?: string; role?: string };
+      requestId?: string;
+    };
+    aggregateHighVolumeLoad({
+      metric: "modules",
+      scope,
+      loaded: modules.length,
+      requestId: requestUser.requestId ?? null,
+      appUserId: requestUser.authUser?.appUserId ?? null,
+      role: requestUser.authUser?.role ?? null,
+    });
     res.status(200).json({ modules });
   } catch (error) {
     next(error);
@@ -1672,51 +1759,103 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
         } as Partial<typeof moduleMain.$inferInsert>)
         .where(eq((cfg.moduleTable as typeof moduleMain).id, req.params.id));
 
-      await tx
-        .update(cfg.linkTable as typeof moduleMainQuestion)
-        .set({
-          isDeleted: true,
-          deletedAt: now,
-          updatedAt: now,
+      const existingModuleLinks = await tx
+        .select({
+          questionId: (cfg.linkTable as typeof moduleMainQuestion).questionId,
+          orderIndex: (cfg.linkTable as typeof moduleMainQuestion).orderIndex,
         })
+        .from(cfg.linkTable as typeof moduleMainQuestion)
         .where(
           and(
             eq((cfg.linkTable as typeof moduleMainQuestion).moduleId, req.params.id),
             eq((cfg.linkTable as typeof moduleMainQuestion).isDeleted, false),
           ),
         );
-      const questionIds: string[] = [];
-      const questionIdMap = new Map<string, string>();
-      const savedQuestionRows: Array<{ sourceQuestion: UiQuestion; persistedQuestionId: string }> = [];
-      const questionChainInputs: Array<{ questionId: string; chains?: string[] }> = [];
-      const existingQuestionIds = parsed.data.questions
+      const existingOrderByQuestionId = new Map<string, number>(
+        existingModuleLinks.map((link) => [link.questionId, link.orderIndex]),
+      );
+      const existingModuleQuestionIds = existingModuleLinks.map((link) => link.questionId);
+
+      const incomingQuestionIds = parsed.data.questions
         .map((question) => question.id)
         .filter((questionId): questionId is string => isUuid(questionId));
+      const questionIdsForLookup = Array.from(
+        new Set([...existingModuleQuestionIds, ...incomingQuestionIds]),
+      );
       const previousQuestionsById =
-        existingQuestionIds.length > 0
-          ? await fetchQuestionsByIds(tx, existingQuestionIds)
+        questionIdsForLookup.length > 0
+          ? await fetchQuestionsByIds(tx, questionIdsForLookup)
           : new Map<string, UiQuestion>();
-      for (const question of parsed.data.questions) {
-        const saved = await upsertQuestionGraphTx(tx, { ...question, rules: [] });
-        if (saved.id) {
-          questionIds.push(saved.id);
-          const previousQuestion =
-            question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
+
+      const chainsReady = await ensureModuleQuestionChainsReady();
+      const existingChainRows =
+        !chainsReady
+          ? []
+          : await tx
+              .select({
+                questionId: moduleQuestionChains.questionId,
+                chainDbName: moduleQuestionChains.chainDbName,
+              })
+              .from(moduleQuestionChains)
+              .where(
+                and(
+                  eq(moduleQuestionChains.scope, scope),
+                  eq(moduleQuestionChains.moduleId, req.params.id),
+                  eq(moduleQuestionChains.isDeleted, false),
+                ),
+              );
+      const existingChainsByQuestionId = new Map<string, string[]>();
+      for (const row of existingChainRows) {
+        const current = existingChainsByQuestionId.get(row.questionId) ?? [];
+        current.push(row.chainDbName);
+        existingChainsByQuestionId.set(row.questionId, current);
+      }
+      for (const [questionId, chains] of existingChainsByQuestionId.entries()) {
+        existingChainsByQuestionId.set(questionId, normalizeChainsForComparison(chains));
+      }
+
+      const questionIdMap = new Map<string, string>();
+      const savedQuestionRowsById = new Map<
+        string,
+        { sourceQuestion: UiQuestion; persistedQuestionId: string }
+      >();
+      const desiredOrderByQuestionId = new Map<string, number>();
+      const desiredChainsByQuestionId = new Map<string, string[]>();
+
+      for (const [orderIndex, question] of parsed.data.questions.entries()) {
+        const previousQuestion =
+          question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
+        const shouldPersistQuestion = needsQuestionGraphUpdate(previousQuestion, question);
+        let persistedQuestionId: string;
+
+        if (shouldPersistQuestion) {
+          const saved = await upsertQuestionGraphTx(tx, { ...question, rules: [] });
+          if (!saved.id) continue;
+          persistedQuestionId = saved.id;
           if (needsIppRecalcForQuestionChange(previousQuestion, question)) {
             affectedQuestionIds.push(saved.id);
           }
-          if (question.id) {
-            questionIdMap.set(question.id, saved.id);
-          }
-          questionIdMap.set(saved.id, saved.id);
-          savedQuestionRows.push({ sourceQuestion: question, persistedQuestionId: saved.id });
-          questionChainInputs.push(
-            question.chains ? { questionId: saved.id, chains: question.chains } : { questionId: saved.id },
-          );
+          savedQuestionRowsById.set(saved.id, {
+            sourceQuestion: question,
+            persistedQuestionId: saved.id,
+          });
+        } else {
+          persistedQuestionId = question.id!;
         }
+
+        if (question.id) {
+          questionIdMap.set(question.id, persistedQuestionId);
+        }
+        questionIdMap.set(persistedQuestionId, persistedQuestionId);
+        desiredOrderByQuestionId.set(persistedQuestionId, orderIndex);
+        desiredChainsByQuestionId.set(
+          persistedQuestionId,
+          normalizeChainsForComparison(question.chains),
+        );
       }
-      const questionOrderById = new Map<string, number>(questionIds.map((questionId, orderIndex) => [questionId, orderIndex]));
-      for (const savedQuestionRow of savedQuestionRows) {
+
+      const questionOrderById = new Map<string, number>(desiredOrderByQuestionId.entries());
+      for (const savedQuestionRow of savedQuestionRowsById.values()) {
         const remappedRules = remapAndValidateQuestionRules(
           savedQuestionRow.sourceQuestion.rules ?? [],
           questionIdMap,
@@ -1730,8 +1869,10 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
         await ensureQuestionRefsExist(tx, referencedIds);
         await persistQuestionRulesTx(tx, savedQuestionRow.persistedQuestionId, remappedRules, now);
       }
-      if (questionIds.length > 0) {
-        for (const [orderIndex, questionId] of questionIds.entries()) {
+
+      for (const [questionId, orderIndex] of desiredOrderByQuestionId.entries()) {
+        const existingOrder = existingOrderByQuestionId.get(questionId);
+        if (existingOrder == null) {
           await tx
             .insert(cfg.linkTable as typeof moduleMainQuestion)
             .values({
@@ -1755,13 +1896,86 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
                 updatedAt: now,
               },
             });
+          continue;
+        }
+        if (existingOrder !== orderIndex) {
+          await tx
+            .update(cfg.linkTable as typeof moduleMainQuestion)
+            .set({ orderIndex, updatedAt: now })
+            .where(
+              and(
+                eq((cfg.linkTable as typeof moduleMainQuestion).moduleId, req.params.id),
+                eq((cfg.linkTable as typeof moduleMainQuestion).questionId, questionId),
+                eq((cfg.linkTable as typeof moduleMainQuestion).isDeleted, false),
+              ),
+            );
         }
       }
-      await upsertModuleQuestionChainsTx(tx, {
-        scope,
-        moduleId: req.params.id,
-        questionChainInputs,
-      });
+
+      const removedQuestionIds = existingModuleQuestionIds.filter(
+        (questionId) => !desiredOrderByQuestionId.has(questionId),
+      );
+      if (removedQuestionIds.length > 0) {
+        await tx
+          .update(cfg.linkTable as typeof moduleMainQuestion)
+          .set({
+            isDeleted: true,
+            deletedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq((cfg.linkTable as typeof moduleMainQuestion).moduleId, req.params.id),
+              eq((cfg.linkTable as typeof moduleMainQuestion).isDeleted, false),
+              inArray((cfg.linkTable as typeof moduleMainQuestion).questionId, removedQuestionIds),
+            ),
+          );
+      }
+
+      if (chainsReady) {
+        const questionIdsForChainDiff = new Set<string>([
+          ...desiredOrderByQuestionId.keys(),
+          ...existingChainsByQuestionId.keys(),
+        ]);
+        for (const questionId of questionIdsForChainDiff) {
+          const previousChains = existingChainsByQuestionId.get(questionId) ?? [];
+          const desiredChains = desiredChainsByQuestionId.get(questionId) ?? [];
+          if (areStringArraysEqual(previousChains, desiredChains)) continue;
+
+          if (previousChains.length > 0) {
+            await tx
+              .update(moduleQuestionChains)
+              .set({
+                isDeleted: true,
+                deletedAt: now,
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(moduleQuestionChains.scope, scope),
+                  eq(moduleQuestionChains.moduleId, req.params.id),
+                  eq(moduleQuestionChains.questionId, questionId),
+                  eq(moduleQuestionChains.isDeleted, false),
+                ),
+              );
+          }
+
+          if (desiredChains.length > 0) {
+            await tx.insert(moduleQuestionChains).values(
+              desiredChains.map((chainDbName) => ({
+                scope,
+                moduleId: req.params.id,
+                questionId,
+                chainDbName,
+                isDeleted: false,
+                deletedAt: null,
+                createdAt: now,
+                updatedAt: now,
+              })),
+            );
+          }
+        }
+      }
     });
 
     if (affectedQuestionIds.length > 0) {
@@ -1805,6 +2019,18 @@ adminFragebogenRouter.get("/fragebogen/:scope", async (req, res, next) => {
   try {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
     const fragebogen = await fetchFragebogenUi(scope);
+    const requestUser = req as Request & {
+      authUser?: { appUserId?: string; role?: string };
+      requestId?: string;
+    };
+    aggregateHighVolumeLoad({
+      metric: "fragebogen",
+      scope,
+      loaded: fragebogen.length,
+      requestId: requestUser.requestId ?? null,
+      appUserId: requestUser.authUser?.appUserId ?? null,
+      role: requestUser.authUser?.role ?? null,
+    });
     res.status(200).json({ fragebogen });
   } catch (error) {
     next(error);
@@ -2024,9 +2250,18 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id/delete", async (req, res, ne
 });
 
 adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const sourceScope = getScopeParam(req.params as Record<string, string | undefined>);
     if (!isUuid(req.params.id)) {
+      logAction("warn", "fragebogen_duplicate_invalid_id", {
+        req,
+        action: "fragebogen_duplicate",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Fragebogen-ID." });
       return;
     }
@@ -2034,10 +2269,19 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
       .object({
         targetScope: scopeSchema.optional(),
         sectionKeywords: z.array(mainSectionSchema).optional(),
+        duplicateModulesToTargetSection: z.boolean().optional(),
       })
       .strict()
       .safeParse(req.body ?? {});
     if (!body.success) {
+      logAction("warn", "fragebogen_duplicate_invalid_payload", {
+        req,
+        action: "fragebogen_duplicate",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Duplicate-Payload." });
       return;
     }
@@ -2045,19 +2289,166 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
 
     const [source] = await fetchFragebogenUi(sourceScope, [req.params.id]);
     if (!source) {
+      logAction("warn", "fragebogen_duplicate_source_not_found", {
+        req,
+        action: "fragebogen_duplicate",
+        result: "rejected",
+        statusCode: 404,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(404).json({ error: "Quelle nicht gefunden." });
       return;
     }
 
+    const duplicateModulesToTargetSection = body.data.duplicateModulesToTargetSection === true;
+    const shouldDuplicateLinkedModules =
+      duplicateModulesToTargetSection && sourceScope === "main" && targetScope === "main";
+    const targetMainSectionForModuleDup =
+      shouldDuplicateLinkedModules && body.data.sectionKeywords && body.data.sectionKeywords.length === 1
+        ? body.data.sectionKeywords[0]
+        : null;
+
+    if (shouldDuplicateLinkedModules && !targetMainSectionForModuleDup) {
+      logAction("warn", "fragebogen_duplicate_missing_target_section", {
+        req,
+        action: "fragebogen_duplicate",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(400).json({
+        error: "Für die Modul-Duplizierung muss genau eine Zielsektion in sectionKeywords gesetzt sein.",
+      });
+      return;
+    }
+
+    const sourceModulesForDuplication =
+      shouldDuplicateLinkedModules
+        ? await fetchModulesUi(sourceScope, source.moduleIds)
+        : [];
+
+    if (shouldDuplicateLinkedModules) {
+      const sourceModuleById = new Map(sourceModulesForDuplication.map((moduleRow) => [moduleRow.id, moduleRow]));
+      const missingSourceModuleId = source.moduleIds.find((moduleId) => !sourceModuleById.has(moduleId));
+      if (missingSourceModuleId) {
+        logAction("warn", "fragebogen_duplicate_source_module_missing", {
+          req,
+          action: "fragebogen_duplicate",
+          result: "rejected",
+          statusCode: 400,
+          requestClass: "client_error",
+          startedAtNs,
+          details: { missingSourceModuleId },
+        });
+        res.status(400).json({ error: "Mindestens ein verknüpftes Modul der Quelle konnte nicht geladen werden." });
+        return;
+      }
+    }
+
     if (targetScope !== "main" && (source.spezialfragen?.length ?? 0) > 0) {
+      logAction("warn", "fragebogen_duplicate_invalid_spezialfragen_scope", {
+        req,
+        action: "fragebogen_duplicate",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Spezialfragen koennen nur im Main-Scope dupliziert werden." });
       return;
     }
 
     const now = new Date();
     const createdId = await db.transaction(async (tx) => {
-      await validateModuleIdsExist(tx, targetScope, source.moduleIds);
       const targetCfg = pickScopeConfig(targetScope);
+
+      const targetModuleIds = shouldDuplicateLinkedModules
+        ? await (async () => {
+            const targetSectionKeywords = [targetMainSectionForModuleDup as MainSection];
+            const sourceModuleById = new Map(sourceModulesForDuplication.map((moduleRow) => [moduleRow.id, moduleRow]));
+            const duplicatedModuleIds: string[] = [];
+
+            for (const sourceModuleId of source.moduleIds) {
+              const sourceModule = sourceModuleById.get(sourceModuleId);
+              if (!sourceModule) {
+                throw new DomainValidationError("Mindestens ein verknuepftes Modul der Quelle konnte nicht geladen werden.");
+              }
+
+              const [createdModule] = await tx
+                .insert(targetCfg.moduleTable as typeof moduleMain)
+                .values({
+                  name: `Kopie von ${sourceModule.name}`,
+                  description: sourceModule.description ?? "",
+                  ...(targetScope === "main"
+                    ? { sectionKeywords: targetSectionKeywords }
+                    : {}),
+                  createdAt: now,
+                  updatedAt: now,
+                } as typeof moduleMain.$inferInsert)
+                .returning();
+
+              if (!createdModule) {
+                throw new Error("Modul-Duplikat konnte nicht erstellt werden.");
+              }
+
+              const questionIds = sourceModule.questions
+                .map((question) => question.id)
+                .filter((id): id is string => typeof id === "string");
+              const sourceChainsByQuestionId = new Map(
+                sourceModule.questions
+                  .filter((question) => typeof question.id === "string")
+                  .map((question) => [question.id as string, question.chains]),
+              );
+
+              ensureAllUuids(questionIds, "Frage");
+              if (questionIds.length > 0) {
+                const existingQuestions = await tx
+                  .select({ id: questionBankShared.id })
+                  .from(questionBankShared)
+                  .where(and(inArray(questionBankShared.id, questionIds), eq(questionBankShared.isDeleted, false)));
+                const foundQuestionIds = new Set(existingQuestions.map((row) => row.id));
+                const missingQuestionIds = questionIds.filter((id) => !foundQuestionIds.has(id));
+                if (missingQuestionIds.length > 0) {
+                  throw new DomainValidationError("Mindestens eine verknuepfte Frage existiert nicht mehr.");
+                }
+              }
+
+              if (questionIds.length > 0) {
+                await tx.insert(targetCfg.linkTable as typeof moduleMainQuestion).values(
+                  questionIds.map((questionId, orderIndex) => ({
+                    moduleId: createdModule.id,
+                    questionId,
+                    orderIndex,
+                    isDeleted: false,
+                    deletedAt: null,
+                    createdAt: now,
+                    updatedAt: now,
+                  })),
+                );
+              }
+
+              await upsertModuleQuestionChainsTx(tx, {
+                scope: targetScope,
+                moduleId: createdModule.id,
+                questionChainInputs: questionIds.map((questionId) => {
+                  const chains = sourceChainsByQuestionId.get(questionId);
+                  return chains ? { questionId, chains } : { questionId };
+                }),
+              });
+
+              duplicatedModuleIds.push(createdModule.id);
+            }
+
+            return duplicatedModuleIds;
+          })()
+        : source.moduleIds;
+
+      if (!shouldDuplicateLinkedModules) {
+        await validateModuleIdsExist(tx, targetScope, source.moduleIds);
+      }
+
       const [created] = await tx
         .insert(targetCfg.fbTable as typeof fragebogenMain)
         .values({
@@ -2084,7 +2475,7 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
         throw new Error("Fragebogen-Duplikat konnte nicht erstellt werden.");
       }
 
-      const moduleIds = Array.from(new Set(source.moduleIds));
+      const moduleIds = Array.from(new Set(targetModuleIds));
       if (moduleIds.length > 0) {
         await tx.insert(targetCfg.fbModuleLink as typeof fragebogenMainModule).values(
           moduleIds.map((moduleId, orderIndex) => ({
@@ -2106,19 +2497,63 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
 
     const [fragebogen] = await fetchFragebogenUi(targetScope, [createdId]);
     res.status(201).json({ fragebogen });
+    logAction("info", "fragebogen_duplicate_success", {
+      req,
+      action: "fragebogen_duplicate",
+      result: "success",
+      statusCode: 201,
+      requestClass: "success",
+      startedAtNs,
+      details: {
+        sourceScope,
+        targetScope,
+        sourceFragebogenId: req.params.id,
+        targetFragebogenId: createdId,
+        duplicatedModulesToTargetSection: shouldDuplicateLinkedModules,
+        moduleCount: source.moduleIds.length,
+      },
+    });
   } catch (error) {
     if (error instanceof Error && error.message.includes("Modul")) {
+      logAction("warn", "fragebogen_duplicate_module_error", {
+        req,
+        action: "fragebogen_duplicate",
+        result: "failure",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { message: error.message },
+      });
       res.status(400).json({ error: error.message });
       return;
     }
+    logAction("error", "fragebogen_duplicate_failed", {
+      req,
+      action: "fragebogen_duplicate",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
     next(error);
   }
 });
 
 adminFragebogenRouter.post("/modules/:scope/:id/duplicate", async (req, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const sourceScope = getScopeParam(req.params as Record<string, string | undefined>);
     if (!isUuid(req.params.id)) {
+      logAction("warn", "module_duplicate_invalid_id", {
+        req,
+        action: "module_duplicate",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Modul-ID." });
       return;
     }
@@ -2130,6 +2565,14 @@ adminFragebogenRouter.post("/modules/:scope/:id/duplicate", async (req, res, nex
       .strict()
       .safeParse(req.body ?? {});
     if (!body.success) {
+      logAction("warn", "module_duplicate_invalid_payload", {
+        req,
+        action: "module_duplicate",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Duplicate-Payload." });
       return;
     }
@@ -2137,6 +2580,14 @@ adminFragebogenRouter.post("/modules/:scope/:id/duplicate", async (req, res, nex
 
     const [source] = await fetchModulesUi(sourceScope, [req.params.id]);
     if (!source) {
+      logAction("warn", "module_duplicate_source_not_found", {
+        req,
+        action: "module_duplicate",
+        result: "rejected",
+        statusCode: 404,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(404).json({ error: "Quelle nicht gefunden." });
       return;
     }
@@ -2209,7 +2660,32 @@ adminFragebogenRouter.post("/modules/:scope/:id/duplicate", async (req, res, nex
 
     const [module] = await fetchModulesUi(targetScope, [createdId]);
     res.status(201).json({ module });
+    logAction("info", "module_duplicate_success", {
+      req,
+      action: "module_duplicate",
+      result: "success",
+      statusCode: 201,
+      requestClass: "success",
+      startedAtNs,
+      details: {
+        sourceScope,
+        targetScope,
+        sourceModuleId: req.params.id,
+        targetModuleId: createdId,
+        questionCount: source.questions.length,
+      },
+    });
   } catch (error) {
+    logAction("error", "module_duplicate_failed", {
+      req,
+      action: "module_duplicate",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
     next(error);
   }
 });
@@ -2240,15 +2716,31 @@ adminFragebogenRouter.get("/question-map", async (req, res, next) => {
   }
 });
 
-adminFragebogenRouter.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+adminFragebogenRouter.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
   if (err instanceof DomainValidationError) {
+    logger.warn("fragebogen_domain_validation_error", {
+      ...getRequestLogMeta(req),
+      message: err.message,
+    });
     res.status(400).json({ error: err.message });
     return;
   }
   if (err instanceof z.ZodError) {
+    logger.warn("fragebogen_zod_validation_error", {
+      ...getRequestLogMeta(req),
+      issues: err.issues.map((issue) => ({
+        code: issue.code,
+        path: issue.path.join("."),
+      })),
+    });
     res.status(400).json({ error: "Ungueltige Eingabedaten." });
     return;
   }
+  logger.error("fragebogen_unhandled_router_error", {
+    ...getRequestLogMeta(req),
+    error: serializeError(err),
+  });
+  markErrorAsLogged(err);
   next(err);
 });
 

@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../lib/db.js";
+import { getRequestLogMeta, logger, serializeError } from "../lib/logger.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { type UserRole, users } from "../lib/schema.js";
 
@@ -43,12 +44,18 @@ export function requireAuth(allowedRoles?: UserRole[]) {
 
       const accessToken = readBearerToken(req);
       if (!accessToken) {
+        logger.warn("auth_missing_access_token", {
+          ...getRequestLogMeta(req),
+        });
         res.status(401).json({ error: "Missing access token." });
         return;
       }
 
       const { data, error } = await supabaseAdmin.auth.getUser(accessToken);
       if (error || !data.user) {
+        logger.warn("auth_invalid_access_token", {
+          ...getRequestLogMeta(req),
+        });
         res.status(401).json({ error: "Invalid access token." });
         return;
       }
@@ -61,11 +68,21 @@ export function requireAuth(allowedRoles?: UserRole[]) {
         .limit(1);
 
       if (!appUser) {
+        logger.warn("auth_user_not_active_or_missing", {
+          ...getRequestLogMeta(req),
+          supabaseAuthId: authId,
+        });
         res.status(403).json({ error: "User is deactivated or missing." });
         return;
       }
 
       if (allowedRoles && !allowedRoles.includes(appUser.role)) {
+        logger.warn("auth_role_not_allowed", {
+          ...getRequestLogMeta(req),
+          appUserId: appUser.id,
+          role: appUser.role,
+          allowedRoles,
+        });
         res.status(403).json({ error: "Role is not allowed for this endpoint." });
         return;
       }
@@ -79,6 +96,10 @@ export function requireAuth(allowedRoles?: UserRole[]) {
 
       next();
     } catch (err) {
+      logger.error("auth_middleware_failure", {
+        ...getRequestLogMeta(req),
+        error: serializeError(err),
+      });
       next(err);
     }
   };

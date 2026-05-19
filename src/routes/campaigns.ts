@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { type Response, Router } from "express";
 import { z } from "zod";
+import { aggregateHighVolumeLoad, logAction, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { type AuthedRequest, requireAuth } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
@@ -1110,11 +1111,43 @@ function respondDomainError(res: Response, error: CampaignDomainError) {
 
 const adminCampaignsRouter = Router();
 adminCampaignsRouter.use(requireAuth(["admin"]));
+adminCampaignsRouter.use((req, res, next) => {
+  if (req.method.toUpperCase() === "GET") {
+    next();
+    return;
+  }
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "campaigns_action_completed", {
+      req,
+      action: "campaigns_mutation",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
-adminCampaignsRouter.get("/campaigns", async (_req, res, next) => {
+adminCampaignsRouter.get("/campaigns", async (req, res, next) => {
   try {
     const rows = await db.select().from(campaigns).where(eq(campaigns.isDeleted, false)).orderBy(desc(campaigns.createdAt));
     const mapped = await mapCampaignRows(rows);
+    const deletedRows = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(campaigns)
+      .where(eq(campaigns.isDeleted, true));
+    aggregateHighVolumeLoad({
+      metric: "campaigns",
+      loaded: mapped.length,
+      softDeleted: Number(deletedRows[0]?.count ?? 0),
+      requestId: (req as { requestId?: string }).requestId ?? null,
+      appUserId: (req as AuthedRequest).authUser?.appUserId ?? null,
+      role: (req as AuthedRequest).authUser?.role ?? null,
+    });
     res.status(200).json({ campaigns: mapped });
   } catch (error) {
     next(error);
@@ -1150,9 +1183,18 @@ adminCampaignsRouter.get("/campaigns/:id/market-visits", async (req, res, next) 
 });
 
 adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const parsed = createCampaignSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "campaign_create_invalid_payload", {
+        req,
+        action: "campaign_create",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Kampagne.", code: "invalid_payload" });
       return;
     }
@@ -1248,28 +1290,86 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
     }
     const [campaign] = await mapCampaignRows([row]);
     res.status(201).json({ campaign });
+    logAction("info", "campaign_create_success", {
+      req,
+      action: "campaign_create",
+      result: "success",
+      statusCode: 201,
+      requestClass: "success",
+      startedAtNs,
+      details: {
+        campaignId,
+        section: parsed.data.section,
+        assignmentsCount: assignments.length,
+      },
+    });
   } catch (error) {
     if (error instanceof CampaignOverlapConflictError) {
+      logAction("warn", "campaign_create_overlap_conflict", {
+        req,
+        action: "campaign_create",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { conflictCount: error.conflicts.length },
+      });
       res.status(error.status).json({ error: error.message, code: error.code, conflicts: error.conflicts });
       return;
     }
     if (error instanceof CampaignDomainError) {
+      logAction("warn", "campaign_create_domain_error", {
+        req,
+        action: "campaign_create",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { code: error.code, message: error.message },
+      });
       respondDomainError(res, error);
       return;
     }
+    logAction("error", "campaign_create_failed", {
+      req,
+      action: "campaign_create",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
     next(error);
   }
 });
 
 adminCampaignsRouter.patch("/campaigns/:id", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const campaignId = String(req.params.id ?? "");
     if (!isUuid(campaignId)) {
+      logAction("warn", "campaign_update_invalid_id", {
+        req,
+        action: "campaign_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
     const parsed = updateCampaignSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "campaign_update_invalid_payload", {
+        req,
+        action: "campaign_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Kampagnen-Aenderung.", code: "invalid_payload" });
       return;
     }
@@ -1367,23 +1467,69 @@ adminCampaignsRouter.patch("/campaigns/:id", async (req: AuthedRequest, res, nex
     }
     const [campaign] = await mapCampaignRows([row]);
     res.status(200).json({ campaign });
+    logAction("info", "campaign_update_success", {
+      req,
+      action: "campaign_update",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { campaignId, status: row.status },
+    });
   } catch (error) {
     if (error instanceof CampaignOverlapConflictError) {
+      logAction("warn", "campaign_update_overlap_conflict", {
+        req,
+        action: "campaign_update",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { conflictCount: error.conflicts.length },
+      });
       res.status(error.status).json({ error: error.message, code: error.code, conflicts: error.conflicts });
       return;
     }
     if (error instanceof CampaignDomainError) {
+      logAction("warn", "campaign_update_domain_error", {
+        req,
+        action: "campaign_update",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { code: error.code, message: error.message },
+      });
       respondDomainError(res, error);
       return;
     }
+    logAction("error", "campaign_update_failed", {
+      req,
+      action: "campaign_update",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
     next(error);
   }
 });
 
 adminCampaignsRouter.patch("/campaigns/:id/delete", async (req, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const campaignId = String(req.params.id ?? "");
     if (!isUuid(campaignId)) {
+      logAction("warn", "campaign_delete_invalid_id", {
+        req,
+        action: "campaign_delete",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
@@ -1394,20 +1540,56 @@ adminCampaignsRouter.patch("/campaigns/:id/delete", async (req, res, next) => {
       .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
       .returning({ id: campaigns.id });
     res.status(200).json({ ok: true, alreadyDeleted: deleted.length === 0 });
+    logAction("info", "campaign_delete_success", {
+      req,
+      action: "campaign_delete",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { campaignId, alreadyDeleted: deleted.length === 0 },
+    });
   } catch (error) {
+    logAction("error", "campaign_delete_failed", {
+      req,
+      action: "campaign_delete",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
     next(error);
   }
 });
 
 adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const campaignId = String(req.params.id ?? "");
     if (!isUuid(campaignId)) {
+      logAction("warn", "campaign_markets_assign_invalid_id", {
+        req,
+        action: "campaign_markets_assign",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
     const parsed = assignMarketsSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "campaign_markets_assign_invalid_payload", {
+        req,
+        action: "campaign_markets_assign",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Marktzuweisung.", code: "invalid_payload" });
       return;
     }
@@ -1481,28 +1663,82 @@ adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, r
     }
     const [campaign] = await mapCampaignRows([row]);
     res.status(200).json({ campaign });
+    logAction("info", "campaign_markets_assign_success", {
+      req,
+      action: "campaign_markets_assign",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { campaignId, assignedCount: assignments.length },
+    });
   } catch (error) {
     if (error instanceof CampaignOverlapConflictError) {
+      logAction("warn", "campaign_markets_assign_overlap_conflict", {
+        req,
+        action: "campaign_markets_assign",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { conflictCount: error.conflicts.length },
+      });
       res.status(error.status).json({ error: error.message, code: error.code, conflicts: error.conflicts });
       return;
     }
     if (error instanceof CampaignDomainError) {
+      logAction("warn", "campaign_markets_assign_domain_error", {
+        req,
+        action: "campaign_markets_assign",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { code: error.code, message: error.message },
+      });
       respondDomainError(res, error);
       return;
     }
+    logAction("error", "campaign_markets_assign_failed", {
+      req,
+      action: "campaign_markets_assign",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
     next(error);
   }
 });
 
 adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const campaignId = String(req.params.id ?? "");
     if (!isUuid(campaignId)) {
+      logAction("warn", "campaign_markets_migrate_invalid_id", {
+        req,
+        action: "campaign_markets_migrate",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
     const parsed = migrateMarketsSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "campaign_markets_migrate_invalid_payload", {
+        req,
+        action: "campaign_markets_migrate",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Marktmigration.", code: "invalid_payload" });
       return;
     }
@@ -1640,24 +1876,70 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
     }
     const [campaign] = await mapCampaignRows([row]);
     res.status(200).json({ campaign, migrated: moves.length });
+    logAction("info", "campaign_markets_migrate_success", {
+      req,
+      action: "campaign_markets_migrate",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { campaignId, migrated: moves.length },
+    });
   } catch (error) {
     if (error instanceof CampaignOverlapConflictError) {
+      logAction("warn", "campaign_markets_migrate_overlap_conflict", {
+        req,
+        action: "campaign_markets_migrate",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { conflictCount: error.conflicts.length },
+      });
       res.status(error.status).json({ error: error.message, code: error.code, conflicts: error.conflicts });
       return;
     }
     if (error instanceof CampaignDomainError) {
+      logAction("warn", "campaign_markets_migrate_domain_error", {
+        req,
+        action: "campaign_markets_migrate",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { code: error.code, message: error.message },
+      });
       respondDomainError(res, error);
       return;
     }
+    logAction("error", "campaign_markets_migrate_failed", {
+      req,
+      action: "campaign_markets_migrate",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
     next(error);
   }
 });
 
 adminCampaignsRouter.patch("/campaigns/:id/markets/:marketId/delete", async (req, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const campaignId = String(req.params.id ?? "");
     const marketId = String(req.params.marketId ?? "");
     if (!isUuid(campaignId) || !isUuid(marketId)) {
+      logAction("warn", "campaign_market_remove_invalid_id", {
+        req,
+        action: "campaign_market_remove",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige ID.", code: "invalid_id" });
       return;
     }
@@ -1682,25 +1964,70 @@ adminCampaignsRouter.patch("/campaigns/:id/markets/:marketId/delete", async (req
       .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
       .limit(1);
     if (!row) {
+      logAction("warn", "campaign_market_remove_campaign_not_found", {
+        req,
+        action: "campaign_market_remove",
+        result: "rejected",
+        statusCode: 404,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { campaignId },
+      });
       res.status(404).json({ error: "Kampagne nicht gefunden.", code: "campaign_not_found" });
       return;
     }
     const [campaign] = await mapCampaignRows([row]);
     res.status(200).json({ campaign, removed: removed.length > 0 });
+    logAction("info", "campaign_market_remove_success", {
+      req,
+      action: "campaign_market_remove",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { campaignId, marketId, removed: removed.length > 0 },
+    });
   } catch (error) {
+    logAction("error", "campaign_market_remove_failed", {
+      req,
+      action: "campaign_market_remove",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
     next(error);
   }
 });
 
 adminCampaignsRouter.post("/campaigns/:id/fragebogen/switch", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const campaignId = String(req.params.id ?? "");
     if (!isUuid(campaignId)) {
+      logAction("warn", "campaign_fragebogen_switch_invalid_id", {
+        req,
+        action: "campaign_fragebogen_switch",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
     const parsed = switchFragebogenSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "campaign_fragebogen_switch_invalid_payload", {
+        req,
+        action: "campaign_fragebogen_switch",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungueltiger Fragebogen-Wechsel.", code: "invalid_payload" });
       return;
     }
@@ -1749,16 +2076,53 @@ adminCampaignsRouter.post("/campaigns/:id/fragebogen/switch", async (req: Authed
       .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
       .limit(1);
     if (!row) {
+      logAction("warn", "campaign_fragebogen_switch_not_found", {
+        req,
+        action: "campaign_fragebogen_switch",
+        result: "rejected",
+        statusCode: 404,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { campaignId },
+      });
       res.status(404).json({ error: "Kampagne nicht gefunden.", code: "campaign_not_found" });
       return;
     }
     const [campaign] = await mapCampaignRows([row]);
     res.status(200).json({ campaign, switched });
+    logAction("info", "campaign_fragebogen_switch_success", {
+      req,
+      action: "campaign_fragebogen_switch",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { campaignId, switched },
+    });
   } catch (error) {
     if (error instanceof CampaignDomainError) {
+      logAction("warn", "campaign_fragebogen_switch_domain_error", {
+        req,
+        action: "campaign_fragebogen_switch",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { code: error.code, message: error.message },
+      });
       respondDomainError(res, error);
       return;
     }
+    logAction("error", "campaign_fragebogen_switch_failed", {
+      req,
+      action: "campaign_fragebogen_switch",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
     next(error);
   }
 });

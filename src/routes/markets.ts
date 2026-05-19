@@ -2,6 +2,7 @@ import { and, asc, desc, eq, gt, ilike, inArray, isNotNull, or, sql } from "driz
 import { Router } from "express";
 import { z } from "zod";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
+import { aggregateHighVolumeLoad, logAction, logger, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { getCurrentRedPeriod } from "../lib/red-monat.js";
@@ -484,6 +485,27 @@ const marketsRouter = Router();
 const adminMarketsRouter = Router();
 
 marketsRouter.use(requireAuth(["admin", "gm", "sm"]));
+marketsRouter.use((req, res, next) => {
+  const shouldTrackRead = req.method.toUpperCase() === "GET" && req.path.startsWith("/gm/");
+  if (!shouldTrackRead) {
+    next();
+    return;
+  }
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "markets_gm_read_completed", {
+      req,
+      action: "markets_gm_read",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 marketsRouter.get("/", async (req, res, next) => {
   try {
@@ -519,7 +541,21 @@ marketsRouter.get("/", async (req, res, next) => {
     } else {
       rows = await db.select().from(markets).where(eq(markets.isDeleted, false)).orderBy(desc(markets.createdAt));
     }
+    const deletedRows = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(markets)
+      .where(eq(markets.isDeleted, true));
+    const requestUser = req as AuthedRequest & { requestId?: string };
     const gmNamesByMarketId = await resolveActiveStandardGmNamesByMarketIds(rows.map((row) => row.id));
+    aggregateHighVolumeLoad({
+      metric: "markets",
+      scope: q ? "search" : "all",
+      loaded: rows.length,
+      softDeleted: Number(deletedRows[0]?.count ?? 0),
+      requestId: requestUser.requestId ?? null,
+      appUserId: requestUser.authUser?.appUserId ?? null,
+      role: requestUser.authUser?.role ?? null,
+    });
     res.status(200).json({
       markets: rows.map((row) => ({
         ...mapMarketRow(row),
@@ -1089,11 +1125,40 @@ marketsRouter.get("/gm/visit-start", async (req: AuthedRequest, res, next) => {
 });
 
 adminMarketsRouter.use(requireAuth(["admin"]));
+adminMarketsRouter.use((req, res, next) => {
+  if (req.method.toUpperCase() === "GET") {
+    next();
+    return;
+  }
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "admin_markets_action_completed", {
+      req,
+      action: "admin_markets_mutation",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const parsed = importMarketsSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "market_import_invalid_payload", {
+        req,
+        action: "market_import",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Invalid import payload." });
       return;
     }
@@ -1132,9 +1197,17 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
     const importedAt = new Date();
     const dataRows = rowsAsStrings.slice(1);
-    console.info(
-      `[markets import] start file=${payload.fileName} sheet=${payload.sheetName} rows=${dataRows.length}`,
-    );
+    logAction("info", "market_import_started", {
+      req,
+      action: "market_import",
+      result: "started",
+      startedAtNs,
+      details: {
+        fileName: payload.fileName,
+        sheetName: payload.sheetName,
+        totalRows: dataRows.length,
+      },
+    });
 
     const lastRowByIdentity = new Map<string, number>();
     for (let i = 0; i < dataRows.length; i += 1) {
@@ -1195,7 +1268,15 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
       for (let i = 0; i < dataRows.length; i += 1) {
         if (i > 0 && i % 500 === 0) {
-          console.info(`[markets import] progress ${i}/${dataRows.length}`);
+          logger.debug("market_import_progress", {
+            action: "market_import",
+            result: "progress",
+            importedRows: i,
+            totalRows: dataRows.length,
+            requestId: (req as { requestId?: string }).requestId ?? null,
+            appUserId: req.authUser?.appUserId ?? null,
+            role: req.authUser?.role ?? null,
+          });
         }
         const row = dataRows[i];
         if (!row) continue;
@@ -1440,18 +1521,47 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       .from(markets)
       .where(eq(markets.isDeleted, false))
       .orderBy(desc(markets.createdAt));
-    console.info(
-      `[markets import] done created=${summary.created} updated=${summary.updated} skipped=${summary.skipped}`,
-    );
+    logAction("info", "market_import_completed", {
+      req,
+      action: "market_import",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: {
+        created: summary.created,
+        updated: summary.updated,
+        skipped: summary.skipped,
+        duplicateInputRowsMerged: summary.duplicateInputRowsMerged,
+      },
+    });
     res.status(200).json({ markets: fresh.map(mapMarketRow), summary });
   } catch (err) {
     if (err instanceof Error && err.message === "IMPORT_IN_PROGRESS") {
+      logAction("warn", "market_import_in_progress", {
+        req,
+        action: "market_import",
+        result: "rejected",
+        statusCode: 409,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(409).json({
         error: "Ein anderer Import laeuft bereits. Bitte in wenigen Sekunden erneut versuchen.",
       });
       return;
     }
     if (isIdentityConstraintViolation(err)) {
+      logAction("warn", "market_import_identity_conflict", {
+        req,
+        action: "market_import",
+        result: "failure",
+        statusCode: 409,
+        requestClass: "client_error",
+        startedAtNs,
+        error: err,
+      });
+      markErrorAsLogged(err);
       res.status(409).json({
         error:
           "Import konnte nicht abgeschlossen werden: aktive Märkte mit gleicher Identität existieren bereits.",
@@ -1459,30 +1569,77 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       return;
     }
     if (isPgLockTimeout(err)) {
+      logAction("warn", "market_import_lock_timeout", {
+        req,
+        action: "market_import",
+        result: "failure",
+        statusCode: 409,
+        requestClass: "client_error",
+        startedAtNs,
+        error: err,
+      });
+      markErrorAsLogged(err);
       res.status(409).json({
         error: "Import konnte keinen DB-Lock erhalten. Bitte erneut versuchen.",
       });
       return;
     }
     if (isPgStatementTimeout(err)) {
+      logAction("error", "market_import_statement_timeout", {
+        req,
+        action: "market_import",
+        result: "failure",
+        statusCode: 504,
+        requestClass: "server_error",
+        startedAtNs,
+        error: err,
+      });
+      markErrorAsLogged(err);
       res.status(504).json({
         error: "Import dauerte zu lange (DB-Timeout). Bitte Datei erneut importieren.",
       });
       return;
     }
+    logAction("error", "market_import_failed", {
+      req,
+      action: "market_import",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });
 
 adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const id = String(req.params.id ?? "");
     if (!id) {
+      logAction("warn", "market_update_invalid_id", {
+        req,
+        action: "market_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Market id is required." });
       return;
     }
     const parsed = updateMarketSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "market_update_invalid_payload", {
+        req,
+        action: "market_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Invalid market update payload." });
       return;
     }
@@ -1490,6 +1647,15 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
     const payload = parsed.data;
     const normalizedRegion = payload.region != null ? normalizeRegionValue(payload.region) : null;
     if (normalizedRegion && !normalizedRegion.ok) {
+      logAction("warn", "market_update_invalid_region", {
+        req,
+        action: "market_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { region: normalizedRegion.raw },
+      });
       res.status(400).json({
         error: `Unbekannte Region "${normalizedRegion.raw || payload.region}". Erlaubt: ${CANONICAL_REGIONS.join(", ")}.`,
       });
@@ -1532,6 +1698,15 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       .returning();
 
     if (!updated) {
+      logAction("warn", "market_update_not_found", {
+        req,
+        action: "market_update",
+        result: "rejected",
+        statusCode: 404,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { marketId: id },
+      });
       res.status(404).json({ error: "Market not found." });
       return;
     }
@@ -1543,27 +1718,74 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         plannedByActiveStandardGmName: gmNamesByMarketId.get(updated.id) ?? null,
       },
     });
+    logAction("info", "market_update_success", {
+      req,
+      action: "market_update",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { marketId: updated.id },
+    });
   } catch (err) {
     if (isIdentityConstraintViolation(err)) {
+      logAction("warn", "market_update_identity_conflict", {
+        req,
+        action: "market_update",
+        result: "failure",
+        statusCode: 409,
+        requestClass: "client_error",
+        startedAtNs,
+        error: err,
+      });
+      markErrorAsLogged(err);
       res.status(409).json({
         error: "Markt konnte nicht angelegt werden: Identitätsnummer bereits bei aktivem Markt vorhanden.",
       });
       return;
     }
+    logAction("error", "market_update_failed", {
+      req,
+      action: "market_update",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });
 
 adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const parsed = createMarketSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "market_create_invalid_payload", {
+        req,
+        action: "market_create",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Invalid market create payload." });
       return;
     }
     const payload = parsed.data;
     const normalizedRegion = normalizeRegionValue(payload.region);
     if (!normalizedRegion.ok) {
+      logAction("warn", "market_create_invalid_region", {
+        req,
+        action: "market_create",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { region: normalizedRegion.raw },
+      });
       res.status(400).json({
         error: `Unbekannte Region "${normalizedRegion.raw || payload.region}". Erlaubt: ${CANONICAL_REGIONS.join(", ")}.`,
       });
@@ -1596,6 +1818,14 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
       })
       .returning();
     if (!created) {
+      logAction("error", "market_create_failed_no_row", {
+        req,
+        action: "market_create",
+        result: "failure",
+        statusCode: 500,
+        requestClass: "server_error",
+        startedAtNs,
+      });
       res.status(500).json({ error: "Failed to create market." });
       return;
     }
@@ -1606,15 +1836,43 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
         plannedByActiveStandardGmName: gmNamesByMarketId.get(created.id) ?? null,
       },
     });
+    logAction("info", "market_create_success", {
+      req,
+      action: "market_create",
+      result: "success",
+      statusCode: 201,
+      requestClass: "success",
+      startedAtNs,
+      details: { marketId: created.id },
+    });
   } catch (err) {
+    logAction("error", "market_create_failed", {
+      req,
+      action: "market_create",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });
 
 adminMarketsRouter.patch("/:id/delete", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const id = String(req.params.id ?? "");
     if (!id) {
+      logAction("warn", "market_delete_invalid_id", {
+        req,
+        action: "market_delete",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Market id is required." });
       return;
     }
@@ -1630,18 +1888,55 @@ adminMarketsRouter.patch("/:id/delete", async (req: AuthedRequest, res, next) =>
 
     if (!updated) {
       res.status(200).json({ ok: true, alreadyDeleted: true });
+      logAction("info", "market_delete_already_deleted", {
+        req,
+        action: "market_delete",
+        result: "success",
+        statusCode: 200,
+        requestClass: "success",
+        startedAtNs,
+        details: { marketId: id, alreadyDeleted: true },
+      });
       return;
     }
     res.status(200).json({ ok: true });
+    logAction("info", "market_delete_success", {
+      req,
+      action: "market_delete",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { marketId: updated.id },
+    });
   } catch (err) {
+    logAction("error", "market_delete_failed", {
+      req,
+      action: "market_delete",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });
 
 adminMarketsRouter.post("/normalize-regions", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const parsed = normalizeRegionsSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
+      logAction("warn", "market_normalize_regions_invalid_payload", {
+        req,
+        action: "market_normalize_regions",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Ungültiger Normalize-Request." });
       return;
     }
@@ -1731,7 +2026,30 @@ adminMarketsRouter.post("/normalize-regions", async (req: AuthedRequest, res, ne
       unmatched,
       allowedRegions: CANONICAL_REGIONS,
     });
+    logAction("info", "market_normalize_regions_completed", {
+      req,
+      action: "market_normalize_regions",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: {
+        processedCount,
+        updatedCount,
+        unmatchedCount,
+      },
+    });
   } catch (err) {
+    logAction("error", "market_normalize_regions_failed", {
+      req,
+      action: "market_normalize_regions",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });

@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import { z } from "zod";
+import { configureLogger, logger } from "../lib/logger.js";
 
 dotenv.config();
 
@@ -21,6 +22,38 @@ const envSchema = z.object({
     return value;
   }, z.boolean().default(false)),
   IPP_FINALIZER_INTERVAL_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
+  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  LOG_INCLUDE_STACK: z.preprocess((value) => {
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      return ["1", "true", "yes", "on"].includes(normalized);
+    }
+    return value;
+  }, z.boolean().default(false)),
+  LOG_HEALTH_REQUESTS: z.preprocess((value) => {
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      return ["1", "true", "yes", "on"].includes(normalized);
+    }
+    return value;
+  }, z.boolean().default(false)),
 });
 
-export const env = envSchema.parse(process.env);
+const parsedEnv = envSchema.safeParse(process.env);
+if (!parsedEnv.success) {
+  logger.error("env_validation_failed", {
+    issues: parsedEnv.error.issues.map((issue) => ({
+      code: issue.code,
+      path: issue.path.join("."),
+      message: issue.message,
+    })),
+  });
+  throw parsedEnv.error;
+}
+
+configureLogger({
+  level: parsedEnv.data.LOG_LEVEL,
+  includeStack: parsedEnv.data.LOG_INCLUDE_STACK,
+});
+
+export const env = parsedEnv.data;

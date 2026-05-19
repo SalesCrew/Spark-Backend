@@ -2,6 +2,7 @@ import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { splitZusatzIntervalsByPauseOverlaps, type BaseAction } from "../lib/admin-zeiterfassung.js";
+import { logAction, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { DEFAULT_TIMEZONE, getCurrentDaySessionForUser, toYmdInTimezone } from "../lib/day-session.js";
@@ -9,6 +10,26 @@ import { gmDaySessionPauses, gmDaySessions, markets, timeTrackingEntries, visitS
 
 const daySessionRouter = Router();
 daySessionRouter.use(requireAuth(["gm", "admin"]));
+daySessionRouter.use((req, res, next) => {
+  if (req.method.toUpperCase() === "GET") {
+    next();
+    return;
+  }
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "day_session_action_completed", {
+      req,
+      action: "day_session_mutation",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 const timezoneSchema = z.string().trim().min(1).max(120);
 const kmSchema = z.number().int().min(0).max(2_000_000);

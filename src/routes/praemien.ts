@@ -3,6 +3,7 @@ import { type Response, Router } from "express";
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { db, sql as pgSql } from "../lib/db.js";
+import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import {
   buildSourceCatalog,
   normalizeMoney,
@@ -22,6 +23,22 @@ import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const adminPraemienRouter = Router();
 adminPraemienRouter.use(requireAuth(["admin"]));
+adminPraemienRouter.use((req, res, next) => {
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "admin_praemien_action_completed", {
+      req,
+      action: req.method.toUpperCase() === "GET" ? "admin_praemien_read" : "admin_praemien_mutation",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 const waveStatusSchema = z.enum(["draft", "active", "archived"]);
 const sectionTypeSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd"]) satisfies z.ZodType<PraemienSectionType>;
@@ -363,10 +380,10 @@ async function loadWaveGraph(waveId: string) {
 }
 
 function logMutation(req: AuthedRequest, action: string, payload: Record<string, unknown>) {
-  console.info("[praemien]", {
+  logger.info("praemien_mutation", {
     action,
+    result: "success",
     actorUserId: req.authUser?.appUserId ?? null,
-    at: new Date().toISOString(),
     ...payload,
   });
 }

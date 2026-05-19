@@ -2,6 +2,7 @@ import { and, asc, eq, gte, inArray, isNotNull, lt } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { computeMarketIppForPeriod } from "../lib/ipp.js";
+import { logAction, startActionTimer } from "../lib/logger.js";
 import { addDays, getRedPeriodForDate, getRedPeriodLabel, getRedYear, startOfDay } from "../lib/red-monat.js";
 import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
 import { db, sql as pgSql } from "../lib/db.js";
@@ -10,6 +11,22 @@ import { requireAuth } from "../middleware/auth.js";
 
 const adminIppRouter = Router();
 adminIppRouter.use(requireAuth(["admin"]));
+adminIppRouter.use((req, res, next) => {
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "admin_ipp_action_completed", {
+      req,
+      action: "admin_ipp_read",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 let checkedIppArchiveTableReadiness = false;
 let hasIppArchiveTable = false;
 

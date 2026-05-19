@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { logAction, startActionTimer } from "../lib/logger.js";
 import { addDays, getRedPeriodForDate, getRedPeriodLabel, getRedYear, startOfDay } from "../lib/red-monat.js";
 import {
   getCachedRedMonthCalendarConfig,
@@ -74,6 +75,38 @@ function buildPeriodsBetween(input: { from: Date; to: Date; now: Date }): Return
 
 redMonthRouter.use(requireAuth(["admin", "gm", "sm"]));
 adminRedMonthRouter.use(requireAuth(["admin"]));
+redMonthRouter.use((req, res, next) => {
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "red_month_read_completed", {
+      req,
+      action: "red_month_read",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
+adminRedMonthRouter.use((req, res, next) => {
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "red_month_admin_action_completed", {
+      req,
+      action: "red_month_config_update",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 redMonthRouter.get("/current", async (_req, res, next) => {
   try {

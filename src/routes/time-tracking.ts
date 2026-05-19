@@ -1,6 +1,7 @@
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
+import { logAction, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { ensureStartedDaySession } from "../lib/day-session.js";
@@ -12,6 +13,26 @@ import {
 
 const timeTrackingRouter = Router();
 timeTrackingRouter.use(requireAuth(["gm", "admin"]));
+timeTrackingRouter.use((req, res, next) => {
+  if (req.method.toUpperCase() === "GET") {
+    next();
+    return;
+  }
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "time_tracking_action_completed", {
+      req,
+      action: "time_tracking_mutation",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 const uuidSchema = z.string().uuid();
 const isoDateTimeSchema = z.string().datetime();

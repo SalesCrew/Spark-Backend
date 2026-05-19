@@ -1,6 +1,7 @@
 import { and, desc, eq } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
+import { aggregateHighVolumeLoad, logAction, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { authAuditLogs, type UserRole, users } from "../lib/schema.js";
@@ -35,6 +36,26 @@ const updateUserSchema = z.object({
 const adminUsersRouter = Router();
 
 adminUsersRouter.use(requireAuth(["admin"]));
+adminUsersRouter.use((req, res, next) => {
+  if (req.method.toUpperCase() === "GET") {
+    next();
+    return;
+  }
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "admin_users_action_completed", {
+      req,
+      action: "admin_users_mutation",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
   try {
@@ -47,6 +68,16 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
       .from(users)
       .where(whereClause)
       .orderBy(desc(users.createdAt));
+    const softDeletedCount = rows.filter((row) => row.deletedAt != null).length;
+    aggregateHighVolumeLoad({
+      metric: "users",
+      scope: role ?? "all",
+      loaded: rows.length,
+      softDeleted: softDeletedCount,
+      requestId: (req as { requestId?: string }).requestId ?? null,
+      appUserId: req.authUser?.appUserId ?? null,
+      role: req.authUser?.role ?? null,
+    });
 
     res.status(200).json({
       users: rows.map((row) => ({
@@ -74,9 +105,18 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
 });
 
 adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const parsed = createUserSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "admin_user_create_invalid_payload", {
+        req,
+        action: "admin_user_create",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Invalid create user payload." });
       return;
     }
@@ -96,6 +136,15 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
     });
 
     if (authError || !authCreated.user) {
+      logAction("warn", "admin_user_create_auth_failed", {
+        req,
+        action: "admin_user_create",
+        result: "failure",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { reason: authError?.message ?? "create_auth_user_failed" },
+      });
       res.status(400).json({ error: authError?.message ?? "Failed to create auth user." });
       return;
     }
@@ -149,25 +198,71 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
         },
         oneTimePassword: password,
       });
+      logAction("info", "admin_user_create_success", {
+        req,
+        action: "admin_user_create",
+        result: "success",
+        statusCode: 201,
+        requestClass: "success",
+        startedAtNs,
+        details: { targetUserId: created.id, role: created.role },
+      });
     } catch (dbError) {
       await supabaseAdmin.auth.admin.deleteUser(authCreated.user.id);
+      logAction("error", "admin_user_create_rollback", {
+        req,
+        action: "admin_user_create",
+        result: "failure",
+        statusCode: 500,
+        requestClass: "server_error",
+        startedAtNs,
+        error: dbError,
+      });
+      markErrorAsLogged(dbError);
       throw dbError;
     }
   } catch (err) {
+    logAction("error", "admin_user_create_failed", {
+      req,
+      action: "admin_user_create",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });
 
 adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const parsed = updateUserSchema.safeParse(req.body);
     if (!parsed.success) {
+      logAction("warn", "admin_user_update_invalid_payload", {
+        req,
+        action: "admin_user_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "Invalid update payload." });
       return;
     }
 
     const id = String(req.params.id ?? "");
     if (!id) {
+      logAction("warn", "admin_user_update_invalid_id", {
+        req,
+        action: "admin_user_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "User id is required." });
       return;
     }
@@ -175,6 +270,15 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
     const payload = parsed.data;
     const [existing] = await db.select().from(users).where(eq(users.id, id)).limit(1);
     if (!existing) {
+      logAction("warn", "admin_user_update_not_found", {
+        req,
+        action: "admin_user_update",
+        result: "rejected",
+        statusCode: 404,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { targetUserId: id },
+      });
       res.status(404).json({ error: "User not found." });
       return;
     }
@@ -197,6 +301,15 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       .returning();
 
     if (!updated) {
+      logAction("warn", "admin_user_update_not_found_after_update", {
+        req,
+        action: "admin_user_update",
+        result: "failure",
+        statusCode: 404,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { targetUserId: id },
+      });
       res.status(404).json({ error: "User not found after update." });
       return;
     }
@@ -220,21 +333,58 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         ipp: updated.ipp == null ? null : Number(updated.ipp),
       },
     });
+    logAction("info", "admin_user_update_success", {
+      req,
+      action: "admin_user_update",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { targetUserId: updated.id },
+    });
   } catch (err) {
+    logAction("error", "admin_user_update_failed", {
+      req,
+      action: "admin_user_update",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });
 
 adminUsersRouter.patch("/:id/deactivate", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
   try {
     const id = String(req.params.id ?? "");
     if (!id) {
+      logAction("warn", "admin_user_deactivate_invalid_id", {
+        req,
+        action: "admin_user_deactivate",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
       res.status(400).json({ error: "User id is required." });
       return;
     }
 
     const [target] = await db.select().from(users).where(eq(users.id, id)).limit(1);
     if (!target) {
+      logAction("warn", "admin_user_deactivate_not_found", {
+        req,
+        action: "admin_user_deactivate",
+        result: "rejected",
+        statusCode: 404,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { targetUserId: id },
+      });
       res.status(404).json({ error: "User not found." });
       return;
     }
@@ -251,6 +401,15 @@ adminUsersRouter.patch("/:id/deactivate", async (req: AuthedRequest, res, next) 
 
     if (!updated) {
       res.status(200).json({ ok: true, alreadyInactive: true });
+      logAction("info", "admin_user_deactivate_already_inactive", {
+        req,
+        action: "admin_user_deactivate",
+        result: "success",
+        statusCode: 200,
+        requestClass: "success",
+        startedAtNs,
+        details: { targetUserId: id, alreadyInactive: true },
+      });
       return;
     }
 
@@ -268,7 +427,26 @@ adminUsersRouter.patch("/:id/deactivate", async (req: AuthedRequest, res, next) 
     });
 
     res.status(200).json({ ok: true });
+    logAction("info", "admin_user_deactivate_success", {
+      req,
+      action: "admin_user_deactivate",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { targetUserId: target.id },
+    });
   } catch (err) {
+    logAction("error", "admin_user_deactivate_failed", {
+      req,
+      action: "admin_user_deactivate",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });

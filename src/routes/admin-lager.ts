@@ -1,6 +1,7 @@
 import { and, asc, eq, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
+import { logAction, startActionTimer } from "../lib/logger.js";
 import { requireAuth } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { lager, users } from "../lib/schema.js";
@@ -17,6 +18,26 @@ const createLagerSchema = z
 const adminLagerRouter = Router();
 
 adminLagerRouter.use(requireAuth(["admin"]));
+adminLagerRouter.use((req, res, next) => {
+  if (req.method.toUpperCase() === "GET") {
+    next();
+    return;
+  }
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "admin_lager_action_completed", {
+      req,
+      action: "admin_lager_mutation",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 adminLagerRouter.get("/lager", async (_req, res, next) => {
   try {

@@ -10,6 +10,7 @@ import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { db } from "../lib/db.js";
 import { ensureStartedDaySession } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
+import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import { addDays, getCurrentRedPeriod, startOfDay } from "../lib/red-monat.js";
 import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
@@ -33,6 +34,28 @@ import {
 
 const gmVisitSessionsRouter = Router();
 gmVisitSessionsRouter.use(requireAuth(["admin", "gm"]));
+gmVisitSessionsRouter.use((req, res, next) => {
+  const method = req.method.toUpperCase();
+  const isTracked = method !== "GET" || req.path === "/gm/bonus-summary" || req.path === "/gm/kpi-summary";
+  if (!isTracked) {
+    next();
+    return;
+  }
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "gm_visit_sessions_action_completed", {
+      req,
+      action: method === "GET" ? "gm_visit_sessions_read" : "gm_visit_sessions_mutation",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
 const VISIT_PHOTOS_BUCKET = "visit-photos";
@@ -2612,7 +2635,9 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
     try {
       await enqueueIppRecalcForDate(session.marketId, now, "visit_session_submitted");
     } catch (enqueueError) {
-      console.error("[gm-visit-sessions] ipp enqueue failed after submit commit", {
+      logger.error("gm_visit_session_submit_ipp_enqueue_failed", {
+        action: "gm_visit_session_submit",
+        result: "failure",
         sessionId: session.id,
         marketId: session.marketId,
         error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
@@ -2621,7 +2646,9 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
     try {
       await recomputeGmKpiCache(gmUserId);
     } catch (kpiError) {
-      console.error("[gm-visit-sessions] gm kpi recompute failed after submit commit", {
+      logger.error("gm_visit_session_submit_kpi_recompute_failed", {
+        action: "gm_visit_session_submit",
+        result: "failure",
         sessionId: session.id,
         gmUserId,
         error: kpiError instanceof Error ? kpiError.message : String(kpiError),

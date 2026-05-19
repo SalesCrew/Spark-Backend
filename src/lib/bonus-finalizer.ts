@@ -2,6 +2,7 @@ import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { db, sql as pgSql } from "./db.js";
 import { DEFAULT_TIMEZONE, toYmdInTimezone } from "./day-session.js";
 import { recomputeGmKpiCache } from "./gm-kpi-cache.js";
+import { logAction, logger, serializeError, startActionTimer } from "./logger.js";
 import { getCurrentRedPeriod } from "./red-monat.js";
 import { refreshRedMonthCalendarConfig } from "./red-month-calendar.js";
 import {
@@ -394,14 +395,32 @@ export async function finalizeBonusForSubmittedVisitSessionTx(
 }
 
 export async function finalizeBonusForSubmittedVisitSession(input: FinalizeBonusInput): Promise<BonusFinalizeResult> {
+  const startedAtNs = startActionTimer();
   const result = await db.transaction(async (tx) => finalizeBonusForSubmittedVisitSessionWithExecutor(tx, input));
+  logAction("info", "bonus_finalizer_finalize_completed", {
+    action: "bonus_finalize_submitted_visit",
+    result: result.applied ? "success" : "skipped",
+    startedAtNs,
+    details: {
+      sessionId: input.sessionId,
+      gmUserId: input.gmUserId,
+      marketId: input.marketId,
+      waveId: result.waveId,
+      applied: result.applied,
+    },
+  });
   try {
     await recomputeGmKpiCache(input.gmUserId);
   } catch (error) {
-    console.error("[bonus-finalizer] gm kpi recompute failed", {
-      gmUserId: input.gmUserId,
-      sessionId: input.sessionId,
-      error: error instanceof Error ? error.message : String(error),
+    logAction("error", "bonus_finalizer_gm_kpi_recompute_failed", {
+      action: "bonus_finalize_submitted_visit",
+      result: "failure",
+      startedAtNs,
+      details: {
+        gmUserId: input.gmUserId,
+        sessionId: input.sessionId,
+      },
+      error,
     });
   }
   return result;

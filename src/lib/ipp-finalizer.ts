@@ -3,6 +3,7 @@ import { env } from "../config/env.js";
 import { db, sql as pgSql } from "./db.js";
 import { recomputeGmKpiCacheForMarketPeriod } from "./gm-kpi-cache.js";
 import { computeMarketIppForPeriod } from "./ipp.js";
+import { logAction, logger, serializeError, startActionTimer } from "./logger.js";
 import { refreshRedMonthCalendarConfig } from "./red-month-calendar.js";
 import { getRedPeriodForDate, getRedPeriodLabel, getRedYear, startOfDay } from "./red-monat.js";
 import { ippMarketRedmonthResults, ippRecalcQueue, visitAnswers, visitSessions } from "./schema.js";
@@ -366,6 +367,15 @@ async function processRecalcQueue(now: Date): Promise<number> {
         .where(eq(ippRecalcQueue.id, item.id));
       processed += 1;
     } catch (error) {
+      logger.error("ipp_finalizer_queue_item_failed", {
+        action: "ipp_finalizer_process_queue_item",
+        result: "failure",
+        queueItemId: item.id,
+        marketId: item.marketId,
+        redPeriodStart: item.redPeriodStart,
+        redPeriodEnd: item.redPeriodEnd,
+        error: serializeError(error),
+      });
       await db
         .update(ippRecalcQueue)
         .set({
@@ -381,6 +391,7 @@ async function processRecalcQueue(now: Date): Promise<number> {
 }
 
 export async function runIppFinalizerOnce(now = new Date()): Promise<FinalizerRunResult> {
+  const startedAtNs = startActionTimer();
   await refreshRedMonthCalendarConfig();
   const lockResult = await withPgAdvisoryLock(IPP_FINALIZER_LOCK_KEY, async () => {
     const periods = await loadClosedPeriodsWithSubmissions(now);
@@ -443,6 +454,12 @@ export async function runIppFinalizerOnce(now = new Date()): Promise<FinalizerRu
   });
 
   if (!lockResult.locked || !lockResult.result) {
+    logAction("debug", "ipp_finalizer_run_skipped_lock", {
+      action: "ipp_finalizer_run",
+      result: "skipped",
+      startedAtNs,
+      details: { reason: "advisory_lock_not_acquired" },
+    });
     return {
       ok: true,
       skippedByLock: true,
@@ -451,11 +468,22 @@ export async function runIppFinalizerOnce(now = new Date()): Promise<FinalizerRu
       queueItemsProcessed: 0,
     };
   }
+  logAction("info", "ipp_finalizer_run_success", {
+    action: "ipp_finalizer_run",
+    result: "success",
+    startedAtNs,
+    details: {
+      periodsProcessed: lockResult.result.periodsProcessed,
+      rowsFinalized: lockResult.result.rowsFinalized,
+      queueItemsProcessed: lockResult.result.queueItemsProcessed,
+    },
+  });
   return lockResult.result;
 }
 
 export function startIppFinalizerScheduler(): () => void {
   if (!env.IPP_FINALIZER_ENABLED) {
+    logger.info("ipp_finalizer_scheduler_disabled");
     return () => {};
   }
 
@@ -463,15 +491,35 @@ export function startIppFinalizerScheduler(): () => void {
   const run = async () => {
     if (running) return;
     running = true;
+    const startedAtNs = startActionTimer();
     try {
       const result = await runIppFinalizerOnce(new Date());
       if (!result.skippedByLock) {
-        console.log(
-          `[ipp-finalizer] periods=${result.periodsProcessed} rows=${result.rowsFinalized} queue=${result.queueItemsProcessed}`,
-        );
+        logAction("info", "ipp_finalizer_scheduler_run_completed", {
+          action: "ipp_finalizer_scheduler_tick",
+          result: "success",
+          startedAtNs,
+          details: {
+            periodsProcessed: result.periodsProcessed,
+            rowsFinalized: result.rowsFinalized,
+            queueItemsProcessed: result.queueItemsProcessed,
+          },
+        });
+      } else {
+        logAction("debug", "ipp_finalizer_scheduler_run_skipped_lock", {
+          action: "ipp_finalizer_scheduler_tick",
+          result: "skipped",
+          startedAtNs,
+          details: { reason: "run_locked" },
+        });
       }
     } catch (error) {
-      console.error("[ipp-finalizer] run failed", error);
+      logAction("error", "ipp_finalizer_scheduler_run_failed", {
+        action: "ipp_finalizer_scheduler_tick",
+        result: "failure",
+        startedAtNs,
+        error,
+      });
     } finally {
       running = false;
     }

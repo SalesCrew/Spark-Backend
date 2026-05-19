@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
+import { logAction, startActionTimer } from "../lib/logger.js";
 import {
   buildDaySessionPayload,
   buildGmAggregates,
@@ -22,6 +23,22 @@ import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const adminZeiterfassungRouter = Router();
 adminZeiterfassungRouter.use(requireAuth(["admin"]));
+adminZeiterfassungRouter.use((req, res, next) => {
+  const startedAtNs = startActionTimer();
+  res.on("finish", () => {
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logAction(level, "admin_zeiterfassung_read_completed", {
+      req,
+      action: "admin_zeiterfassung_read",
+      result: res.statusCode >= 400 ? "failure" : "success",
+      statusCode: res.statusCode,
+      requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
+      startedAtNs,
+      details: { route: req.path, method: req.method },
+    });
+  });
+  next();
+});
 
 const ymdRegex = /^\d{4}-\d{2}-\d{2}$/;
 const querySchema = z

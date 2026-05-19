@@ -1,5 +1,6 @@
 import { and, desc, eq } from "drizzle-orm";
 import { db, sql as pgSql } from "./db.js";
+import { logAction, logger, serializeError, startActionTimer } from "./logger.js";
 import { redMonthCalendarConfig } from "./schema.js";
 
 const DEFAULT_ANCHOR_START = new Date(2026, 0, 27);
@@ -53,6 +54,13 @@ function parseYmdDate(raw: string): Date {
   return new Date(year, month - 1, day);
 }
 
+function toYmd(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 function msUntilNextLocalMidnight(now = new Date()): number {
   const nextMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
   return Math.max(1_000, nextMidnight.getTime() - now.getTime());
@@ -90,9 +98,31 @@ async function ensureCalendarConfigTableReady(): Promise<boolean> {
 }
 
 export async function refreshRedMonthCalendarConfig(): Promise<ActiveRedMonthCalendarConfig> {
+  const startedAtNs = startActionTimer();
   const fromDb = await readActiveConfigFromDb();
   if (fromDb) {
     cachedConfig = copyConfig(fromDb);
+    logAction("debug", "red_month_calendar_refresh_loaded_db", {
+      action: "red_month_calendar_refresh",
+      result: "success",
+      startedAtNs,
+      details: {
+        anchorStart: toYmd(fromDb.anchorStart),
+        cycleWeeks: fromDb.cycleWeeks,
+        timezone: fromDb.timezone,
+      },
+    });
+  } else {
+    logAction("debug", "red_month_calendar_refresh_used_cache", {
+      action: "red_month_calendar_refresh",
+      result: "success",
+      startedAtNs,
+      details: {
+        anchorStart: toYmd(cachedConfig.anchorStart),
+        cycleWeeks: cachedConfig.cycleWeeks,
+        timezone: cachedConfig.timezone,
+      },
+    });
   }
   return getCachedRedMonthCalendarConfig();
 }
@@ -159,10 +189,21 @@ export function startRedMonthCalendarScheduler(): () => void {
   const runRefresh = async () => {
     if (stopped || running) return;
     running = true;
+    const startedAtNs = startActionTimer();
     try {
       await refreshRedMonthCalendarConfig();
+      logAction("debug", "red_month_calendar_scheduler_refresh_success", {
+        action: "red_month_calendar_scheduler_tick",
+        result: "success",
+        startedAtNs,
+      });
     } catch (error) {
-      console.error("[red-month-calendar] refresh failed", error);
+      logAction("error", "red_month_calendar_refresh_failed", {
+        action: "red_month_calendar_scheduler_tick",
+        result: "failure",
+        startedAtNs,
+        error,
+      });
     } finally {
       running = false;
     }
