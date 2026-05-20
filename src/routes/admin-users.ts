@@ -4,6 +4,7 @@ import { z } from "zod";
 import { aggregateHighVolumeLoad, logAction, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
+import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { authAuditLogs, type UserRole, users } from "../lib/schema.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { generatePassword } from "../services/password.js";
@@ -68,6 +69,25 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
       .from(users)
       .where(whereClause)
       .orderBy(desc(users.createdAt));
+    const gmRows = rows.filter((row) => row.role === "gm");
+    const gmKpiByUserId = new Map<string, { ipp: number; ippSampleCount: number }>(
+      await Promise.all(
+        gmRows.map(async (row): Promise<[string, { ipp: number; ippSampleCount: number }]> => {
+          try {
+            const summary = await recomputeGmKpiCache(row.id);
+            return [
+              row.id,
+              {
+                ipp: summary.ippAllTimeAvg,
+                ippSampleCount: summary.ippSampleCount,
+              },
+            ];
+          } catch {
+            return [row.id, { ipp: 0, ippSampleCount: 0 }];
+          }
+        }),
+      ),
+    );
     const softDeletedCount = rows.filter((row) => row.deletedAt != null).length;
     aggregateHighVolumeLoad({
       metric: "users",
@@ -81,6 +101,7 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
 
     res.status(200).json({
       users: rows.map((row) => ({
+        ...(row.role === "gm" ? { ipp: Number(gmKpiByUserId.get(row.id)?.ipp ?? 0), ippSampleCount: Number(gmKpiByUserId.get(row.id)?.ippSampleCount ?? 0) } : {}),
         id: row.id,
         supabaseAuthId: row.supabaseAuthId,
         role: row.role,
@@ -92,7 +113,7 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
         city: row.city,
         postalCode: row.postalCode,
         region: row.region,
-        ipp: row.ipp == null ? null : Number(row.ipp),
+        ...(row.role !== "gm" ? { ipp: row.ipp == null ? null : Number(row.ipp), ippSampleCount: null } : {}),
         isActive: row.isActive,
         deletedAt: row.deletedAt,
         createdAt: row.createdAt,
@@ -177,6 +198,15 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
         eventType: "user_created",
         details: `role=${created.role}`,
       });
+      const gmKpi =
+        created.role === "gm"
+          ? await recomputeGmKpiCache(created.id)
+              .then((summary) => ({
+                ipp: summary.ippAllTimeAvg,
+                ippSampleCount: summary.ippSampleCount,
+              }))
+              .catch(() => ({ ipp: 0, ippSampleCount: 0 }))
+          : null;
 
       res.status(201).json({
         user: {
@@ -190,7 +220,8 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
           city: created.city,
           postalCode: created.postalCode,
           region: created.region,
-          ipp: created.ipp == null ? null : Number(created.ipp),
+          ipp: created.role === "gm" ? gmKpi?.ipp ?? 0 : created.ipp == null ? null : Number(created.ipp),
+          ippSampleCount: created.role === "gm" ? gmKpi?.ippSampleCount ?? 0 : null,
           isActive: created.isActive,
           deletedAt: created.deletedAt,
           createdAt: created.createdAt,
@@ -326,11 +357,21 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       eventType: "user_updated",
       details: null,
     });
+    const gmKpi =
+      updated.role === "gm"
+        ? await recomputeGmKpiCache(updated.id)
+            .then((summary) => ({
+              ipp: summary.ippAllTimeAvg,
+              ippSampleCount: summary.ippSampleCount,
+            }))
+            .catch(() => ({ ipp: 0, ippSampleCount: 0 }))
+        : null;
 
     res.status(200).json({
       user: {
         ...updated,
-        ipp: updated.ipp == null ? null : Number(updated.ipp),
+        ipp: updated.role === "gm" ? gmKpi?.ipp ?? 0 : updated.ipp == null ? null : Number(updated.ipp),
+        ippSampleCount: updated.role === "gm" ? gmKpi?.ippSampleCount ?? 0 : null,
       },
     });
     logAction("info", "admin_user_update_success", {

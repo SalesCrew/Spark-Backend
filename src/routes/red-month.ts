@@ -46,14 +46,16 @@ function buildPeriodDto(input: { start: Date; end: Date; now: Date }) {
   const start = startOfDay(input.start);
   const end = startOfDay(input.end);
   const today = startOfDay(input.now);
+  const currentPeriod = getRedPeriodForDate(today);
+  const periodInfo = getRedPeriodForDate(start);
   return {
     id: `${toYmd(start)}`,
     label: getRedPeriodLabel(start),
-    periodIndexFromAnchor: getRedPeriodForDate(start).periodIndexFromAnchor,
+    periodIndexFromAnchor: periodInfo.periodIndexFromAnchor,
     start: toYmd(start),
     end: toYmd(end),
     year: getRedYear(start),
-    isCurrent: today >= start && today <= end,
+    isCurrent: periodInfo.periodIndexFromAnchor === currentPeriod.periodIndexFromAnchor,
     daysUntilEnd: Math.max(0, Math.floor((end.getTime() - today.getTime()) / (24 * 60 * 60 * 1000))),
   };
 }
@@ -68,7 +70,20 @@ function buildPeriodsBetween(input: { from: Date; to: Date; now: Date }): Return
     const info = getRedPeriodForDate(cursor);
     if (info.start > to) break;
     periods.push(buildPeriodDto({ start: info.start, end: info.end, now: input.now }));
-    cursor = addDays(info.end, 1);
+    let advanced = false;
+    let nextCursor = addDays(info.end, 1);
+    for (let guard = 0; guard < 7; guard += 1) {
+      const nextInfo = getRedPeriodForDate(nextCursor);
+      if (nextInfo.start.getTime() > info.start.getTime()) {
+        cursor = nextInfo.start;
+        advanced = true;
+        break;
+      }
+      nextCursor = addDays(nextCursor, 1);
+    }
+    if (!advanced) {
+      cursor = addDays(info.end, 3);
+    }
   }
   return periods;
 }

@@ -51,7 +51,12 @@ function parseYmdDate(raw: string): Date {
   if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day) || month <= 0 || day <= 0) {
     return new Date(DEFAULT_ANCHOR_START);
   }
-  return new Date(year, month - 1, day);
+  const parsed = new Date(year, month - 1, day);
+  const normalized = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+  const weekday = normalized.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
+  const distanceToMonday = (weekday + 6) % 7;
+  normalized.setDate(normalized.getDate() - distanceToMonday);
+  return normalized;
 }
 
 function toYmd(date: Date): string {
@@ -137,6 +142,7 @@ export async function setActiveRedMonthCalendarConfig(input: {
   }
   const cycleWeeks = normalizeCycleWeeks(input.cycleWeeks);
   const timezone = input.timezone?.trim() || DEFAULT_TIMEZONE;
+  const normalizedAnchorStart = toYmd(parseYmdDate(input.anchorStart));
   const now = new Date();
   const [upserted] = await db.transaction(async (tx) => {
     const [activeRow] = await tx
@@ -149,7 +155,7 @@ export async function setActiveRedMonthCalendarConfig(input: {
       return tx
         .update(redMonthCalendarConfig)
         .set({
-          anchorStart: input.anchorStart,
+          anchorStart: normalizedAnchorStart,
           cycleWeeks,
           timezone,
           updatedAt: now,
@@ -160,7 +166,7 @@ export async function setActiveRedMonthCalendarConfig(input: {
     return tx
       .insert(redMonthCalendarConfig)
       .values({
-        anchorStart: input.anchorStart,
+        anchorStart: normalizedAnchorStart,
         cycleWeeks,
         timezone,
         isActive: true,

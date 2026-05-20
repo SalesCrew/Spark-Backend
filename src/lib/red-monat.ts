@@ -20,6 +20,30 @@ export function addDays(date: Date, days: number): Date {
   return next;
 }
 
+function isBusinessDay(date: Date): boolean {
+  const day = date.getDay();
+  return day >= 1 && day <= 5;
+}
+
+function alignToMonday(date: Date): Date {
+  const normalized = startOfDay(date);
+  const day = normalized.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
+  const distanceToMonday = (day + 6) % 7;
+  return addDays(normalized, -distanceToMonday);
+}
+
+function addBusinessDays(date: Date, businessDays: number): Date {
+  if (businessDays === 0) return startOfDay(date);
+  const step = businessDays > 0 ? 1 : -1;
+  let remaining = Math.abs(businessDays);
+  let cursor = startOfDay(date);
+  while (remaining > 0) {
+    cursor = addDays(cursor, step);
+    if (isBusinessDay(cursor)) remaining -= 1;
+  }
+  return cursor;
+}
+
 function cycleWeeksAt(index: number): number {
   const config = getCachedRedMonthCalendarConfig();
   return config.cycleWeeks[index] ?? config.cycleWeeks[0] ?? RED_CYCLE_WEEKS[0];
@@ -28,16 +52,18 @@ function cycleWeeksAt(index: number): number {
 export function getRedPeriodForDate(now = new Date()): RedPeriodInfo {
   const target = startOfDay(now);
   const config = getCachedRedMonthCalendarConfig();
-  const anchor = startOfDay(config.anchorStart);
+  const anchor = alignToMonday(config.anchorStart);
   let periodStart = new Date(anchor);
   let cycleIndex = 0;
   let periodIndexFromAnchor = 0;
 
   if (target >= anchor) {
     while (true) {
-      const periodLengthDays = cycleWeeksAt(cycleIndex) * 7;
-      const periodEnd = addDays(periodStart, periodLengthDays - 1);
-      if (target <= periodEnd) {
+      const periodLengthBusinessDays = cycleWeeksAt(cycleIndex) * 5;
+      const periodEnd = addBusinessDays(periodStart, periodLengthBusinessDays - 1);
+      // Weekends are carried by the preceding RED period while period end remains Friday.
+      const periodLookupEnd = addDays(periodEnd, 2);
+      if (target <= periodLookupEnd) {
         return {
           start: periodStart,
           end: periodEnd,
@@ -45,7 +71,7 @@ export function getRedPeriodForDate(now = new Date()): RedPeriodInfo {
           periodIndexFromAnchor,
         };
       }
-      periodStart = addDays(periodStart, periodLengthDays);
+      periodStart = addBusinessDays(periodStart, periodLengthBusinessDays);
       cycleIndex = (cycleIndex + 1) % config.cycleWeeks.length;
       periodIndexFromAnchor += 1;
     }
@@ -53,11 +79,11 @@ export function getRedPeriodForDate(now = new Date()): RedPeriodInfo {
 
   while (target < periodStart) {
     cycleIndex = (cycleIndex - 1 + config.cycleWeeks.length) % config.cycleWeeks.length;
-    periodStart = addDays(periodStart, -cycleWeeksAt(cycleIndex) * 7);
+    periodStart = addBusinessDays(periodStart, -cycleWeeksAt(cycleIndex) * 5);
     periodIndexFromAnchor -= 1;
   }
 
-  const periodEnd = addDays(periodStart, cycleWeeksAt(cycleIndex) * 7 - 1);
+  const periodEnd = addBusinessDays(periodStart, cycleWeeksAt(cycleIndex) * 5 - 1);
   return {
     start: periodStart,
     end: periodEnd,

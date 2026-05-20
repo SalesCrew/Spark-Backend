@@ -41,6 +41,7 @@ export const visitSectionStatusEnum = pgEnum("visit_section_status", ["draft", "
 export const visitAnswerStatusEnum = pgEnum("visit_answer_status", ["unanswered", "answered", "hidden_by_rule", "skipped", "invalid"]);
 export const visitAnswerOptionRoleEnum = pgEnum("visit_answer_option_role", ["top", "sub"]);
 export const visitAnswerEventTypeEnum = pgEnum("visit_answer_event_type", ["set", "clear", "status_change"]);
+export const marketTypeEnum = pgEnum("market_type", ["universum", "kuehler", "both"]);
 export const timeTrackingActivityTypeEnum = pgEnum("time_tracking_activity_type", [
   "sonderaufgabe",
   "arztbesuch",
@@ -122,6 +123,13 @@ export const markets = pgTable(
     infoFlag: boolean("info_flag").notNull().default(false),
     infoNote: text("info_note").notNull().default(""),
     universeMarket: boolean("universe_market").notNull().default(false),
+    marketType: marketTypeEnum("market_type").notNull().default("universum"),
+    kuehlerStammnr: text("kuehler_stammnr"),
+    kuehlerBd: text("kuehler_bd"),
+    kuehlerAnzahlKsAmStandort: integer("kuehler_anzahl_ks_am_standort"),
+    kuehlerInternalId: text("kuehler_internal_id"),
+    kuehlerSerialNumber: text("kuehler_serial_number"),
+    kuehlerModel: text("kuehler_model"),
     isActive: boolean("is_active").notNull().default(true),
     importSourceFileName: text("import_source_file_name").notNull().default(""),
     importedAt: timestamp("imported_at", { withTimezone: true }).defaultNow().notNull(),
@@ -140,7 +148,11 @@ export const markets = pgTable(
     uniqueIndex("markets_flex_number_unique")
       .on(table.flexNumber)
       .where(sql`${table.isDeleted} = false AND ${table.flexNumber} IS NOT NULL`),
+    uniqueIndex("markets_kuehler_internal_id_unique")
+      .on(table.kuehlerInternalId)
+      .where(sql`${table.isDeleted} = false AND ${table.kuehlerInternalId} IS NOT NULL`),
     index("markets_region_idx").on(table.region),
+    index("markets_market_type_idx").on(table.marketType),
     index("markets_city_idx").on(table.city),
     index("markets_postal_code_idx").on(table.postalCode),
     index("markets_current_gm_name_idx").on(table.currentGmName),
