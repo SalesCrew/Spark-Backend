@@ -125,11 +125,6 @@ export const markets = pgTable(
     universeMarket: boolean("universe_market").notNull().default(false),
     marketType: marketTypeEnum("market_type").notNull().default("universum"),
     kuehlerStammnr: text("kuehler_stammnr"),
-    kuehlerBd: text("kuehler_bd"),
-    kuehlerAnzahlKsAmStandort: integer("kuehler_anzahl_ks_am_standort"),
-    kuehlerInternalId: text("kuehler_internal_id"),
-    kuehlerSerialNumber: text("kuehler_serial_number"),
-    kuehlerModel: text("kuehler_model"),
     isActive: boolean("is_active").notNull().default(true),
     importSourceFileName: text("import_source_file_name").notNull().default(""),
     importedAt: timestamp("imported_at", { withTimezone: true }).defaultNow().notNull(),
@@ -148,9 +143,6 @@ export const markets = pgTable(
     uniqueIndex("markets_flex_number_unique")
       .on(table.flexNumber)
       .where(sql`${table.isDeleted} = false AND ${table.flexNumber} IS NOT NULL`),
-    uniqueIndex("markets_kuehler_internal_id_unique")
-      .on(table.kuehlerInternalId)
-      .where(sql`${table.isDeleted} = false AND ${table.kuehlerInternalId} IS NOT NULL`),
     index("markets_region_idx").on(table.region),
     index("markets_market_type_idx").on(table.marketType),
     index("markets_city_idx").on(table.city),
@@ -158,6 +150,36 @@ export const markets = pgTable(
     index("markets_current_gm_name_idx").on(table.currentGmName),
     index("markets_active_idx").on(table.isActive),
     index("markets_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const marketKuehlerUnits = pgTable(
+  "market_kuehler_units",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    marketId: uuid("market_id")
+      .notNull()
+      .references(() => markets.id, { onDelete: "cascade" }),
+    name: text("name").notNull().default(""),
+    employee: text("employee").notNull().default(""),
+    kuehlerInternalId: text("kuehler_internal_id"),
+    kuehlerBd: text("kuehler_bd"),
+    kuehlerAnzahlKsAmStandort: integer("kuehler_anzahl_ks_am_standort"),
+    kuehlerSerialNumber: text("kuehler_serial_number"),
+    kuehlerModel: text("kuehler_model"),
+    importSourceFileName: text("import_source_file_name").notNull().default(""),
+    importedAt: timestamp("imported_at", { withTimezone: true }).defaultNow().notNull(),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("market_kuehler_units_market_deleted_idx").on(table.marketId, table.isDeleted),
+    index("market_kuehler_units_internal_id_idx").on(table.kuehlerInternalId),
+    uniqueIndex("market_kuehler_units_internal_id_active_unique")
+      .on(table.kuehlerInternalId)
+      .where(sql`${table.isDeleted} = false AND ${table.kuehlerInternalId} IS NOT NULL`),
+    index("market_kuehler_units_deleted_idx").on(table.isDeleted),
   ],
 );
 
@@ -229,6 +251,7 @@ export const campaignMarketAssignments = pgTable(
       .references(() => markets.id, { onDelete: "cascade" }),
     assignedAt: timestamp("assigned_at", { withTimezone: true }).defaultNow().notNull(),
     gmUserId: uuid("gm_user_id").references(() => users.id, { onDelete: "set null" }),
+    assignmentSlot: integer("assignment_slot").notNull().default(1),
     visitTargetCount: integer("visit_target_count").notNull().default(1),
     currentVisitsCount: integer("current_visits_count").notNull().default(0),
     assignedByUserId: uuid("assigned_by_user_id").references(() => users.id, { onDelete: "set null" }),
@@ -238,13 +261,14 @@ export const campaignMarketAssignments = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
+    check("campaign_market_assignments_assignment_slot_ck", sql`${table.assignmentSlot} >= 1`),
     check("campaign_market_assignments_visit_target_count_ck", sql`${table.visitTargetCount} >= 1`),
     check("campaign_market_assignments_current_visits_count_ck", sql`${table.currentVisitsCount} >= 0`),
     uniqueIndex("campaign_market_assignments_campaign_market_gm_active_unique")
-      .on(table.campaignId, table.marketId, table.gmUserId)
+      .on(table.campaignId, table.marketId, table.gmUserId, table.assignmentSlot)
       .where(sql`${table.isDeleted} = false and ${table.gmUserId} is not null`),
     uniqueIndex("campaign_market_assignments_campaign_market_unassigned_active_unique")
-      .on(table.campaignId, table.marketId)
+      .on(table.campaignId, table.marketId, table.assignmentSlot)
       .where(sql`${table.isDeleted} = false and ${table.gmUserId} is null`),
     index("campaign_market_assignments_market_idx").on(table.marketId),
     index("campaign_market_assignments_gm_deleted_idx").on(table.gmUserId, table.isDeleted),
@@ -1555,6 +1579,8 @@ export type UserRow = typeof users.$inferSelect;
 export type NewUserRow = typeof users.$inferInsert;
 export type MarketRow = typeof markets.$inferSelect;
 export type NewMarketRow = typeof markets.$inferInsert;
+export type MarketKuehlerUnitRow = typeof marketKuehlerUnits.$inferSelect;
+export type NewMarketKuehlerUnitRow = typeof marketKuehlerUnits.$inferInsert;
 export type LagerRow = typeof lager.$inferSelect;
 export type NewLagerRow = typeof lager.$inferInsert;
 export type CampaignRow = typeof campaigns.$inferSelect;

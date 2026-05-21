@@ -10,6 +10,7 @@ import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
 import {
   campaignMarketAssignments,
   campaigns,
+  marketKuehlerUnits,
   markets,
   photoTags,
   visitSessionSections,
@@ -140,7 +141,7 @@ const universumImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; req
 
 const kuehlerImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; required: boolean; isIdentity: boolean }> = [
   { key: "kuehlerStammnr", label: "Stammnr", required: true, isIdentity: true },
-  { key: "kuehlerInternalId", label: "internal_id", required: true, isIdentity: false },
+  { key: "kuehlerInternalId", label: "internal_id", required: false, isIdentity: false },
   { key: "kuehlerBd", label: "BD", required: false, isIdentity: false },
   { key: "kuehlerAnzahlKsAmStandort", label: "Anzahl KS am Standort", required: false, isIdentity: false },
   { key: "kuehlerSerialNumber", label: "Serial Number", required: false, isIdentity: false },
@@ -215,11 +216,6 @@ const updateMarketSchema = z
     universeMarket: z.boolean().optional(),
     marketType: marketTypeSchema.optional(),
     kuehlerStammnr: z.string().optional(),
-    kuehlerBd: z.string().optional(),
-    kuehlerAnzahlKsAmStandort: z.number().int().min(0).nullable().optional(),
-    kuehlerInternalId: z.string().optional(),
-    kuehlerSerialNumber: z.string().optional(),
-    kuehlerModel: z.string().optional(),
     isActive: z.boolean().optional(),
     importSourceFileName: z.string().optional(),
     importedAt: z.string().datetime().optional(),
@@ -247,15 +243,39 @@ const createMarketSchema = z
     universeMarket: z.boolean().optional().default(true),
     marketType: marketTypeSchema.optional().default("universum"),
     kuehlerStammnr: z.string().optional().default(""),
-    kuehlerBd: z.string().optional().default(""),
-    kuehlerAnzahlKsAmStandort: z.number().int().min(0).nullable().optional(),
-    kuehlerInternalId: z.string().optional().default(""),
-    kuehlerSerialNumber: z.string().optional().default(""),
-    kuehlerModel: z.string().optional().default(""),
     isActive: z.boolean().optional().default(true),
     importSourceFileName: z.string().optional().default(""),
     importedAt: z.string().datetime().optional(),
     plannedToId: z.string().uuid().nullable().optional(),
+  })
+  .strict();
+
+const createKuehlerUnitSchema = z
+  .object({
+    name: z.string().optional().default(""),
+    employee: z.string().optional().default(""),
+    kuehlerInternalId: z.string().optional(),
+    kuehlerBd: z.string().optional().default(""),
+    kuehlerAnzahlKsAmStandort: z.number().int().min(0).nullable().optional(),
+    kuehlerSerialNumber: z.string().optional().default(""),
+    kuehlerModel: z.string().optional().default(""),
+    importSourceFileName: z.string().optional().default(""),
+    importedAt: z.string().datetime().optional(),
+  })
+  .strict();
+
+const updateKuehlerUnitSchema = z
+  .object({
+    name: z.string().optional(),
+    employee: z.string().optional(),
+    kuehlerInternalId: z.string().optional(),
+    kuehlerBd: z.string().optional(),
+    kuehlerAnzahlKsAmStandort: z.number().int().min(0).nullable().optional(),
+    kuehlerSerialNumber: z.string().optional(),
+    kuehlerModel: z.string().optional(),
+    importSourceFileName: z.string().optional(),
+    importedAt: z.string().datetime().optional(),
+    isDeleted: z.boolean().optional(),
   })
   .strict();
 
@@ -296,34 +316,45 @@ function deriveUniverseMarketFromType(type: MarketType): boolean {
   return type !== "kuehler";
 }
 
+function marketTypePriority(type: MarketType): number {
+  if (type === "both") return 3;
+  if (type === "universum") return 2;
+  return 1;
+}
+
+function choosePreferredMarketByStammnr(
+  current: typeof markets.$inferSelect | undefined,
+  candidate: typeof markets.$inferSelect,
+): typeof markets.$inferSelect {
+  if (!current) return candidate;
+  const currentPriority = marketTypePriority(current.marketType);
+  const candidatePriority = marketTypePriority(candidate.marketType);
+  if (candidatePriority !== currentPriority) {
+    return candidatePriority > currentPriority ? candidate : current;
+  }
+  return candidate.createdAt < current.createdAt ? candidate : current;
+}
+
 function resolveKuehlerIdentity(input: {
   marketType: MarketType;
   incomingKuehlerStammnr?: unknown;
   incomingCokeMasterNumber?: unknown;
-  incomingKuehlerInternalId?: unknown;
   existingKuehlerStammnr?: unknown;
   existingCokeMasterNumber?: unknown;
-  existingKuehlerInternalId?: unknown;
-}): { ok: true; stammnr: string | null; kuehlerInternalId: string | null } | { ok: false; error: string } {
+}): { ok: true; stammnr: string | null } | { ok: false; error: string } {
   const incomingStammnr = normalizeStammnrForMatch(input.incomingKuehlerStammnr);
   const incomingCokeStammnr = normalizeStammnrForMatch(input.incomingCokeMasterNumber);
   const existingStammnr = normalizeStammnrForMatch(input.existingKuehlerStammnr);
   const existingCokeStammnr = normalizeStammnrForMatch(input.existingCokeMasterNumber);
   const stammnr = incomingStammnr ?? incomingCokeStammnr ?? existingStammnr ?? existingCokeStammnr;
-  const incomingInternalId = normalizeIdentity(input.incomingKuehlerInternalId);
-  const existingInternalId = normalizeIdentity(input.existingKuehlerInternalId);
-  const kuehlerInternalId = incomingInternalId ?? existingInternalId;
 
   if (input.marketType === "universum") {
-    return { ok: true, stammnr: null, kuehlerInternalId: null };
+    return { ok: true, stammnr: null };
   }
   if (!stammnr) {
     return { ok: false, error: "Für Markt-Typ Kühler/Beides ist eine gültige Stammnr erforderlich." };
   }
-  if (!kuehlerInternalId) {
-    return { ok: false, error: "Für Markt-Typ Kühler/Beides ist eine gültige internal_id erforderlich." };
-  }
-  return { ok: true, stammnr, kuehlerInternalId };
+  return { ok: true, stammnr };
 }
 
 const CANONICAL_REGIONS = ["Nord", "West", "Ost", "Süd"] as const;
@@ -395,8 +426,7 @@ function isIdentityConstraintViolation(err: unknown): boolean {
   return (
     err.constraint === "markets_standard_market_number_unique" ||
     err.constraint === "markets_coke_master_number_unique" ||
-    err.constraint === "markets_flex_number_unique" ||
-    err.constraint === "markets_kuehler_internal_id_unique"
+    err.constraint === "markets_flex_number_unique"
   );
 }
 
@@ -489,6 +519,9 @@ function buildSkipMeta(
 }
 
 function mapMarketRow(row: typeof markets.$inferSelect) {
+  const createdAtIso = row.createdAt instanceof Date ? row.createdAt.toISOString() : new Date().toISOString();
+  const updatedAtIso = row.updatedAt instanceof Date ? row.updatedAt.toISOString() : createdAtIso;
+  const importedAtIso = row.importedAt instanceof Date ? row.importedAt.toISOString() : createdAtIso;
   return {
     id: row.id,
     standardMarketNumber: row.standardMarketNumber,
@@ -509,19 +542,36 @@ function mapMarketRow(row: typeof markets.$inferSelect) {
     universeMarket: row.universeMarket,
     marketType: row.marketType,
     kuehlerStammnr: row.kuehlerStammnr,
-    kuehlerBd: row.kuehlerBd,
-    kuehlerAnzahlKsAmStandort: row.kuehlerAnzahlKsAmStandort,
-    kuehlerInternalId: row.kuehlerInternalId,
-    kuehlerSerialNumber: row.kuehlerSerialNumber,
-    kuehlerModel: row.kuehlerModel,
     isActive: row.isActive,
     importSourceFileName: row.importSourceFileName,
-    importedAt: row.importedAt.toISOString(),
+    importedAt: importedAtIso,
     plannedToId: row.plannedToId,
     plannedByActiveStandardGmName: null as string | null,
     isDeleted: row.isDeleted,
-    createdAt: row.createdAt.toISOString(),
-    updatedAt: row.updatedAt.toISOString(),
+    createdAt: createdAtIso,
+    updatedAt: updatedAtIso,
+  };
+}
+
+function mapKuehlerUnitRow(row: typeof marketKuehlerUnits.$inferSelect) {
+  const createdAtIso = row.createdAt instanceof Date ? row.createdAt.toISOString() : new Date().toISOString();
+  const updatedAtIso = row.updatedAt instanceof Date ? row.updatedAt.toISOString() : createdAtIso;
+  const importedAtIso = row.importedAt instanceof Date ? row.importedAt.toISOString() : createdAtIso;
+  return {
+    id: row.id,
+    marketId: row.marketId,
+    name: row.name,
+    employee: row.employee,
+    kuehlerInternalId: row.kuehlerInternalId,
+    kuehlerBd: row.kuehlerBd,
+    kuehlerAnzahlKsAmStandort: row.kuehlerAnzahlKsAmStandort,
+    kuehlerSerialNumber: row.kuehlerSerialNumber,
+    kuehlerModel: row.kuehlerModel,
+    importSourceFileName: row.importSourceFileName,
+    importedAt: importedAtIso,
+    isDeleted: row.isDeleted,
+    createdAt: createdAtIso,
+    updatedAt: updatedAtIso,
   };
 }
 
@@ -649,10 +699,6 @@ marketsRouter.get("/", async (req, res, next) => {
               ilike(markets.cokeMasterNumber, like),
               ilike(markets.flexNumber, like),
               ilike(markets.kuehlerStammnr, like),
-              ilike(markets.kuehlerBd, like),
-              ilike(markets.kuehlerInternalId, like),
-              ilike(markets.kuehlerSerialNumber, like),
-              ilike(markets.kuehlerModel, like),
               ilike(markets.currentGmName, like),
             ),
           ),
@@ -1299,6 +1345,9 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       updated: number;
       skipped: number;
       duplicateInputRowsMerged: number;
+      kuehlerUnitsCreated: number;
+      kuehlerUnitsUpdated: number;
+      kuehlerUnitsSkipped: number;
       matchedBy: Record<"standardMarketNumber" | "cokeMasterNumber" | "flexNumber" | "namePLZ", number>;
       skippedReasons: Array<{
         row: number;
@@ -1318,6 +1367,9 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       updated: 0,
       skipped: 0,
       duplicateInputRowsMerged: 0,
+      kuehlerUnitsCreated: 0,
+      kuehlerUnitsUpdated: 0,
+      kuehlerUnitsSkipped: 0,
       matchedBy: { standardMarketNumber: 0, cokeMasterNumber: 0, flexNumber: 0, namePLZ: 0 },
       skippedReasons: [],
     };
@@ -1337,29 +1389,350 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       },
     });
 
+    if (importType === "kuehler") {
+      await db.transaction(async (tx) => {
+        await tx.execute(sql`set local lock_timeout = '5s'`);
+        await tx.execute(sql`set local statement_timeout = '90s'`);
+        const importLock = await tx.execute<{ locked: boolean }>(
+          sql`select pg_try_advisory_xact_lock(47110333) as locked`,
+        );
+        if (!importLock[0]?.locked) {
+          throw new Error("IMPORT_IN_PROGRESS");
+        }
+
+        const existingMarkets = await tx.select().from(markets).where(eq(markets.isDeleted, false));
+        const existingUnits = await tx
+          .select()
+          .from(marketKuehlerUnits)
+          .where(and(eq(marketKuehlerUnits.isDeleted, false), isNotNull(marketKuehlerUnits.kuehlerInternalId)));
+
+        const marketByCanonicalStammnr = new Map<string, typeof markets.$inferSelect>();
+        const registerMarket = (market: typeof markets.$inferSelect) => {
+          const keyCandidates = [
+            normalizeStammnrForMatch(market.kuehlerStammnr),
+            normalizeStammnrForMatch(market.cokeMasterNumber),
+          ];
+          for (const keyCandidate of keyCandidates) {
+            const canonical = normStr(keyCandidate ?? "");
+            if (!canonical) continue;
+            const current = marketByCanonicalStammnr.get(canonical);
+            marketByCanonicalStammnr.set(canonical, choosePreferredMarketByStammnr(current, market));
+          }
+        };
+        for (const market of existingMarkets) {
+          registerMarket(market);
+        }
+
+        const unitByCanonicalInternalId = new Map<string, typeof marketKuehlerUnits.$inferSelect>();
+        for (const unit of existingUnits) {
+          const key = normStr(unit.kuehlerInternalId ?? "");
+          if (!key) continue;
+          unitByCanonicalInternalId.set(key, unit);
+        }
+
+        const seedByCanonicalStammnr = new Map<
+          string,
+          {
+            rowNum: number;
+            sampleText: string;
+            draft: MarketDraft;
+            normalizedDraftRegion: RegionNormalizationResult | null;
+          }
+        >();
+        for (let i = 0; i < dataRows.length; i += 1) {
+          const row = dataRows[i];
+          if (!row) continue;
+          if (row.every((cell) => !cell || !cell.trim())) continue;
+          const draft = mapRowToDraft(row, payload.mapping, importType);
+          const stammnr = normalizeStammnrForMatch(draft.kuehlerStammnr);
+          const canonicalStammnr = normStr(stammnr ?? "");
+          if (!canonicalStammnr || seedByCanonicalStammnr.has(canonicalStammnr)) continue;
+          const sampleText = String(draft.name ?? draft.city ?? row.find((cell) => cell?.trim()) ?? "");
+          const normalizedDraftRegion =
+            draft.region != null ? normalizeRegionValue(String(draft.region)) : null;
+          seedByCanonicalStammnr.set(canonicalStammnr, {
+            rowNum: i + 2,
+            sampleText,
+            draft,
+            normalizedDraftRegion,
+          });
+        }
+
+        for (let i = 0; i < dataRows.length; i += 1) {
+          const row = dataRows[i];
+          if (!row) continue;
+          const rowNum = i + 2;
+          if (row.every((cell) => !cell || !cell.trim())) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            continue;
+          }
+
+          const draft = mapRowToDraft(row, payload.mapping, importType);
+          const sampleText = String(draft.name ?? draft.city ?? row.find((cell) => cell?.trim()) ?? "");
+          const stammnr = normalizeStammnrForMatch(draft.kuehlerStammnr);
+          const canonicalStammnr = normStr(stammnr ?? "");
+          if (!canonicalStammnr) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: "Stammnr fehlt oder ist nach Normalisierung leer",
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+
+          const normalizedDraftRegion =
+            draft.region != null ? normalizeRegionValue(String(draft.region)) : null;
+          if (normalizedDraftRegion && !normalizedDraftRegion.ok) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `Region konnte nicht normalisiert werden (${normalizedDraftRegion.raw || "leer"})`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+
+          let resolvedMarket = marketByCanonicalStammnr.get(canonicalStammnr);
+          if (!resolvedMarket) {
+            const seed = seedByCanonicalStammnr.get(canonicalStammnr);
+            const seedDraft = seed?.draft ?? draft;
+            const seedSampleText = seed?.sampleText ?? sampleText;
+            const seedRowNum = seed?.rowNum ?? rowNum;
+            const seedNormalizedRegion = seed?.normalizedDraftRegion ?? normalizedDraftRegion;
+            if (!seedNormalizedRegion || !seedNormalizedRegion.ok) {
+              summary.skipped += 1;
+              summary.kuehlerUnitsSkipped += 1;
+              if (summary.skippedReasons.length < 50) {
+                summary.skippedReasons.push({
+                  row: seedRowNum,
+                  reason: `Neuer Markt mit ungültiger Seed-Region (${seedNormalizedRegion?.raw || "leer"})`,
+                  sample: seedSampleText,
+                  draft: seedDraft,
+                });
+              }
+              continue;
+            }
+            const hasSeedVisibles = Boolean(
+              seedDraft.name && (seedDraft.postalCode || seedDraft.city),
+            );
+            if (!hasSeedVisibles) {
+              summary.skipped += 1;
+              summary.kuehlerUnitsSkipped += 1;
+              if (summary.skippedReasons.length < 50) {
+                const { missingFields, missingFieldKeys, fetchedFields } = buildSkipMeta(
+                  seedDraft,
+                  payload.mapping,
+                  importType,
+                );
+                summary.skippedReasons.push({
+                  row: seedRowNum,
+                  reason: "Neuer Markt ohne Pflichtfelder (Name, PLZ, Region)",
+                  sample: seedSampleText,
+                  draft: seedDraft,
+                  missingFields,
+                  missingFieldKeys,
+                  fetchedFields,
+                });
+              }
+              continue;
+            }
+
+            const [createdMarket] = await tx
+              .insert(markets)
+              .values({
+                standardMarketNumber: null,
+                cokeMasterNumber: stammnr,
+                flexNumber: null,
+                name: String(seedDraft.name ?? ""),
+                dbName: "",
+                address: String(seedDraft.address ?? ""),
+                postalCode: String(seedDraft.postalCode ?? ""),
+                city: String(seedDraft.city ?? ""),
+                region: seedNormalizedRegion.canonical,
+                emEh: "",
+                employee: normalizeOptionalText(String(seedDraft.employee ?? "")) ?? "",
+                currentGmName: "",
+                visitFrequencyPerYear: 0,
+                infoFlag: false,
+                infoNote: "",
+                universeMarket: false,
+                marketType: "kuehler",
+                kuehlerStammnr: stammnr,
+                isActive: true,
+                importSourceFileName: payload.fileName,
+                importedAt,
+                isDeleted: false,
+              })
+              .returning();
+            if (!createdMarket) {
+              summary.skipped += 1;
+              summary.kuehlerUnitsSkipped += 1;
+              continue;
+            }
+            summary.created += 1;
+            resolvedMarket = createdMarket;
+            marketByCanonicalStammnr.set(canonicalStammnr, createdMarket);
+            registerMarket(createdMarket);
+          } else {
+            const nextMarketType: MarketType =
+              resolvedMarket.marketType === "universum" ? "both" : resolvedMarket.marketType;
+            const nextUniverseMarket = deriveUniverseMarketFromType(nextMarketType);
+            const shouldUpdateMarket =
+              nextMarketType !== resolvedMarket.marketType ||
+              nextUniverseMarket !== resolvedMarket.universeMarket ||
+              normalizeStammnrForMatch(resolvedMarket.kuehlerStammnr) !== stammnr ||
+              normalizeStammnrForMatch(resolvedMarket.cokeMasterNumber) !== stammnr;
+
+            if (shouldUpdateMarket) {
+              const [updatedMarket] = await tx
+                .update(markets)
+                .set({
+                  marketType: nextMarketType,
+                  universeMarket: nextUniverseMarket,
+                  kuehlerStammnr: stammnr,
+                  cokeMasterNumber: stammnr,
+                  importSourceFileName: payload.fileName,
+                  importedAt,
+                  updatedAt: new Date(),
+                })
+                .where(eq(markets.id, resolvedMarket.id))
+                .returning();
+              if (updatedMarket) {
+                summary.updated += 1;
+                resolvedMarket = updatedMarket;
+                marketByCanonicalStammnr.set(canonicalStammnr, updatedMarket);
+                registerMarket(updatedMarket);
+              }
+            }
+          }
+
+          if (!resolvedMarket) {
+            summary.kuehlerUnitsSkipped += 1;
+            continue;
+          }
+
+          const normalizedInternalId = normalizeIdentity(draft.kuehlerInternalId);
+          const canonicalInternalId = normStr(normalizedInternalId ?? "");
+          const unitName = normalizeOptionalText(String(draft.name ?? "")) ?? "";
+          const unitEmployee = normalizeOptionalText(String(draft.employee ?? "")) ?? "";
+          const unitBd = normalizeOptionalText(String(draft.kuehlerBd ?? ""));
+          const unitSerial = normalizeOptionalText(String(draft.kuehlerSerialNumber ?? ""));
+          const unitModel = normalizeOptionalText(String(draft.kuehlerModel ?? ""));
+          const unitCount =
+            draft.kuehlerAnzahlKsAmStandort != null
+              ? Number(draft.kuehlerAnzahlKsAmStandort)
+              : null;
+
+          if (canonicalInternalId) {
+            const existingUnit = unitByCanonicalInternalId.get(canonicalInternalId);
+            if (existingUnit) {
+              const [updatedUnit] = await tx
+                .update(marketKuehlerUnits)
+                .set({
+                  marketId: resolvedMarket.id,
+                  name: unitName,
+                  employee: unitEmployee,
+                  kuehlerInternalId: normalizedInternalId,
+                  kuehlerBd: unitBd,
+                  kuehlerAnzahlKsAmStandort: unitCount,
+                  kuehlerSerialNumber: unitSerial,
+                  kuehlerModel: unitModel,
+                  importSourceFileName: payload.fileName,
+                  importedAt,
+                  isDeleted: false,
+                  updatedAt: new Date(),
+                })
+                .where(eq(marketKuehlerUnits.id, existingUnit.id))
+                .returning();
+              if (updatedUnit) {
+                summary.kuehlerUnitsUpdated += 1;
+                unitByCanonicalInternalId.set(canonicalInternalId, updatedUnit);
+              } else {
+                summary.kuehlerUnitsSkipped += 1;
+              }
+              continue;
+            }
+          }
+
+          const [createdUnit] = await tx
+            .insert(marketKuehlerUnits)
+            .values({
+              marketId: resolvedMarket.id,
+              name: unitName,
+              employee: unitEmployee,
+              kuehlerInternalId: normalizedInternalId,
+              kuehlerBd: unitBd,
+              kuehlerAnzahlKsAmStandort: unitCount,
+              kuehlerSerialNumber: unitSerial,
+              kuehlerModel: unitModel,
+              importSourceFileName: payload.fileName,
+              importedAt,
+              isDeleted: false,
+            })
+            .returning();
+          if (createdUnit) {
+            summary.kuehlerUnitsCreated += 1;
+            if (canonicalInternalId) {
+              unitByCanonicalInternalId.set(canonicalInternalId, createdUnit);
+            }
+          } else {
+            summary.kuehlerUnitsSkipped += 1;
+          }
+        }
+      });
+
+      const fresh = await db
+        .select()
+        .from(markets)
+        .where(eq(markets.isDeleted, false))
+        .orderBy(desc(markets.createdAt));
+      logAction("info", "market_import_completed", {
+        req,
+        action: "market_import",
+        result: "success",
+        statusCode: 200,
+        requestClass: "success",
+        startedAtNs,
+        details: {
+          importType,
+          created: summary.created,
+          updated: summary.updated,
+          skipped: summary.skipped,
+          duplicateInputRowsMerged: summary.duplicateInputRowsMerged,
+          kuehlerUnitsCreated: summary.kuehlerUnitsCreated,
+          kuehlerUnitsUpdated: summary.kuehlerUnitsUpdated,
+          kuehlerUnitsSkipped: summary.kuehlerUnitsSkipped,
+        },
+      });
+      res.status(200).json({ markets: fresh.map(mapMarketRow), summary });
+      return;
+    }
+
     const lastRowByIdentity = new Map<string, number>();
     for (let i = 0; i < dataRows.length; i += 1) {
       const row = dataRows[i];
       if (!row) continue;
       const draft = mapRowToDraft(row, payload.mapping, importType);
       const stdKey = normStr(normalizeIdentity(draft.standardMarketNumber)?.toString());
-      const cokeKey =
-        importType === "kuehler"
-          ? normalizeStammnrKey(draft.kuehlerStammnr)
-          : normStr(normalizeIdentity(draft.cokeMasterNumber)?.toString());
+      const cokeKey = normStr(normalizeIdentity(draft.cokeMasterNumber)?.toString());
       const flexKey = normStr(normalizeIdentity(draft.flexNumber)?.toString());
-      const identityKey =
-        importType === "kuehler"
-          ? cokeKey
-            ? `coke:${cokeKey}`
-            : ""
-          : stdKey
-            ? `std:${stdKey}`
-            : cokeKey
-              ? `coke:${cokeKey}`
-              : flexKey
-                ? `flex:${flexKey}`
-                : "";
+      const identityKey = stdKey
+        ? `std:${stdKey}`
+        : cokeKey
+          ? `coke:${cokeKey}`
+          : flexKey
+            ? `flex:${flexKey}`
+            : "";
       if (!identityKey) continue;
       if (lastRowByIdentity.has(identityKey)) {
         summary.duplicateInputRowsMerged += 1;
@@ -1391,10 +1764,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         const row = pendingCreates[idx];
         if (!row) return;
         const std = normStr((row.standardMarketNumber as string | null | undefined) ?? "");
-        const coke =
-          importType === "kuehler"
-            ? normalizeStammnrKey(row.cokeMasterNumber)
-            : normStr((row.cokeMasterNumber as string | null | undefined) ?? "");
+        const coke = normStr((row.cokeMasterNumber as string | null | undefined) ?? "");
         const flex = normStr((row.flexNumber as string | null | undefined) ?? "");
         const name = normStr((row.name as string | undefined) ?? "");
         const plz = normStr((row.postalCode as string | undefined) ?? "");
@@ -1407,10 +1777,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       for (const market of existing) {
         if (market.standardMarketNumber) byStandard.set(normStr(market.standardMarketNumber), market);
         if (market.cokeMasterNumber) {
-          const cokeKey =
-            importType === "kuehler"
-              ? normalizeStammnrKey(market.cokeMasterNumber)
-              : normStr(market.cokeMasterNumber);
+          const cokeKey = normStr(market.cokeMasterNumber);
           if (cokeKey) byCoke.set(cokeKey, market);
         }
         if (market.flexNumber) byFlex.set(normStr(market.flexNumber), market);
@@ -1439,47 +1806,26 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
         const draft = mapRowToDraft(row, payload.mapping, importType);
         const sampleText = String(draft.name ?? draft.city ?? row.find((c) => c?.trim()) ?? "");
-        const hasDraftIdentity =
-          importType === "kuehler"
-            ? Boolean(draft.kuehlerStammnr)
-            : Boolean(draft.standardMarketNumber || draft.cokeMasterNumber || draft.flexNumber);
+        const hasDraftIdentity = Boolean(
+          draft.standardMarketNumber || draft.cokeMasterNumber || draft.flexNumber,
+        );
         const hasDraftVisibles = Boolean(draft.name && (draft.postalCode || draft.city) && draft.region);
         const normalizedDraftRegion =
           draft.region != null ? normalizeRegionValue(String(draft.region)) : null;
 
         const stdIdentity = normalizeIdentity(draft.standardMarketNumber);
-        const cokeIdentity =
-          importType === "kuehler"
-            ? normalizeStammnrForMatch(draft.kuehlerStammnr)
-            : normalizeIdentity(draft.cokeMasterNumber);
+        const cokeIdentity = normalizeIdentity(draft.cokeMasterNumber);
         const flexIdentity = normalizeIdentity(draft.flexNumber);
         const stdKey = normStr(stdIdentity ?? "");
         const cokeKey = normStr(cokeIdentity ?? "");
         const flexKey = normStr(flexIdentity ?? "");
-        const identityKey =
-          importType === "kuehler"
-            ? cokeKey
-              ? `coke:${cokeKey}`
-              : ""
-            : stdKey
-              ? `std:${stdKey}`
-              : cokeKey
-                ? `coke:${cokeKey}`
-                : flexKey
-                  ? `flex:${flexKey}`
-                  : "";
-        if (importType === "kuehler" && !cokeIdentity) {
-          summary.skipped += 1;
-          if (summary.skippedReasons.length < 50) {
-            summary.skippedReasons.push({
-              row: rowNum,
-              reason: "Stammnr fehlt oder ist nach Normalisierung leer",
-              sample: sampleText,
-              draft,
-            });
-          }
-          continue;
-        }
+        const identityKey = stdKey
+          ? `std:${stdKey}`
+          : cokeKey
+            ? `coke:${cokeKey}`
+            : flexKey
+              ? `flex:${flexKey}`
+              : "";
         if (identityKey && lastRowByIdentity.get(identityKey) !== i) {
           continue;
         }
@@ -1523,15 +1869,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         let matchKey: keyof typeof summary.matchedBy | null = null;
         const namePlzKey = `${normStr(String(draft.name ?? ""))}|${normStr(String(draft.postalCode ?? ""))}`;
 
-        if (importType === "kuehler") {
-          if (cokeKey && byCoke.has(cokeKey)) {
-            matched = byCoke.get(cokeKey);
-            matchKey = "cokeMasterNumber";
-          } else if (cokeKey && pendingByCoke.has(cokeKey)) {
-            matchedPendingIndex = pendingByCoke.get(cokeKey);
-            matchKey = "cokeMasterNumber";
-          }
-        } else if (stdKey && byStandard.has(stdKey)) {
+        if (stdKey && byStandard.has(stdKey)) {
           matched = byStandard.get(stdKey);
           matchKey = "standardMarketNumber";
         } else if (stdKey && pendingByStandard.has(stdKey)) {
@@ -1558,71 +1896,6 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         }
 
         if (matched) {
-          if (importType === "kuehler") {
-            const nextMarketType: MarketType =
-              matched.marketType === "universum" || matched.universeMarket ? "both" : matched.marketType;
-            const nextUniverseMarket = deriveUniverseMarketFromType(nextMarketType);
-            const incomingName = draft.name != null ? String(draft.name) : "";
-            const incomingAddress = draft.address != null ? String(draft.address) : "";
-            const incomingPostalCode = draft.postalCode != null ? String(draft.postalCode) : "";
-            const incomingCity = draft.city != null ? String(draft.city) : "";
-            const incomingRegion = normalizedDraftRegion?.ok ? normalizedDraftRegion.canonical : "";
-            const incomingEmployee = draft.employee != null ? (normalizeOptionalText(String(draft.employee)) ?? "") : "";
-            const [updated] = await tx
-              .update(markets)
-              .set({
-                cokeMasterNumber: cokeIdentity ?? matched.cokeMasterNumber,
-                name: matched.name.trim().length > 0 ? matched.name : incomingName,
-                address: matched.address.trim().length > 0 ? matched.address : incomingAddress,
-                postalCode: matched.postalCode.trim().length > 0 ? matched.postalCode : incomingPostalCode,
-                city: matched.city.trim().length > 0 ? matched.city : incomingCity,
-                region: matched.region.trim().length > 0 ? matched.region : incomingRegion,
-                employee: matched.employee.trim().length > 0 ? matched.employee : incomingEmployee,
-                marketType: nextMarketType,
-                universeMarket: nextUniverseMarket,
-                kuehlerStammnr: cokeIdentity,
-                kuehlerBd:
-                  draft.kuehlerBd != null ? (normalizeOptionalText(String(draft.kuehlerBd)) ?? "") : matched.kuehlerBd,
-                kuehlerAnzahlKsAmStandort:
-                  draft.kuehlerAnzahlKsAmStandort != null
-                    ? Number(draft.kuehlerAnzahlKsAmStandort)
-                    : matched.kuehlerAnzahlKsAmStandort,
-                kuehlerInternalId:
-                  draft.kuehlerInternalId != null
-                    ? normalizeIdentity(String(draft.kuehlerInternalId))
-                    : matched.kuehlerInternalId,
-                kuehlerSerialNumber:
-                  draft.kuehlerSerialNumber != null
-                    ? normalizeIdentity(String(draft.kuehlerSerialNumber))
-                    : matched.kuehlerSerialNumber,
-                kuehlerModel:
-                  draft.kuehlerModel != null
-                    ? (normalizeOptionalText(String(draft.kuehlerModel)) ?? "")
-                    : matched.kuehlerModel,
-                importSourceFileName: payload.fileName,
-                importedAt,
-                updatedAt: new Date(),
-              })
-              .where(eq(markets.id, matched.id))
-              .returning();
-
-            if (updated) {
-              summary.updated += 1;
-              if (matchKey) summary.matchedBy[matchKey] += 1;
-              if (updated.standardMarketNumber) byStandard.set(normStr(updated.standardMarketNumber), updated);
-              if (updated.cokeMasterNumber) {
-                const nextCokeKey =
-                  importType === "kuehler"
-                    ? normalizeStammnrKey(updated.cokeMasterNumber)
-                    : normStr(updated.cokeMasterNumber);
-                if (nextCokeKey) byCoke.set(nextCokeKey, updated);
-              }
-              if (updated.flexNumber) byFlex.set(normStr(updated.flexNumber), updated);
-              byNamePlz.set(`${normStr(updated.name)}|${normStr(updated.postalCode)}`, updated);
-            }
-            continue;
-          }
-
           const nextMarketType: MarketType = matched.marketType === "kuehler" ? "both" : matched.marketType;
           const nextUniverseMarket = deriveUniverseMarketFromType(nextMarketType);
           const [updated] = await tx
@@ -1657,11 +1930,6 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
               universeMarket: nextUniverseMarket,
               marketType: nextMarketType,
               kuehlerStammnr: matched.kuehlerStammnr,
-              kuehlerBd: matched.kuehlerBd,
-              kuehlerAnzahlKsAmStandort: matched.kuehlerAnzahlKsAmStandort,
-              kuehlerInternalId: matched.kuehlerInternalId,
-              kuehlerSerialNumber: matched.kuehlerSerialNumber,
-              kuehlerModel: matched.kuehlerModel,
               visitFrequencyPerYear:
                 draft.visitFrequencyPerYear != null
                   ? Number(draft.visitFrequencyPerYear)
@@ -1691,106 +1959,39 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         if (matchedPendingIndex != null) {
           const pending = pendingCreates[matchedPendingIndex];
           if (pending) {
-            if (importType === "kuehler") {
-              const pendingType = (pending.marketType as MarketType | null | undefined) ?? "kuehler";
-              const nextPendingType: MarketType =
-                pendingType === "universum" || Boolean(pending.universeMarket) ? "both" : pendingType;
-              pending.cokeMasterNumber = cokeIdentity ?? pending.cokeMasterNumber;
-              pending.name =
-                String(pending.name ?? "").trim().length > 0
-                  ? pending.name
-                  : draft.name != null
-                    ? String(draft.name)
-                    : pending.name;
-              pending.address =
-                String(pending.address ?? "").trim().length > 0
-                  ? pending.address
-                  : draft.address != null
-                    ? String(draft.address)
-                    : pending.address;
-              pending.postalCode =
-                String(pending.postalCode ?? "").trim().length > 0
-                  ? pending.postalCode
-                  : draft.postalCode != null
-                    ? String(draft.postalCode)
-                    : pending.postalCode;
-              pending.city =
-                String(pending.city ?? "").trim().length > 0
-                  ? pending.city
-                  : draft.city != null
-                    ? String(draft.city)
-                    : pending.city;
-              pending.region =
-                String(pending.region ?? "").trim().length > 0
-                  ? pending.region
-                  : draft.region != null && normalizedDraftRegion?.ok
-                    ? normalizedDraftRegion.canonical
-                    : pending.region;
-              pending.employee =
-                String(pending.employee ?? "").trim().length > 0
-                  ? pending.employee
-                  : draft.employee != null
-                    ? (normalizeOptionalText(String(draft.employee)) ?? "")
-                    : pending.employee;
-              pending.marketType = nextPendingType;
-              pending.universeMarket = deriveUniverseMarketFromType(nextPendingType);
-              pending.kuehlerStammnr = cokeIdentity;
-              pending.kuehlerBd =
-                draft.kuehlerBd != null
-                  ? (normalizeOptionalText(String(draft.kuehlerBd)) ?? "")
-                  : pending.kuehlerBd;
-              pending.kuehlerAnzahlKsAmStandort =
-                draft.kuehlerAnzahlKsAmStandort != null
-                  ? Number(draft.kuehlerAnzahlKsAmStandort)
-                  : pending.kuehlerAnzahlKsAmStandort;
-              pending.kuehlerInternalId =
-                draft.kuehlerInternalId != null
-                  ? normalizeIdentity(String(draft.kuehlerInternalId))
-                  : pending.kuehlerInternalId;
-              pending.kuehlerSerialNumber =
-                draft.kuehlerSerialNumber != null
-                  ? normalizeIdentity(String(draft.kuehlerSerialNumber))
-                  : pending.kuehlerSerialNumber;
-              pending.kuehlerModel =
-                draft.kuehlerModel != null
-                  ? (normalizeOptionalText(String(draft.kuehlerModel)) ?? "")
-                  : pending.kuehlerModel;
-              pending.isActive = pending.isActive ?? true;
-            } else {
-              pending.standardMarketNumber =
-                draft.standardMarketNumber != null
-                  ? normalizeIdentity(String(draft.standardMarketNumber))
-                  : pending.standardMarketNumber;
-              pending.cokeMasterNumber =
-                draft.cokeMasterNumber != null
-                  ? normalizeIdentity(String(draft.cokeMasterNumber))
-                  : pending.cokeMasterNumber;
-              pending.flexNumber =
-                draft.flexNumber != null ? normalizeIdentity(String(draft.flexNumber)) : pending.flexNumber;
-              pending.name = draft.name != null ? String(draft.name) : pending.name;
-              pending.dbName =
-                draft.dbName != null ? (normalizeOptionalText(String(draft.dbName)) ?? "") : pending.dbName;
-              pending.address = draft.address != null ? String(draft.address) : pending.address;
-              pending.postalCode = draft.postalCode != null ? String(draft.postalCode) : pending.postalCode;
-              pending.city = draft.city != null ? String(draft.city) : pending.city;
-              pending.region =
-                draft.region != null && normalizedDraftRegion?.ok
-                  ? normalizedDraftRegion.canonical
-                  : pending.region;
-              pending.emEh = draft.emEh != null ? (normalizeOptionalText(String(draft.emEh)) ?? "") : pending.emEh;
-              pending.employee =
-                draft.employee != null ? (normalizeOptionalText(String(draft.employee)) ?? "") : pending.employee;
-              const pendingType = (pending.marketType as MarketType | null | undefined) ?? "universum";
-              const nextPendingType: MarketType = pendingType === "kuehler" ? "both" : pendingType;
-              pending.marketType = nextPendingType;
-              pending.universeMarket = deriveUniverseMarketFromType(nextPendingType);
-              pending.isActive = pending.isActive ?? true;
-              pending.visitFrequencyPerYear =
-                draft.visitFrequencyPerYear != null
-                  ? Number(draft.visitFrequencyPerYear)
-                  : pending.visitFrequencyPerYear;
-              pending.infoFlag = draft.infoFlag != null ? Boolean(draft.infoFlag) : pending.infoFlag;
-            }
+            pending.standardMarketNumber =
+              draft.standardMarketNumber != null
+                ? normalizeIdentity(String(draft.standardMarketNumber))
+                : pending.standardMarketNumber;
+            pending.cokeMasterNumber =
+              draft.cokeMasterNumber != null
+                ? normalizeIdentity(String(draft.cokeMasterNumber))
+                : pending.cokeMasterNumber;
+            pending.flexNumber =
+              draft.flexNumber != null ? normalizeIdentity(String(draft.flexNumber)) : pending.flexNumber;
+            pending.name = draft.name != null ? String(draft.name) : pending.name;
+            pending.dbName =
+              draft.dbName != null ? (normalizeOptionalText(String(draft.dbName)) ?? "") : pending.dbName;
+            pending.address = draft.address != null ? String(draft.address) : pending.address;
+            pending.postalCode = draft.postalCode != null ? String(draft.postalCode) : pending.postalCode;
+            pending.city = draft.city != null ? String(draft.city) : pending.city;
+            pending.region =
+              draft.region != null && normalizedDraftRegion?.ok
+                ? normalizedDraftRegion.canonical
+                : pending.region;
+            pending.emEh = draft.emEh != null ? (normalizeOptionalText(String(draft.emEh)) ?? "") : pending.emEh;
+            pending.employee =
+              draft.employee != null ? (normalizeOptionalText(String(draft.employee)) ?? "") : pending.employee;
+            const pendingType = (pending.marketType as MarketType | null | undefined) ?? "universum";
+            const nextPendingType: MarketType = pendingType === "kuehler" ? "both" : pendingType;
+            pending.marketType = nextPendingType;
+            pending.universeMarket = deriveUniverseMarketFromType(nextPendingType);
+            pending.isActive = pending.isActive ?? true;
+            pending.visitFrequencyPerYear =
+              draft.visitFrequencyPerYear != null
+                ? Number(draft.visitFrequencyPerYear)
+                : pending.visitFrequencyPerYear;
+            pending.infoFlag = draft.infoFlag != null ? Boolean(draft.infoFlag) : pending.infoFlag;
             pending.importSourceFileName = payload.fileName;
             pending.importedAt = importedAt;
             registerPending(matchedPendingIndex);
@@ -1823,56 +2024,24 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
         const pendingIndex =
           pendingCreates.push({
-            standardMarketNumber:
-              importType === "kuehler" ? null : normalizeIdentity(draft.standardMarketNumber),
-            cokeMasterNumber:
-              importType === "kuehler"
-                ? normalizeStammnrForMatch(draft.kuehlerStammnr)
-                : normalizeIdentity(draft.cokeMasterNumber),
-            flexNumber: importType === "kuehler" ? null : normalizeIdentity(draft.flexNumber),
+            standardMarketNumber: normalizeIdentity(draft.standardMarketNumber),
+            cokeMasterNumber: normalizeIdentity(draft.cokeMasterNumber),
+            flexNumber: normalizeIdentity(draft.flexNumber),
             name: String(draft.name ?? ""),
-            dbName:
-              importType === "kuehler"
-                ? ""
-                : normalizeOptionalText(String(draft.dbName ?? "")) ?? "",
+            dbName: normalizeOptionalText(String(draft.dbName ?? "")) ?? "",
             address: String(draft.address ?? ""),
             postalCode: String(draft.postalCode ?? ""),
             city: String(draft.city ?? ""),
             region: normalizedDraftRegion?.ok ? normalizedDraftRegion.canonical : String(draft.region ?? ""),
-            emEh:
-              importType === "kuehler"
-                ? ""
-                : normalizeOptionalText(String(draft.emEh ?? "")) ?? "",
+            emEh: normalizeOptionalText(String(draft.emEh ?? "")) ?? "",
             employee: normalizeOptionalText(String(draft.employee ?? "")) ?? "",
             currentGmName: "",
-            visitFrequencyPerYear:
-              importType === "kuehler" ? 0 : Number(draft.visitFrequencyPerYear ?? 0),
-            infoFlag: importType === "kuehler" ? false : Boolean(draft.infoFlag ?? false),
+            visitFrequencyPerYear: Number(draft.visitFrequencyPerYear ?? 0),
+            infoFlag: Boolean(draft.infoFlag ?? false),
             infoNote: "",
-            universeMarket: importType === "kuehler" ? false : true,
-            marketType: importType === "kuehler" ? "kuehler" : "universum",
-            kuehlerStammnr:
-              importType === "kuehler" ? normalizeStammnrForMatch(draft.kuehlerStammnr) : null,
-            kuehlerBd:
-              importType === "kuehler"
-                ? (normalizeOptionalText(String(draft.kuehlerBd ?? "")) ?? "")
-                : null,
-            kuehlerAnzahlKsAmStandort:
-              importType === "kuehler"
-                ? (draft.kuehlerAnzahlKsAmStandort != null
-                    ? Number(draft.kuehlerAnzahlKsAmStandort)
-                    : null)
-                : null,
-            kuehlerInternalId:
-              importType === "kuehler" ? normalizeIdentity(draft.kuehlerInternalId) : null,
-            kuehlerSerialNumber:
-              importType === "kuehler"
-                ? normalizeIdentity(draft.kuehlerSerialNumber)
-                : null,
-            kuehlerModel:
-              importType === "kuehler"
-                ? (normalizeOptionalText(String(draft.kuehlerModel ?? "")) ?? "")
-                : null,
+            universeMarket: true,
+            marketType: "universum",
+            kuehlerStammnr: null,
             isActive: true,
             importSourceFileName: payload.fileName,
             importedAt,
@@ -1990,6 +2159,200 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
   }
 });
 
+adminMarketsRouter.get("/:id/kuehler-units", async (req: AuthedRequest, res, next) => {
+  try {
+    const marketId = String(req.params.id ?? "");
+    if (!marketId) {
+      res.status(400).json({ error: "Market id is required." });
+      return;
+    }
+    const [existingMarket] = await db
+      .select({ id: markets.id })
+      .from(markets)
+      .where(and(eq(markets.id, marketId), eq(markets.isDeleted, false)))
+      .limit(1);
+    if (!existingMarket) {
+      res.status(404).json({ error: "Market not found." });
+      return;
+    }
+    const rows = await db
+      .select()
+      .from(marketKuehlerUnits)
+      .where(and(eq(marketKuehlerUnits.marketId, marketId), eq(marketKuehlerUnits.isDeleted, false)))
+      .orderBy(desc(marketKuehlerUnits.importedAt), desc(marketKuehlerUnits.createdAt));
+    res.status(200).json({ units: rows.map(mapKuehlerUnitRow) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminMarketsRouter.post("/:id/kuehler-units", async (req: AuthedRequest, res, next) => {
+  try {
+    const marketId = String(req.params.id ?? "");
+    if (!marketId) {
+      res.status(400).json({ error: "Market id is required." });
+      return;
+    }
+    const parsed = createKuehlerUnitSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid kuehler unit payload." });
+      return;
+    }
+    const payload = parsed.data;
+    const normalizedInternalId = normalizeIdentity(payload.kuehlerInternalId);
+    const txResult = await db.transaction(async (tx) => {
+      const [existingMarket] = await tx
+        .select({
+          id: markets.id,
+          marketType: markets.marketType,
+          universeMarket: markets.universeMarket,
+          kuehlerStammnr: markets.kuehlerStammnr,
+          cokeMasterNumber: markets.cokeMasterNumber,
+        })
+        .from(markets)
+        .where(and(eq(markets.id, marketId), eq(markets.isDeleted, false)))
+        .limit(1);
+      if (!existingMarket) {
+        return { status: "not_found" as const };
+      }
+
+      const promotionStammnr =
+        normalizeStammnrForMatch(existingMarket.kuehlerStammnr) ??
+        normalizeStammnrForMatch(existingMarket.cokeMasterNumber);
+      if (existingMarket.marketType === "universum" && !promotionStammnr) {
+        return { status: "missing_stammnr" as const };
+      }
+
+      const [createdUnit] = await tx
+        .insert(marketKuehlerUnits)
+        .values({
+          marketId,
+          name: normalizeOptionalText(payload.name) ?? "",
+          employee: normalizeOptionalText(payload.employee) ?? "",
+          kuehlerInternalId: normalizedInternalId,
+          kuehlerBd: normalizeOptionalText(payload.kuehlerBd),
+          kuehlerAnzahlKsAmStandort: payload.kuehlerAnzahlKsAmStandort ?? null,
+          kuehlerSerialNumber: normalizeOptionalText(payload.kuehlerSerialNumber),
+          kuehlerModel: normalizeOptionalText(payload.kuehlerModel),
+          importSourceFileName: payload.importSourceFileName,
+          importedAt: payload.importedAt ? new Date(payload.importedAt) : new Date(),
+          isDeleted: false,
+        })
+        .returning();
+      if (!createdUnit) {
+        return { status: "create_failed" as const };
+      }
+
+      const nextMarketType: MarketType =
+        existingMarket.marketType === "universum" ? "both" : existingMarket.marketType;
+      if (nextMarketType !== existingMarket.marketType) {
+        await tx
+          .update(markets)
+          .set({
+            marketType: nextMarketType,
+            universeMarket: deriveUniverseMarketFromType(nextMarketType),
+            kuehlerStammnr: promotionStammnr,
+            cokeMasterNumber: promotionStammnr,
+            updatedAt: new Date(),
+          })
+          .where(eq(markets.id, marketId));
+      }
+
+      return { status: "ok" as const, unit: createdUnit };
+    });
+
+    if (txResult.status === "not_found") {
+      res.status(404).json({ error: "Market not found." });
+      return;
+    }
+    if (txResult.status === "missing_stammnr") {
+      res.status(400).json({
+        error:
+          "Kühler kann nur angelegt werden, wenn der Markt eine gültige Stammnr (kuehler_stammnr oder coke_master_number) hat.",
+      });
+      return;
+    }
+    if (txResult.status === "create_failed") {
+      res.status(500).json({ error: "Failed to create kuehler unit." });
+      return;
+    }
+
+    res.status(201).json({ unit: mapKuehlerUnitRow(txResult.unit) });
+  } catch (err) {
+    if (isPgUniqueViolation(err) && err.constraint === "market_kuehler_units_internal_id_active_unique") {
+      res.status(409).json({ error: "Kühler konnte nicht angelegt werden: internal_id bereits vorhanden." });
+      return;
+    }
+    next(err);
+  }
+});
+
+adminMarketsRouter.patch("/:marketId/kuehler-units/:unitId", async (req: AuthedRequest, res, next) => {
+  try {
+    const marketId = String(req.params.marketId ?? "");
+    const unitId = String(req.params.unitId ?? "");
+    if (!marketId || !unitId) {
+      res.status(400).json({ error: "Market id and unit id are required." });
+      return;
+    }
+    const parsed = updateKuehlerUnitSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid kuehler unit update payload." });
+      return;
+    }
+
+    const [existingUnit] = await db
+      .select()
+      .from(marketKuehlerUnits)
+      .where(
+        and(
+          eq(marketKuehlerUnits.id, unitId),
+          eq(marketKuehlerUnits.marketId, marketId),
+          eq(marketKuehlerUnits.isDeleted, false),
+        ),
+      )
+      .limit(1);
+    if (!existingUnit) {
+      res.status(404).json({ error: "Kühler-Eintrag nicht gefunden." });
+      return;
+    }
+
+    const payload = parsed.data;
+    const [updatedUnit] = await db
+      .update(marketKuehlerUnits)
+      .set({
+        name: payload.name != null ? normalizeOptionalText(payload.name) ?? "" : undefined,
+        employee: payload.employee != null ? normalizeOptionalText(payload.employee) ?? "" : undefined,
+        kuehlerInternalId:
+          payload.kuehlerInternalId != null ? normalizeIdentity(payload.kuehlerInternalId) : undefined,
+        kuehlerBd: payload.kuehlerBd != null ? normalizeOptionalText(payload.kuehlerBd) : undefined,
+        kuehlerAnzahlKsAmStandort:
+          payload.kuehlerAnzahlKsAmStandort != null ? payload.kuehlerAnzahlKsAmStandort : undefined,
+        kuehlerSerialNumber:
+          payload.kuehlerSerialNumber != null ? normalizeOptionalText(payload.kuehlerSerialNumber) : undefined,
+        kuehlerModel: payload.kuehlerModel != null ? normalizeOptionalText(payload.kuehlerModel) : undefined,
+        importSourceFileName:
+          payload.importSourceFileName != null ? payload.importSourceFileName : undefined,
+        importedAt: payload.importedAt ? new Date(payload.importedAt) : undefined,
+        isDeleted: payload.isDeleted,
+        updatedAt: new Date(),
+      })
+      .where(eq(marketKuehlerUnits.id, existingUnit.id))
+      .returning();
+    if (!updatedUnit) {
+      res.status(404).json({ error: "Kühler-Eintrag nicht gefunden." });
+      return;
+    }
+    res.status(200).json({ unit: mapKuehlerUnitRow(updatedUnit) });
+  } catch (err) {
+    if (isPgUniqueViolation(err) && err.constraint === "market_kuehler_units_internal_id_active_unique") {
+      res.status(409).json({ error: "Kühler konnte nicht aktualisiert werden: internal_id bereits vorhanden." });
+      return;
+    }
+    next(err);
+  }
+});
+
 adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
   const startedAtNs = startActionTimer();
   try {
@@ -2055,17 +2418,14 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       marketType: resolvedMarketType,
       incomingKuehlerStammnr: payload.kuehlerStammnr,
       incomingCokeMasterNumber: payload.cokeMasterNumber,
-      incomingKuehlerInternalId: payload.kuehlerInternalId,
       existingKuehlerStammnr: existingMarket.kuehlerStammnr,
       existingCokeMasterNumber: existingMarket.cokeMasterNumber,
-      existingKuehlerInternalId: existingMarket.kuehlerInternalId,
     });
     if (!identityResolution.ok) {
       res.status(400).json({ error: identityResolution.error });
       return;
     }
     const resolvedStammnr = identityResolution.stammnr;
-    const resolvedKuehlerInternalId = identityResolution.kuehlerInternalId;
 
     const normalizedRegion = payload.region != null ? normalizeRegionValue(payload.region) : null;
     if (normalizedRegion && !normalizedRegion.ok) {
@@ -2116,27 +2476,6 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         universeMarket: resolvedUniverseMarket,
         marketType: resolvedMarketType,
         kuehlerStammnr: resolvedMarketType === "universum" ? null : resolvedStammnr,
-        kuehlerBd:
-          resolvedMarketType === "universum"
-            ? null
-            : payload.kuehlerBd != null
-              ? (normalizeOptionalText(payload.kuehlerBd) ?? "")
-              : undefined,
-        kuehlerAnzahlKsAmStandort:
-          resolvedMarketType === "universum" ? null : payload.kuehlerAnzahlKsAmStandort,
-        kuehlerInternalId: resolvedMarketType === "universum" ? null : resolvedKuehlerInternalId,
-        kuehlerSerialNumber:
-          resolvedMarketType === "universum"
-            ? null
-            : payload.kuehlerSerialNumber != null
-              ? normalizeOptionalText(payload.kuehlerSerialNumber)
-              : undefined,
-        kuehlerModel:
-          resolvedMarketType === "universum"
-            ? null
-            : payload.kuehlerModel != null
-              ? (normalizeOptionalText(payload.kuehlerModel) ?? "")
-              : undefined,
         isActive: payload.isActive,
         importSourceFileName: payload.importSourceFileName,
         importedAt: payload.importedAt ? new Date(payload.importedAt) : undefined,
@@ -2221,14 +2560,12 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
       marketType: resolvedMarketType,
       incomingKuehlerStammnr: payload.kuehlerStammnr,
       incomingCokeMasterNumber: payload.cokeMasterNumber,
-      incomingKuehlerInternalId: payload.kuehlerInternalId,
     });
     if (!identityResolution.ok) {
       res.status(400).json({ error: identityResolution.error });
       return;
     }
     const resolvedStammnr = identityResolution.stammnr;
-    const resolvedKuehlerInternalId = identityResolution.kuehlerInternalId;
     const normalizedRegion = normalizeRegionValue(payload.region);
     if (!normalizedRegion.ok) {
       logAction("warn", "market_create_invalid_region", {
@@ -2267,19 +2604,6 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
         universeMarket: resolvedUniverseMarket,
         marketType: resolvedMarketType,
         kuehlerStammnr: resolvedMarketType === "universum" ? null : resolvedStammnr,
-        kuehlerBd:
-          resolvedMarketType === "universum"
-            ? null
-            : normalizeOptionalText(payload.kuehlerBd) ?? "",
-        kuehlerAnzahlKsAmStandort:
-          resolvedMarketType === "universum" ? null : payload.kuehlerAnzahlKsAmStandort ?? null,
-        kuehlerInternalId: resolvedMarketType === "universum" ? null : resolvedKuehlerInternalId,
-        kuehlerSerialNumber:
-          resolvedMarketType === "universum" ? null : normalizeOptionalText(payload.kuehlerSerialNumber),
-        kuehlerModel:
-          resolvedMarketType === "universum"
-            ? null
-            : normalizeOptionalText(payload.kuehlerModel) ?? "",
         isActive: payload.isActive,
         importSourceFileName: payload.importSourceFileName,
         importedAt: payload.importedAt ? new Date(payload.importedAt) : new Date(),
@@ -2383,6 +2707,64 @@ adminMarketsRouter.patch("/:id/delete", async (req: AuthedRequest, res, next) =>
     logAction("error", "market_delete_failed", {
       req,
       action: "market_delete",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
+    next(err);
+  }
+});
+
+adminMarketsRouter.delete("/:id/hard-delete", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    const id = String(req.params.id ?? "");
+    if (!id) {
+      logAction("warn", "market_hard_delete_invalid_id", {
+        req,
+        action: "market_hard_delete",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(400).json({ error: "Market id is required." });
+      return;
+    }
+
+    const [deleted] = await db.delete(markets).where(eq(markets.id, id)).returning({ id: markets.id });
+
+    if (!deleted) {
+      res.status(200).json({ ok: true, alreadyDeleted: true });
+      logAction("info", "market_hard_delete_already_deleted", {
+        req,
+        action: "market_hard_delete",
+        result: "success",
+        statusCode: 200,
+        requestClass: "success",
+        startedAtNs,
+        details: { marketId: id, alreadyDeleted: true },
+      });
+      return;
+    }
+
+    res.status(200).json({ ok: true });
+    logAction("info", "market_hard_delete_success", {
+      req,
+      action: "market_hard_delete",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { marketId: deleted.id },
+    });
+  } catch (err) {
+    logAction("error", "market_hard_delete_failed", {
+      req,
+      action: "market_hard_delete",
       result: "failure",
       statusCode: 500,
       requestClass: "server_error",
