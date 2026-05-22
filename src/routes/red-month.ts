@@ -19,9 +19,17 @@ const getCalendarQuerySchema = z.object({
   to: z.string().regex(ymdRegex).optional(),
 });
 
+function isMondayYmd(value: string): boolean {
+  const parsed = parseYmd(value);
+  if (toYmd(parsed) !== value) return false;
+  return parsed.getDay() === 1;
+}
+
 const updateConfigSchema = z
   .object({
-    anchorStart: z.string().regex(ymdRegex),
+    anchorStart: z.string().regex(ymdRegex).refine(isMondayYmd, {
+      message: "Anchor-Start muss ein Montag sein.",
+    }),
     cycleWeeks: z.array(z.number().int().positive()).min(1),
     timezone: z.string().trim().min(1).optional(),
   })
@@ -167,7 +175,8 @@ adminRedMonthRouter.patch("/red-month/config", async (req, res, next) => {
   try {
     const parsed = updateConfigSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige RED-Monat Konfiguration." });
+      const firstIssue = parsed.error.issues[0]?.message;
+      res.status(400).json({ error: firstIssue || "Ungueltige RED-Monat Konfiguration." });
       return;
     }
     const updated = await setActiveRedMonthCalendarConfig({

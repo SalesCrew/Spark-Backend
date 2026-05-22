@@ -49,13 +49,13 @@ function parseYmdDate(raw: string): Date {
   const month = Number(rawMonth ?? "0");
   const day = Number(rawDay ?? "0");
   if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day) || month <= 0 || day <= 0) {
-    return new Date(DEFAULT_ANCHOR_START);
+    throw new Error("Ungueltiges RED-Monat Anchor-Startdatum.");
   }
   const parsed = new Date(year, month - 1, day);
   const normalized = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
-  const weekday = normalized.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
-  const distanceToMonday = (weekday + 6) % 7;
-  normalized.setDate(normalized.getDate() - distanceToMonday);
+  if (toYmd(normalized) !== raw) {
+    throw new Error("Ungueltiges RED-Monat Anchor-Startdatum.");
+  }
   return normalized;
 }
 
@@ -142,7 +142,12 @@ export async function setActiveRedMonthCalendarConfig(input: {
   }
   const cycleWeeks = normalizeCycleWeeks(input.cycleWeeks);
   const timezone = input.timezone?.trim() || DEFAULT_TIMEZONE;
-  const normalizedAnchorStart = toYmd(parseYmdDate(input.anchorStart));
+  const parsedAnchorStart = parseYmdDate(input.anchorStart);
+  // RED anchor start must be explicit and stable; never auto-shift weekdays.
+  if (parsedAnchorStart.getDay() !== 1) {
+    throw new Error("RED-Monat Anchor-Start muss ein Montag sein.");
+  }
+  const normalizedAnchorStart = toYmd(parsedAnchorStart);
   const now = new Date();
   const [upserted] = await db.transaction(async (tx) => {
     const [activeRow] = await tx

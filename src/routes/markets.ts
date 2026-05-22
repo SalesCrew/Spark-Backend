@@ -123,10 +123,10 @@ function getCurrentRedPeriodBounds(now = new Date()): { startYmd: string; endYmd
 }
 
 const universumImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; required: boolean; isIdentity: boolean }> = [
-  { key: "standardMarketNumber", label: "Standardmarkt Nr", required: false, isIdentity: true },
-  { key: "cokeMasterNumber", label: "Stammnr. von Coke", required: false, isIdentity: true },
-  { key: "flexNumber", label: "Flex-Nummer", required: false, isIdentity: true },
-  { key: "name", label: "Name", required: true, isIdentity: false },
+  { key: "standardMarketNumber", label: "Standardmarkt Nr", required: false, isIdentity: false },
+  { key: "cokeMasterNumber", label: "Stammnr. von Coke", required: true, isIdentity: true },
+  { key: "flexNumber", label: "Flex-Nummer", required: true, isIdentity: true },
+  { key: "name", label: "Name", required: false, isIdentity: false },
   { key: "address", label: "Adresse", required: true, isIdentity: false },
   { key: "postalCode", label: "Postleitzahl", required: true, isIdentity: false },
   { key: "city", label: "Ort", required: true, isIdentity: false },
@@ -1718,7 +1718,12 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       return;
     }
 
-    const lastRowByIdentity = new Map<string, number>();
+    const rowDecisionByIndex = new Map<number, { kind: "accepted" | "duplicate" | "conflict"; reason?: string }>();
+    const cokeByFlex = new Map<string, string>();
+    const flexByCoke = new Map<string, string>();
+    const firstRowByPair = new Map<string, number>();
+    const pairByStandard = new Map<string, string>();
+    const firstRowByStandard = new Map<string, number>();
     for (let i = 0; i < dataRows.length; i += 1) {
       const row = dataRows[i];
       if (!row) continue;
@@ -1726,18 +1731,58 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       const stdKey = normStr(normalizeIdentity(draft.standardMarketNumber)?.toString());
       const cokeKey = normStr(normalizeIdentity(draft.cokeMasterNumber)?.toString());
       const flexKey = normStr(normalizeIdentity(draft.flexNumber)?.toString());
-      const identityKey = stdKey
-        ? `std:${stdKey}`
-        : cokeKey
-          ? `coke:${cokeKey}`
-          : flexKey
-            ? `flex:${flexKey}`
-            : "";
-      if (!identityKey) continue;
-      if (lastRowByIdentity.has(identityKey)) {
-        summary.duplicateInputRowsMerged += 1;
+      if (!flexKey || !cokeKey) {
+        rowDecisionByIndex.set(i, { kind: "accepted" });
+        continue;
       }
-      lastRowByIdentity.set(identityKey, i);
+
+      const pairKey = `${flexKey}|${cokeKey}`;
+      const firstPairRow = firstRowByPair.get(pairKey);
+      if (firstPairRow != null) {
+        summary.duplicateInputRowsMerged += 1;
+        rowDecisionByIndex.set(i, { kind: "duplicate" });
+        continue;
+      }
+
+      const existingCokeForFlex = cokeByFlex.get(flexKey);
+      if (existingCokeForFlex && existingCokeForFlex !== cokeKey) {
+        const existingPairRow = firstRowByPair.get(`${flexKey}|${existingCokeForFlex}`);
+        rowDecisionByIndex.set(i, {
+          kind: "conflict",
+          reason: `Identitätskonflikt: Flex-Nummer ${String(draft.flexNumber ?? flexKey)} ist bereits mit Stammnr. von Coke ${existingCokeForFlex} verknüpft (erste Zeile ${(existingPairRow ?? i) + 2}).`,
+        });
+        continue;
+      }
+
+      const existingFlexForCoke = flexByCoke.get(cokeKey);
+      if (existingFlexForCoke && existingFlexForCoke !== flexKey) {
+        const existingPairRow = firstRowByPair.get(`${existingFlexForCoke}|${cokeKey}`);
+        rowDecisionByIndex.set(i, {
+          kind: "conflict",
+          reason: `Identitätskonflikt: Stammnr. von Coke ${String(draft.cokeMasterNumber ?? cokeKey)} ist bereits mit Flex-Nummer ${existingFlexForCoke} verknüpft (erste Zeile ${(existingPairRow ?? i) + 2}).`,
+        });
+        continue;
+      }
+
+      if (stdKey) {
+        const existingPairForStandard = pairByStandard.get(stdKey);
+        if (existingPairForStandard && existingPairForStandard !== pairKey) {
+          rowDecisionByIndex.set(i, {
+            kind: "conflict",
+            reason: `Identitätskonflikt: Standardmarkt Nr ${String(draft.standardMarketNumber ?? stdKey)} verweist auf mehrere Flex/Stammnr-Paare (erste Zeile ${(firstRowByStandard.get(stdKey) ?? i) + 2}).`,
+          });
+          continue;
+        }
+      }
+
+      rowDecisionByIndex.set(i, { kind: "accepted" });
+      firstRowByPair.set(pairKey, i);
+      cokeByFlex.set(flexKey, cokeKey);
+      flexByCoke.set(cokeKey, flexKey);
+      if (stdKey && !pairByStandard.has(stdKey)) {
+        pairByStandard.set(stdKey, pairKey);
+        firstRowByStandard.set(stdKey, i);
+      }
     }
 
     await db.transaction(async (tx) => {
@@ -1806,10 +1851,6 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
         const draft = mapRowToDraft(row, payload.mapping, importType);
         const sampleText = String(draft.name ?? draft.city ?? row.find((c) => c?.trim()) ?? "");
-        const hasDraftIdentity = Boolean(
-          draft.standardMarketNumber || draft.cokeMasterNumber || draft.flexNumber,
-        );
-        const hasDraftVisibles = Boolean(draft.name && (draft.postalCode || draft.city) && draft.region);
         const normalizedDraftRegion =
           draft.region != null ? normalizeRegionValue(String(draft.region)) : null;
 
@@ -1819,33 +1860,18 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         const stdKey = normStr(stdIdentity ?? "");
         const cokeKey = normStr(cokeIdentity ?? "");
         const flexKey = normStr(flexIdentity ?? "");
-        const identityKey = stdKey
-          ? `std:${stdKey}`
-          : cokeKey
-            ? `coke:${cokeKey}`
-            : flexKey
-              ? `flex:${flexKey}`
-              : "";
-        if (identityKey && lastRowByIdentity.get(identityKey) !== i) {
+        const rowDecision = rowDecisionByIndex.get(i);
+        if (rowDecision?.kind === "duplicate") {
           continue;
         }
-
-        if (!hasDraftIdentity && !hasDraftVisibles) {
+        if (rowDecision?.kind === "conflict") {
           summary.skipped += 1;
           if (summary.skippedReasons.length < 50) {
-            const { missingFields, missingFieldKeys, fetchedFields } = buildSkipMeta(
-              draft,
-              payload.mapping,
-              importType,
-            );
             summary.skippedReasons.push({
               row: rowNum,
-              reason: "Keine Identität und fehlende Pflichtfelder",
+              reason: rowDecision.reason ?? "Identitätskonflikt im Import",
               sample: sampleText,
               draft,
-              missingFields,
-              missingFieldKeys,
-              fetchedFields,
             });
           }
           continue;
@@ -1863,11 +1889,40 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           }
           continue;
         }
+        const hasRequiredUniversumFields = Boolean(
+          flexIdentity &&
+          cokeIdentity &&
+          draft.address &&
+          draft.postalCode &&
+          draft.city &&
+          normalizedDraftRegion?.ok,
+        );
+        if (!hasRequiredUniversumFields) {
+          summary.skipped += 1;
+          if (summary.skippedReasons.length < 50) {
+            const { missingFields, missingFieldKeys, fetchedFields } = buildSkipMeta(
+              draft,
+              payload.mapping,
+              importType,
+            );
+            summary.skippedReasons.push({
+              row: rowNum,
+              reason: "Universum-Markt ohne Pflichtfelder (Flex-Nummer, Stammnr. von Coke, Adresse, PLZ, Ort, Region)",
+              sample: sampleText,
+              draft,
+              missingFields,
+              missingFieldKeys,
+              fetchedFields,
+            });
+          }
+          continue;
+        }
 
         let matched: typeof markets.$inferSelect | undefined;
         let matchedPendingIndex: number | undefined;
         let matchKey: keyof typeof summary.matchedBy | null = null;
         const namePlzKey = `${normStr(String(draft.name ?? ""))}|${normStr(String(draft.postalCode ?? ""))}`;
+        const allowNamePlzFallback = !(importType === "universum" && flexKey);
 
         if (stdKey && byStandard.has(stdKey)) {
           matched = byStandard.get(stdKey);
@@ -1887,10 +1942,10 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         } else if (flexKey && pendingByFlex.has(flexKey)) {
           matchedPendingIndex = pendingByFlex.get(flexKey);
           matchKey = "flexNumber";
-        } else if (namePlzKey && byNamePlz.has(namePlzKey)) {
+        } else if (allowNamePlzFallback && namePlzKey && byNamePlz.has(namePlzKey)) {
           matched = byNamePlz.get(namePlzKey);
           matchKey = "namePLZ";
-        } else if (namePlzKey && pendingByNamePlz.has(namePlzKey)) {
+        } else if (allowNamePlzFallback && namePlzKey && pendingByNamePlz.has(namePlzKey)) {
           matchedPendingIndex = pendingByNamePlz.get(namePlzKey);
           matchKey = "namePLZ";
         }
@@ -1997,27 +2052,6 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             registerPending(matchedPendingIndex);
             summary.updated += 1;
             if (matchKey) summary.matchedBy[matchKey] += 1;
-          }
-          continue;
-        }
-
-        if (!hasDraftVisibles) {
-          summary.skipped += 1;
-          if (summary.skippedReasons.length < 50) {
-            const { missingFields, missingFieldKeys, fetchedFields } = buildSkipMeta(
-              draft,
-              payload.mapping,
-              importType,
-            );
-            summary.skippedReasons.push({
-              row: rowNum,
-              reason: "Neuer Markt ohne Pflichtfelder (Name, PLZ, Region)",
-              sample: sampleText,
-              draft,
-              missingFields,
-              missingFieldKeys,
-              fetchedFields,
-            });
           }
           continue;
         }
