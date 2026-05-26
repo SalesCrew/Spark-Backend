@@ -475,6 +475,7 @@ export const questionBankShared = pgTable(
     questionType: questionTypeEnum("question_type").notNull(),
     text: text("text").notNull().default(""),
     required: boolean("required").notNull().default(true),
+    redSurvey: boolean("red_survey"),
     chains: text("chains").array(),
     config: jsonb("config").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
     rules: jsonb("rules").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
@@ -1179,6 +1180,9 @@ export const visitSessions = pgTable(
   (table) => [
     index("visit_sessions_gm_status_idx").on(table.gmUserId, table.status),
     index("visit_sessions_market_idx").on(table.marketId),
+    index("visit_sessions_gm_market_submitted_idx")
+      .on(table.gmUserId, table.marketId, table.submittedAt)
+      .where(sql`${table.isDeleted} = false AND ${table.status} = 'submitted' AND ${table.submittedAt} IS NOT NULL`),
     index("visit_sessions_deleted_idx").on(table.isDeleted),
     uniqueIndex("visit_sessions_client_token_active_unique")
       .on(table.gmUserId, table.clientSessionToken)
@@ -1370,6 +1374,7 @@ export const visitSessionQuestions = pgTable(
     questionChainsSnapshot: text("question_chains_snapshot").array().notNull().default(sql`'{}'::text[]`),
     appliesToMarketChainSnapshot: boolean("applies_to_market_chain_snapshot").notNull().default(true),
     requiredSnapshot: boolean("required_snapshot").notNull().default(true),
+    redSurveySnapshot: boolean("red_survey_snapshot"),
     orderIndex: integer("order_index").notNull().default(0),
     isDeleted: boolean("is_deleted").notNull().default(false),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
@@ -1384,6 +1389,9 @@ export const visitSessionQuestions = pgTable(
       table.appliesToMarketChainSnapshot,
       table.isDeleted,
     ),
+    index("visit_session_questions_red_survey_snapshot_idx")
+      .on(table.visitSessionSectionId)
+      .where(sql`${table.isDeleted} = false AND ${table.redSurveySnapshot} = true`),
     index("visit_session_questions_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -1425,6 +1433,9 @@ export const visitAnswers = pgTable(
       .where(sql`${table.isDeleted} = false`),
     index("visit_answers_session_idx").on(table.visitSessionId),
     index("visit_answers_section_idx").on(table.visitSessionSectionId),
+    index("visit_answers_question_session_active_idx")
+      .on(table.questionId, table.visitSessionId)
+      .where(sql`${table.isDeleted} = false`),
     index("visit_answers_deleted_idx").on(table.isDeleted),
   ],
 );

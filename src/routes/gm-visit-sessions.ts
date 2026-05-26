@@ -67,6 +67,7 @@ type ResolvedQuestion = {
   type: "single" | "yesno" | "yesnomulti" | "multiple" | "likert" | "text" | "numeric" | "slider" | "photo" | "matrix";
   text: string;
   required: boolean;
+  redSurvey: boolean | null;
   config: Record<string, unknown>;
   rules: Array<Record<string, unknown>>;
   scoring: Record<string, Record<string, unknown>>;
@@ -103,6 +104,7 @@ function toResolvedQuestion(question: {
   type: ResolvedQuestion["type"];
   text: string;
   required: boolean;
+  redSurvey?: boolean | null;
   config: Record<string, unknown>;
   rules?: Array<Record<string, unknown>>;
   scoring?: Record<string, Record<string, unknown>>;
@@ -114,6 +116,7 @@ function toResolvedQuestion(question: {
     type: question.type,
     text: question.text,
     required: question.required,
+    redSurvey: question.redSurvey ?? null,
     config: question.config ?? {},
     rules: question.rules ?? [],
     scoring: question.scoring ?? {},
@@ -1289,6 +1292,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
               questionChainsSnapshot: normalizeQuestionChains(question.chains),
               appliesToMarketChainSnapshot: question.appliesToMarketChain,
               requiredSnapshot: question.required,
+              redSurveySnapshot: question.redSurvey,
               orderIndex: questionOrder,
               isDeleted: false,
               deletedAt: null,

@@ -107,6 +107,7 @@ const questionSchema = z
     type: questionTypeSchema,
     text: z.string().default(""),
     required: z.boolean().default(true),
+    redSurvey: z.boolean().nullable().optional(),
     config: z.record(z.string(), z.unknown()).default({}),
     rules: z.array(ruleSchema).default([]),
     scoring: z.record(z.string(), scoreValueSchema).default({}),
@@ -251,6 +252,9 @@ function parseIsoDateOrThrow(value: string, fieldName: string): string {
 function validateQuestionDomain(question: UiQuestion) {
   const config = (question.config ?? {}) as Record<string, unknown>;
   const scoringKeys = Object.keys(question.scoring ?? {});
+  if (question.redSurvey === true && question.type !== "yesno") {
+    throw new DomainValidationError("Red Survey darf nur fuer Ja/Nein Fragen aktiviert werden.");
+  }
   if ((question.type === "numeric" || question.type === "slider") && scoringKeys.some((key) => key !== "__value__")) {
     throw new DomainValidationError("Numerische Fragen duerfen nur den Scoring-Key '__value__' verwenden.");
   }
@@ -479,6 +483,7 @@ function questionGraphSnapshotForComparison(question: UiQuestion) {
     type: question.type,
     text: question.text,
     required: question.required,
+    redSurvey: question.redSurvey ?? null,
     config: sortJsonValue(
       sanitizeQuestionConfig((question.config ?? {}) as Record<string, unknown>),
     ) as Record<string, unknown>,
@@ -984,6 +989,7 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
       type: base.questionType as UiQuestion["type"],
       text: base.text,
       required: base.required,
+      redSurvey: base.redSurvey,
       config,
       rules: rulesByQuestion.get(base.id) ?? [],
       scoring: scoringByQuestion.get(base.id) ?? {},
@@ -1034,6 +1040,14 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
     questionId && isUuid(questionId)
       ? (await fetchQuestionsByIds(tx, [questionId])).get(questionId) ?? null
       : null;
+  const nextRedSurvey =
+    parsed.type === "yesno"
+      ? parsed.redSurvey === undefined
+        ? questionId
+          ? (previousQuestion?.redSurvey ?? null)
+          : false
+        : parsed.redSurvey
+      : false;
 
   const cleanConfig = sanitizeQuestionConfig(config);
   if (previousQuestion && questionId) {
@@ -1058,6 +1072,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         questionType: parsed.type,
         text: parsed.text,
         required: parsed.required,
+        redSurvey: nextRedSurvey,
         config: cleanConfig,
         rules: [],
         scoring: {},
@@ -1071,6 +1086,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         questionType: parsed.type,
         text: parsed.text,
         required: parsed.required,
+        redSurvey: nextRedSurvey,
         config: cleanConfig,
         rules: [],
         scoring: {},
@@ -1567,6 +1583,9 @@ adminFragebogenRouter.patch("/questions/:id", async (req, res, next) => {
       type: partial.data.type ?? existing.type,
       text: partial.data.text ?? existing.text,
       required: partial.data.required ?? existing.required,
+      redSurvey: Object.prototype.hasOwnProperty.call(partial.data, "redSurvey")
+        ? partial.data.redSurvey
+        : (existing.redSurvey ?? null),
       config: partial.data.config ?? existing.config,
       rules: partial.data.rules ?? existing.rules,
       scoring: partial.data.scoring ?? existing.scoring,

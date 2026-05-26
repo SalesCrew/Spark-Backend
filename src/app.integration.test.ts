@@ -9,6 +9,7 @@ import { finalizeBonusForSubmittedVisitSession, readGmActiveBonusSummary } from 
 import { enqueueIppRecalcForQuestionScoringChanges, runIppFinalizerOnce } from "./lib/ipp-finalizer.js";
 import { computeMarketIppForPeriod } from "./lib/ipp.js";
 import { addDays, getCurrentRedPeriod, getRedPeriodForDate, startOfDay } from "./lib/red-monat.js";
+import { loadRedSurveySessionStatsBySessionIds } from "./lib/red-survey-stats.js";
 import {
   campaignMarketAssignmentHistory,
   campaignFragebogenHistory,
@@ -89,6 +90,8 @@ let checkedPraemienReadiness = false;
 let dbHasPraemienTables = false;
 let checkedQuestionAnswerHistoryReadiness = false;
 let dbHasQuestionAnswerHistoryTable = false;
+let checkedRedSurveyReadiness = false;
+let dbHasRedSurveyColumns = false;
 
 async function ensureDbReadyForFragebogenTests(): Promise<boolean> {
   if (checkedDbReadiness) return dbHasFragebogenTables;
@@ -107,6 +110,29 @@ async function ensureDbReadyForQuestionAnswerHistoryTests(): Promise<boolean> {
   dbHasQuestionAnswerHistoryTable = Boolean(result[0]?.question_answer_history);
   checkedQuestionAnswerHistoryReadiness = true;
   return dbHasQuestionAnswerHistoryTable;
+}
+
+async function ensureDbReadyForRedSurveyTests(): Promise<boolean> {
+  if (checkedRedSurveyReadiness) return dbHasRedSurveyColumns;
+  const questionColumnRows = await sql<{ column_name: string }[]>`
+    select column_name
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'question_bank_shared'
+      and column_name in ('red_survey')
+  `;
+  const visitQuestionColumnRows = await sql<{ column_name: string }[]>`
+    select column_name
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'visit_session_questions'
+      and column_name in ('red_survey_snapshot')
+  `;
+  const questionColumns = new Set(questionColumnRows.map((entry) => entry.column_name));
+  const visitQuestionColumns = new Set(visitQuestionColumnRows.map((entry) => entry.column_name));
+  dbHasRedSurveyColumns = questionColumns.has("red_survey") && visitQuestionColumns.has("red_survey_snapshot");
+  checkedRedSurveyReadiness = true;
+  return dbHasRedSurveyColumns;
 }
 
 async function ensureDbReadyForCampaignTests(): Promise<boolean> {
@@ -1525,6 +1551,161 @@ test("module create accepts yesnomulti branch array shape from editor payload", 
   await request(app).patch(`/admin/modules/main/${moduleId}/delete`).send({});
 });
 
+test("module red survey persists for yesno and rejects activation on non-yesno", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForFragebogenTests()) || !(await ensureDbReadyForRedSurveyTests())) {
+    t.skip("Fragebogen red survey columns are not present in the configured DATABASE_URL.");
+    return;
+  }
+
+  const app = createApp();
+  const uniq = `it-red-survey-module-${Date.now()}`;
+
+  const createModuleRes = await request(app).post("/admin/modules/main").send({
+    name: `Module ${uniq}`,
+    description: "",
+    sectionKeywords: ["standard"],
+    questions: [
+      {
+        id: `tmp-yesno-${uniq}`,
+        type: "yesno",
+        text: `YesNo ${uniq}`,
+        required: true,
+        redSurvey: true,
+        config: { options: ["Ja", "Nein"] },
+        rules: [],
+        scoring: {},
+      },
+      {
+        id: `tmp-text-${uniq}`,
+        type: "text",
+        text: `Text ${uniq}`,
+        required: false,
+        redSurvey: false,
+        config: {},
+        rules: [],
+        scoring: {},
+      },
+    ],
+  });
+  assert.equal(createModuleRes.status, 201);
+  const moduleId = createModuleRes.body.module?.id as string;
+  assert.ok(moduleId);
+  const createdQuestions = createModuleRes.body.module?.questions as Array<{ id: string; text: string; redSurvey?: boolean | null }>;
+  const yesNoQuestion = createdQuestions.find((question) => question.text === `YesNo ${uniq}`);
+  const textQuestion = createdQuestions.find((question) => question.text === `Text ${uniq}`);
+  assert.ok(yesNoQuestion?.id);
+  assert.ok(textQuestion?.id);
+  assert.equal(yesNoQuestion?.redSurvey, true);
+  assert.equal(textQuestion?.redSurvey, false);
+
+  const persistedRows = await db
+    .select({
+      id: questionBankShared.id,
+      redSurvey: questionBankShared.redSurvey,
+    })
+    .from(questionBankShared)
+    .where(inArray(questionBankShared.id, [yesNoQuestion!.id, textQuestion!.id]));
+  const persistedById = new Map(persistedRows.map((row) => [row.id, row.redSurvey]));
+  assert.equal(persistedById.get(yesNoQuestion!.id), true);
+  assert.equal(persistedById.get(textQuestion!.id), false);
+
+  const patchDisableRes = await request(app).patch(`/admin/questions/${yesNoQuestion!.id}`).send({
+    redSurvey: false,
+  });
+  assert.equal(patchDisableRes.status, 200);
+  assert.equal(patchDisableRes.body.question?.redSurvey, false);
+
+  const [persistedAfterDisable] = await db
+    .select({
+      redSurvey: questionBankShared.redSurvey,
+    })
+    .from(questionBankShared)
+    .where(eq(questionBankShared.id, yesNoQuestion!.id))
+    .limit(1);
+  assert.equal(persistedAfterDisable?.redSurvey ?? null, false);
+
+  const invalidQuestionRes = await request(app).post("/admin/questions").send({
+    type: "text",
+    text: `Invalid Red Survey ${uniq}`,
+    required: true,
+    redSurvey: true,
+    config: {},
+    rules: [],
+    scoring: {},
+  });
+  assert.equal(invalidQuestionRes.status, 400);
+  assert.equal(invalidQuestionRes.body.error, "Red Survey darf nur fuer Ja/Nein Fragen aktiviert werden.");
+
+  await request(app).patch(`/admin/modules/main/${moduleId}/delete`).send({});
+});
+
+test("historical yesno question keeps null red survey until explicitly changed", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForFragebogenTests()) || !(await ensureDbReadyForRedSurveyTests())) {
+    t.skip("Fragebogen red survey columns are not present in the configured DATABASE_URL.");
+    return;
+  }
+
+  const app = createApp();
+  const questionId = randomUUID();
+  const now = new Date();
+  const uniq = `it-red-survey-null-${Date.now()}`;
+  try {
+    await db.insert(questionBankShared).values({
+      id: questionId,
+      questionType: "yesno",
+      text: `Historical ${uniq}`,
+      required: true,
+      redSurvey: null,
+      config: { options: ["Ja", "Nein"] },
+      rules: [],
+      scoring: {},
+      isDeleted: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const patchWithoutToggleRes = await request(app).patch(`/admin/questions/${questionId}`).send({
+      text: `Historical ${uniq} updated`,
+    });
+    assert.equal(patchWithoutToggleRes.status, 200);
+    assert.equal(patchWithoutToggleRes.body.question?.redSurvey ?? null, null);
+
+    const [afterNoToggle] = await db
+      .select({
+        redSurvey: questionBankShared.redSurvey,
+      })
+      .from(questionBankShared)
+      .where(eq(questionBankShared.id, questionId))
+      .limit(1);
+    assert.equal(afterNoToggle?.redSurvey ?? null, null);
+
+    const patchWithToggleRes = await request(app).patch(`/admin/questions/${questionId}`).send({
+      redSurvey: true,
+    });
+    assert.equal(patchWithToggleRes.status, 200);
+    assert.equal(patchWithToggleRes.body.question?.redSurvey, true);
+
+    const [afterToggle] = await db
+      .select({
+        redSurvey: questionBankShared.redSurvey,
+      })
+      .from(questionBankShared)
+      .where(eq(questionBankShared.id, questionId))
+      .limit(1);
+    assert.equal(afterToggle?.redSurvey ?? null, true);
+  } finally {
+    await db
+      .update(questionBankShared)
+      .set({
+        isDeleted: true,
+        updatedAt: new Date(),
+      })
+      .where(eq(questionBankShared.id, questionId));
+  }
+});
+
 test("module create remaps rule references between new questions in one payload", async (t) => {
   enableTestAuthBypass();
   if (!(await ensureDbReadyForFragebogenTests())) {
@@ -2226,6 +2407,199 @@ test("campaign create for section standard succeeds", async (t) => {
 
   const campaignId = createRes.body.campaign?.id as string;
   await request(app).patch(`/admin/campaigns/${campaignId}/delete`).send({});
+});
+
+test("campaign hard delete requires exact confirmation and stays campaign-scoped", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForCampaignTests()) || !(await ensureDbReadyForVisitSessionTests())) {
+    t.skip("Campaign/visit-session tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const [gmUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(1);
+  const [market] = await db
+    .select({ id: markets.id })
+    .from(markets)
+    .where(eq(markets.isDeleted, false))
+    .limit(1);
+  if (!gmUser?.id || !market?.id) {
+    t.skip("Missing gm/market seed data for campaign hard-delete test.");
+    return;
+  }
+
+  const app = createApp();
+  const uniq = Date.now();
+  const createFirstRes = await request(app).post("/admin/campaigns").send({
+    name: `Campaign Hard Delete Source ${uniq}`,
+    section: "standard",
+    status: "inactive",
+    scheduleType: "always",
+    marketIds: [],
+  });
+  assert.equal(createFirstRes.status, 201);
+  const firstCampaignId = createFirstRes.body.campaign?.id as string;
+
+  const createSecondRes = await request(app).post("/admin/campaigns").send({
+    name: `Campaign Hard Delete Keep ${uniq}`,
+    section: "standard",
+    status: "inactive",
+    scheduleType: "always",
+    marketIds: [],
+  });
+  assert.equal(createSecondRes.status, 201);
+  const secondCampaignId = createSecondRes.body.campaign?.id as string;
+
+  const campaignOnlySessionId = randomUUID();
+  const sharedSessionId = randomUUID();
+  const secondOnlySessionId = randomUUID();
+  const now = new Date();
+
+  await db.insert(visitSessions).values([
+    {
+      id: campaignOnlySessionId,
+      gmUserId: gmUser.id,
+      marketId: market.id,
+      status: "submitted",
+      startedAt: now,
+      submittedAt: now,
+      lastSavedAt: now,
+    },
+    {
+      id: sharedSessionId,
+      gmUserId: gmUser.id,
+      marketId: market.id,
+      status: "submitted",
+      startedAt: now,
+      submittedAt: now,
+      lastSavedAt: now,
+    },
+    {
+      id: secondOnlySessionId,
+      gmUserId: gmUser.id,
+      marketId: market.id,
+      status: "submitted",
+      startedAt: now,
+      submittedAt: now,
+      lastSavedAt: now,
+    },
+  ]);
+
+  await db.insert(visitSessionSections).values([
+    {
+      visitSessionId: campaignOnlySessionId,
+      campaignId: firstCampaignId,
+      section: "standard",
+      fragebogenNameSnapshot: "Standard",
+      status: "submitted",
+      orderIndex: 0,
+    },
+    {
+      visitSessionId: sharedSessionId,
+      campaignId: firstCampaignId,
+      section: "standard",
+      fragebogenNameSnapshot: "Standard",
+      status: "submitted",
+      orderIndex: 0,
+    },
+    {
+      visitSessionId: sharedSessionId,
+      campaignId: secondCampaignId,
+      section: "standard",
+      fragebogenNameSnapshot: "Standard",
+      status: "submitted",
+      orderIndex: 1,
+    },
+    {
+      visitSessionId: secondOnlySessionId,
+      campaignId: secondCampaignId,
+      section: "standard",
+      fragebogenNameSnapshot: "Standard",
+      status: "submitted",
+      orderIndex: 0,
+    },
+  ]);
+
+  const wrongConfirmationRes = await request(app)
+    .delete(`/admin/campaigns/${firstCampaignId}/hard-delete`)
+    .send({ confirmationText: "falsch" });
+  assert.equal(wrongConfirmationRes.status, 400);
+  assert.equal(wrongConfirmationRes.body.code, "invalid_confirmation_text");
+
+  const [firstCampaignStillThere] = await db
+    .select({ id: campaigns.id })
+    .from(campaigns)
+    .where(eq(campaigns.id, firstCampaignId))
+    .limit(1);
+  assert.ok(firstCampaignStillThere?.id);
+
+  const confirmationText = "Ich bin mir sicher, dass ich alle Daten zu dieser Kampagne Löschen will!";
+  const hardDeleteRes = await request(app)
+    .delete(`/admin/campaigns/${firstCampaignId}/hard-delete`)
+    .send({ confirmationText });
+  assert.equal(hardDeleteRes.status, 200);
+  assert.equal(hardDeleteRes.body.ok, true);
+  assert.equal(Boolean(hardDeleteRes.body.alreadyDeleted), false);
+
+  const [firstCampaignAfterDelete] = await db
+    .select({ id: campaigns.id })
+    .from(campaigns)
+    .where(eq(campaigns.id, firstCampaignId))
+    .limit(1);
+  assert.equal(firstCampaignAfterDelete, undefined);
+
+  const [secondCampaignAfterDelete] = await db
+    .select({ id: campaigns.id })
+    .from(campaigns)
+    .where(eq(campaigns.id, secondCampaignId))
+    .limit(1);
+  assert.ok(secondCampaignAfterDelete?.id);
+
+  const firstCampaignSectionsAfterDelete = await db
+    .select({ id: visitSessionSections.id })
+    .from(visitSessionSections)
+    .where(eq(visitSessionSections.campaignId, firstCampaignId));
+  assert.equal(firstCampaignSectionsAfterDelete.length, 0);
+
+  const secondCampaignSectionsAfterDelete = await db
+    .select({ id: visitSessionSections.id })
+    .from(visitSessionSections)
+    .where(eq(visitSessionSections.campaignId, secondCampaignId));
+  assert.equal(secondCampaignSectionsAfterDelete.length, 2);
+
+  const [campaignOnlySessionAfterDelete] = await db
+    .select({ id: visitSessions.id })
+    .from(visitSessions)
+    .where(eq(visitSessions.id, campaignOnlySessionId))
+    .limit(1);
+  assert.equal(campaignOnlySessionAfterDelete, undefined);
+
+  const [sharedSessionAfterDelete] = await db
+    .select({ id: visitSessions.id })
+    .from(visitSessions)
+    .where(eq(visitSessions.id, sharedSessionId))
+    .limit(1);
+  assert.ok(sharedSessionAfterDelete?.id);
+
+  const [secondOnlySessionAfterDelete] = await db
+    .select({ id: visitSessions.id })
+    .from(visitSessions)
+    .where(eq(visitSessions.id, secondOnlySessionId))
+    .limit(1);
+  assert.ok(secondOnlySessionAfterDelete?.id);
+
+  const hardDeleteAgainRes = await request(app)
+    .delete(`/admin/campaigns/${firstCampaignId}/hard-delete`)
+    .send({ confirmationText });
+  assert.equal(hardDeleteAgainRes.status, 200);
+  assert.equal(hardDeleteAgainRes.body.ok, true);
+  assert.equal(Boolean(hardDeleteAgainRes.body.alreadyDeleted), true);
+
+  await request(app)
+    .delete(`/admin/campaigns/${secondCampaignId}/hard-delete`)
+    .send({ confirmationText });
 });
 
 test("campaign schedule validation rejects bad date window", async (t) => {
@@ -5720,6 +6094,245 @@ test("gm visit submit ignores non-applicable chain questions and their rules", a
     if (marketId) {
       await db.update(markets).set({ isDeleted: true, updatedAt: new Date() }).where(eq(markets.id, marketId));
     }
+    delete process.env.BYPASS_AUTH_ROLE;
+    delete process.env.BYPASS_AUTH_USER_ID;
+  }
+});
+
+test("gm visit session snapshots red survey and derived completion equals yes count", async (t) => {
+  enableTestAuthBypass();
+  if (
+    !(await ensureDbReadyForVisitSessionTests())
+    || !(await ensureDbReadyForCampaignTests())
+    || !(await ensureDbReadyForRedSurveyTests())
+  ) {
+    t.skip("Visit session red survey columns are not present in the configured DATABASE_URL.");
+    return;
+  }
+
+  const [gmUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(1);
+  if (!gmUser?.id) {
+    t.skip("No active GM user available for red survey snapshot test.");
+    return;
+  }
+
+  await ensureStartedDayForGm(gmUser.id);
+  setTestBypassRole("gm");
+  setTestBypassUserId(gmUser.id);
+
+  const now = new Date();
+  const uniq = `visit-red-survey-${Date.now()}`;
+  const campaignId = randomUUID();
+  const moduleId = randomUUID();
+  const fragebogenId = randomUUID();
+  const marketId = randomUUID();
+  const redSurveyQuestionId = randomUUID();
+  const normalQuestionId = randomUUID();
+  let createdSessionId: string | null = null;
+
+  try {
+    await db.insert(questionBankShared).values([
+      {
+        id: redSurveyQuestionId,
+        questionType: "yesno",
+        text: `Red Survey YesNo ${uniq}`,
+        required: false,
+        redSurvey: true,
+        config: { options: ["Ja", "Nein"] },
+        rules: [],
+        scoring: {},
+        isDeleted: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: normalQuestionId,
+        questionType: "yesno",
+        text: `Normal YesNo ${uniq}`,
+        required: false,
+        redSurvey: false,
+        config: { options: ["Ja", "Nein"] },
+        rules: [],
+        scoring: {},
+        isDeleted: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
+
+    await db.insert(moduleMain).values({
+      id: moduleId,
+      name: `Red Survey Module ${uniq}`,
+      description: "",
+      sectionKeywords: ["standard"],
+      isDeleted: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(moduleMainQuestion).values([
+      {
+        moduleId,
+        questionId: redSurveyQuestionId,
+        orderIndex: 0,
+        isDeleted: false,
+        deletedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        moduleId,
+        questionId: normalQuestionId,
+        orderIndex: 1,
+        isDeleted: false,
+        deletedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
+
+    await db.insert(fragebogenMain).values({
+      id: fragebogenId,
+      name: `Red Survey FB ${uniq}`,
+      description: "",
+      sectionKeywords: ["standard"],
+      nurEinmalAusfuellbar: false,
+      status: "active",
+      scheduleType: "always",
+      isDeleted: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(fragebogenMainModule).values({
+      fragebogenId,
+      moduleId,
+      orderIndex: 0,
+      isDeleted: false,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(markets).values({
+      id: marketId,
+      name: `Red Survey Markt ${uniq}`,
+      dbName: "",
+      address: "Red Survey Straße 1",
+      postalCode: "1010",
+      city: "Wien",
+      region: "Wien",
+      isDeleted: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(campaigns).values({
+      id: campaignId,
+      name: `Red Survey Campaign ${uniq}`,
+      section: "standard",
+      currentFragebogenId: fragebogenId,
+      status: "active",
+      scheduleType: "always",
+      isDeleted: false,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(campaignMarketAssignments).values({
+      campaignId,
+      marketId,
+      gmUserId: gmUser.id,
+      assignedAt: now,
+      assignedByUserId: null,
+      isDeleted: false,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const app = createApp();
+    const createRes = await request(app).post("/markets/gm/visit-sessions").send({
+      marketId,
+      campaignIds: [campaignId],
+    });
+    assert.equal(createRes.status, 201);
+    createdSessionId = createRes.body.session?.id as string;
+    assert.ok(createdSessionId);
+
+    const createdQuestions = (createRes.body.sections?.[0]?.questions ?? []) as Array<{
+      visitQuestionId?: string;
+      questionId?: string;
+    }>;
+    const redSurveyVisitQuestionId = createdQuestions.find((entry) => entry.questionId === redSurveyQuestionId)?.visitQuestionId;
+    const normalVisitQuestionId = createdQuestions.find((entry) => entry.questionId === normalQuestionId)?.visitQuestionId;
+    assert.ok(redSurveyVisitQuestionId);
+    assert.ok(normalVisitQuestionId);
+
+    const snapshotRows = await db
+      .select({
+        questionId: visitSessionQuestions.questionId,
+        redSurveySnapshot: visitSessionQuestions.redSurveySnapshot,
+      })
+      .from(visitSessionQuestions)
+      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+      .where(and(eq(visitSessionSections.visitSessionId, createdSessionId), eq(visitSessionQuestions.isDeleted, false)));
+    const snapshotByQuestionId = new Map(snapshotRows.map((row) => [row.questionId, row.redSurveySnapshot]));
+    assert.equal(snapshotByQuestionId.get(redSurveyQuestionId), true);
+    assert.equal(snapshotByQuestionId.get(normalQuestionId), false);
+
+    const saveRedSurveyYes = await request(app).patch(`/markets/gm/visit-sessions/${createdSessionId}/answers`).send({
+      visitQuestionId: redSurveyVisitQuestionId,
+      answer: "Ja",
+    });
+    assert.equal(saveRedSurveyYes.status, 200);
+    assert.equal(saveRedSurveyYes.body.result?.isValid, true);
+
+    const saveNormalNo = await request(app).patch(`/markets/gm/visit-sessions/${createdSessionId}/answers`).send({
+      visitQuestionId: normalVisitQuestionId,
+      answer: "Nein",
+    });
+    assert.equal(saveNormalNo.status, 200);
+    assert.equal(saveNormalNo.body.result?.isValid, true);
+
+    const submitRes = await request(app).post(`/markets/gm/visit-sessions/${createdSessionId}/submit`).send({});
+    assert.equal(submitRes.status, 200);
+    assert.equal(submitRes.body.status, "submitted");
+
+    const statsBySessionId = await loadRedSurveySessionStatsBySessionIds([createdSessionId]);
+    const stats = statsBySessionId.get(createdSessionId);
+    assert.ok(stats);
+    assert.equal(stats?.flaggedQuestionCount, 1);
+    assert.equal(stats?.yesCount, 1);
+    assert.equal(stats?.completedCount, stats?.yesCount);
+  } finally {
+    if (createdSessionId) {
+      await db
+        .update(visitSessions)
+        .set({ isDeleted: true, deletedAt: new Date(), updatedAt: new Date() })
+        .where(eq(visitSessions.id, createdSessionId));
+    }
+    await db
+      .update(campaigns)
+      .set({ isDeleted: true, deletedAt: new Date(), updatedAt: new Date() })
+      .where(eq(campaigns.id, campaignId));
+    await db
+      .update(markets)
+      .set({ isDeleted: true, updatedAt: new Date() })
+      .where(eq(markets.id, marketId));
+    await db
+      .update(fragebogenMain)
+      .set({ isDeleted: true, updatedAt: new Date() })
+      .where(eq(fragebogenMain.id, fragebogenId));
+    await db
+      .update(moduleMain)
+      .set({ isDeleted: true, updatedAt: new Date() })
+      .where(eq(moduleMain.id, moduleId));
+    await db
+      .update(questionBankShared)
+      .set({ isDeleted: true, updatedAt: new Date() })
+      .where(inArray(questionBankShared.id, [redSurveyQuestionId, normalQuestionId]));
     delete process.env.BYPASS_AUTH_ROLE;
     delete process.env.BYPASS_AUTH_USER_ID;
   }
