@@ -83,6 +83,12 @@ const switchFragebogenSchema = z
   })
   .strict();
 
+const hardDeleteCampaignSchema = z
+  .object({
+    confirmationText: z.string(),
+  })
+  .strict();
+
 const migrateMarketsSchema = z
   .object({
     moves: z
@@ -99,6 +105,8 @@ const migrateMarketsSchema = z
       .min(1),
   })
   .strict();
+
+const HARD_DELETE_CAMPAIGN_CONFIRMATION_TEXT = "Ich bin mir sicher, dass ich alle Daten zu dieser Kampagne Löschen will!";
 
 class CampaignDomainError extends Error {
   code:
@@ -1650,6 +1658,126 @@ adminCampaignsRouter.patch("/campaigns/:id/delete", async (req, res, next) => {
     logAction("error", "campaign_delete_failed", {
       req,
       action: "campaign_delete",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
+    next(error);
+  }
+});
+
+adminCampaignsRouter.delete("/campaigns/:id/hard-delete", async (req, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    const campaignId = String(req.params.id ?? "");
+    if (!isUuid(campaignId)) {
+      logAction("warn", "campaign_hard_delete_invalid_id", {
+        req,
+        action: "campaign_hard_delete",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      return;
+    }
+
+    const parsed = hardDeleteCampaignSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logAction("warn", "campaign_hard_delete_invalid_payload", {
+        req,
+        action: "campaign_hard_delete",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(400).json({ error: "Ungueltiger Request-Body.", code: "invalid_payload" });
+      return;
+    }
+
+    if (parsed.data.confirmationText !== HARD_DELETE_CAMPAIGN_CONFIRMATION_TEXT) {
+      logAction("warn", "campaign_hard_delete_confirmation_mismatch", {
+        req,
+        action: "campaign_hard_delete",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { campaignId },
+      });
+      res.status(400).json({ error: "Bestaetigungstext stimmt nicht exakt ueberein.", code: "invalid_confirmation_text" });
+      return;
+    }
+
+    let alreadyDeleted = false;
+    let deletedSectionsCount = 0;
+    let deletedOrphanSessionsCount = 0;
+
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT ${campaigns.id} FROM ${campaigns} WHERE ${campaigns.id} = ${campaignId} FOR UPDATE`);
+
+      const deletedSections = await tx
+        .delete(visitSessionSections)
+        .where(eq(visitSessionSections.campaignId, campaignId))
+        .returning({ visitSessionId: visitSessionSections.visitSessionId });
+      deletedSectionsCount = deletedSections.length;
+
+      const affectedVisitSessionIds = Array.from(
+        new Set(
+          deletedSections
+            .map((entry) => entry.visitSessionId)
+            .filter((value): value is string => typeof value === "string" && value.length > 0),
+        ),
+      );
+
+      if (affectedVisitSessionIds.length > 0) {
+        const deletedSessions = await tx
+          .delete(visitSessions)
+          .where(
+            and(
+              inArray(visitSessions.id, affectedVisitSessionIds),
+              sql`NOT EXISTS (
+                SELECT 1
+                FROM ${visitSessionSections}
+                WHERE ${visitSessionSections.visitSessionId} = ${visitSessions.id}
+              )`,
+            ),
+          )
+          .returning({ id: visitSessions.id });
+        deletedOrphanSessionsCount = deletedSessions.length;
+      }
+
+      const deletedCampaignRows = await tx
+        .delete(campaigns)
+        .where(eq(campaigns.id, campaignId))
+        .returning({ id: campaigns.id });
+      alreadyDeleted = deletedCampaignRows.length === 0;
+    });
+
+    res.status(200).json({ ok: true, alreadyDeleted });
+    logAction("info", "campaign_hard_delete_success", {
+      req,
+      action: "campaign_hard_delete",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: {
+        campaignId,
+        alreadyDeleted,
+        deletedSectionsCount,
+        deletedOrphanSessionsCount,
+      },
+    });
+  } catch (error) {
+    logAction("error", "campaign_hard_delete_failed", {
+      req,
+      action: "campaign_hard_delete",
       result: "failure",
       statusCode: 500,
       requestClass: "server_error",
