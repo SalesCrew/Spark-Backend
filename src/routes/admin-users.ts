@@ -34,6 +34,10 @@ const updateUserSchema = z.object({
   ipp: z.number().min(0).max(99.9).optional(),
 });
 
+const updateOwnPasswordSchema = z.object({
+  newPassword: z.string().min(8).max(128),
+});
+
 const adminUsersRouter = Router();
 
 adminUsersRouter.use(requireAuth(["admin"]));
@@ -387,6 +391,150 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
     logAction("error", "admin_user_update_failed", {
       req,
       action: "admin_user_update",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
+    next(err);
+  }
+});
+
+adminUsersRouter.patch("/:id/password", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    const id = String(req.params.id ?? "");
+    if (!id) {
+      logAction("warn", "admin_user_password_invalid_id", {
+        req,
+        action: "admin_user_password_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(400).json({ error: "User id is required." });
+      return;
+    }
+
+    if (!req.authUser || req.authUser.role !== "admin") {
+      logAction("warn", "admin_user_password_missing_auth", {
+        req,
+        action: "admin_user_password_update",
+        result: "rejected",
+        statusCode: 401,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    if (req.authUser.appUserId !== id) {
+      logAction("warn", "admin_user_password_forbidden_target", {
+        req,
+        action: "admin_user_password_update",
+        result: "rejected",
+        statusCode: 403,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { targetUserId: id, actorUserId: req.authUser.appUserId },
+      });
+      res.status(403).json({ error: "You can only update your own password." });
+      return;
+    }
+
+    const parsed = updateOwnPasswordSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logAction("warn", "admin_user_password_invalid_payload", {
+        req,
+        action: "admin_user_password_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(400).json({ error: "Invalid password payload." });
+      return;
+    }
+
+    const [target] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    if (!target) {
+      logAction("warn", "admin_user_password_target_not_found", {
+        req,
+        action: "admin_user_password_update",
+        result: "rejected",
+        statusCode: 404,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { targetUserId: id },
+      });
+      res.status(404).json({ error: "User not found." });
+      return;
+    }
+
+    if (target.role !== "admin") {
+      logAction("warn", "admin_user_password_role_not_allowed", {
+        req,
+        action: "admin_user_password_update",
+        result: "rejected",
+        statusCode: 403,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { targetUserId: id, targetRole: target.role },
+      });
+      res.status(403).json({ error: "Password update is currently admin-only." });
+      return;
+    }
+
+    const { newPassword } = parsed.data;
+    const { error: authError } = await supabaseAdmin.auth.admin.updateUserById(target.supabaseAuthId, {
+      password: newPassword,
+    });
+    if (authError) {
+      logAction("warn", "admin_user_password_supabase_failed", {
+        req,
+        action: "admin_user_password_update",
+        result: "failure",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { reason: authError.message },
+      });
+      res.status(400).json({ error: authError.message || "Password update failed." });
+      return;
+    }
+
+    await db
+      .update(users)
+      .set({
+        updatedAt: new Date(),
+      })
+      .where(eq(users.id, id));
+
+    await db.insert(authAuditLogs).values({
+      actorUserId: req.authUser.appUserId,
+      targetUserId: id,
+      eventType: "password_updated",
+      details: "scope=self",
+    });
+
+    res.status(200).json({ ok: true });
+    logAction("info", "admin_user_password_success", {
+      req,
+      action: "admin_user_password_update",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { targetUserId: id },
+    });
+  } catch (err) {
+    logAction("error", "admin_user_password_failed", {
+      req,
+      action: "admin_user_password_update",
       result: "failure",
       statusCode: 500,
       requestClass: "server_error",
