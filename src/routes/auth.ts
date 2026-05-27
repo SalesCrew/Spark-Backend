@@ -9,7 +9,7 @@ import { supabaseAnon } from "../lib/supabase.js";
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
-  role: z.enum(["gm", "sm", "admin", "coke"]),
+  role: z.enum(["gm", "sm", "admin", "coke"]).optional(),
 });
 
 const refreshSchema = z.object({
@@ -97,7 +97,7 @@ authRouter.post("/login", async (req, res, next) => {
       return;
     }
 
-    if (appUser.role !== role) {
+    if (role && appUser.role !== role) {
       await supabaseAnon.auth.signOut();
       logAction("warn", "auth_login_role_mismatch", {
         req,
@@ -119,7 +119,7 @@ authRouter.post("/login", async (req, res, next) => {
       actorUserId: appUser.id,
       targetUserId: appUser.id,
       eventType: "login_success",
-      details: `role=${role}`,
+      details: `role=${appUser.role}`,
     });
 
     res.status(200).json({

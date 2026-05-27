@@ -1,0 +1,59 @@
+{
+  "runTag": "smoke-red-survey-1779796734751",
+  "startedAtUtc": "2026-05-26T11:58:54.751Z",
+  "status": "failed",
+  "assertions": [
+    "DB columns red_survey and red_survey_snapshot exist",
+    "non-yesno redSurvey=true rejected with 400",
+    "module create persisted redSurvey true/false for yesno questions"
+  ],
+  "datasets": [
+    {
+      "table": "module_main",
+      "id": "2ccc07e6-8f16-4154-967e-3a63c6a34404",
+      "label": "smoke module"
+    },
+    {
+      "table": "question_bank_shared",
+      "id": "4adde277-b9b8-49be-8109-00343a5d2a4e",
+      "label": "red survey question"
+    },
+    {
+      "table": "question_bank_shared",
+      "id": "aa38d3f6-4b58-41b1-a2ad-09ec155adbd1",
+      "label": "normal yesno question"
+    },
+    {
+      "table": "fragebogen_main",
+      "id": "9a44e77e-4e6f-4619-b07f-ef5e6e4c4ac4",
+      "label": "smoke fragebogen"
+    },
+    {
+      "table": "markets",
+      "id": "ba258e33-4f79-444c-a1fb-48a944a18866",
+      "label": "smoke market"
+    },
+    {
+      "table": "campaigns",
+      "id": "93d95d35-3db0-4bcd-8560-c15fa0dc60cd",
+      "label": "smoke campaign"
+    },
+    {
+      "table": "users",
+      "id": "9a037ab5-607a-4786-babb-66ab26f2def6",
+      "label": "smoke gm user"
+    },
+    {
+      "table": "campaign_market_assignments",
+      "id": "93d95d35-3db0-4bcd-8560-c15fa0dc60cd:ba258e33-4f79-444c-a1fb-48a944a18866:9a037ab5-607a-4786-babb-66ab26f2def6",
+      "label": "smoke assignment"
+    },
+    {
+      "table": "visit_sessions",
+      "id": "7360f367-5942-40ac-b9e4-0a2fdf5fccd4",
+      "label": "smoke visit session"
+    }
+  ],
+  "finishedAtUtc": "2026-05-26T11:59:02.639Z",
+  "error": "AssertionError: The expression evaluated to a falsy value:\n\n  assert.ok(redVisitQuestionId)\n"
+}

@@ -760,7 +760,6 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
     }
 
     await refreshRedMonthCalendarConfig();
-    const { startYmd, endYmd } = getCurrentRedPeriodBounds();
     const rows = await db
       .select()
       .from(markets)
@@ -776,15 +775,15 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
               and ${campaignMarketAssignments.gmUserId} = ${gmUserId}
               and ${campaignMarketAssignments.isDeleted} = false
               and ${campaigns.isDeleted} = false
-              and ${campaigns.status} in ('active', 'scheduled')
+              and ${campaigns.status} = 'active'
               and (
                 ${campaigns.scheduleType} = 'always'
                 or (
                   ${campaigns.scheduleType} = 'scheduled'
                   and ${campaigns.startDate} is not null
                   and ${campaigns.endDate} is not null
-                  and ${campaigns.startDate} <= ${endYmd}
-                  and ${campaigns.endDate} >= ${startYmd}
+                  and ${campaigns.startDate} <= current_date
+                  and ${campaigns.endDate} >= current_date
                 )
               )
           )`,

@@ -202,6 +202,31 @@ export const lager = pgTable(
   ],
 );
 
+export const lagerGmAssignments = pgTable(
+  "lager_gm_assignments",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    lagerId: uuid("lager_id")
+      .notNull()
+      .references(() => lager.id, { onDelete: "cascade" }),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("lager_gm_assignments_lager_gm_active_unique")
+      .on(table.lagerId, table.gmUserId)
+      .where(sql`${table.isDeleted} = false`),
+    index("lager_gm_assignments_lager_deleted_idx").on(table.lagerId, table.isDeleted),
+    index("lager_gm_assignments_gm_deleted_idx").on(table.gmUserId, table.isDeleted),
+    index("lager_gm_assignments_deleted_idx").on(table.isDeleted),
+  ],
+);
+
 export const authAuditLogs = pgTable(
   "auth_audit_logs",
   {
