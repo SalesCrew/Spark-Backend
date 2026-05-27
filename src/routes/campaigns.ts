@@ -293,6 +293,25 @@ function windowsOverlap(left: CampaignScheduleWindow, right: CampaignScheduleWin
   return !(left.endDate < right.startDate || right.endDate < left.startDate);
 }
 
+function deriveEffectiveCampaignStatus(input: {
+  status: "active" | "scheduled" | "inactive";
+  scheduleType: "always" | "scheduled";
+  startDate: string | null;
+  endDate: string | null;
+}): "active" | "scheduled" | "inactive" {
+  if (input.status === "inactive") return "inactive";
+  if (input.scheduleType === "always") return "active";
+  if (!input.startDate || !input.endDate) return input.status;
+
+  const todayYmd = new Date().toISOString().slice(0, 10);
+  const startYmd = input.startDate.slice(0, 10);
+  const endYmd = input.endDate.slice(0, 10);
+
+  if (todayYmd < startYmd) return "scheduled";
+  if (todayYmd > endYmd) return "inactive";
+  return "active";
+}
+
 function normalizeAssignments(input: {
   section: CampaignSection;
   marketIds?: string[];
@@ -704,7 +723,12 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
     section: row.section,
     currentFragebogenId: row.currentFragebogenId,
     currentFragebogenName: row.currentFragebogenId ? (fbNameBySectionAndId.get(`${row.section}:${row.currentFragebogenId}`) ?? null) : null,
-    status: row.status,
+    status: deriveEffectiveCampaignStatus({
+      status: row.status,
+      scheduleType: row.scheduleType,
+      startDate: row.startDate,
+      endDate: row.endDate,
+    }),
     scheduleType: row.scheduleType,
     startDate: row.startDate ? String(row.startDate) : null,
     endDate: row.endDate ? String(row.endDate) : null,
