@@ -602,6 +602,32 @@ type ProgressSectionPayload = {
   markets: ProgressMarketRow[];
 };
 
+function campaignIsLiveNowCondition() {
+  return sql`(
+    (
+      ${campaigns.status} = 'active'
+      and (
+        ${campaigns.scheduleType} = 'always'
+        or (
+          ${campaigns.scheduleType} = 'scheduled'
+          and ${campaigns.startDate} is not null
+          and ${campaigns.endDate} is not null
+          and ${campaigns.startDate} <= current_date
+          and ${campaigns.endDate} >= current_date
+        )
+      )
+    )
+    or (
+      ${campaigns.status} = 'scheduled'
+      and ${campaigns.scheduleType} = 'scheduled'
+      and ${campaigns.startDate} is not null
+      and ${campaigns.endDate} is not null
+      and ${campaigns.startDate} <= current_date
+      and ${campaigns.endDate} >= current_date
+    )
+  )`;
+}
+
 async function resolveActiveStandardGmNamesByMarketIds(marketIds: string[]) {
   const uniqueMarketIds = Array.from(new Set(marketIds));
   if (uniqueMarketIds.length === 0) return new Map<string, string>();
@@ -622,17 +648,7 @@ async function resolveActiveStandardGmNamesByMarketIds(marketIds: string[]) {
         eq(campaignMarketAssignments.isDeleted, false),
         eq(campaigns.isDeleted, false),
         eq(campaigns.section, "standard"),
-        eq(campaigns.status, "active"),
-        sql`(
-          ${campaigns.scheduleType} = 'always'
-          or (
-            ${campaigns.scheduleType} = 'scheduled'
-            and ${campaigns.startDate} is not null
-            and ${campaigns.endDate} is not null
-            and ${campaigns.startDate} <= current_date
-            and ${campaigns.endDate} >= current_date
-          )
-        )`,
+        campaignIsLiveNowCondition(),
       ),
     )
     .orderBy(desc(campaignMarketAssignments.assignedAt));
@@ -775,17 +791,7 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
               and ${campaignMarketAssignments.gmUserId} = ${gmUserId}
               and ${campaignMarketAssignments.isDeleted} = false
               and ${campaigns.isDeleted} = false
-              and ${campaigns.status} = 'active'
-              and (
-                ${campaigns.scheduleType} = 'always'
-                or (
-                  ${campaigns.scheduleType} = 'scheduled'
-                  and ${campaigns.startDate} is not null
-                  and ${campaigns.endDate} is not null
-                  and ${campaigns.startDate} <= current_date
-                  and ${campaigns.endDate} >= current_date
-                )
-              )
+              and ${campaignIsLiveNowCondition()}
           )`,
         ),
       )
@@ -805,17 +811,7 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
           eq(campaignMarketAssignments.gmUserId, gmUserId),
           eq(campaignMarketAssignments.isDeleted, false),
           eq(campaigns.isDeleted, false),
-          eq(campaigns.status, "active"),
-          sql`(
-            ${campaigns.scheduleType} = 'always'
-            or (
-              ${campaigns.scheduleType} = 'scheduled'
-              and ${campaigns.startDate} is not null
-              and ${campaigns.endDate} is not null
-              and ${campaigns.startDate} <= current_date
-              and ${campaigns.endDate} >= current_date
-            )
-          )`,
+          campaignIsLiveNowCondition(),
         ),
       );
 
@@ -884,18 +880,8 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
           eq(campaignMarketAssignments.isDeleted, false),
           eq(campaigns.isDeleted, false),
           eq(markets.isDeleted, false),
-          eq(campaigns.status, "active"),
+          campaignIsLiveNowCondition(),
           inArray(campaigns.section, ["kuehler", "mhd"]),
-          sql`(
-            ${campaigns.scheduleType} = 'always'
-            or (
-              ${campaigns.scheduleType} = 'scheduled'
-              and ${campaigns.startDate} is not null
-              and ${campaigns.endDate} is not null
-              and ${campaigns.startDate} <= current_date
-              and ${campaigns.endDate} >= current_date
-            )
-          )`,
         ),
       )
       .orderBy(asc(campaigns.section), asc(campaigns.name), asc(markets.name), asc(markets.address));
@@ -1085,17 +1071,7 @@ marketsRouter.get("/gm/visit-start", async (req: AuthedRequest, res, next) => {
           inArray(campaigns.id, campaignIds),
           eq(campaignMarketAssignments.isDeleted, false),
           eq(campaigns.isDeleted, false),
-          eq(campaigns.status, "active"),
-          sql`(
-            ${campaigns.scheduleType} = 'always'
-            or (
-              ${campaigns.scheduleType} = 'scheduled'
-              and ${campaigns.startDate} is not null
-              and ${campaigns.endDate} is not null
-              and ${campaigns.startDate} <= current_date
-              and ${campaigns.endDate} >= current_date
-            )
-          )`,
+          campaignIsLiveNowCondition(),
         ),
       );
 
