@@ -22,6 +22,7 @@ type BaseAction = {
   marketName?: string;
   marketAddress?: string;
   subtype?: string;
+  comment?: string;
   questionnaireType?: string;
   questionnaireTypes?: string[];
 };
@@ -50,6 +51,7 @@ type SessionEntry = {
   marketName?: string;
   marketAddress?: string;
   subtype?: string;
+  comment?: string;
   questionnaireType?: string;
   questionnaireTypes?: string[];
 };
@@ -62,6 +64,7 @@ type TimelineSegment = {
   title: string;
   subtitle?: string;
   subtype?: string;
+  comment?: string;
   questionnaireType?: string;
 };
 
@@ -269,6 +272,7 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
     ...(action.marketName ? { marketName: action.marketName } : {}),
     ...(action.marketAddress ? { marketAddress: action.marketAddress } : {}),
     ...(action.subtype ? { subtype: action.subtype } : {}),
+    ...(action.comment ? { comment: action.comment } : {}),
     ...(action.questionnaireType ? { questionnaireType: action.questionnaireType } : {}),
     ...(action.questionnaireTypes && action.questionnaireTypes.length > 0
       ? { questionnaireTypes: action.questionnaireTypes }
@@ -329,6 +333,9 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
         : {}),
       ...(current.kind === "zusatzzeit" && current.subtype
         ? { subtype: current.subtype }
+        : {}),
+      ...(current.kind === "zusatzzeit" && current.comment
+        ? { comment: current.comment }
         : {}),
       ...(current.kind === "marktbesuch" && current.questionnaireType
         ? { questionnaireType: current.questionnaireType }

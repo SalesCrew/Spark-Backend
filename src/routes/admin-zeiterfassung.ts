@@ -199,6 +199,7 @@ async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayloa
       marketName?: string;
       marketAddress?: string;
       subtype?: string;
+      comment?: string;
       questionnaireType?: string;
       questionnaireTypes?: string[];
     }>
@@ -315,6 +316,7 @@ async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayloa
       gmUserId: timeTrackingEntries.gmUserId,
       status: timeTrackingEntries.status,
       activityType: timeTrackingEntries.activityType,
+      comment: timeTrackingEntries.comment,
       startAt: timeTrackingEntries.startAt,
       endAt: timeTrackingEntries.endAt,
       marketName: markets.name,
@@ -347,6 +349,7 @@ async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayloa
       startAt,
       endAt,
       subtype: row.activityType,
+      ...(row.comment ? { comment: row.comment } : {}),
       ...(row.marketName ? { marketName: row.marketName } : {}),
       ...(row.marketAddress ? { marketAddress: row.marketAddress } : {}),
     });
