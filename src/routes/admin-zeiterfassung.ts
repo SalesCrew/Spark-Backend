@@ -53,6 +53,17 @@ const querySchema = z
   })
   .strict();
 
+const editableSegmentKindSchema = z.enum(["marktbesuch", "pause", "zusatzzeit"]);
+const hhmmRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const segmentPatchSchema = z
+  .object({
+    sessionId: z.string().uuid(),
+    startTime: z.string().regex(hhmmRegex).optional(),
+    endTime: z.string().regex(hhmmRegex).optional(),
+    comment: z.string().trim().max(2_000).nullable().optional(),
+  })
+  .strict();
+
 type QueryInput = {
   from: string;
   to: string;
@@ -132,6 +143,154 @@ type DayRow = {
   gmLastName: string;
   gmRegion: string | null;
 };
+
+type SessionInterval = {
+  kind: "marktbesuch" | "pause" | "zusatzzeit";
+  id: string;
+  startAt: Date;
+  endAt: Date;
+};
+
+function getTimeZoneOffsetMs(date: Date, timeZone: string): number {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(date);
+  const map = new Map(parts.map((part) => [part.type, part.value]));
+  const year = Number(map.get("year") ?? "0");
+  const month = Number(map.get("month") ?? "1");
+  const day = Number(map.get("day") ?? "1");
+  const hour = Number(map.get("hour") ?? "0");
+  const minute = Number(map.get("minute") ?? "0");
+  const second = Number(map.get("second") ?? "0");
+  const asUtcEpoch = Date.UTC(year, month - 1, day, hour, minute, second, 0);
+  return asUtcEpoch - date.getTime();
+}
+
+function parseWorkDateHmToUtc(workDate: string, hm: string, timeZone: string): Date | null {
+  const match = hhmmRegex.exec(hm.trim());
+  if (!match) return null;
+  const [yearRaw, monthRaw, dayRaw] = workDate.split("-");
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (
+    !Number.isFinite(year) ||
+    !Number.isFinite(month) ||
+    !Number.isFinite(day) ||
+    !Number.isFinite(hour) ||
+    !Number.isFinite(minute)
+  ) {
+    return null;
+  }
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
+  const firstOffset = getTimeZoneOffsetMs(utcGuess, timeZone);
+  let candidateEpoch = utcGuess.getTime() - firstOffset;
+  const secondOffset = getTimeZoneOffsetMs(new Date(candidateEpoch), timeZone);
+  if (secondOffset !== firstOffset) {
+    candidateEpoch = utcGuess.getTime() - secondOffset;
+  }
+  const candidate = new Date(candidateEpoch);
+  if (toYmdInTimezone(candidate, timeZone) !== workDate) return null;
+  return candidate;
+}
+
+function intersects(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
+  return aStart.getTime() < bEnd.getTime() && aEnd.getTime() > bStart.getTime();
+}
+
+function isAllowedOverlap(kindA: SessionInterval["kind"], kindB: SessionInterval["kind"]): boolean {
+  return (
+    (kindA === "pause" && kindB === "zusatzzeit") ||
+    (kindA === "zusatzzeit" && kindB === "pause")
+  );
+}
+
+async function loadSessionIntervals(input: {
+  daySessionId: string;
+  gmUserId: string;
+  workDate: string;
+  timezone: string;
+}): Promise<SessionInterval[]> {
+  const dayStartExpr = sql`(${input.workDate}::timestamp at time zone ${input.timezone})`;
+  const dayEndExpr = sql`((${input.workDate}::timestamp at time zone ${input.timezone}) + interval '1 day')`;
+
+  const [pauseRows, visitRows, extraRows] = await Promise.all([
+    db
+      .select({
+        id: gmDaySessionPauses.id,
+        startAt: gmDaySessionPauses.pauseStartedAt,
+        endAt: gmDaySessionPauses.pauseEndedAt,
+      })
+      .from(gmDaySessionPauses)
+      .where(
+        and(
+          eq(gmDaySessionPauses.daySessionId, input.daySessionId),
+          eq(gmDaySessionPauses.isDeleted, false),
+          isNotNull(gmDaySessionPauses.pauseEndedAt),
+        ),
+      ),
+    db
+      .select({
+        id: visitSessions.id,
+        startAt: visitSessions.startedAt,
+        endAt: visitSessions.submittedAt,
+      })
+      .from(visitSessions)
+      .where(
+        and(
+          eq(visitSessions.gmUserId, input.gmUserId),
+          eq(visitSessions.status, "submitted"),
+          eq(visitSessions.isDeleted, false),
+          sql`${visitSessions.startedAt} >= ${dayStartExpr}`,
+          sql`${visitSessions.startedAt} < ${dayEndExpr}`,
+          isNotNull(visitSessions.submittedAt),
+        ),
+      ),
+    db
+      .select({
+        id: timeTrackingEntries.id,
+        startAt: timeTrackingEntries.startAt,
+        endAt: timeTrackingEntries.endAt,
+      })
+      .from(timeTrackingEntries)
+      .where(
+        and(
+          eq(timeTrackingEntries.gmUserId, input.gmUserId),
+          eq(timeTrackingEntries.status, "submitted"),
+          eq(timeTrackingEntries.isDeleted, false),
+          isNotNull(timeTrackingEntries.startAt),
+          isNotNull(timeTrackingEntries.endAt),
+          sql`${timeTrackingEntries.startAt} >= ${dayStartExpr}`,
+          sql`${timeTrackingEntries.startAt} < ${dayEndExpr}`,
+        ),
+      ),
+  ]);
+
+  const intervals: SessionInterval[] = [];
+  for (const row of pauseRows) {
+    if (!row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
+    intervals.push({ kind: "pause", id: row.id, startAt: row.startAt, endAt: row.endAt });
+  }
+  for (const row of visitRows) {
+    if (!row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
+    intervals.push({ kind: "marktbesuch", id: row.id, startAt: row.startAt, endAt: row.endAt });
+  }
+  for (const row of extraRows) {
+    if (!row.startAt || !row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
+    intervals.push({ kind: "zusatzzeit", id: row.id, startAt: row.startAt, endAt: row.endAt });
+  }
+  return intervals;
+}
 
 async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayload[]> {
   const statuses = input.includeLive
@@ -426,6 +585,299 @@ adminZeiterfassungRouter.get("/gm-aggregates", async (req: AuthedRequest, res, n
         totalGms: rows.length,
       },
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedRequest, res, next) => {
+  try {
+    const kindParse = editableSegmentKindSchema.safeParse(req.params.kind);
+    if (!kindParse.success) {
+      res.status(400).json({ error: "Unbekannter Segment-Typ." });
+      return;
+    }
+    const segmentId = String(req.params.segmentId ?? "").trim();
+    if (!isUuid(segmentId)) {
+      res.status(400).json({ error: "Ungueltige Segment-ID." });
+      return;
+    }
+    const parsed = segmentPatchSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltige Bearbeitungsdaten." });
+      return;
+    }
+    const kind = kindParse.data;
+    const body = parsed.data;
+    const hasAnyUpdate =
+      body.startTime !== undefined || body.endTime !== undefined || body.comment !== undefined;
+    if (!hasAnyUpdate) {
+      res.status(400).json({ error: "Keine Aenderung uebermittelt." });
+      return;
+    }
+    if (body.comment !== undefined && kind !== "zusatzzeit") {
+      res.status(400).json({ error: "Kommentar kann nur bei Zusatzzeiterfassung bearbeitet werden." });
+      return;
+    }
+
+    const [session] = await db
+      .select({
+        id: gmDaySessions.id,
+        gmUserId: gmDaySessions.gmUserId,
+        workDate: gmDaySessions.workDate,
+        timezone: gmDaySessions.timezone,
+        status: gmDaySessions.status,
+        dayStartedAt: gmDaySessions.dayStartedAt,
+        dayEndedAt: gmDaySessions.dayEndedAt,
+      })
+      .from(gmDaySessions)
+      .where(
+        and(
+          eq(gmDaySessions.id, body.sessionId),
+          eq(gmDaySessions.isDeleted, false),
+        ),
+      )
+      .limit(1);
+    if (!session) {
+      res.status(404).json({ error: "Arbeitstag nicht gefunden." });
+      return;
+    }
+    if (session.status !== "submitted" && session.status !== "ended") {
+      res.status(409).json({ error: "Nur beendete/gespeicherte Arbeitstage koennen bearbeitet werden." });
+      return;
+    }
+
+    const timezone = session.timezone || "Europe/Vienna";
+    const dayStartAt = session.dayStartedAt;
+    const dayEndAt = session.dayEndedAt;
+    if (!dayStartAt || !dayEndAt) {
+      res.status(409).json({ error: "Arbeitstag ist unvollstaendig und kann nicht bearbeitet werden." });
+      return;
+    }
+
+    const now = new Date();
+    if (dayEndAt.getTime() > now.getTime()) {
+      res.status(409).json({ error: "Zukuenftige Zeiten koennen nicht bearbeitet werden." });
+      return;
+    }
+
+    let targetStartAt: Date | null = null;
+    let targetEndAt: Date | null = null;
+
+    if (kind === "marktbesuch") {
+      const [visit] = await db
+        .select({
+          id: visitSessions.id,
+          gmUserId: visitSessions.gmUserId,
+          startAt: visitSessions.startedAt,
+          endAt: visitSessions.submittedAt,
+        })
+        .from(visitSessions)
+        .where(
+          and(
+            eq(visitSessions.id, segmentId),
+            eq(visitSessions.gmUserId, session.gmUserId),
+            eq(visitSessions.isDeleted, false),
+            eq(visitSessions.status, "submitted"),
+            isNotNull(visitSessions.submittedAt),
+          ),
+        )
+        .limit(1);
+      if (!visit) {
+        res.status(404).json({ error: "Marktbesuch nicht gefunden." });
+        return;
+      }
+
+      targetStartAt = body.startTime
+        ? parseWorkDateHmToUtc(session.workDate, body.startTime, timezone)
+        : visit.startAt;
+      targetEndAt = body.endTime
+        ? parseWorkDateHmToUtc(session.workDate, body.endTime, timezone)
+        : visit.endAt;
+      if (!targetStartAt || !targetEndAt) {
+        res.status(400).json({ error: "Ungueltige Uhrzeit." });
+        return;
+      }
+      if (targetEndAt.getTime() <= targetStartAt.getTime()) {
+        res.status(400).json({ error: "Endzeit muss nach Startzeit liegen." });
+        return;
+      }
+      if (targetStartAt.getTime() < dayStartAt.getTime() || targetEndAt.getTime() > dayEndAt.getTime()) {
+        res.status(400).json({ error: "Zeit liegt ausserhalb des Arbeitstags." });
+        return;
+      }
+      if (targetEndAt.getTime() > now.getTime()) {
+        res.status(400).json({ error: "Zukuenftige Zeiten sind nicht erlaubt." });
+        return;
+      }
+
+      const intervals = await loadSessionIntervals({
+        daySessionId: session.id,
+        gmUserId: session.gmUserId,
+        workDate: session.workDate,
+        timezone,
+      });
+      for (const interval of intervals) {
+        if (interval.kind === "marktbesuch" && interval.id === segmentId) continue;
+        if (isAllowedOverlap("marktbesuch", interval.kind)) continue;
+        if (intersects(targetStartAt, targetEndAt, interval.startAt, interval.endAt)) {
+          res.status(409).json({ error: "Zeit ueberschneidet sich mit einem bestehenden Eintrag." });
+          return;
+        }
+      }
+
+      await db
+        .update(visitSessions)
+        .set({
+          startedAt: targetStartAt,
+          submittedAt: targetEndAt,
+          updatedAt: now,
+        })
+        .where(eq(visitSessions.id, segmentId));
+    } else if (kind === "pause") {
+      const [pause] = await db
+        .select({
+          id: gmDaySessionPauses.id,
+          daySessionId: gmDaySessionPauses.daySessionId,
+          startAt: gmDaySessionPauses.pauseStartedAt,
+          endAt: gmDaySessionPauses.pauseEndedAt,
+        })
+        .from(gmDaySessionPauses)
+        .where(
+          and(
+            eq(gmDaySessionPauses.id, segmentId),
+            eq(gmDaySessionPauses.daySessionId, session.id),
+            eq(gmDaySessionPauses.isDeleted, false),
+            isNotNull(gmDaySessionPauses.pauseEndedAt),
+          ),
+        )
+        .limit(1);
+      if (!pause || !pause.endAt) {
+        res.status(404).json({ error: "Pause nicht gefunden." });
+        return;
+      }
+
+      targetStartAt = body.startTime
+        ? parseWorkDateHmToUtc(session.workDate, body.startTime, timezone)
+        : pause.startAt;
+      targetEndAt = body.endTime
+        ? parseWorkDateHmToUtc(session.workDate, body.endTime, timezone)
+        : pause.endAt;
+      if (!targetStartAt || !targetEndAt) {
+        res.status(400).json({ error: "Ungueltige Uhrzeit." });
+        return;
+      }
+      if (targetEndAt.getTime() <= targetStartAt.getTime()) {
+        res.status(400).json({ error: "Endzeit muss nach Startzeit liegen." });
+        return;
+      }
+      if (targetStartAt.getTime() < dayStartAt.getTime() || targetEndAt.getTime() > dayEndAt.getTime()) {
+        res.status(400).json({ error: "Zeit liegt ausserhalb des Arbeitstags." });
+        return;
+      }
+      if (targetEndAt.getTime() > now.getTime()) {
+        res.status(400).json({ error: "Zukuenftige Zeiten sind nicht erlaubt." });
+        return;
+      }
+
+      const intervals = await loadSessionIntervals({
+        daySessionId: session.id,
+        gmUserId: session.gmUserId,
+        workDate: session.workDate,
+        timezone,
+      });
+      for (const interval of intervals) {
+        if (interval.kind === "pause" && interval.id === segmentId) continue;
+        if (isAllowedOverlap("pause", interval.kind)) continue;
+        if (intersects(targetStartAt, targetEndAt, interval.startAt, interval.endAt)) {
+          res.status(409).json({ error: "Zeit ueberschneidet sich mit einem bestehenden Eintrag." });
+          return;
+        }
+      }
+
+      await db
+        .update(gmDaySessionPauses)
+        .set({
+          pauseStartedAt: targetStartAt,
+          pauseEndedAt: targetEndAt,
+          updatedAt: now,
+        })
+        .where(eq(gmDaySessionPauses.id, segmentId));
+    } else {
+      const [extra] = await db
+        .select({
+          id: timeTrackingEntries.id,
+          gmUserId: timeTrackingEntries.gmUserId,
+          startAt: timeTrackingEntries.startAt,
+          endAt: timeTrackingEntries.endAt,
+        })
+        .from(timeTrackingEntries)
+        .where(
+          and(
+            eq(timeTrackingEntries.id, segmentId),
+            eq(timeTrackingEntries.gmUserId, session.gmUserId),
+            eq(timeTrackingEntries.status, "submitted"),
+            eq(timeTrackingEntries.isDeleted, false),
+            isNotNull(timeTrackingEntries.startAt),
+            isNotNull(timeTrackingEntries.endAt),
+          ),
+        )
+        .limit(1);
+      if (!extra || !extra.startAt || !extra.endAt) {
+        res.status(404).json({ error: "Zusatzzeiterfassung nicht gefunden." });
+        return;
+      }
+
+      targetStartAt = body.startTime
+        ? parseWorkDateHmToUtc(session.workDate, body.startTime, timezone)
+        : extra.startAt;
+      targetEndAt = body.endTime
+        ? parseWorkDateHmToUtc(session.workDate, body.endTime, timezone)
+        : extra.endAt;
+      if (!targetStartAt || !targetEndAt) {
+        res.status(400).json({ error: "Ungueltige Uhrzeit." });
+        return;
+      }
+      if (targetEndAt.getTime() <= targetStartAt.getTime()) {
+        res.status(400).json({ error: "Endzeit muss nach Startzeit liegen." });
+        return;
+      }
+      if (targetStartAt.getTime() < dayStartAt.getTime() || targetEndAt.getTime() > dayEndAt.getTime()) {
+        res.status(400).json({ error: "Zeit liegt ausserhalb des Arbeitstags." });
+        return;
+      }
+      if (targetEndAt.getTime() > now.getTime()) {
+        res.status(400).json({ error: "Zukuenftige Zeiten sind nicht erlaubt." });
+        return;
+      }
+
+      const intervals = await loadSessionIntervals({
+        daySessionId: session.id,
+        gmUserId: session.gmUserId,
+        workDate: session.workDate,
+        timezone,
+      });
+      for (const interval of intervals) {
+        if (interval.kind === "zusatzzeit" && interval.id === segmentId) continue;
+        if (isAllowedOverlap("zusatzzeit", interval.kind)) continue;
+        if (intersects(targetStartAt, targetEndAt, interval.startAt, interval.endAt)) {
+          res.status(409).json({ error: "Zeit ueberschneidet sich mit einem bestehenden Eintrag." });
+          return;
+        }
+      }
+
+      await db
+        .update(timeTrackingEntries)
+        .set({
+          startAt: targetStartAt,
+          endAt: targetEndAt,
+          ...(body.comment !== undefined ? { comment: body.comment?.trim() || null } : {}),
+          updatedAt: now,
+        })
+        .where(eq(timeTrackingEntries.id, segmentId));
+    }
+
+    res.status(200).json({ ok: true });
   } catch (error) {
     next(error);
   }

@@ -57,6 +57,7 @@ type SessionEntry = {
 };
 
 type TimelineSegment = {
+  id: string;
   kind: TimelineKind;
   start: string;
   end: string;
@@ -289,6 +290,7 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
       const anfahrtDuration = diffMinutesAtLeastOne(input.startAt, first.startAt);
       if (anfahrtDuration > 0) {
         timeline.push({
+          id: `anfahrt-${input.sessionId}`,
           kind: "anfahrt",
           start: dayStartLabel,
           end: toHm(first.startAt, input.timezone),
@@ -308,6 +310,7 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
       const gap = diffMinutesAtLeastOne(prev.endAt, current.startAt);
       if (gap > 0) {
         timeline.push({
+          id: `fahrtzeit-${input.sessionId}-${index}`,
           kind: "fahrtzeit",
           start: toHm(prev.endAt, input.timezone),
           end: toHm(current.startAt, input.timezone),
@@ -318,6 +321,7 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
     }
 
     const timelineSegment: TimelineSegment = {
+      id: current.id,
       kind: current.kind,
       start: toHm(current.startAt, input.timezone),
       end: toHm(current.endAt, input.timezone),
@@ -352,6 +356,7 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
     const heimfahrtDuration = diffMinutesAtLeastOne(last.endAt, input.endAt);
     if (heimfahrtDuration > 0) {
       timeline.push({
+        id: `heimfahrt-${input.sessionId}`,
         kind: "heimfahrt",
         start: toHm(last.endAt, input.timezone),
         end: dayEndLabel,
