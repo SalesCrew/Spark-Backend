@@ -713,6 +713,14 @@ function pickScopeConfig(scope: Scope) {
   };
 }
 
+function normalizeSingleChoiceAvailabilityForScope(question: UiQuestion, scope: Scope): UiQuestion {
+  if (scope === "kuehler") return question;
+  return {
+    ...question,
+    singleChoiceAvailability: false,
+  };
+}
+
 async function upsertModuleQuestionChainsTx(
   tx: DbTx,
   input: {
@@ -1557,7 +1565,9 @@ adminFragebogenRouter.get("/questions", async (_req, res, next) => {
     const rows = await db
       .select({ id: questionBankShared.id })
       .from(questionBankShared)
-      .where(eq(questionBankShared.isDeleted, false))
+      .where(
+        sql`${questionBankShared.isDeleted} = false AND coalesce(${questionBankShared.singleChoiceAvailability}, false) = false`,
+      )
       .orderBy(desc(questionBankShared.updatedAt));
     const questionsMap = await fetchQuestionsByIds(db, rows.map((row) => row.id));
     res.status(200).json({ questions: rows.map((row) => questionsMap.get(row.id)).filter(Boolean) });
@@ -1695,21 +1705,25 @@ adminFragebogenRouter.post("/modules/:scope", async (req, res, next) => {
           ? await fetchQuestionsByIds(tx, existingQuestionIds)
           : new Map<string, UiQuestion>();
       for (const question of payload.questions) {
-        const saved = await upsertQuestionGraphTx(tx, { ...question, rules: [] });
+        const scopedQuestion = normalizeSingleChoiceAvailabilityForScope(
+          { ...question, rules: [] },
+          scope,
+        );
+        const saved = await upsertQuestionGraphTx(tx, scopedQuestion);
         if (saved.id) {
           questionIds.push(saved.id);
           const previousQuestion =
             question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
-          if (needsIppRecalcForQuestionChange(previousQuestion, question)) {
+          if (needsIppRecalcForQuestionChange(previousQuestion, scopedQuestion)) {
             affectedQuestionIds.push(saved.id);
           }
           if (question.id) {
             questionIdMap.set(question.id, saved.id);
           }
           questionIdMap.set(saved.id, saved.id);
-          savedQuestionRows.push({ sourceQuestion: question, persistedQuestionId: saved.id });
+          savedQuestionRows.push({ sourceQuestion: scopedQuestion, persistedQuestionId: saved.id });
           questionChainInputs.push(
-            question.chains ? { questionId: saved.id, chains: question.chains } : { questionId: saved.id },
+            scopedQuestion.chains ? { questionId: saved.id, chains: scopedQuestion.chains } : { questionId: saved.id },
           );
         }
       }
@@ -1867,20 +1881,24 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
       const desiredChainsByQuestionId = new Map<string, string[]>();
 
       for (const [orderIndex, question] of parsed.data.questions.entries()) {
+        const scopedQuestion = normalizeSingleChoiceAvailabilityForScope(
+          { ...question, rules: [] },
+          scope,
+        );
         const previousQuestion =
           question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
-        const shouldPersistQuestion = needsQuestionGraphUpdate(previousQuestion, question);
+        const shouldPersistQuestion = needsQuestionGraphUpdate(previousQuestion, scopedQuestion);
         let persistedQuestionId: string;
 
         if (shouldPersistQuestion) {
-          const saved = await upsertQuestionGraphTx(tx, { ...question, rules: [] });
+          const saved = await upsertQuestionGraphTx(tx, scopedQuestion);
           if (!saved.id) continue;
           persistedQuestionId = saved.id;
-          if (needsIppRecalcForQuestionChange(previousQuestion, question)) {
+          if (needsIppRecalcForQuestionChange(previousQuestion, scopedQuestion)) {
             affectedQuestionIds.push(saved.id);
           }
           savedQuestionRowsById.set(saved.id, {
-            sourceQuestion: question,
+            sourceQuestion: scopedQuestion,
             persistedQuestionId: saved.id,
           });
         } else {
@@ -1894,7 +1912,7 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
         desiredOrderByQuestionId.set(persistedQuestionId, orderIndex);
         desiredChainsByQuestionId.set(
           persistedQuestionId,
-          normalizeChainsForComparison(question.chains),
+          normalizeChainsForComparison(scopedQuestion.chains),
         );
       }
 
