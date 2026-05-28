@@ -283,6 +283,20 @@ async function ensureMarketsExist(marketIds: string[]) {
   }
 }
 
+async function loadActiveUniversumMarketIds(): Promise<string[]> {
+  const rows = await db
+    .select({ id: markets.id })
+    .from(markets)
+    .where(
+      and(
+        eq(markets.isDeleted, false),
+        eq(markets.isActive, true),
+        eq(markets.marketType, "universum"),
+      ),
+    );
+  return rows.map((row) => row.id);
+}
+
 type CampaignAssignmentInput = {
   marketId: string;
   gmUserId: string | null;
@@ -1803,12 +1817,18 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
     const now = new Date();
     const auditUserId = await resolveAuditUserId(req.authUser?.appUserId);
     const schedule = normalizeSchedule(parsed.data);
+    const autoFlexMarketIds = parsed.data.section === "flex"
+      ? await loadActiveUniversumMarketIds()
+      : null;
     const assignments = normalizeAssignments({
       section: parsed.data.section,
-      marketIds: parsed.data.marketIds,
-      ...(parsed.data.assignments ? { assignments: parsed.data.assignments } : {}),
+      marketIds: autoFlexMarketIds ?? parsed.data.marketIds,
+      ...(parsed.data.section !== "flex" && parsed.data.assignments ? { assignments: parsed.data.assignments } : {}),
     });
     const marketIds = assignments.map((assignment) => assignment.marketId);
+    if (parsed.data.section === "flex" && marketIds.length === 0) {
+      throw new CampaignDomainError("invalid_payload", 400, "Keine aktiven Universumsmärkte für Flexkampagne gefunden.");
+    }
     if (parsed.data.currentFragebogenId) {
       await ensureFragebogenMatchesSection(parsed.data.section, parsed.data.currentFragebogenId);
     }
