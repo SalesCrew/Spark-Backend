@@ -1,10 +1,14 @@
 import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { type Response, Router } from "express";
 import { z } from "zod";
-import { aggregateHighVolumeLoad, logAction, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
+import { finalizeBonusForSubmittedVisitSessionTx } from "../lib/bonus-finalizer.js";
+import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
+import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
+import { aggregateHighVolumeLoad, logAction, logger, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { type AuthedRequest, requireAuth } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
+import { buildVisitAnswerValidationResult, computeMissingRequiredQuestions } from "../lib/visit-session-answer-validation.js";
 import {
   campaignMarketAssignmentHistory,
   campaignFragebogenHistory,
@@ -19,6 +23,7 @@ import {
   visitAnswerPhotoTags,
   visitAnswerPhotos,
   visitAnswers,
+  visitAnswerEvents,
   visitQuestionComments,
   visitSessionQuestions,
   visitSessionSections,
@@ -107,6 +112,25 @@ const migrateMarketsSchema = z
   .strict();
 
 const HARD_DELETE_CAMPAIGN_CONFIRMATION_TEXT = "Ich bin mir sicher, dass ich alle Daten zu dieser Kampagne Löschen will!";
+const adminSubmittedVisitAnswerPatchSchema = z
+  .object({
+    visitQuestionId: z.string().uuid(),
+    answer: z.unknown(),
+    comment: z.string().max(4000).optional(),
+  })
+  .strict();
+
+function deriveVisitAnswerEventType(input: {
+  previousStatus: "unanswered" | "answered" | "invalid" | "hidden_by_rule" | "skipped" | null;
+  nextStatus: "unanswered" | "answered" | "invalid";
+}): "set" | "clear" | "status_change" {
+  if (input.previousStatus == null) {
+    return input.nextStatus === "unanswered" ? "clear" : "set";
+  }
+  if (input.previousStatus !== input.nextStatus) return "status_change";
+  if (input.nextStatus === "unanswered") return "clear";
+  return "set";
+}
 
 class CampaignDomainError extends Error {
   code:
@@ -1303,6 +1327,458 @@ adminCampaignsRouter.get("/campaigns/:id/market-visits", async (req, res, next) 
       markets: summaries,
     });
   } catch (error) {
+    next(error);
+  }
+});
+
+adminCampaignsRouter.patch("/campaigns/visit-sessions/:sessionId/answers", async (req: AuthedRequest, res, next) => {
+  try {
+    const sessionId = String(req.params.sessionId ?? "");
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungültige Session-ID.", code: "invalid_session_id" });
+      return;
+    }
+
+    const parsed = adminSubmittedVisitAnswerPatchSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültiges Antwort-Payload.", code: "invalid_payload" });
+      return;
+    }
+
+    const [session] = await db
+      .select({
+        id: visitSessions.id,
+        gmUserId: visitSessions.gmUserId,
+        marketId: visitSessions.marketId,
+        status: visitSessions.status,
+        submittedAt: visitSessions.submittedAt,
+      })
+      .from(visitSessions)
+      .where(and(eq(visitSessions.id, sessionId), eq(visitSessions.isDeleted, false)))
+      .limit(1);
+    if (!session) {
+      res.status(404).json({ error: "Session nicht gefunden.", code: "session_not_found" });
+      return;
+    }
+    if (session.status !== "submitted") {
+      res.status(409).json({ error: "Nur abgeschlossene Sessions können bearbeitet werden.", code: "session_not_submitted" });
+      return;
+    }
+
+    const [visitQuestion] = await db
+      .select({
+        visitQuestionId: visitSessionQuestions.id,
+        visitSessionSectionId: visitSessionSections.id,
+        questionId: visitSessionQuestions.questionId,
+        questionType: visitSessionQuestions.questionType,
+        questionConfigSnapshot: visitSessionQuestions.questionConfigSnapshot,
+      })
+      .from(visitSessionQuestions)
+      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+      .where(
+        and(
+          eq(visitSessionQuestions.id, parsed.data.visitQuestionId),
+          eq(visitSessionQuestions.isDeleted, false),
+          eq(visitSessionSections.visitSessionId, session.id),
+          eq(visitSessionSections.isDeleted, false),
+        ),
+      )
+      .limit(1);
+    if (!visitQuestion) {
+      res.status(404).json({ error: "Frage in Session nicht gefunden.", code: "question_not_found" });
+      return;
+    }
+    if (visitQuestion.questionType === "photo") {
+      res.status(400).json({
+        error: "Foto-Fragen können in diesem Schritt nicht bearbeitet werden.",
+        code: "photo_edit_not_supported",
+      });
+      return;
+    }
+
+    const validation = buildVisitAnswerValidationResult(
+      visitQuestion.questionType,
+      (visitQuestion.questionConfigSnapshot ?? {}) as Record<string, unknown>,
+      parsed.data.answer,
+    );
+    const actorUserId = req.authUser?.appUserId ?? null;
+    const now = new Date();
+
+    const result = await db.transaction(async (tx) => {
+      const siblingQuestions = await tx
+        .select({
+          visitQuestionId: visitSessionQuestions.id,
+          visitSessionSectionId: visitSessionSections.id,
+          questionId: visitSessionQuestions.questionId,
+          questionType: visitSessionQuestions.questionType,
+        })
+        .from(visitSessionQuestions)
+        .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+        .where(
+          and(
+            eq(visitSessionSections.visitSessionId, session.id),
+            eq(visitSessionSections.isDeleted, false),
+            eq(visitSessionQuestions.questionId, visitQuestion.questionId),
+            eq(visitSessionQuestions.isDeleted, false),
+          ),
+        );
+      const siblingQuestionIds = siblingQuestions.map((row) => row.visitQuestionId);
+      if (siblingQuestionIds.length === 0) {
+        throw new Error("Keine zugehörigen Fragen in der Session gefunden.");
+      }
+
+      await tx.execute(
+        sql`SELECT id FROM ${visitSessionQuestions} WHERE ${inArray(visitSessionQuestions.id, siblingQuestionIds)} FOR UPDATE`,
+      );
+
+      const existingAnswers = await tx
+        .select()
+        .from(visitAnswers)
+        .where(and(inArray(visitAnswers.visitSessionQuestionId, siblingQuestionIds), eq(visitAnswers.isDeleted, false)));
+      const existingAnswerByVisitQuestionId = new Map(existingAnswers.map((row) => [row.visitSessionQuestionId, row]));
+
+      const resultByVisitQuestionId = new Map<string, {
+        answerId: string;
+        answerStatus: "unanswered" | "answered" | "invalid" | "hidden_by_rule" | "skipped";
+        isValid: boolean;
+        validationError: string | null;
+      }>();
+
+      const auditEvents: Array<typeof visitAnswerEvents.$inferInsert> = [];
+
+      for (const sibling of siblingQuestions) {
+        const existing = existingAnswerByVisitQuestionId.get(sibling.visitQuestionId);
+        const beforeSnapshot = existing
+          ? {
+              answerStatus: existing.answerStatus,
+              valueText: existing.valueText,
+              valueNumber: existing.valueNumber == null ? null : String(existing.valueNumber),
+              valueJson: (existing.valueJson as Record<string, unknown> | null) ?? null,
+              isValid: existing.isValid,
+              validationError: existing.validationError,
+              version: existing.version,
+            }
+          : null;
+
+        let answerId = existing?.id ?? null;
+        let afterStatus: "unanswered" | "answered" | "invalid";
+        let afterIsValid: boolean;
+        let afterValidationError: string | null;
+        let afterVersion = 1;
+
+        if (existing) {
+          const [updated] = await tx
+            .update(visitAnswers)
+            .set({
+              answerStatus: validation.answerStatus,
+              valueText: validation.valueText,
+              valueNumber: validation.valueNumber,
+              valueJson: validation.valueJson,
+              isValid: validation.isValid,
+              validationError: validation.validationError,
+              answeredAt: validation.answerStatus === "answered" ? now : existing.answeredAt,
+              changedAt: now,
+              version: existing.version + 1,
+              updatedAt: now,
+            })
+            .where(eq(visitAnswers.id, existing.id))
+            .returning();
+          answerId = updated?.id ?? existing.id;
+          afterStatus = (updated?.answerStatus as "unanswered" | "answered" | "invalid" | undefined) ?? validation.answerStatus;
+          afterIsValid = updated?.isValid ?? validation.isValid;
+          afterValidationError = updated?.validationError ?? validation.validationError;
+          afterVersion = updated?.version ?? (existing.version + 1);
+        } else {
+          const [created] = await tx
+            .insert(visitAnswers)
+            .values({
+              visitSessionId: session.id,
+              visitSessionSectionId: sibling.visitSessionSectionId,
+              visitSessionQuestionId: sibling.visitQuestionId,
+              questionId: sibling.questionId,
+              questionType: sibling.questionType,
+              answerStatus: validation.answerStatus,
+              valueText: validation.valueText,
+              valueNumber: validation.valueNumber,
+              valueJson: validation.valueJson,
+              isValid: validation.isValid,
+              validationError: validation.validationError,
+              answeredAt: validation.answerStatus === "answered" ? now : null,
+              changedAt: now,
+              version: 1,
+              isDeleted: false,
+              deletedAt: null,
+              createdAt: now,
+              updatedAt: now,
+            })
+            .returning();
+          answerId = created?.id ?? null;
+          afterStatus = (created?.answerStatus as "unanswered" | "answered" | "invalid" | undefined) ?? validation.answerStatus;
+          afterIsValid = created?.isValid ?? validation.isValid;
+          afterValidationError = created?.validationError ?? validation.validationError;
+          afterVersion = created?.version ?? 1;
+        }
+        if (!answerId) throw new Error("Antwort konnte nicht gespeichert werden.");
+
+        await tx
+          .update(visitAnswerOptions)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(eq(visitAnswerOptions.visitAnswerId, answerId), eq(visitAnswerOptions.isDeleted, false)));
+        if (validation.options.length > 0) {
+          await tx.insert(visitAnswerOptions).values(
+            validation.options.map((opt) => ({
+              visitAnswerId: answerId as string,
+              optionRole: opt.optionRole,
+              optionValue: opt.optionValue,
+              orderIndex: opt.orderIndex,
+              isDeleted: false,
+              deletedAt: null,
+              createdAt: now,
+              updatedAt: now,
+            })),
+          );
+        }
+
+        await tx
+          .update(visitAnswerMatrixCells)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(eq(visitAnswerMatrixCells.visitAnswerId, answerId), eq(visitAnswerMatrixCells.isDeleted, false)));
+        if (validation.matrixCells.length > 0) {
+          await tx.insert(visitAnswerMatrixCells).values(
+            validation.matrixCells.map((cell) => ({
+              visitAnswerId: answerId as string,
+              rowKey: cell.rowKey,
+              columnKey: cell.columnKey,
+              cellValueText: cell.cellValueText,
+              cellValueDate: cell.cellValueDate,
+              cellSelected: cell.cellSelected,
+              orderIndex: cell.orderIndex,
+              isDeleted: false,
+              deletedAt: null,
+              createdAt: now,
+              updatedAt: now,
+            })),
+          );
+        }
+
+        if (parsed.data.comment !== undefined) {
+          const [existingComment] = await tx
+            .select()
+            .from(visitQuestionComments)
+            .where(and(eq(visitQuestionComments.visitSessionQuestionId, sibling.visitQuestionId), eq(visitQuestionComments.isDeleted, false)))
+            .limit(1);
+          if (parsed.data.comment.trim().length === 0) {
+            if (existingComment) {
+              await tx
+                .update(visitQuestionComments)
+                .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+                .where(eq(visitQuestionComments.id, existingComment.id));
+            }
+          } else if (existingComment) {
+            await tx
+              .update(visitQuestionComments)
+              .set({ commentText: parsed.data.comment, commentedAt: now, updatedAt: now })
+              .where(eq(visitQuestionComments.id, existingComment.id));
+          } else {
+            await tx.insert(visitQuestionComments).values({
+              visitSessionQuestionId: sibling.visitQuestionId,
+              commentText: parsed.data.comment,
+              commentedAt: now,
+              isDeleted: false,
+              deletedAt: null,
+              createdAt: now,
+              updatedAt: now,
+            });
+          }
+        }
+
+        auditEvents.push({
+          visitAnswerId: answerId as string,
+          eventType: deriveVisitAnswerEventType({
+            previousStatus: beforeSnapshot?.answerStatus ?? null,
+            nextStatus: afterStatus,
+          }),
+          payload: {
+            source: "admin_submitted_edit",
+            sessionId: session.id,
+            visitQuestionId: sibling.visitQuestionId,
+            questionId: sibling.questionId,
+            before: beforeSnapshot,
+            after: {
+              answerStatus: afterStatus,
+              valueText: validation.valueText,
+              valueNumber: validation.valueNumber,
+              valueJson: validation.valueJson,
+              isValid: afterIsValid,
+              validationError: afterValidationError,
+              version: afterVersion,
+            },
+            ...(parsed.data.comment !== undefined ? { comment: parsed.data.comment } : {}),
+          },
+          actorUserId,
+          createdAt: now,
+        });
+
+        resultByVisitQuestionId.set(sibling.visitQuestionId, {
+          answerId: answerId as string,
+          answerStatus: afterStatus,
+          isValid: afterIsValid,
+          validationError: afterValidationError,
+        });
+      }
+
+      if (auditEvents.length > 0) {
+        await tx.insert(visitAnswerEvents).values(auditEvents);
+      }
+
+      const sections = await tx
+        .select({ id: visitSessionSections.id })
+        .from(visitSessionSections)
+        .where(and(eq(visitSessionSections.visitSessionId, session.id), eq(visitSessionSections.isDeleted, false)));
+      const sectionIds = sections.map((row) => row.id);
+      const allQuestions =
+        sectionIds.length === 0
+          ? []
+          : await tx
+              .select({
+                id: visitSessionQuestions.id,
+                questionId: visitSessionQuestions.questionId,
+                questionType: visitSessionQuestions.questionType,
+                questionTextSnapshot: visitSessionQuestions.questionTextSnapshot,
+                questionConfigSnapshot: visitSessionQuestions.questionConfigSnapshot,
+                questionRulesSnapshot: visitSessionQuestions.questionRulesSnapshot,
+                requiredSnapshot: visitSessionQuestions.requiredSnapshot,
+                appliesToMarketChainSnapshot: visitSessionQuestions.appliesToMarketChainSnapshot,
+              })
+              .from(visitSessionQuestions)
+              .where(and(inArray(visitSessionQuestions.visitSessionSectionId, sectionIds), eq(visitSessionQuestions.isDeleted, false)));
+      const questionIds = allQuestions.map((row) => row.id);
+      const allAnswers =
+        questionIds.length === 0
+          ? []
+          : await tx
+              .select({
+                id: visitAnswers.id,
+                visitSessionQuestionId: visitAnswers.visitSessionQuestionId,
+                answerStatus: visitAnswers.answerStatus,
+                valueText: visitAnswers.valueText,
+                valueNumber: visitAnswers.valueNumber,
+                valueJson: visitAnswers.valueJson,
+                isValid: visitAnswers.isValid,
+              })
+              .from(visitAnswers)
+              .where(and(inArray(visitAnswers.visitSessionQuestionId, questionIds), eq(visitAnswers.isDeleted, false)));
+      const answerIds = allAnswers.map((row) => row.id);
+      const allPhotos =
+        answerIds.length === 0
+          ? []
+          : await tx
+              .select({
+                id: visitAnswerPhotos.id,
+                visitAnswerId: visitAnswerPhotos.visitAnswerId,
+                storagePath: visitAnswerPhotos.storagePath,
+              })
+              .from(visitAnswerPhotos)
+              .where(and(inArray(visitAnswerPhotos.visitAnswerId, answerIds), eq(visitAnswerPhotos.isDeleted, false)));
+      const photoIds = allPhotos.map((row) => row.id);
+      const allPhotoTags =
+        photoIds.length === 0
+          ? []
+          : await tx
+              .select({
+                visitAnswerPhotoId: visitAnswerPhotoTags.visitAnswerPhotoId,
+              })
+              .from(visitAnswerPhotoTags)
+              .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, photoIds), eq(visitAnswerPhotoTags.isDeleted, false)));
+
+      const { missingRequired } = computeMissingRequiredQuestions({
+        questions: allQuestions.map((question) => ({
+          id: question.id,
+          questionId: question.questionId,
+          questionType: question.questionType,
+          questionTextSnapshot: question.questionTextSnapshot,
+          questionConfigSnapshot: (question.questionConfigSnapshot ?? {}) as Record<string, unknown>,
+          questionRulesSnapshot: (question.questionRulesSnapshot ?? []) as Array<Record<string, unknown>>,
+          requiredSnapshot: question.requiredSnapshot,
+          appliesToMarketChainSnapshot: Boolean(question.appliesToMarketChainSnapshot),
+        })),
+        answers: allAnswers.map((answer) => ({
+          id: answer.id,
+          visitSessionQuestionId: answer.visitSessionQuestionId,
+          answerStatus: answer.answerStatus,
+          valueText: answer.valueText,
+          valueNumber: answer.valueNumber == null ? null : String(answer.valueNumber),
+          valueJson: (answer.valueJson as Record<string, unknown> | null) ?? null,
+          isValid: answer.isValid,
+        })),
+        photos: allPhotos,
+        photoTags: allPhotoTags,
+      });
+      if (missingRequired.length > 0) {
+        const error = new Error("Edit würde eine ungültige Session erzeugen.") as Error & {
+          code?: string;
+          missingRequired?: Array<{
+            visitQuestionId: string;
+            questionId: string;
+            questionText: string;
+            questionType: string;
+          }>;
+        };
+        error.code = "visit_edit_incomplete_required";
+        error.missingRequired = missingRequired;
+        throw error;
+      }
+
+      await tx
+        .update(visitSessions)
+        .set({ lastSavedAt: now, updatedAt: now })
+        .where(eq(visitSessions.id, session.id));
+
+      await finalizeBonusForSubmittedVisitSessionTx(tx, {
+        sessionId: session.id,
+        gmUserId: session.gmUserId,
+        marketId: session.marketId,
+        submittedAt: session.submittedAt ?? now,
+      });
+
+      const primaryResult = resultByVisitQuestionId.get(visitQuestion.visitQuestionId);
+      if (!primaryResult) throw new Error("Antwort konnte nicht gespeichert werden.");
+      return primaryResult;
+    });
+
+    try {
+      await enqueueIppRecalcForDate(session.marketId, session.submittedAt ?? now, "visit_session_admin_edit");
+    } catch (enqueueError) {
+      logger.error("admin_visit_answer_edit_ipp_enqueue_failed", {
+        action: "admin_visit_answer_edit",
+        result: "failure",
+        sessionId: session.id,
+        marketId: session.marketId,
+        error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
+      });
+    }
+    try {
+      await recomputeGmKpiCache(session.gmUserId);
+    } catch (kpiError) {
+      logger.error("admin_visit_answer_edit_kpi_recompute_failed", {
+        action: "admin_visit_answer_edit",
+        result: "failure",
+        sessionId: session.id,
+        gmUserId: session.gmUserId,
+        error: kpiError instanceof Error ? kpiError.message : String(kpiError),
+      });
+    }
+
+    res.status(200).json({ ok: true, result });
+  } catch (error) {
+    if (error instanceof Error && (error as { code?: string }).code === "visit_edit_incomplete_required") {
+      res.status(409).json({
+        error: "Änderung verletzt Pflicht-/Regelzustand der Session.",
+        code: "visit_edit_incomplete_required",
+        missingRequired: (error as { missingRequired?: unknown }).missingRequired ?? [],
+      });
+      return;
+    }
     next(error);
   }
 });

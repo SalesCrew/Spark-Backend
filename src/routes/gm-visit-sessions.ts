@@ -15,7 +15,10 @@ import { addDays, getCurrentRedPeriod, startOfDay } from "../lib/red-monat.js";
 import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
-import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
+import {
+  buildVisitAnswerValidationResult,
+  computeMissingRequiredQuestions,
+} from "../lib/visit-session-answer-validation.js";
 import {
   campaignMarketAssignments,
   campaigns,
@@ -1799,7 +1802,7 @@ gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/answers", async (req:
       return;
     }
 
-    const validation = buildValidationResult(
+    const validation = buildVisitAnswerValidationResult(
       visitQuestion.questionType,
       (visitQuestion.questionConfigSnapshot ?? {}) as Record<string, unknown>,
       parsed.data.answer,
@@ -2573,52 +2576,35 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
       tagsByPhotoId.set(row.visitAnswerPhotoId, bucket);
     }
 
-    const applicableQuestions = questions.filter((question) => question.appliesToMarketChainSnapshot);
-    const visibilityQuestions = applicableQuestions.map((question) => ({
-      id: question.id,
-      questionId: question.questionId,
-      rules: (question.questionRulesSnapshot ?? []) as Array<Record<string, unknown>>,
-    }));
-    const answerByVisitQuestionId = new Map<string, string | string[] | undefined>();
-    for (const question of applicableQuestions) {
-      answerByVisitQuestionId.set(
-        question.id,
-        extractRuleAnswerValue(answersByQuestionId.get(question.id)),
-      );
-    }
-    const hiddenQuestionIds = computeHiddenQuestionIds(visibilityQuestions, answerByVisitQuestionId);
-
-    const missingRequired = applicableQuestions
-      .filter((q) => q.requiredSnapshot && !hiddenQuestionIds.has(q.id))
-      .filter((q) => {
-        const answer = answersByQuestionId.get(q.id);
-        if (!answer || answer.answerStatus !== "answered" || !answer.isValid) return true;
-        if (q.questionType !== "photo") return false;
-        const photos = photosByAnswerId.get(answer.id) ?? [];
-        if (photos.length === 0) return true;
-        const cfg = (q.questionConfigSnapshot ?? {}) as Record<string, unknown>;
-        const tagsEnabled = Boolean(cfg.tagsEnabled) && Array.isArray(cfg.tagIds) && (cfg.tagIds as unknown[]).length > 0;
-        const persistedStorage = Array.isArray((answer.valueJson as { storage?: unknown } | null)?.storage)
-          ? ((answer.valueJson as { storage?: Array<{ path?: unknown }> }).storage ?? [])
-              .map((entry) => (typeof entry.path === "string" ? entry.path : ""))
-              .filter((entry) => entry.length > 0)
-          : [];
-        const photoPaths = photos.map((photo) => photo.storagePath);
-        if (persistedStorage.length !== photoPaths.length) return true;
-        const persistedSet = new Set(persistedStorage);
-        if (photoPaths.some((path) => !persistedSet.has(path))) return true;
-        if (!tagsEnabled) return false;
-        const missingPerPhotoTag = photos.some((photo) => (tagsByPhotoId.get(photo.id) ?? []).length === 0);
-        if (missingPerPhotoTag) return true;
-        const tagsCount = photos.reduce((sum, photo) => sum + ((tagsByPhotoId.get(photo.id) ?? []).length), 0);
-        return tagsCount === 0;
-      })
-      .map((q) => ({
-        visitQuestionId: q.id,
-        questionId: q.questionId,
-        questionText: q.questionTextSnapshot,
-        questionType: q.questionType,
-      }));
+    const { missingRequired } = computeMissingRequiredQuestions({
+      questions: questions.map((question) => ({
+        id: question.id,
+        questionId: question.questionId,
+        questionType: question.questionType,
+        questionTextSnapshot: question.questionTextSnapshot,
+        questionConfigSnapshot: (question.questionConfigSnapshot ?? {}) as Record<string, unknown>,
+        questionRulesSnapshot: (question.questionRulesSnapshot ?? []) as Array<Record<string, unknown>>,
+        requiredSnapshot: question.requiredSnapshot,
+        appliesToMarketChainSnapshot: Boolean(question.appliesToMarketChainSnapshot),
+      })),
+      answers: answers.map((answer) => ({
+        id: answer.id,
+        visitSessionQuestionId: answer.visitSessionQuestionId,
+        answerStatus: answer.answerStatus,
+        valueText: answer.valueText,
+        valueNumber: answer.valueNumber == null ? null : String(answer.valueNumber),
+        valueJson: (answer.valueJson as Record<string, unknown> | null) ?? null,
+        isValid: answer.isValid,
+      })),
+      photos: committedPhotos.map((photo) => ({
+        id: photo.id,
+        visitAnswerId: photo.visitAnswerId,
+        storagePath: photo.storagePath,
+      })),
+      photoTags: committedPhotoTags.map((tag) => ({
+        visitAnswerPhotoId: tag.visitAnswerPhotoId,
+      })),
+    });
 
     if (missingRequired.length > 0) {
       res.status(409).json({
