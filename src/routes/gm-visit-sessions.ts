@@ -536,11 +536,23 @@ async function resolveVisitSectionsForSelection(input: {
         inArray(campaigns.id, input.campaignIds),
         eq(campaignMarketAssignments.isDeleted, false),
         eq(campaigns.isDeleted, false),
-        eq(campaigns.status, "active"),
         sql`(
-          ${campaigns.scheduleType} = 'always'
+          (
+            ${campaigns.status} = 'active'
+            and (
+              ${campaigns.scheduleType} = 'always'
+              or (
+                ${campaigns.scheduleType} = 'scheduled'
+                and ${campaigns.startDate} is not null
+                and ${campaigns.endDate} is not null
+                and ${campaigns.startDate} <= current_date
+                and ${campaigns.endDate} >= current_date
+              )
+            )
+          )
           or (
-            ${campaigns.scheduleType} = 'scheduled'
+            ${campaigns.status} = 'scheduled'
+            and ${campaigns.scheduleType} = 'scheduled'
             and ${campaigns.startDate} is not null
             and ${campaigns.endDate} is not null
             and ${campaigns.startDate} <= current_date
