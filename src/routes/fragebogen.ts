@@ -164,6 +164,8 @@ let checkedModuleQuestionChainsReadiness = false;
 let hasModuleQuestionChainsTable = false;
 let checkedQuestionAnswerHistoryReadiness = false;
 let hasQuestionAnswerHistoryTable = false;
+let checkedQuestionBankSingleChoiceAvailabilityColumnReadiness = false;
+let hasQuestionBankSingleChoiceAvailabilityColumn = false;
 
 class DomainValidationError extends Error {
   constructor(message: string) {
@@ -190,6 +192,24 @@ async function ensureQuestionAnswerHistoryReady(): Promise<boolean> {
   hasQuestionAnswerHistoryTable = Boolean(result[0]?.question_answer_history);
   checkedQuestionAnswerHistoryReadiness = true;
   return hasQuestionAnswerHistoryTable;
+}
+
+async function ensureQuestionBankSingleChoiceAvailabilityColumnReady(): Promise<boolean> {
+  if (checkedQuestionBankSingleChoiceAvailabilityColumnReadiness) {
+    return hasQuestionBankSingleChoiceAvailabilityColumn;
+  }
+  const result = await pgSql<{ column_exists: boolean }[]>`
+    select exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'question_bank_shared'
+        and column_name = 'single_choice_availability'
+    ) as column_exists
+  `;
+  hasQuestionBankSingleChoiceAvailabilityColumn = Boolean(result[0]?.column_exists);
+  checkedQuestionBankSingleChoiceAvailabilityColumnReadiness = true;
+  return hasQuestionBankSingleChoiceAvailabilityColumn;
 }
 
 function getScopeParam(params: Record<string, string | undefined>): Scope {
@@ -892,11 +912,33 @@ async function loadSpezialfragenByFragebogenIds(dbLike: DbLike, ids: string[]): 
 async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<string, UiQuestion>> {
   const uniqueIds = Array.from(new Set(ids.filter(isUuid)));
   if (uniqueIds.length === 0) return new Map();
+  const hasSingleChoiceAvailabilityColumn = await ensureQuestionBankSingleChoiceAvailabilityColumnReady();
 
-  const baseRows = await dbLike
-    .select()
-    .from(questionBankShared)
-    .where(and(eq(questionBankShared.isDeleted, false), inArray(questionBankShared.id, uniqueIds)));
+  const baseRows = hasSingleChoiceAvailabilityColumn
+    ? await dbLike
+        .select({
+          id: questionBankShared.id,
+          questionType: questionBankShared.questionType,
+          text: questionBankShared.text,
+          required: questionBankShared.required,
+          redSurvey: questionBankShared.redSurvey,
+          singleChoiceAvailability: questionBankShared.singleChoiceAvailability,
+          config: questionBankShared.config,
+        })
+        .from(questionBankShared)
+        .where(and(eq(questionBankShared.isDeleted, false), inArray(questionBankShared.id, uniqueIds)))
+    : await dbLike
+        .select({
+          id: questionBankShared.id,
+          questionType: questionBankShared.questionType,
+          text: questionBankShared.text,
+          required: questionBankShared.required,
+          redSurvey: questionBankShared.redSurvey,
+          singleChoiceAvailability: sql<boolean | null>`null::boolean`.as("single_choice_availability"),
+          config: questionBankShared.config,
+        })
+        .from(questionBankShared)
+        .where(and(eq(questionBankShared.isDeleted, false), inArray(questionBankShared.id, uniqueIds)));
   if (baseRows.length === 0) return new Map();
 
   const questionIds = baseRows.map((row) => row.id);
@@ -1056,6 +1098,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
     questionId && isUuid(questionId)
       ? (await fetchQuestionsByIds(tx, [questionId])).get(questionId) ?? null
       : null;
+  const hasSingleChoiceAvailabilityColumn = await ensureQuestionBankSingleChoiceAvailabilityColumnReady();
   const nextRedSurvey =
     parsed.type === "yesno"
       ? parsed.redSurvey === undefined
@@ -1064,14 +1107,15 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
           : false
         : parsed.redSurvey
       : false;
-  const nextSingleChoiceAvailability =
-    parsed.type === "single"
+  const nextSingleChoiceAvailability = hasSingleChoiceAvailabilityColumn
+    ? parsed.type === "single"
       ? parsed.singleChoiceAvailability === undefined
         ? questionId
           ? (previousQuestion?.singleChoiceAvailability ?? null)
           : false
         : parsed.singleChoiceAvailability
-      : false;
+      : false
+    : false;
 
   if (nextSingleChoiceAvailability === true) {
     config.options = [...SINGLE_CHOICE_AVAILABILITY_OPTIONS];
@@ -1101,7 +1145,9 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         text: parsed.text,
         required: parsed.required,
         redSurvey: nextRedSurvey,
-        singleChoiceAvailability: nextSingleChoiceAvailability,
+        ...(hasSingleChoiceAvailabilityColumn
+          ? { singleChoiceAvailability: nextSingleChoiceAvailability }
+          : {}),
         config: cleanConfig,
         rules: [],
         scoring: {},
@@ -1116,7 +1162,9 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         text: parsed.text,
         required: parsed.required,
         redSurvey: nextRedSurvey,
-        singleChoiceAvailability: nextSingleChoiceAvailability,
+        ...(hasSingleChoiceAvailabilityColumn
+          ? { singleChoiceAvailability: nextSingleChoiceAvailability }
+          : {}),
         config: cleanConfig,
         rules: [],
         scoring: {},
@@ -1562,13 +1610,20 @@ adminFragebogenRouter.patch("/photo-tags/:id", async (req, res, next) => {
 
 adminFragebogenRouter.get("/questions", async (_req, res, next) => {
   try {
-    const rows = await db
-      .select({ id: questionBankShared.id })
-      .from(questionBankShared)
-      .where(
-        sql`${questionBankShared.isDeleted} = false AND coalesce(${questionBankShared.singleChoiceAvailability}, false) = false`,
-      )
-      .orderBy(desc(questionBankShared.updatedAt));
+    const hasSingleChoiceAvailabilityColumn = await ensureQuestionBankSingleChoiceAvailabilityColumnReady();
+    const rows = hasSingleChoiceAvailabilityColumn
+      ? await db
+          .select({ id: questionBankShared.id })
+          .from(questionBankShared)
+          .where(
+            sql`${questionBankShared.isDeleted} = false AND coalesce(${questionBankShared.singleChoiceAvailability}, false) = false`,
+          )
+          .orderBy(desc(questionBankShared.updatedAt))
+      : await db
+          .select({ id: questionBankShared.id })
+          .from(questionBankShared)
+          .where(eq(questionBankShared.isDeleted, false))
+          .orderBy(desc(questionBankShared.updatedAt));
     const questionsMap = await fetchQuestionsByIds(db, rows.map((row) => row.id));
     res.status(200).json({ questions: rows.map((row) => questionsMap.get(row.id)).filter(Boolean) });
   } catch (error) {
