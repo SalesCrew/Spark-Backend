@@ -81,6 +81,7 @@ const questionTypeSchema = z.enum([
   "photo",
   "matrix",
 ]);
+const SINGLE_CHOICE_AVAILABILITY_OPTIONS = ["Voll", "Mittel", "Leer"] as const;
 
 const scoreValueSchema = z
   .object({
@@ -108,6 +109,7 @@ const questionSchema = z
     text: z.string().default(""),
     required: z.boolean().default(true),
     redSurvey: z.boolean().nullable().optional(),
+    singleChoiceAvailability: z.boolean().nullable().optional(),
     config: z.record(z.string(), z.unknown()).default({}),
     rules: z.array(ruleSchema).default([]),
     scoring: z.record(z.string(), scoreValueSchema).default({}),
@@ -255,13 +257,17 @@ function validateQuestionDomain(question: UiQuestion) {
   if (question.redSurvey === true && question.type !== "yesno") {
     throw new DomainValidationError("Red Survey darf nur fuer Ja/Nein Fragen aktiviert werden.");
   }
+  if (question.singleChoiceAvailability === true && question.type !== "single") {
+    throw new DomainValidationError("Verfuegbarkeitsabfrage darf nur fuer Single Choice Fragen aktiviert werden.");
+  }
   if ((question.type === "numeric" || question.type === "slider") && scoringKeys.some((key) => key !== "__value__")) {
     throw new DomainValidationError("Numerische Fragen duerfen nur den Scoring-Key '__value__' verwenden.");
   }
 
   if (question.type === "single" || question.type === "multiple") {
     const options = parseArrayField(config.options);
-    if (options.length === 0) {
+    const allowCanonicalAvailabilityOptions = question.type === "single" && question.singleChoiceAvailability === true;
+    if (!allowCanonicalAvailabilityOptions && options.length === 0) {
       throw new DomainValidationError("Auswahlfragen benoetigen mindestens eine Option.");
     }
   }
@@ -484,6 +490,7 @@ function questionGraphSnapshotForComparison(question: UiQuestion) {
     text: question.text,
     required: question.required,
     redSurvey: question.redSurvey ?? null,
+    singleChoiceAvailability: question.singleChoiceAvailability ?? null,
     config: sortJsonValue(
       sanitizeQuestionConfig((question.config ?? {}) as Record<string, unknown>),
     ) as Record<string, unknown>,
@@ -990,6 +997,7 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
       text: base.text,
       required: base.required,
       redSurvey: base.redSurvey,
+      singleChoiceAvailability: base.singleChoiceAvailability,
       config,
       rules: rulesByQuestion.get(base.id) ?? [],
       scoring: scoringByQuestion.get(base.id) ?? {},
@@ -1048,6 +1056,18 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
           : false
         : parsed.redSurvey
       : false;
+  const nextSingleChoiceAvailability =
+    parsed.type === "single"
+      ? parsed.singleChoiceAvailability === undefined
+        ? questionId
+          ? (previousQuestion?.singleChoiceAvailability ?? null)
+          : false
+        : parsed.singleChoiceAvailability
+      : false;
+
+  if (nextSingleChoiceAvailability === true) {
+    config.options = [...SINGLE_CHOICE_AVAILABILITY_OPTIONS];
+  }
 
   const cleanConfig = sanitizeQuestionConfig(config);
   if (previousQuestion && questionId) {
@@ -1073,6 +1093,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         text: parsed.text,
         required: parsed.required,
         redSurvey: nextRedSurvey,
+        singleChoiceAvailability: nextSingleChoiceAvailability,
         config: cleanConfig,
         rules: [],
         scoring: {},
@@ -1087,6 +1108,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         text: parsed.text,
         required: parsed.required,
         redSurvey: nextRedSurvey,
+        singleChoiceAvailability: nextSingleChoiceAvailability,
         config: cleanConfig,
         rules: [],
         scoring: {},
@@ -1586,6 +1608,9 @@ adminFragebogenRouter.patch("/questions/:id", async (req, res, next) => {
       redSurvey: Object.prototype.hasOwnProperty.call(partial.data, "redSurvey")
         ? partial.data.redSurvey
         : (existing.redSurvey ?? null),
+      singleChoiceAvailability: Object.prototype.hasOwnProperty.call(partial.data, "singleChoiceAvailability")
+        ? partial.data.singleChoiceAvailability
+        : (existing.singleChoiceAvailability ?? null),
       config: partial.data.config ?? existing.config,
       rules: partial.data.rules ?? existing.rules,
       scoring: partial.data.scoring ?? existing.scoring,

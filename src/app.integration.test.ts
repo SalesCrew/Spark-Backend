@@ -92,6 +92,8 @@ let checkedQuestionAnswerHistoryReadiness = false;
 let dbHasQuestionAnswerHistoryTable = false;
 let checkedRedSurveyReadiness = false;
 let dbHasRedSurveyColumns = false;
+let checkedSingleChoiceAvailabilityReadiness = false;
+let dbHasSingleChoiceAvailabilityColumns = false;
 
 async function ensureDbReadyForFragebogenTests(): Promise<boolean> {
   if (checkedDbReadiness) return dbHasFragebogenTables;
@@ -133,6 +135,30 @@ async function ensureDbReadyForRedSurveyTests(): Promise<boolean> {
   dbHasRedSurveyColumns = questionColumns.has("red_survey") && visitQuestionColumns.has("red_survey_snapshot");
   checkedRedSurveyReadiness = true;
   return dbHasRedSurveyColumns;
+}
+
+async function ensureDbReadyForSingleChoiceAvailabilityTests(): Promise<boolean> {
+  if (checkedSingleChoiceAvailabilityReadiness) return dbHasSingleChoiceAvailabilityColumns;
+  const questionColumnRows = await sql<{ column_name: string }[]>`
+    select column_name
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'question_bank_shared'
+      and column_name in ('single_choice_availability')
+  `;
+  const visitQuestionColumnRows = await sql<{ column_name: string }[]>`
+    select column_name
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'visit_session_questions'
+      and column_name in ('single_choice_availability_snapshot')
+  `;
+  const questionColumns = new Set(questionColumnRows.map((entry) => entry.column_name));
+  const visitQuestionColumns = new Set(visitQuestionColumnRows.map((entry) => entry.column_name));
+  dbHasSingleChoiceAvailabilityColumns = questionColumns.has("single_choice_availability")
+    && visitQuestionColumns.has("single_choice_availability_snapshot");
+  checkedSingleChoiceAvailabilityReadiness = true;
+  return dbHasSingleChoiceAvailabilityColumns;
 }
 
 async function ensureDbReadyForCampaignTests(): Promise<boolean> {
@@ -1703,6 +1729,285 @@ test("historical yesno question keeps null red survey until explicitly changed",
         updatedAt: new Date(),
       })
       .where(eq(questionBankShared.id, questionId));
+  }
+});
+
+test("single choice availability persists for single, canonicalizes options, and rejects non-single activation", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForFragebogenTests()) || !(await ensureDbReadyForSingleChoiceAvailabilityTests())) {
+    t.skip("Single choice availability columns are not present in the configured DATABASE_URL.");
+    return;
+  }
+
+  const app = createApp();
+  const uniq = `it-single-availability-module-${Date.now()}`;
+
+  const createModuleRes = await request(app).post("/admin/modules/main").send({
+    name: `Module ${uniq}`,
+    description: "",
+    sectionKeywords: ["standard"],
+    questions: [
+      {
+        id: `tmp-single-${uniq}`,
+        type: "single",
+        text: `Single ${uniq}`,
+        required: true,
+        singleChoiceAvailability: true,
+        config: { options: ["Top", "Leer"] },
+        rules: [],
+        scoring: {},
+      },
+    ],
+  });
+  assert.equal(createModuleRes.status, 201);
+  const moduleId = createModuleRes.body.module?.id as string;
+  assert.ok(moduleId);
+
+  const createdQuestions = createModuleRes.body.module?.questions as Array<{
+    id: string;
+    text: string;
+    singleChoiceAvailability?: boolean | null;
+    config?: Record<string, unknown>;
+  }>;
+  const singleQuestion = createdQuestions.find((question) => question.text === `Single ${uniq}`);
+  assert.ok(singleQuestion?.id);
+  assert.equal(singleQuestion?.singleChoiceAvailability, true);
+  assert.deepEqual(((singleQuestion?.config ?? {}).options as string[] | undefined) ?? [], ["Voll", "Mittel", "Leer"]);
+
+  const [persistedSingle] = await db
+    .select({
+      singleChoiceAvailability: questionBankShared.singleChoiceAvailability,
+      config: questionBankShared.config,
+    })
+    .from(questionBankShared)
+    .where(eq(questionBankShared.id, singleQuestion!.id))
+    .limit(1);
+  assert.equal(persistedSingle?.singleChoiceAvailability ?? null, true);
+  const persistedOptions = ((persistedSingle?.config ?? {}) as Record<string, unknown>).options;
+  assert.deepEqual(Array.isArray(persistedOptions) ? persistedOptions : [], ["Voll", "Mittel", "Leer"]);
+
+  const invalidQuestionRes = await request(app).post("/admin/questions").send({
+    type: "text",
+    text: `Invalid single availability ${uniq}`,
+    required: true,
+    singleChoiceAvailability: true,
+    config: {},
+    rules: [],
+    scoring: {},
+  });
+  assert.equal(invalidQuestionRes.status, 400);
+  assert.equal(
+    invalidQuestionRes.body.error,
+    "Verfuegbarkeitsabfrage darf nur fuer Single Choice Fragen aktiviert werden.",
+  );
+
+  await request(app).patch(`/admin/modules/main/${moduleId}/delete`).send({});
+});
+
+test("gm visit session snapshots single choice availability flag", async (t) => {
+  enableTestAuthBypass();
+  if (
+    !(await ensureDbReadyForVisitSessionTests())
+    || !(await ensureDbReadyForCampaignTests())
+    || !(await ensureDbReadyForSingleChoiceAvailabilityTests())
+  ) {
+    t.skip("Visit session single choice availability columns are not present in the configured DATABASE_URL.");
+    return;
+  }
+
+  const [gmUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(1);
+  if (!gmUser?.id) {
+    t.skip("No active GM user available for single choice availability snapshot test.");
+    return;
+  }
+
+  await ensureStartedDayForGm(gmUser.id);
+  setTestBypassRole("gm");
+  setTestBypassUserId(gmUser.id);
+
+  const now = new Date();
+  const uniq = `visit-single-availability-${Date.now()}`;
+  const campaignId = randomUUID();
+  const moduleId = randomUUID();
+  const fragebogenId = randomUUID();
+  const marketId = randomUUID();
+  const availabilityQuestionId = randomUUID();
+  const normalQuestionId = randomUUID();
+  let createdSessionId: string | null = null;
+
+  try {
+    await db.insert(questionBankShared).values([
+      {
+        id: availabilityQuestionId,
+        questionType: "single",
+        text: `Availability Single ${uniq}`,
+        required: false,
+        singleChoiceAvailability: true,
+        config: { options: ["Voll", "Mittel", "Leer"] },
+        rules: [],
+        scoring: {},
+        isDeleted: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: normalQuestionId,
+        questionType: "single",
+        text: `Normal Single ${uniq}`,
+        required: false,
+        singleChoiceAvailability: false,
+        config: { options: ["A", "B"] },
+        rules: [],
+        scoring: {},
+        isDeleted: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
+
+    await db.insert(moduleMain).values({
+      id: moduleId,
+      name: `Single Availability Module ${uniq}`,
+      description: "",
+      sectionKeywords: ["standard"],
+      isDeleted: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(moduleMainQuestion).values([
+      {
+        moduleId,
+        questionId: availabilityQuestionId,
+        orderIndex: 0,
+        isDeleted: false,
+        deletedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        moduleId,
+        questionId: normalQuestionId,
+        orderIndex: 1,
+        isDeleted: false,
+        deletedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
+
+    await db.insert(fragebogenMain).values({
+      id: fragebogenId,
+      name: `Single Availability FB ${uniq}`,
+      description: "",
+      sectionKeywords: ["standard"],
+      nurEinmalAusfuellbar: false,
+      status: "active",
+      scheduleType: "always",
+      isDeleted: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(fragebogenMainModule).values({
+      fragebogenId,
+      moduleId,
+      orderIndex: 0,
+      isDeleted: false,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(markets).values({
+      id: marketId,
+      name: `Single Availability Markt ${uniq}`,
+      dbName: "",
+      address: "Single Straße 1",
+      postalCode: "1010",
+      city: "Wien",
+      region: "Wien",
+      isDeleted: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(campaigns).values({
+      id: campaignId,
+      name: `Single Availability Campaign ${uniq}`,
+      section: "standard",
+      currentFragebogenId: fragebogenId,
+      status: "active",
+      scheduleType: "always",
+      isDeleted: false,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(campaignMarketAssignments).values({
+      campaignId,
+      marketId,
+      gmUserId: gmUser.id,
+      assignedAt: now,
+      assignedByUserId: null,
+      isDeleted: false,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const app = createApp();
+    const createRes = await request(app).post("/markets/gm/visit-sessions").send({
+      marketId,
+      campaignIds: [campaignId],
+    });
+    assert.equal(createRes.status, 201);
+    createdSessionId = createRes.body.session?.id as string;
+    assert.ok(createdSessionId);
+
+    const snapshotRows = await db
+      .select({
+        questionId: visitSessionQuestions.questionId,
+        singleChoiceAvailabilitySnapshot: visitSessionQuestions.singleChoiceAvailabilitySnapshot,
+      })
+      .from(visitSessionQuestions)
+      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+      .where(and(eq(visitSessionSections.visitSessionId, createdSessionId), eq(visitSessionQuestions.isDeleted, false)));
+    const snapshotByQuestionId = new Map(
+      snapshotRows.map((row) => [row.questionId, row.singleChoiceAvailabilitySnapshot]),
+    );
+    assert.equal(snapshotByQuestionId.get(availabilityQuestionId), true);
+    assert.equal(snapshotByQuestionId.get(normalQuestionId), false);
+  } finally {
+    if (createdSessionId) {
+      await db
+        .update(visitSessions)
+        .set({ isDeleted: true, deletedAt: new Date(), updatedAt: new Date() })
+        .where(eq(visitSessions.id, createdSessionId));
+    }
+    await db
+      .update(campaigns)
+      .set({ isDeleted: true, deletedAt: new Date(), updatedAt: new Date() })
+      .where(eq(campaigns.id, campaignId));
+    await db
+      .update(markets)
+      .set({ isDeleted: true, updatedAt: new Date() })
+      .where(eq(markets.id, marketId));
+    await db
+      .update(fragebogenMain)
+      .set({ isDeleted: true, updatedAt: new Date() })
+      .where(eq(fragebogenMain.id, fragebogenId));
+    await db
+      .update(moduleMain)
+      .set({ isDeleted: true, updatedAt: new Date() })
+      .where(eq(moduleMain.id, moduleId));
+    await db
+      .update(questionBankShared)
+      .set({ isDeleted: true, updatedAt: new Date() })
+      .where(inArray(questionBankShared.id, [availabilityQuestionId, normalQuestionId]));
+    delete process.env.BYPASS_AUTH_ROLE;
+    delete process.env.BYPASS_AUTH_USER_ID;
   }
 });
 
