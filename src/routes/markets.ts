@@ -841,6 +841,61 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
   }
 });
 
+marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    if (req.authUser?.role === "sm") {
+      res.status(403).json({ error: "Nur GMs (oder Admin zur Einsicht) duerfen diese Daten abrufen." });
+      return;
+    }
+
+    await refreshRedMonthCalendarConfig();
+    const [rows, activeFlexCampaignRows] = await Promise.all([
+      db
+        .select()
+        .from(markets)
+        .where(eq(markets.isDeleted, false))
+        .orderBy(desc(markets.createdAt)),
+      db
+        .select({
+          campaignId: campaigns.id,
+          campaignName: campaigns.name,
+          section: campaigns.section,
+        })
+        .from(campaigns)
+        .where(
+          and(
+            eq(campaigns.section, "flex"),
+            eq(campaigns.isDeleted, false),
+            isNotNull(campaigns.currentFragebogenId),
+            campaignIsLiveNowCondition(),
+          ),
+        )
+        .orderBy(asc(campaigns.name)),
+    ]);
+
+    const activeFlexCampaigns: ActiveNowCampaignSummary[] = activeFlexCampaignRows.map((row) => ({
+      campaignId: row.campaignId,
+      campaignName: row.campaignName,
+      section: row.section,
+    }));
+    const gmNamesByMarketId = await resolveActiveStandardGmNamesByMarketIds(rows.map((row) => row.id));
+    res.status(200).json({
+      markets: rows.map((row) => ({
+        ...mapMarketRow(row),
+        plannedByActiveStandardGmName: gmNamesByMarketId.get(row.id) ?? null,
+        activeNowCampaigns: activeFlexCampaigns,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;

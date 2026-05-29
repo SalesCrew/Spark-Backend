@@ -1081,6 +1081,8 @@ async function buildCampaignMarketVisitSummaries(campaignId: string) {
           type: string;
           text: string;
           required: boolean;
+          singleChoiceAvailability: boolean | null;
+          singleChoiceAvailabilityType: string | null;
           config: Record<string, unknown>;
           rules: Array<Record<string, unknown>>;
           chains: string[];
@@ -1183,6 +1185,8 @@ async function buildCampaignMarketVisitSummaries(campaignId: string) {
             type: question.questionType,
             text: question.questionTextSnapshot,
             required: question.requiredSnapshot,
+            singleChoiceAvailability: question.singleChoiceAvailabilitySnapshot ?? null,
+            singleChoiceAvailabilityType: question.singleChoiceAvailabilityTypeSnapshot ?? null,
             config: (question.questionConfigSnapshot ?? {}) as Record<string, unknown>,
             rules: (question.questionRulesSnapshot ?? []) as Array<Record<string, unknown>>,
             chains: normalizeQuestionChains(question.questionChainsSnapshot),

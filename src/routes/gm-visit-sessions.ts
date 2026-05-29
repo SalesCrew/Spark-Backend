@@ -64,6 +64,8 @@ const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
 const VISIT_PHOTOS_BUCKET = "visit-photos";
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const isUuid = (value: string | null | undefined): value is string => Boolean(value && uuidRegex.test(value));
+const SINGLE_CHOICE_AVAILABILITY_TYPES = ["Cooler", "SingleServe", "MultiServe", "Promos", "Warehouse"] as const;
+type SingleChoiceAvailabilityType = (typeof SINGLE_CHOICE_AVAILABILITY_TYPES)[number];
 
 type ResolvedQuestion = {
   questionId: string;
@@ -72,6 +74,7 @@ type ResolvedQuestion = {
   required: boolean;
   redSurvey: boolean | null;
   singleChoiceAvailability: boolean | null;
+  singleChoiceAvailabilityType: SingleChoiceAvailabilityType | null;
   config: Record<string, unknown>;
   rules: Array<Record<string, unknown>>;
   scoring: Record<string, Record<string, unknown>>;
@@ -110,6 +113,7 @@ function toResolvedQuestion(question: {
   required: boolean;
   redSurvey?: boolean | null;
   singleChoiceAvailability?: boolean | null;
+  singleChoiceAvailabilityType?: SingleChoiceAvailabilityType | null;
   config: Record<string, unknown>;
   rules?: Array<Record<string, unknown>>;
   scoring?: Record<string, Record<string, unknown>>;
@@ -123,6 +127,7 @@ function toResolvedQuestion(question: {
     required: question.required,
     redSurvey: question.redSurvey ?? null,
     singleChoiceAvailability: question.singleChoiceAvailability ?? null,
+    singleChoiceAvailabilityType: question.singleChoiceAvailabilityType ?? null,
     config: question.config ?? {},
     rules: question.rules ?? [],
     scoring: question.scoring ?? {},
@@ -516,6 +521,29 @@ async function resolveVisitSectionsForSelection(input: {
   marketId: string;
   campaignIds: string[];
 }): Promise<ResolvedSection[]> {
+  const liveNowCondition = sql`(
+    (
+      ${campaigns.status} = 'active'
+      and (
+        ${campaigns.scheduleType} = 'always'
+        or (
+          ${campaigns.scheduleType} = 'scheduled'
+          and ${campaigns.startDate} is not null
+          and ${campaigns.endDate} is not null
+          and ${campaigns.startDate} <= current_date
+          and ${campaigns.endDate} >= current_date
+        )
+      )
+    )
+    or (
+      ${campaigns.status} = 'scheduled'
+      and ${campaigns.scheduleType} = 'scheduled'
+      and ${campaigns.startDate} is not null
+      and ${campaigns.endDate} is not null
+      and ${campaigns.startDate} <= current_date
+      and ${campaigns.endDate} >= current_date
+    )
+  )`;
   const [marketRow] = await db
     .select({ dbName: markets.dbName })
     .from(markets)
@@ -539,33 +567,33 @@ async function resolveVisitSectionsForSelection(input: {
         inArray(campaigns.id, input.campaignIds),
         eq(campaignMarketAssignments.isDeleted, false),
         eq(campaigns.isDeleted, false),
-        sql`(
-          (
-            ${campaigns.status} = 'active'
-            and (
-              ${campaigns.scheduleType} = 'always'
-              or (
-                ${campaigns.scheduleType} = 'scheduled'
-                and ${campaigns.startDate} is not null
-                and ${campaigns.endDate} is not null
-                and ${campaigns.startDate} <= current_date
-                and ${campaigns.endDate} >= current_date
-              )
-            )
-          )
-          or (
-            ${campaigns.status} = 'scheduled'
-            and ${campaigns.scheduleType} = 'scheduled'
-            and ${campaigns.startDate} is not null
-            and ${campaigns.endDate} is not null
-            and ${campaigns.startDate} <= current_date
-            and ${campaigns.endDate} >= current_date
-          )
-        )`,
+        liveNowCondition,
       ),
     );
 
   const selectedById = new Map(selectedRows.map((row) => [row.campaignId, row]));
+  const missingAfterAssignment = input.campaignIds.filter((id) => !selectedById.has(id));
+  if (missingAfterAssignment.length > 0) {
+    const flexFallbackRows = await db
+      .select({
+        campaignId: campaigns.id,
+        campaignName: campaigns.name,
+        section: campaigns.section,
+        currentFragebogenId: campaigns.currentFragebogenId,
+      })
+      .from(campaigns)
+      .where(
+        and(
+          inArray(campaigns.id, missingAfterAssignment),
+          eq(campaigns.section, "flex"),
+          eq(campaigns.isDeleted, false),
+          liveNowCondition,
+        ),
+      );
+    for (const row of flexFallbackRows) {
+      selectedById.set(row.campaignId, row);
+    }
+  }
   const missingRequested = input.campaignIds.filter((id) => !selectedById.has(id));
   if (missingRequested.length > 0) {
     const err = new Error("Mindestens eine ausgewählte Kampagne ist nicht mehr aktiv/zugeordnet.");
@@ -630,6 +658,9 @@ async function resolveVisitSectionsForSelection(input: {
                   type: question.type,
                   text: question.text,
                   required: question.required,
+                  redSurvey: question.redSurvey ?? null,
+                  singleChoiceAvailability: question.singleChoiceAvailability ?? null,
+                  singleChoiceAvailabilityType: (question.singleChoiceAvailabilityType as SingleChoiceAvailabilityType | null) ?? null,
                   config: question.config ?? {},
                   rules: (question.rules ?? []) as Array<Record<string, unknown>>,
                   scoring: question.scoring ?? {},
@@ -666,6 +697,9 @@ async function resolveVisitSectionsForSelection(input: {
                   type: question.type,
                   text: question.text,
                   required: question.required,
+                  redSurvey: question.redSurvey ?? null,
+                  singleChoiceAvailability: question.singleChoiceAvailability ?? null,
+                  singleChoiceAvailabilityType: (question.singleChoiceAvailabilityType as SingleChoiceAvailabilityType | null) ?? null,
                   config: question.config ?? {},
                   rules: (question.rules ?? []) as Array<Record<string, unknown>>,
                   scoring: question.scoring ?? {},
@@ -702,6 +736,9 @@ async function resolveVisitSectionsForSelection(input: {
                 type: question.type,
                 text: question.text,
                 required: question.required,
+                redSurvey: question.redSurvey ?? null,
+                singleChoiceAvailability: question.singleChoiceAvailability ?? null,
+                singleChoiceAvailabilityType: (question.singleChoiceAvailabilityType as SingleChoiceAvailabilityType | null) ?? null,
                 config: question.config ?? {},
                 rules: (question.rules ?? []) as Array<Record<string, unknown>>,
                 scoring: question.scoring ?? {},
@@ -749,6 +786,8 @@ async function loadStartSectionsFromSession(sessionId: string): Promise<Array<{
     type: "single" | "yesno" | "yesnomulti" | "multiple" | "likert" | "text" | "numeric" | "slider" | "photo" | "matrix";
     text: string;
     required: boolean;
+    singleChoiceAvailability: boolean | null;
+    singleChoiceAvailabilityType: SingleChoiceAvailabilityType | null;
     config: Record<string, unknown>;
     rules: Array<Record<string, unknown>>;
     scoring: Record<string, Record<string, unknown>>;
@@ -814,6 +853,8 @@ async function loadStartSectionsFromSession(sessionId: string): Promise<Array<{
         type: question.questionType,
         text: question.questionTextSnapshot,
         required: question.requiredSnapshot,
+        singleChoiceAvailability: question.singleChoiceAvailabilitySnapshot ?? null,
+        singleChoiceAvailabilityType: (question.singleChoiceAvailabilityTypeSnapshot as SingleChoiceAvailabilityType | null) ?? null,
         config,
         rules: (question.questionRulesSnapshot ?? []) as Array<Record<string, unknown>>,
         scoring: {},
@@ -1312,6 +1353,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
               requiredSnapshot: question.required,
               redSurveySnapshot: question.redSurvey,
               singleChoiceAvailabilitySnapshot: question.singleChoiceAvailability,
+              singleChoiceAvailabilityTypeSnapshot: question.singleChoiceAvailabilityType,
               orderIndex: questionOrder,
               isDeleted: false,
               deletedAt: null,
@@ -1483,6 +1525,8 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
           type: q.type,
           text: q.text,
           required: q.required,
+          singleChoiceAvailability: q.singleChoiceAvailability,
+          singleChoiceAvailabilityType: q.singleChoiceAvailabilityType,
           config: q.config,
           rules: q.rules,
           scoring: q.scoring,
@@ -1684,6 +1728,8 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
             type: question.questionType,
             text: question.questionTextSnapshot,
             required: question.requiredSnapshot,
+            singleChoiceAvailability: question.singleChoiceAvailabilitySnapshot ?? null,
+            singleChoiceAvailabilityType: (question.singleChoiceAvailabilityTypeSnapshot as SingleChoiceAvailabilityType | null) ?? null,
             config: enrichedConfig,
             rules: question.questionRulesSnapshot,
             chains: normalizeQuestionChains(question.questionChainsSnapshot),

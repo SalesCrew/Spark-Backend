@@ -82,6 +82,7 @@ const questionTypeSchema = z.enum([
   "matrix",
 ]);
 const SINGLE_CHOICE_AVAILABILITY_OPTIONS = ["Voll", "Mittel", "Leer"] as const;
+const SINGLE_CHOICE_AVAILABILITY_TYPES = ["Cooler", "SingleServe", "MultiServe", "Promos", "Warehouse"] as const;
 
 const scoreValueSchema = z
   .object({
@@ -110,6 +111,7 @@ const questionSchema = z
     required: z.boolean().default(true),
     redSurvey: z.boolean().nullable().optional(),
     singleChoiceAvailability: z.boolean().nullable().optional(),
+    singleChoiceAvailabilityType: z.enum(SINGLE_CHOICE_AVAILABILITY_TYPES).nullable().optional(),
     config: z.record(z.string(), z.unknown()).default({}),
     rules: z.array(ruleSchema).default([]),
     scoring: z.record(z.string(), scoreValueSchema).default({}),
@@ -166,6 +168,8 @@ let checkedQuestionAnswerHistoryReadiness = false;
 let hasQuestionAnswerHistoryTable = false;
 let checkedQuestionBankSingleChoiceAvailabilityColumnReadiness = false;
 let hasQuestionBankSingleChoiceAvailabilityColumn = false;
+let checkedQuestionBankSingleChoiceAvailabilityTypeColumnReadiness = false;
+let hasQuestionBankSingleChoiceAvailabilityTypeColumn = false;
 
 class DomainValidationError extends Error {
   constructor(message: string) {
@@ -212,6 +216,24 @@ async function ensureQuestionBankSingleChoiceAvailabilityColumnReady(): Promise<
   return hasQuestionBankSingleChoiceAvailabilityColumn;
 }
 
+async function ensureQuestionBankSingleChoiceAvailabilityTypeColumnReady(): Promise<boolean> {
+  if (checkedQuestionBankSingleChoiceAvailabilityTypeColumnReadiness) {
+    return hasQuestionBankSingleChoiceAvailabilityTypeColumn;
+  }
+  const result = await pgSql<{ column_exists: boolean }[]>`
+    select exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'question_bank_shared'
+        and column_name = 'single_choice_availability_type'
+    ) as column_exists
+  `;
+  hasQuestionBankSingleChoiceAvailabilityTypeColumn = Boolean(result[0]?.column_exists);
+  checkedQuestionBankSingleChoiceAvailabilityTypeColumnReadiness = true;
+  return hasQuestionBankSingleChoiceAvailabilityTypeColumn;
+}
+
 function getScopeParam(params: Record<string, string | undefined>): Scope {
   return scopeSchema.parse(params.scope ?? params["scope(main|kuehler|mhd)"]);
 }
@@ -229,6 +251,19 @@ function parseArrayField(raw: unknown): string[] {
     }
   }
   return [];
+}
+
+function normalizeSingleChoiceAvailabilityType(
+  value: unknown,
+): UiQuestion["singleChoiceAvailabilityType"] {
+  if (value == null) return null;
+  if (
+    typeof value === "string"
+    && (SINGLE_CHOICE_AVAILABILITY_TYPES as readonly string[]).includes(value)
+  ) {
+    return value as UiQuestion["singleChoiceAvailabilityType"];
+  }
+  return null;
 }
 
 function normalizeChainDbNames(rawChains: string[] | undefined): string[] {
@@ -279,6 +314,9 @@ function validateQuestionDomain(question: UiQuestion) {
   }
   if (question.singleChoiceAvailability === true && question.type !== "single") {
     throw new DomainValidationError("Verfuegbarkeitsabfrage darf nur fuer Single Choice Fragen aktiviert werden.");
+  }
+  if (question.singleChoiceAvailabilityType != null && question.type !== "single") {
+    throw new DomainValidationError("Verfuegbarkeits-Typ darf nur fuer Single Choice Fragen gesetzt werden.");
   }
   if ((question.type === "numeric" || question.type === "slider") && scoringKeys.some((key) => key !== "__value__")) {
     throw new DomainValidationError("Numerische Fragen duerfen nur den Scoring-Key '__value__' verwenden.");
@@ -511,6 +549,7 @@ function questionGraphSnapshotForComparison(question: UiQuestion) {
     required: question.required,
     redSurvey: question.redSurvey ?? null,
     singleChoiceAvailability: question.singleChoiceAvailability ?? null,
+    singleChoiceAvailabilityType: question.singleChoiceAvailabilityType ?? null,
     config: sortJsonValue(
       sanitizeQuestionConfig((question.config ?? {}) as Record<string, unknown>),
     ) as Record<string, unknown>,
@@ -733,11 +772,16 @@ function pickScopeConfig(scope: Scope) {
   };
 }
 
-function normalizeSingleChoiceAvailabilityForScope(question: UiQuestion, scope: Scope): UiQuestion {
-  if (scope === "kuehler") return question;
+function normalizeSingleChoiceAvailabilityForScope(
+  question: UiQuestion,
+  scope: Scope,
+  previousQuestion: UiQuestion | null,
+): UiQuestion {
+  if (scope === "main") return question;
   return {
     ...question,
-    singleChoiceAvailability: false,
+    singleChoiceAvailability: previousQuestion?.singleChoiceAvailability ?? false,
+    singleChoiceAvailabilityType: previousQuestion?.singleChoiceAvailabilityType ?? null,
   };
 }
 
@@ -913,8 +957,11 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
   const uniqueIds = Array.from(new Set(ids.filter(isUuid)));
   if (uniqueIds.length === 0) return new Map();
   const hasSingleChoiceAvailabilityColumn = await ensureQuestionBankSingleChoiceAvailabilityColumnReady();
+  const hasSingleChoiceAvailabilityTypeColumn = hasSingleChoiceAvailabilityColumn
+    ? await ensureQuestionBankSingleChoiceAvailabilityTypeColumnReady()
+    : false;
 
-  const baseRows = hasSingleChoiceAvailabilityColumn
+  const baseRows = hasSingleChoiceAvailabilityColumn && hasSingleChoiceAvailabilityTypeColumn
     ? await dbLike
         .select({
           id: questionBankShared.id,
@@ -923,10 +970,25 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
           required: questionBankShared.required,
           redSurvey: questionBankShared.redSurvey,
           singleChoiceAvailability: questionBankShared.singleChoiceAvailability,
+          singleChoiceAvailabilityType: questionBankShared.singleChoiceAvailabilityType,
           config: questionBankShared.config,
         })
         .from(questionBankShared)
         .where(and(eq(questionBankShared.isDeleted, false), inArray(questionBankShared.id, uniqueIds)))
+    : hasSingleChoiceAvailabilityColumn
+      ? await dbLike
+          .select({
+            id: questionBankShared.id,
+            questionType: questionBankShared.questionType,
+            text: questionBankShared.text,
+            required: questionBankShared.required,
+            redSurvey: questionBankShared.redSurvey,
+            singleChoiceAvailability: questionBankShared.singleChoiceAvailability,
+            singleChoiceAvailabilityType: sql<string | null>`null::text`.as("single_choice_availability_type"),
+            config: questionBankShared.config,
+          })
+          .from(questionBankShared)
+          .where(and(eq(questionBankShared.isDeleted, false), inArray(questionBankShared.id, uniqueIds)))
     : await dbLike
         .select({
           id: questionBankShared.id,
@@ -935,6 +997,7 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
           required: questionBankShared.required,
           redSurvey: questionBankShared.redSurvey,
           singleChoiceAvailability: sql<boolean | null>`null::boolean`.as("single_choice_availability"),
+          singleChoiceAvailabilityType: sql<string | null>`null::text`.as("single_choice_availability_type"),
           config: questionBankShared.config,
         })
         .from(questionBankShared)
@@ -1048,6 +1111,7 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
       required: base.required,
       redSurvey: base.redSurvey,
       singleChoiceAvailability: base.singleChoiceAvailability,
+      singleChoiceAvailabilityType: normalizeSingleChoiceAvailabilityType(base.singleChoiceAvailabilityType),
       config,
       rules: rulesByQuestion.get(base.id) ?? [],
       scoring: scoringByQuestion.get(base.id) ?? {},
@@ -1099,6 +1163,9 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
       ? (await fetchQuestionsByIds(tx, [questionId])).get(questionId) ?? null
       : null;
   const hasSingleChoiceAvailabilityColumn = await ensureQuestionBankSingleChoiceAvailabilityColumnReady();
+  const hasSingleChoiceAvailabilityTypeColumn = hasSingleChoiceAvailabilityColumn
+    ? await ensureQuestionBankSingleChoiceAvailabilityTypeColumnReady()
+    : false;
   const nextRedSurvey =
     parsed.type === "yesno"
       ? parsed.redSurvey === undefined
@@ -1116,6 +1183,30 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         : parsed.singleChoiceAvailability
       : false
     : false;
+  const nextSingleChoiceAvailabilityType = hasSingleChoiceAvailabilityTypeColumn
+    ? parsed.type === "single"
+      ? nextSingleChoiceAvailability === true
+        ? parsed.singleChoiceAvailabilityType === undefined
+          ? questionId
+            ? (previousQuestion?.singleChoiceAvailabilityType ?? null)
+            : null
+          : parsed.singleChoiceAvailabilityType
+        : null
+      : null
+    : null;
+
+  const canKeepLegacyAvailabilityType =
+    previousQuestion?.singleChoiceAvailability === true
+    && (previousQuestion?.singleChoiceAvailabilityType ?? null) == null
+    && parsed.singleChoiceAvailabilityType === undefined;
+  if (
+    hasSingleChoiceAvailabilityTypeColumn
+    && nextSingleChoiceAvailability === true
+    && !nextSingleChoiceAvailabilityType
+    && !canKeepLegacyAvailabilityType
+  ) {
+    throw new DomainValidationError("Bei aktiver Verfuegbarkeitsabfrage muss ein Typ ausgewaehlt werden.");
+  }
 
   if (nextSingleChoiceAvailability === true) {
     config.options = [...SINGLE_CHOICE_AVAILABILITY_OPTIONS];
@@ -1148,6 +1239,9 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         ...(hasSingleChoiceAvailabilityColumn
           ? { singleChoiceAvailability: nextSingleChoiceAvailability }
           : {}),
+        ...(hasSingleChoiceAvailabilityTypeColumn
+          ? { singleChoiceAvailabilityType: nextSingleChoiceAvailabilityType }
+          : {}),
         config: cleanConfig,
         rules: [],
         scoring: {},
@@ -1164,6 +1258,9 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         redSurvey: nextRedSurvey,
         ...(hasSingleChoiceAvailabilityColumn
           ? { singleChoiceAvailability: nextSingleChoiceAvailability }
+          : {}),
+        ...(hasSingleChoiceAvailabilityTypeColumn
+          ? { singleChoiceAvailabilityType: nextSingleChoiceAvailabilityType }
           : {}),
         config: cleanConfig,
         rules: [],
@@ -1676,6 +1773,9 @@ adminFragebogenRouter.patch("/questions/:id", async (req, res, next) => {
       singleChoiceAvailability: Object.prototype.hasOwnProperty.call(partial.data, "singleChoiceAvailability")
         ? partial.data.singleChoiceAvailability
         : (existing.singleChoiceAvailability ?? null),
+      singleChoiceAvailabilityType: Object.prototype.hasOwnProperty.call(partial.data, "singleChoiceAvailabilityType")
+        ? partial.data.singleChoiceAvailabilityType
+        : (existing.singleChoiceAvailabilityType ?? null),
       config: partial.data.config ?? existing.config,
       rules: partial.data.rules ?? existing.rules,
       scoring: partial.data.scoring ?? existing.scoring,
@@ -1760,15 +1860,16 @@ adminFragebogenRouter.post("/modules/:scope", async (req, res, next) => {
           ? await fetchQuestionsByIds(tx, existingQuestionIds)
           : new Map<string, UiQuestion>();
       for (const question of payload.questions) {
+        const previousQuestion =
+          question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
         const scopedQuestion = normalizeSingleChoiceAvailabilityForScope(
           { ...question, rules: [] },
           scope,
+          previousQuestion,
         );
         const saved = await upsertQuestionGraphTx(tx, scopedQuestion);
         if (saved.id) {
           questionIds.push(saved.id);
-          const previousQuestion =
-            question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
           if (needsIppRecalcForQuestionChange(previousQuestion, scopedQuestion)) {
             affectedQuestionIds.push(saved.id);
           }
@@ -1936,12 +2037,13 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
       const desiredChainsByQuestionId = new Map<string, string[]>();
 
       for (const [orderIndex, question] of parsed.data.questions.entries()) {
+        const previousQuestion =
+          question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
         const scopedQuestion = normalizeSingleChoiceAvailabilityForScope(
           { ...question, rules: [] },
           scope,
+          previousQuestion,
         );
-        const previousQuestion =
-          question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
         const shouldPersistQuestion = needsQuestionGraphUpdate(previousQuestion, scopedQuestion);
         let persistedQuestionId: string;
 
