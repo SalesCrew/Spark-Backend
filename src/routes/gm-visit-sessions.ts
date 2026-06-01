@@ -66,6 +66,35 @@ const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 const isUuid = (value: string | null | undefined): value is string => Boolean(value && uuidRegex.test(value));
 const SINGLE_CHOICE_AVAILABILITY_TYPES = ["Cooler", "SingleServe", "MultiServe", "Promos", "Warehouse"] as const;
 type SingleChoiceAvailabilityType = (typeof SINGLE_CHOICE_AVAILABILITY_TYPES)[number];
+const QUESTION_TYPES = ["single", "yesno", "yesnomulti", "multiple", "likert", "text", "numeric", "slider", "photo", "matrix"] as const;
+const QUESTION_TYPE_SET = new Set<string>(QUESTION_TYPES);
+
+function parseOptionalIsoTimestamp(value: string | undefined): Date | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+}
+
+let visitSessionQuestionAvailabilityTypeSnapshotColumnReady: boolean | null = null;
+
+async function ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady(): Promise<boolean> {
+  if (visitSessionQuestionAvailabilityTypeSnapshotColumnReady != null) {
+    return visitSessionQuestionAvailabilityTypeSnapshotColumnReady;
+  }
+  const result = await db.execute(sql<{ exists: boolean }>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'visit_session_questions'
+        AND column_name = 'single_choice_availability_type_snapshot'
+    ) AS "exists"
+  `);
+  const firstRow = (result as Array<{ exists?: unknown }>)[0];
+  visitSessionQuestionAvailabilityTypeSnapshotColumnReady = Boolean(firstRow?.exists);
+  return visitSessionQuestionAvailabilityTypeSnapshotColumnReady;
+}
 
 type ResolvedQuestion = {
   questionId: string;
@@ -94,6 +123,29 @@ type ResolvedSection = {
   questions: ResolvedQuestion[];
 };
 
+function buildVisitSessionQuestionSnapshotSelect(hasAvailabilityTypeSnapshotColumn: boolean) {
+  return {
+    id: visitSessionQuestions.id,
+    visitSessionSectionId: visitSessionQuestions.visitSessionSectionId,
+    questionId: visitSessionQuestions.questionId,
+    moduleId: visitSessionQuestions.moduleId,
+    moduleNameSnapshot: visitSessionQuestions.moduleNameSnapshot,
+    questionType: visitSessionQuestions.questionType,
+    questionTextSnapshot: visitSessionQuestions.questionTextSnapshot,
+    questionConfigSnapshot: visitSessionQuestions.questionConfigSnapshot,
+    questionRulesSnapshot: visitSessionQuestions.questionRulesSnapshot,
+    questionChainsSnapshot: visitSessionQuestions.questionChainsSnapshot,
+    appliesToMarketChainSnapshot: visitSessionQuestions.appliesToMarketChainSnapshot,
+    requiredSnapshot: visitSessionQuestions.requiredSnapshot,
+    redSurveySnapshot: visitSessionQuestions.redSurveySnapshot,
+    singleChoiceAvailabilitySnapshot: visitSessionQuestions.singleChoiceAvailabilitySnapshot,
+    singleChoiceAvailabilityTypeSnapshot: hasAvailabilityTypeSnapshotColumn
+      ? visitSessionQuestions.singleChoiceAvailabilityTypeSnapshot
+      : sql<string | null>`null::text`,
+    orderIndex: visitSessionQuestions.orderIndex,
+  };
+}
+
 type PhotoTagMeta = {
   id: string;
   label: string;
@@ -108,7 +160,7 @@ function normalizeExt(ext: string | null | undefined): string {
 
 function toResolvedQuestion(question: {
   id?: string;
-  type: ResolvedQuestion["type"];
+  type: string;
   text: string;
   required: boolean;
   redSurvey?: boolean | null;
@@ -120,9 +172,19 @@ function toResolvedQuestion(question: {
   chains?: string[];
 }, module: { id?: string; name?: string }): ResolvedQuestion | null {
   if (!isUuid(question.id)) return null;
+  if (!QUESTION_TYPE_SET.has(question.type)) {
+    logger.warn("gm_visit_sessions_invalid_question_type_skipped", {
+      action: "gm_visit_sessions_resolve_sections",
+      result: "failure",
+      questionId: question.id,
+      moduleId: module.id ?? null,
+      questionType: question.type,
+    });
+    return null;
+  }
   return {
     questionId: question.id,
-    type: question.type,
+    type: question.type as ResolvedQuestion["type"],
     text: question.text,
     required: question.required,
     redSurvey: question.redSurvey ?? null,
@@ -813,12 +875,13 @@ async function loadStartSectionsFromSession(sessionId: string): Promise<Array<{
           .from(campaigns)
           .where(inArray(campaigns.id, campaignIds));
   const campaignNameById = new Map(campaignRows.map((row) => [row.id, row.name]));
+  const hasAvailabilityTypeSnapshotColumn = await ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady();
 
   const questions =
     sectionIds.length === 0
       ? []
       : await db
-          .select()
+          .select(buildVisitSessionQuestionSnapshotSelect(hasAvailabilityTypeSnapshotColumn))
           .from(visitSessionQuestions)
           .where(and(inArray(visitSessionQuestions.visitSessionSectionId, sectionIds), eq(visitSessionQuestions.isDeleted, false)))
           .orderBy(asc(visitSessionQuestions.orderIndex));
@@ -1286,6 +1349,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       questionIds: sessionQuestionIds,
       now: new Date(),
     });
+    const hasAvailabilityTypeSnapshotColumn = await ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady();
 
     const created = await db.transaction(async (tx) => {
       const now = new Date();
@@ -1337,29 +1401,32 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
 
         const withIds: Array<ResolvedQuestion & { visitQuestionId: string }> = [];
         for (const [questionOrder, question] of section.questions.entries()) {
+          const questionInsertValues = {
+            visitSessionSectionId: sectionRow.id,
+            questionId: question.questionId,
+            moduleId: isUuid(question.moduleId) ? question.moduleId : null,
+            moduleNameSnapshot: question.moduleName,
+            questionType: question.type,
+            questionTextSnapshot: question.text,
+            questionConfigSnapshot: question.config,
+            questionRulesSnapshot: question.rules as unknown as Array<Record<string, unknown>>,
+            questionChainsSnapshot: normalizeQuestionChains(question.chains),
+            appliesToMarketChainSnapshot: question.appliesToMarketChain,
+            requiredSnapshot: question.required,
+            redSurveySnapshot: question.redSurvey,
+            singleChoiceAvailabilitySnapshot: question.singleChoiceAvailability,
+            ...(hasAvailabilityTypeSnapshotColumn
+              ? { singleChoiceAvailabilityTypeSnapshot: question.singleChoiceAvailabilityType }
+              : {}),
+            orderIndex: questionOrder,
+            isDeleted: false,
+            deletedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          };
           const [qRow] = await tx
             .insert(visitSessionQuestions)
-            .values({
-              visitSessionSectionId: sectionRow.id,
-              questionId: question.questionId,
-              moduleId: isUuid(question.moduleId) ? question.moduleId : null,
-              moduleNameSnapshot: question.moduleName,
-              questionType: question.type,
-              questionTextSnapshot: question.text,
-              questionConfigSnapshot: question.config,
-              questionRulesSnapshot: question.rules as unknown as Array<Record<string, unknown>>,
-              questionChainsSnapshot: normalizeQuestionChains(question.chains),
-              appliesToMarketChainSnapshot: question.appliesToMarketChain,
-              requiredSnapshot: question.required,
-              redSurveySnapshot: question.redSurvey,
-              singleChoiceAvailabilitySnapshot: question.singleChoiceAvailability,
-              singleChoiceAvailabilityTypeSnapshot: question.singleChoiceAvailabilityType,
-              orderIndex: questionOrder,
-              isDeleted: false,
-              deletedAt: null,
-              createdAt: now,
-              updatedAt: now,
-            })
+            .values(questionInsertValues)
             .returning();
           if (!qRow) throw new Error("visit question konnte nicht erstellt werden.");
 
@@ -1560,7 +1627,6 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
       res.status(400).json({ error: "Ungültige Session-ID." });
       return;
     }
-
     const [session] = await db
       .select()
       .from(visitSessions)
@@ -1597,11 +1663,12 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
             .from(campaigns)
             .where(inArray(campaigns.id, campaignIds));
     const campaignNameById = new Map(campaignRows.map((row) => [row.id, row.name]));
+    const hasAvailabilityTypeSnapshotColumn = await ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady();
 
     const questions = sectionIds.length === 0
       ? []
       : await db
-          .select()
+          .select(buildVisitSessionQuestionSnapshotSelect(hasAvailabilityTypeSnapshotColumn))
           .from(visitSessionQuestions)
           .where(and(inArray(visitSessionQuestions.visitSessionSectionId, sectionIds), eq(visitSessionQuestions.isDeleted, false)))
           .orderBy(asc(visitSessionQuestions.orderIndex));
@@ -2557,6 +2624,35 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
       res.status(400).json({ error: "Ungültige Session-ID." });
       return;
     }
+    const submitPayload = z
+      .object({
+        startedAt: z.string().optional(),
+        submittedAt: z.string().optional(),
+      })
+      .strict()
+      .safeParse(req.body ?? {});
+    if (!submitPayload.success) {
+      res.status(400).json({ error: "Ungültige Abschlussdaten." });
+      return;
+    }
+    const requestedStartedAt = parseOptionalIsoTimestamp(submitPayload.data.startedAt);
+    const requestedSubmittedAt = parseOptionalIsoTimestamp(submitPayload.data.submittedAt);
+    if ((requestedStartedAt == null) !== (requestedSubmittedAt == null)) {
+      res.status(400).json({ error: "Start- und Endzeit müssen gemeinsam übermittelt werden." });
+      return;
+    }
+    if (submitPayload.data.startedAt && requestedStartedAt == null) {
+      res.status(400).json({ error: "Ungültige Startzeit." });
+      return;
+    }
+    if (submitPayload.data.submittedAt && requestedSubmittedAt == null) {
+      res.status(400).json({ error: "Ungültige Endzeit." });
+      return;
+    }
+    if (requestedStartedAt && requestedSubmittedAt && requestedSubmittedAt.getTime() < requestedStartedAt.getTime()) {
+      res.status(400).json({ error: "Endzeit darf nicht vor Startzeit liegen." });
+      return;
+    }
 
     const [session] = await db
       .select()
@@ -2581,7 +2677,17 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
       sectionIds.length === 0
         ? []
         : await db
-            .select()
+            .select({
+              id: visitSessionQuestions.id,
+              visitSessionSectionId: visitSessionQuestions.visitSessionSectionId,
+              questionId: visitSessionQuestions.questionId,
+              questionType: visitSessionQuestions.questionType,
+              questionTextSnapshot: visitSessionQuestions.questionTextSnapshot,
+              questionConfigSnapshot: visitSessionQuestions.questionConfigSnapshot,
+              questionRulesSnapshot: visitSessionQuestions.questionRulesSnapshot,
+              requiredSnapshot: visitSessionQuestions.requiredSnapshot,
+              appliesToMarketChainSnapshot: visitSessionQuestions.appliesToMarketChainSnapshot,
+            })
             .from(visitSessionQuestions)
             .where(and(inArray(visitSessionQuestions.visitSessionSectionId, sectionIds), eq(visitSessionQuestions.isDeleted, false)));
     const questionIds = questions.map((row) => row.id);
@@ -2662,6 +2768,8 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
     }
 
     const now = new Date();
+    const effectiveStartedAt = requestedStartedAt ?? session.startedAt;
+    const effectiveSubmittedAt = requestedSubmittedAt ?? now;
     await db.transaction(async (tx) => {
       await tx
         .update(visitSessionSections)
@@ -2671,7 +2779,8 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
         .update(visitSessions)
         .set({
           status: "submitted",
-          submittedAt: now,
+          startedAt: effectiveStartedAt,
+          submittedAt: effectiveSubmittedAt,
           lastSavedAt: now,
           updatedAt: now,
         })
@@ -2680,12 +2789,12 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
         sessionId: session.id,
         gmUserId,
         marketId: session.marketId,
-        submittedAt: now,
+        submittedAt: effectiveSubmittedAt,
       });
     });
 
     try {
-      await enqueueIppRecalcForDate(session.marketId, now, "visit_session_submitted");
+      await enqueueIppRecalcForDate(session.marketId, effectiveSubmittedAt, "visit_session_submitted");
     } catch (enqueueError) {
       logger.error("gm_visit_session_submit_ipp_enqueue_failed", {
         action: "gm_visit_session_submit",

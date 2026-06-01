@@ -144,19 +144,21 @@ async function ensureDbReadyForSingleChoiceAvailabilityTests(): Promise<boolean>
     from information_schema.columns
     where table_schema = 'public'
       and table_name = 'question_bank_shared'
-      and column_name in ('single_choice_availability')
+      and column_name in ('single_choice_availability', 'single_choice_availability_type')
   `;
   const visitQuestionColumnRows = await sql<{ column_name: string }[]>`
     select column_name
     from information_schema.columns
     where table_schema = 'public'
       and table_name = 'visit_session_questions'
-      and column_name in ('single_choice_availability_snapshot')
+      and column_name in ('single_choice_availability_snapshot', 'single_choice_availability_type_snapshot')
   `;
   const questionColumns = new Set(questionColumnRows.map((entry) => entry.column_name));
   const visitQuestionColumns = new Set(visitQuestionColumnRows.map((entry) => entry.column_name));
   dbHasSingleChoiceAvailabilityColumns = questionColumns.has("single_choice_availability")
-    && visitQuestionColumns.has("single_choice_availability_snapshot");
+    && questionColumns.has("single_choice_availability_type")
+    && visitQuestionColumns.has("single_choice_availability_snapshot")
+    && visitQuestionColumns.has("single_choice_availability_type_snapshot");
   checkedSingleChoiceAvailabilityReadiness = true;
   return dbHasSingleChoiceAvailabilityColumns;
 }
@@ -1753,6 +1755,7 @@ test("single choice availability persists for single, canonicalizes options, and
         text: `Single ${uniq}`,
         required: true,
         singleChoiceAvailability: true,
+        singleChoiceAvailabilityType: "Cooler",
         config: { options: ["Top", "Leer"] },
         rules: [],
         scoring: {},
@@ -1767,24 +1770,43 @@ test("single choice availability persists for single, canonicalizes options, and
     id: string;
     text: string;
     singleChoiceAvailability?: boolean | null;
+    singleChoiceAvailabilityType?: string | null;
     config?: Record<string, unknown>;
   }>;
   const singleQuestion = createdQuestions.find((question) => question.text === `Single ${uniq}`);
   assert.ok(singleQuestion?.id);
   assert.equal(singleQuestion?.singleChoiceAvailability, true);
+  assert.equal(singleQuestion?.singleChoiceAvailabilityType ?? null, "Cooler");
   assert.deepEqual(((singleQuestion?.config ?? {}).options as string[] | undefined) ?? [], ["Voll", "Mittel", "Leer"]);
 
   const [persistedSingle] = await db
     .select({
       singleChoiceAvailability: questionBankShared.singleChoiceAvailability,
+      singleChoiceAvailabilityType: questionBankShared.singleChoiceAvailabilityType,
       config: questionBankShared.config,
     })
     .from(questionBankShared)
     .where(eq(questionBankShared.id, singleQuestion!.id))
     .limit(1);
   assert.equal(persistedSingle?.singleChoiceAvailability ?? null, true);
+  assert.equal(persistedSingle?.singleChoiceAvailabilityType ?? null, "Cooler");
   const persistedOptions = ((persistedSingle?.config ?? {}) as Record<string, unknown>).options;
   assert.deepEqual(Array.isArray(persistedOptions) ? persistedOptions : [], ["Voll", "Mittel", "Leer"]);
+
+  const missingTypeRes = await request(app).post("/admin/questions").send({
+    type: "single",
+    text: `Missing availability type ${uniq}`,
+    required: true,
+    singleChoiceAvailability: true,
+    config: { options: ["Voll", "Mittel", "Leer"] },
+    rules: [],
+    scoring: {},
+  });
+  assert.equal(missingTypeRes.status, 400);
+  assert.equal(
+    missingTypeRes.body.error,
+    "Bei aktiver Verfuegbarkeitsabfrage muss ein Typ ausgewaehlt werden.",
+  );
 
   const invalidQuestionRes = await request(app).post("/admin/questions").send({
     type: "text",
@@ -1802,6 +1824,96 @@ test("single choice availability persists for single, canonicalizes options, and
   );
 
   await request(app).patch(`/admin/modules/main/${moduleId}/delete`).send({});
+});
+
+test("kuehler scope preserves existing availability fields on module saves", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForFragebogenTests()) || !(await ensureDbReadyForSingleChoiceAvailabilityTests())) {
+    t.skip("Single choice availability columns are not present in the configured DATABASE_URL.");
+    return;
+  }
+
+  const app = createApp();
+  const uniq = `it-kuehler-preserve-availability-${Date.now()}`;
+  let questionId: string | null = null;
+  let moduleId: string | null = null;
+
+  try {
+    const createQuestionRes = await request(app).post("/admin/questions").send({
+      type: "single",
+      text: `Kuehler Preserve ${uniq}`,
+      required: true,
+      singleChoiceAvailability: true,
+      singleChoiceAvailabilityType: "Promos",
+      config: { options: ["Voll", "Mittel", "Leer"] },
+      rules: [],
+      scoring: {},
+    });
+    assert.equal(createQuestionRes.status, 201);
+    questionId = createQuestionRes.body.question?.id as string;
+    assert.ok(questionId);
+
+    const createModuleRes = await request(app).post("/admin/modules/kuehler").send({
+      name: `Kuehler ${uniq}`,
+      description: "",
+      questions: [
+        {
+          id: questionId,
+          type: "single",
+          text: `Kuehler Preserve ${uniq}`,
+          required: true,
+          singleChoiceAvailability: false,
+          singleChoiceAvailabilityType: null,
+          config: { options: ["X", "Y"] },
+          rules: [],
+          scoring: {},
+        },
+      ],
+    });
+    assert.equal(createModuleRes.status, 201);
+    moduleId = createModuleRes.body.module?.id as string;
+    assert.ok(moduleId);
+
+    const patchModuleRes = await request(app).patch(`/admin/modules/kuehler/${moduleId}`).send({
+      name: `Kuehler ${uniq} edited`,
+      description: "edited",
+      questions: [
+        {
+          id: questionId,
+          type: "single",
+          text: `Kuehler Preserve ${uniq} edited`,
+          required: true,
+          singleChoiceAvailability: false,
+          singleChoiceAvailabilityType: null,
+          config: { options: ["A", "B"] },
+          rules: [],
+          scoring: {},
+        },
+      ],
+    });
+    assert.equal(patchModuleRes.status, 200);
+
+    const [persisted] = await db
+      .select({
+        singleChoiceAvailability: questionBankShared.singleChoiceAvailability,
+        singleChoiceAvailabilityType: questionBankShared.singleChoiceAvailabilityType,
+      })
+      .from(questionBankShared)
+      .where(eq(questionBankShared.id, questionId!))
+      .limit(1);
+    assert.equal(persisted?.singleChoiceAvailability ?? null, true);
+    assert.equal(persisted?.singleChoiceAvailabilityType ?? null, "Promos");
+  } finally {
+    if (moduleId) {
+      await request(app).patch(`/admin/modules/kuehler/${moduleId}/delete`).send({});
+    }
+    if (questionId) {
+      await db
+        .update(questionBankShared)
+        .set({ isDeleted: true, updatedAt: new Date() })
+        .where(eq(questionBankShared.id, questionId));
+    }
+  }
 });
 
 test("gm visit session snapshots single choice availability flag", async (t) => {
@@ -1847,6 +1959,7 @@ test("gm visit session snapshots single choice availability flag", async (t) => 
         text: `Availability Single ${uniq}`,
         required: false,
         singleChoiceAvailability: true,
+        singleChoiceAvailabilityType: "Warehouse",
         config: { options: ["Voll", "Mittel", "Leer"] },
         rules: [],
         scoring: {},
@@ -1970,15 +2083,24 @@ test("gm visit session snapshots single choice availability flag", async (t) => 
       .select({
         questionId: visitSessionQuestions.questionId,
         singleChoiceAvailabilitySnapshot: visitSessionQuestions.singleChoiceAvailabilitySnapshot,
+        singleChoiceAvailabilityTypeSnapshot: visitSessionQuestions.singleChoiceAvailabilityTypeSnapshot,
       })
       .from(visitSessionQuestions)
       .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
       .where(and(eq(visitSessionSections.visitSessionId, createdSessionId), eq(visitSessionQuestions.isDeleted, false)));
     const snapshotByQuestionId = new Map(
-      snapshotRows.map((row) => [row.questionId, row.singleChoiceAvailabilitySnapshot]),
+      snapshotRows.map((row) => [
+        row.questionId,
+        {
+          availability: row.singleChoiceAvailabilitySnapshot,
+          availabilityType: row.singleChoiceAvailabilityTypeSnapshot,
+        },
+      ]),
     );
-    assert.equal(snapshotByQuestionId.get(availabilityQuestionId), true);
-    assert.equal(snapshotByQuestionId.get(normalQuestionId), false);
+    assert.equal(snapshotByQuestionId.get(availabilityQuestionId)?.availability ?? null, true);
+    assert.equal(snapshotByQuestionId.get(availabilityQuestionId)?.availabilityType ?? null, "Warehouse");
+    assert.equal(snapshotByQuestionId.get(normalQuestionId)?.availability ?? null, false);
+    assert.equal(snapshotByQuestionId.get(normalQuestionId)?.availabilityType ?? null, null);
   } finally {
     if (createdSessionId) {
       await db

@@ -213,6 +213,26 @@ function isMissingAssignmentSlotColumnError(error: unknown): boolean {
   return /assignment_slot/i.test(message) && /does not exist/i.test(message);
 }
 
+let visitSessionQuestionAvailabilityTypeSnapshotColumnReady: boolean | null = null;
+
+async function ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady(): Promise<boolean> {
+  if (visitSessionQuestionAvailabilityTypeSnapshotColumnReady != null) {
+    return visitSessionQuestionAvailabilityTypeSnapshotColumnReady;
+  }
+  const result = await db.execute(sql<{ exists: boolean }>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'visit_session_questions'
+        AND column_name = 'single_choice_availability_type_snapshot'
+    ) AS "exists"
+  `);
+  const firstRow = (result as Array<{ exists?: unknown }>)[0];
+  visitSessionQuestionAvailabilityTypeSnapshotColumnReady = Boolean(firstRow?.exists);
+  return visitSessionQuestionAvailabilityTypeSnapshotColumnReady;
+}
+
 function extractRuleAnswerValue(answer: (typeof visitAnswers.$inferSelect) | undefined): string | string[] | undefined {
   if (!answer) return undefined;
   const raw = (answer.valueJson as { raw?: unknown } | null | undefined)?.raw;
@@ -920,11 +940,30 @@ async function buildCampaignMarketVisitSummaries(campaignId: string) {
     )
     .orderBy(asc(visitSessionSections.orderIndex));
   const sectionIds = sections.map((section) => section.id);
+  const hasAvailabilityTypeSnapshotColumn = await ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady();
   const questions =
     sectionIds.length === 0
       ? []
       : await db
-          .select()
+          .select({
+            id: visitSessionQuestions.id,
+            visitSessionSectionId: visitSessionQuestions.visitSessionSectionId,
+            questionId: visitSessionQuestions.questionId,
+            moduleId: visitSessionQuestions.moduleId,
+            moduleNameSnapshot: visitSessionQuestions.moduleNameSnapshot,
+            questionType: visitSessionQuestions.questionType,
+            questionTextSnapshot: visitSessionQuestions.questionTextSnapshot,
+            requiredSnapshot: visitSessionQuestions.requiredSnapshot,
+            singleChoiceAvailabilitySnapshot: visitSessionQuestions.singleChoiceAvailabilitySnapshot,
+            singleChoiceAvailabilityTypeSnapshot: hasAvailabilityTypeSnapshotColumn
+              ? visitSessionQuestions.singleChoiceAvailabilityTypeSnapshot
+              : sql<string | null>`null::text`,
+            questionConfigSnapshot: visitSessionQuestions.questionConfigSnapshot,
+            questionRulesSnapshot: visitSessionQuestions.questionRulesSnapshot,
+            questionChainsSnapshot: visitSessionQuestions.questionChainsSnapshot,
+            appliesToMarketChainSnapshot: visitSessionQuestions.appliesToMarketChainSnapshot,
+            orderIndex: visitSessionQuestions.orderIndex,
+          })
           .from(visitSessionQuestions)
           .where(
             and(
