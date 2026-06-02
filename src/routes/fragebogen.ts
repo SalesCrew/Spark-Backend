@@ -84,9 +84,39 @@ const questionTypeSchema = z.enum([
 const SINGLE_CHOICE_AVAILABILITY_OPTIONS = ["Voll", "Mittel", "Leer"] as const;
 const SINGLE_CHOICE_AVAILABILITY_TYPES = ["Cooler", "SingleServe", "MultiServe", "Promos", "Warehouse"] as const;
 
+async function hasQuestionScoringZweitplatzierungColumn(): Promise<boolean> {
+  const result = await db.execute(sql<{ exists: boolean }>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'question_scoring'
+        AND column_name = 'zweitplatzierung'
+    ) AS "exists"
+  `);
+  const firstRow = (result as Array<{ exists?: unknown }>)[0];
+  return Boolean(firstRow?.exists);
+}
+
+async function hasQuestionScoringMitbewerberabfrageColumn(): Promise<boolean> {
+  const result = await db.execute(sql<{ exists: boolean }>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'question_scoring'
+        AND column_name = 'mitbewerberabfrage'
+    ) AS "exists"
+  `);
+  const firstRow = (result as Array<{ exists?: unknown }>)[0];
+  return Boolean(firstRow?.exists);
+}
+
 const scoreValueSchema = z
   .object({
     ipp: z.number().finite().gte(-99999).lte(99999).optional(),
+    zweitplatzierung: z.number().finite().gte(-99999).lte(99999).optional(),
+    mitbewerberabfrage: z.number().finite().gte(-99999).lte(99999).optional(),
     boni: z.number().finite().gte(-99999).lte(99999).optional(),
   })
   .strict();
@@ -1005,12 +1035,25 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
   if (baseRows.length === 0) return new Map();
 
   const questionIds = baseRows.map((row) => row.id);
+  const hasZweitplatzierungColumn = await hasQuestionScoringZweitplatzierungColumn();
+  const hasMitbewerberabfrageColumn = await hasQuestionScoringMitbewerberabfrageColumn();
   const matrixRows = await dbLike
     .select()
     .from(questionMatrix)
     .where(and(inArray(questionMatrix.questionId, questionIds), eq(questionMatrix.isDeleted, false)));
   const scoringRows = await dbLike
-    .select()
+    .select({
+      questionId: questionScoring.questionId,
+      scoreKey: questionScoring.scoreKey,
+      ipp: questionScoring.ipp,
+      zweitplatzierung: hasZweitplatzierungColumn
+        ? questionScoring.zweitplatzierung
+        : sql<string | null>`null::numeric`.as("zweitplatzierung"),
+      mitbewerberabfrage: hasMitbewerberabfrageColumn
+        ? questionScoring.mitbewerberabfrage
+        : sql<string | null>`null::numeric`.as("mitbewerberabfrage"),
+      boni: questionScoring.boni,
+    })
     .from(questionScoring)
     .where(and(inArray(questionScoring.questionId, questionIds), eq(questionScoring.isDeleted, false)));
   const ruleRows = await dbLike
@@ -1039,11 +1082,16 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
           .orderBy(asc(questionRuleTargets.ruleId), asc(questionRuleTargets.orderIndex));
 
   const matrixByQuestion = new Map(matrixRows.map((row) => [row.questionId, row]));
-  const scoringByQuestion = new Map<string, Record<string, { ipp?: number; boni?: number }>>();
+  const scoringByQuestion = new Map<
+    string,
+    Record<string, { ipp?: number; zweitplatzierung?: number; mitbewerberabfrage?: number; boni?: number }>
+  >();
   for (const row of scoringRows) {
     const current = scoringByQuestion.get(row.questionId) ?? {};
-    const value: { ipp?: number; boni?: number } = {};
+    const value: { ipp?: number; zweitplatzierung?: number; mitbewerberabfrage?: number; boni?: number } = {};
     if (row.ipp != null) value.ipp = Number(row.ipp);
+    if (row.zweitplatzierung != null) value.zweitplatzierung = Number(row.zweitplatzierung);
+    if (row.mitbewerberabfrage != null) value.mitbewerberabfrage = Number(row.mitbewerberabfrage);
     if (row.boni != null) value.boni = Number(row.boni);
     current[row.scoreKey] = value;
     scoringByQuestion.set(row.questionId, current);
@@ -1162,6 +1210,8 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
     questionId && isUuid(questionId)
       ? (await fetchQuestionsByIds(tx, [questionId])).get(questionId) ?? null
       : null;
+  const hasZweitplatzierungColumn = await hasQuestionScoringZweitplatzierungColumn();
+  const hasMitbewerberabfrageColumn = await hasQuestionScoringMitbewerberabfrageColumn();
   const hasSingleChoiceAvailabilityColumn = await ensureQuestionBankSingleChoiceAvailabilityColumnReady();
   const hasSingleChoiceAvailabilityTypeColumn = hasSingleChoiceAvailabilityColumn
     ? await ensureQuestionBankSingleChoiceAvailabilityTypeColumnReady()
@@ -1289,6 +1339,12 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
       .update(questionScoring)
       .set({
         ipp: value.ipp != null ? String(value.ipp) : null,
+        ...(hasZweitplatzierungColumn
+          ? { zweitplatzierung: value.zweitplatzierung != null ? String(value.zweitplatzierung) : null }
+          : {}),
+        ...(hasMitbewerberabfrageColumn
+          ? { mitbewerberabfrage: value.mitbewerberabfrage != null ? String(value.mitbewerberabfrage) : null }
+          : {}),
         boni: value.boni != null ? String(value.boni) : null,
         isDeleted: false,
         deletedAt: null,
@@ -1301,6 +1357,12 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         questionId,
         scoreKey,
         ipp: value.ipp != null ? String(value.ipp) : null,
+        ...(hasZweitplatzierungColumn
+          ? { zweitplatzierung: value.zweitplatzierung != null ? String(value.zweitplatzierung) : null }
+          : {}),
+        ...(hasMitbewerberabfrageColumn
+          ? { mitbewerberabfrage: value.mitbewerberabfrage != null ? String(value.mitbewerberabfrage) : null }
+          : {}),
         boni: value.boni != null ? String(value.boni) : null,
         isDeleted: false,
         deletedAt: null,

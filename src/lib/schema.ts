@@ -577,6 +577,8 @@ export const questionScoring = pgTable(
       .references(() => questionBankShared.id, { onDelete: "cascade" }),
     scoreKey: text("score_key").notNull(),
     ipp: numeric("ipp", { precision: 8, scale: 2 }),
+    zweitplatzierung: numeric("zweitplatzierung", { precision: 8, scale: 2 }),
+    mitbewerberabfrage: numeric("mitbewerberabfrage", { precision: 8, scale: 2 }),
     boni: numeric("boni", { precision: 8, scale: 2 }),
     isDeleted: boolean("is_deleted").notNull().default(false),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
@@ -590,6 +592,12 @@ export const questionScoring = pgTable(
     index("question_scoring_boni_active_idx")
       .on(table.questionId, table.boni)
       .where(sql`${table.isDeleted} = false and ${table.boni} is not null`),
+    index("question_scoring_zweitplatzierung_active_idx")
+      .on(table.questionId, table.zweitplatzierung)
+      .where(sql`${table.isDeleted} = false and ${table.zweitplatzierung} is not null`),
+    index("question_scoring_mitbewerberabfrage_active_idx")
+      .on(table.questionId, table.mitbewerberabfrage)
+      .where(sql`${table.isDeleted} = false and ${table.mitbewerberabfrage} is not null`),
     index("question_scoring_deleted_idx").on(table.isDeleted),
   ],
 );
