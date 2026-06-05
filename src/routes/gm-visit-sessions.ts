@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import {
@@ -74,6 +74,19 @@ function parseOptionalIsoTimestamp(value: string | undefined): Date | null {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed;
+}
+
+const MAX_REQUESTED_VISIT_START_AGE_MS = 36 * 60 * 60 * 1000;
+const MAX_REQUESTED_VISIT_START_FUTURE_MS = 2 * 60 * 1000;
+
+function resolveAcceptedVisitStartAt(startedAt: string | undefined, now: Date): Date {
+  const requested = parseOptionalIsoTimestamp(startedAt);
+  if (!requested) return now;
+  const requestedMs = requested.getTime();
+  const nowMs = now.getTime();
+  if (requestedMs > nowMs + MAX_REQUESTED_VISIT_START_FUTURE_MS) return now;
+  if (requestedMs < nowMs - MAX_REQUESTED_VISIT_START_AGE_MS) return now;
+  return requested;
 }
 
 let visitSessionQuestionAvailabilityTypeSnapshotColumnReady: boolean | null = null;
@@ -931,6 +944,128 @@ async function loadStartSectionsFromSession(sessionId: string): Promise<Array<{
   }));
 }
 
+function sameCampaignSet(left: string[], right: string[]): boolean {
+  const leftSorted = normalizeUnique(left).sort();
+  const rightSorted = normalizeUnique(right).sort();
+  return leftSorted.length === rightSorted.length && leftSorted.every((campaignId, idx) => campaignId === rightSorted[idx]);
+}
+
+async function loadDraftVisitForSelection(input: {
+  gmUserId: string;
+  marketId: string;
+  campaignIds: string[];
+}): Promise<typeof visitSessions.$inferSelect | null> {
+  const requestedCampaignIds = normalizeUnique(input.campaignIds);
+  if (requestedCampaignIds.length === 0) return null;
+  const candidates = await db
+    .select()
+    .from(visitSessions)
+    .where(
+      and(
+        eq(visitSessions.gmUserId, input.gmUserId),
+        eq(visitSessions.marketId, input.marketId),
+        eq(visitSessions.status, "draft"),
+        isNull(visitSessions.submittedAt),
+        eq(visitSessions.isDeleted, false),
+      ),
+    )
+    .orderBy(desc(visitSessions.startedAt), desc(visitSessions.updatedAt))
+    .limit(10);
+
+  for (const candidate of candidates) {
+    const sectionRows = await db
+      .select({ campaignId: visitSessionSections.campaignId })
+      .from(visitSessionSections)
+      .where(and(eq(visitSessionSections.visitSessionId, candidate.id), eq(visitSessionSections.isDeleted, false)));
+    if (sameCampaignSet(sectionRows.map((row) => row.campaignId), requestedCampaignIds)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function buildVisitStartPayloadFromSession(session: typeof visitSessions.$inferSelect) {
+  const [market] = await db
+    .select()
+    .from(markets)
+    .where(and(eq(markets.id, session.marketId), eq(markets.isDeleted, false)))
+    .limit(1);
+  if (!market) return null;
+  const sections = await loadStartSectionsFromSession(session.id);
+  return {
+    session: {
+      id: session.id,
+      status: session.status,
+      startedAt: session.startedAt.toISOString(),
+    },
+    market: {
+      id: market.id,
+      name: market.name,
+      address: market.address,
+      postalCode: market.postalCode,
+      city: market.city,
+    },
+    sections,
+  };
+}
+
+async function buildVisitStartPayloadForSelection(input: {
+  gmUserId: string;
+  marketId: string;
+  campaignIds: string[];
+}) {
+  const [market] = await db
+    .select()
+    .from(markets)
+    .where(and(eq(markets.id, input.marketId), eq(markets.isDeleted, false)))
+    .limit(1);
+  if (!market) return null;
+
+  const resolvedSections = await resolveVisitSectionsForSelection(input);
+  const configuredPhotoTagIds = normalizeUnique(
+    resolvedSections.flatMap((section) =>
+      section.questions.flatMap((question) => extractConfiguredPhotoTagIds(question.config)),
+    ),
+  );
+  const tagMetaById = await loadPhotoTagMetaByIds(configuredPhotoTagIds);
+  const sections = resolvedSections.map((section) => ({
+    ...section,
+    questions: section.questions.map((question) => ({
+      ...question,
+      config: withPhotoTagMeta(question.type, question.config, tagMetaById),
+    })),
+  }));
+
+  if (sections.flatMap((section) => section.questions).length === 0) {
+    const err = new Error("Fuer die ausgewaehlten Kampagnen wurden keine Besuchsfragen gefunden.");
+    (err as { status?: number; code?: string; details?: unknown }).status = 409;
+    (err as { status?: number; code?: string; details?: unknown }).code = "visit_start_no_questions";
+    (err as { status?: number; code?: string; details?: unknown }).details = {
+      marketId: input.marketId,
+      campaignIds: input.campaignIds,
+      sectionCount: sections.length,
+      sections: sections.map((section) => ({
+        campaignId: section.campaignId,
+        section: section.section,
+        fragebogenId: section.fragebogenId,
+        questionCount: section.questions.length,
+      })),
+    };
+    throw err;
+  }
+
+  return {
+    market: {
+      id: market.id,
+      name: market.name,
+      address: market.address,
+      postalCode: market.postalCode,
+      city: market.city,
+    },
+    sections,
+  };
+}
+
 function buildValidationResult(
   questionType: string,
   config: Record<string, unknown>,
@@ -1191,6 +1326,137 @@ function buildValidationResult(
   return { ...empty, answerStatus: "invalid", isValid: false, validationError: `Unbekannter Fragetyp: ${questionType}` };
 }
 
+gmVisitSessionsRouter.get("/gm/visit-sessions/active", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    const parsed = z
+      .object({
+        marketId: z.string().uuid(),
+        campaignIds: z.string().min(1),
+      })
+      .strict()
+      .safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige aktive Visit-Session Parameter." });
+      return;
+    }
+    const campaignIds = Array.from(
+      new Set(
+        parsed.data.campaignIds
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter((entry) => isUuid(entry)),
+      ),
+    );
+    if (campaignIds.length === 0) {
+      res.status(400).json({ error: "Keine gültigen Kampagnen übermittelt." });
+      return;
+    }
+    const draft = await loadDraftVisitForSelection({
+      gmUserId,
+      marketId: parsed.data.marketId,
+      campaignIds,
+    });
+    if (!draft) {
+      res.status(200).json({ session: null });
+      return;
+    }
+    const payload = await buildVisitStartPayloadFromSession(draft);
+    if (!payload) {
+      res.status(409).json({ error: "Bestehende Session verweist auf einen nicht mehr verfügbaren Markt." });
+      return;
+    }
+    res.status(200).json(payload);
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.get("/gm/visit-sessions/latest-active", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    const [draft] = await db
+      .select()
+      .from(visitSessions)
+      .where(
+        and(
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.status, "draft"),
+          isNull(visitSessions.submittedAt),
+          eq(visitSessions.isDeleted, false),
+        ),
+      )
+      .orderBy(desc(visitSessions.startedAt), desc(visitSessions.updatedAt))
+      .limit(1);
+    if (!draft) {
+      res.status(200).json({ session: null });
+      return;
+    }
+    const payload = await buildVisitStartPayloadFromSession(draft);
+    if (!payload) {
+      res.status(409).json({ error: "Bestehende Session verweist auf einen nicht mehr verfuegbaren Markt." });
+      return;
+    }
+    res.status(200).json(payload);
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.get("/gm/visit-sessions/start-payload", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    const parsed = z
+      .object({
+        marketId: z.string().uuid(),
+        campaignIds: z.string().min(1),
+      })
+      .strict()
+      .safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltige visit-start Parameter." });
+      return;
+    }
+    const campaignIds = Array.from(
+      new Set(
+        parsed.data.campaignIds
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter((entry) => isUuid(entry)),
+      ),
+    );
+    if (campaignIds.length === 0) {
+      res.status(400).json({ error: "Mindestens eine gueltige Kampagnen-ID ist erforderlich." });
+      return;
+    }
+
+    const payload = await buildVisitStartPayloadForSelection({
+      gmUserId,
+      marketId: parsed.data.marketId,
+      campaignIds,
+    });
+    if (!payload) {
+      res.status(404).json({ error: "Markt nicht gefunden." });
+      return;
+    }
+    res.status(200).json(payload);
+  } catch (error) {
+    next(error);
+  }
+});
+
 gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;
@@ -1212,6 +1478,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
         marketId: z.string().uuid(),
         campaignIds: z.array(z.string().uuid()).min(1),
         clientSessionToken: z.string().trim().min(1).max(120).optional(),
+        startedAt: z.string().optional(),
       })
       .strict()
       .safeParse(req.body);
@@ -1322,6 +1589,21 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       }
     }
 
+    const existingDraft = await loadDraftVisitForSelection({
+      gmUserId,
+      marketId: market.id,
+      campaignIds,
+    });
+    if (existingDraft) {
+      const existingPayload = await buildVisitStartPayloadFromSession(existingDraft);
+      if (!existingPayload) {
+        res.status(409).json({ error: "Bestehende Session verweist auf einen nicht mehr verfuegbaren Markt." });
+        return;
+      }
+      res.status(200).json(existingPayload);
+      return;
+    }
+
     const resolvedSections = await resolveVisitSectionsForSelection({
       gmUserId,
       marketId: parsed.data.marketId,
@@ -1340,6 +1622,24 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
         config: withPhotoTagMeta(question.type, question.config, tagMetaById),
       })),
     }));
+    if (sections.flatMap((section) => section.questions).length === 0) {
+      res.status(409).json({
+        error: "Fuer die ausgewaehlten Kampagnen wurden keine Besuchsfragen gefunden.",
+        code: "visit_start_no_questions",
+        details: {
+          marketId: market.id,
+          campaignIds,
+          sectionCount: sections.length,
+          sections: sections.map((section) => ({
+            campaignId: section.campaignId,
+            section: section.section,
+            fragebogenId: section.fragebogenId,
+            questionCount: section.questions.length,
+          })),
+        },
+      });
+      return;
+    }
     const sessionQuestionIds = normalizeUnique(
       sections.flatMap((section) => section.questions.map((question) => question.questionId)),
     );
@@ -1353,13 +1653,14 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
 
     const created = await db.transaction(async (tx) => {
       const now = new Date();
+      const acceptedStartedAt = resolveAcceptedVisitStartAt(parsed.data.startedAt, now);
       const [sessionRow] = await tx
         .insert(visitSessions)
         .values({
           gmUserId,
           marketId: market.id,
           status: "draft",
-          startedAt: now,
+          startedAt: acceptedStartedAt,
           lastSavedAt: now,
           clientSessionToken: requestedToken,
           isDeleted: false,
@@ -2817,6 +3118,88 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
     }
 
     res.status(200).json({ ok: true, sessionId: session.id, status: "submitted" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.delete("/gm/visit-sessions/:sessionId", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungueltige Visit-Session-ID." });
+      return;
+    }
+    const [session] = await db
+      .select()
+      .from(visitSessions)
+      .where(and(eq(visitSessions.id, sessionId), eq(visitSessions.gmUserId, gmUserId), eq(visitSessions.isDeleted, false)))
+      .limit(1);
+    if (!session) {
+      res.status(404).json({ error: "Visit-Session nicht gefunden." });
+      return;
+    }
+    if (session.status !== "draft" || session.submittedAt != null) {
+      res.status(409).json({
+        error: "Nur laufende, nicht abgeschlossene Frageboegen koennen abgebrochen werden.",
+        code: "visit_cancel_not_draft",
+      });
+      return;
+    }
+
+    const photoRows = await db
+      .select({
+        bucket: visitAnswerPhotos.storageBucket,
+        path: visitAnswerPhotos.storagePath,
+      })
+      .from(visitAnswerPhotos)
+      .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
+      .where(
+        and(
+          eq(visitAnswers.visitSessionId, session.id),
+          eq(visitAnswers.isDeleted, false),
+          eq(visitAnswerPhotos.isDeleted, false),
+        ),
+      );
+
+    await db.delete(visitSessions).where(eq(visitSessions.id, session.id));
+
+    const pathsByBucket = new Map<string, string[]>();
+    for (const row of photoRows) {
+      const bucket = row.bucket.trim();
+      const path = row.path.trim();
+      if (!bucket || !path) continue;
+      pathsByBucket.set(bucket, [...(pathsByBucket.get(bucket) ?? []), path]);
+    }
+    for (const [bucket, paths] of pathsByBucket.entries()) {
+      try {
+        const { error } = await supabaseAdmin.storage.from(bucket).remove(Array.from(new Set(paths)));
+        if (error) {
+          logger.warn("gm_visit_session_cancel_photo_cleanup_failed", {
+            action: "gm_visit_session_cancel",
+            result: "failure",
+            sessionId: session.id,
+            bucket,
+            error: error.message,
+          });
+        }
+      } catch (cleanupError) {
+        logger.warn("gm_visit_session_cancel_photo_cleanup_failed", {
+          action: "gm_visit_session_cancel",
+          result: "failure",
+          sessionId: session.id,
+          bucket,
+          error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        });
+      }
+    }
+
+    res.status(200).json({ ok: true, sessionId: session.id, status: "cancelled" });
   } catch (error) {
     next(error);
   }

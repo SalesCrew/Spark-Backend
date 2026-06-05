@@ -38,6 +38,7 @@ const isoDateTimeSchema = z.string().datetime();
 const startSchema = z
   .object({
     timezone: timezoneSchema.optional(),
+    startedAt: isoDateTimeSchema.optional(),
   })
   .strict();
 
@@ -58,6 +59,20 @@ const submitSchema = z
     comment: z.string().trim().max(2_000).optional(),
   })
   .strict();
+
+const MAX_REQUESTED_START_AGE_MS = 36 * 60 * 60 * 1000;
+const MAX_REQUESTED_START_FUTURE_MS = 2 * 60 * 1000;
+
+function resolveAcceptedStartAt(startedAt: string | undefined, now: Date): Date {
+  if (!startedAt) return now;
+  const requested = new Date(startedAt);
+  const requestedMs = requested.getTime();
+  if (!Number.isFinite(requestedMs)) return now;
+  const nowMs = now.getTime();
+  if (requestedMs > nowMs + MAX_REQUESTED_START_FUTURE_MS) return now;
+  if (requestedMs < nowMs - MAX_REQUESTED_START_AGE_MS) return now;
+  return requested;
+}
 
 function serializeDaySession(row: typeof gmDaySessions.$inferSelect | null) {
   if (!row) {
@@ -180,7 +195,8 @@ daySessionRouter.get("/current", async (req: AuthedRequest, res, next) => {
       return;
     }
     const now = new Date();
-    const session = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
+    const todaySession = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
+    const session = todaySession ?? (await loadAnyOpenSessionForUser(gmUserId));
     const openPause = session ? await loadOpenPause(gmUserId, session.id) : null;
     res.status(200).json({
       session: serializeDaySession(session ?? null),
@@ -461,8 +477,9 @@ daySessionRouter.post("/start", async (req: AuthedRequest, res, next) => {
     }
     const now = new Date();
     const timezone = parsed.data.timezone ?? DEFAULT_TIMEZONE;
-    const workDate = toYmdInTimezone(now, timezone);
-    const existing = await loadTodaySession(gmUserId, now, timezone);
+    const acceptedStartAt = resolveAcceptedStartAt(parsed.data.startedAt, now);
+    const workDate = toYmdInTimezone(acceptedStartAt, timezone);
+    const existing = await loadTodaySession(gmUserId, acceptedStartAt, timezone);
     if (existing) {
       if (existing.status === "submitted") {
         res.status(409).json({ error: "Der Arbeitstag wurde bereits abgeschlossen.", code: "day_already_submitted" });
@@ -488,20 +505,8 @@ daySessionRouter.post("/start", async (req: AuthedRequest, res, next) => {
 
     const openSession = await loadAnyOpenSessionForUser(gmUserId);
     if (openSession) {
-      if (openSession.workDate === workDate) {
-        res.status(200).json({ session: serializeDaySession(openSession) });
-        return;
-      }
-      await db
-        .update(gmDaySessions)
-        .set({
-          status: "cancelled",
-          cancelledAt: now,
-          isDeleted: true,
-          deletedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(gmDaySessions.id, openSession.id));
+      res.status(200).json({ session: serializeDaySession(openSession) });
+      return;
     }
 
     const [created] = await db
@@ -511,7 +516,7 @@ daySessionRouter.post("/start", async (req: AuthedRequest, res, next) => {
         workDate,
         timezone,
         status: "started",
-        dayStartedAt: now,
+        dayStartedAt: acceptedStartAt,
       })
       .returning();
     if (!created) throw new Error("Arbeitstag konnte nicht gestartet werden.");
