@@ -16,6 +16,11 @@ import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import {
+  respondTimelineValidationError,
+  validateGmTimelineInterval,
+  validateGmTimelineStartPoint,
+} from "../lib/zeiterfassung-validation.js";
+import {
   buildVisitAnswerValidationResult,
   computeMissingRequiredQuestions,
 } from "../lib/visit-session-answer-validation.js";
@@ -1606,6 +1611,16 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       return;
     }
 
+    const startValidationNow = new Date();
+    const acceptedStartedAt = resolveAcceptedVisitStartAt(parsed.data.startedAt, startValidationNow);
+    await validateGmTimelineStartPoint({
+      gmUserId,
+      kind: "marktbesuch",
+      id: "pending-visit-session",
+      startAt: acceptedStartedAt,
+      now: startValidationNow,
+    });
+
     const resolvedSections = await resolveVisitSectionsForSelection({
       gmUserId,
       marketId: parsed.data.marketId,
@@ -1655,7 +1670,6 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
 
     const created = await db.transaction(async (tx) => {
       const now = new Date();
-      const acceptedStartedAt = resolveAcceptedVisitStartAt(parsed.data.startedAt, now);
       const [sessionRow] = await tx
         .insert(visitSessions)
         .values({
@@ -1909,6 +1923,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       })),
     });
   } catch (error) {
+    if (respondTimelineValidationError(res, error)) return;
     const err = error as { status?: number; code?: string; details?: unknown; message?: string };
     if (err?.status) {
       res.status(err.status).json({ error: err.message ?? "visit session Fehler", code: err.code, details: err.details });
@@ -2206,6 +2221,14 @@ gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/start", async (req: A
       return;
     }
 
+    await validateGmTimelineStartPoint({
+      gmUserId,
+      kind: "marktbesuch",
+      id: session.id,
+      startAt: requestedStartedAt,
+      now,
+    });
+
     await db
       .update(visitSessions)
       .set({
@@ -2225,6 +2248,7 @@ gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/start", async (req: A
       },
     });
   } catch (error) {
+    if (respondTimelineValidationError(res, error)) return;
     next(error);
   }
 });
@@ -3051,6 +3075,18 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
       return;
     }
 
+    const now = new Date();
+    const effectiveStartedAt = requestedStartedAt ?? session.startedAt;
+    const effectiveSubmittedAt = requestedSubmittedAt ?? now;
+    await validateGmTimelineInterval({
+      gmUserId,
+      kind: "marktbesuch",
+      id: session.id,
+      startAt: effectiveStartedAt,
+      endAt: effectiveSubmittedAt,
+      now,
+    });
+
     const sections = await db
       .select()
       .from(visitSessionSections)
@@ -3150,9 +3186,6 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
       return;
     }
 
-    const now = new Date();
-    const effectiveStartedAt = requestedStartedAt ?? session.startedAt;
-    const effectiveSubmittedAt = requestedSubmittedAt ?? now;
     await db.transaction(async (tx) => {
       await tx
         .update(visitSessionSections)
@@ -3201,6 +3234,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
 
     res.status(200).json({ ok: true, sessionId: session.id, status: "submitted" });
   } catch (error) {
+    if (respondTimelineValidationError(res, error)) return;
     next(error);
   }
 });

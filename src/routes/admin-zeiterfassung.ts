@@ -7,7 +7,9 @@ import {
   buildGmAggregates,
   resolvePrimaryQuestionnaireType,
   toYmdInTimezone,
+  validateTimelineInterval,
   type DaySessionPayload,
+  type TimelineInterval,
 } from "../lib/admin-zeiterfassung.js";
 import { db } from "../lib/db.js";
 import {
@@ -144,13 +146,6 @@ type DayRow = {
   gmRegion: string | null;
 };
 
-type SessionInterval = {
-  kind: "marktbesuch" | "pause" | "zusatzzeit";
-  id: string;
-  startAt: Date;
-  endAt: Date;
-};
-
 function getTimeZoneOffsetMs(date: Date, timeZone: string): number {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -204,23 +199,12 @@ function parseWorkDateHmToUtc(workDate: string, hm: string, timeZone: string): D
   return candidate;
 }
 
-function intersects(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
-  return aStart.getTime() < bEnd.getTime() && aEnd.getTime() > bStart.getTime();
-}
-
-function isAllowedOverlap(kindA: SessionInterval["kind"], kindB: SessionInterval["kind"]): boolean {
-  return (
-    (kindA === "pause" && kindB === "zusatzzeit") ||
-    (kindA === "zusatzzeit" && kindB === "pause")
-  );
-}
-
 async function loadSessionIntervals(input: {
   daySessionId: string;
   gmUserId: string;
   workDate: string;
   timezone: string;
-}): Promise<SessionInterval[]> {
+}): Promise<TimelineInterval[]> {
   const dayStartExpr = sql`(${input.workDate}::timestamp at time zone ${input.timezone})`;
   const dayEndExpr = sql`((${input.workDate}::timestamp at time zone ${input.timezone}) + interval '1 day')`;
 
@@ -276,7 +260,7 @@ async function loadSessionIntervals(input: {
       ),
   ]);
 
-  const intervals: SessionInterval[] = [];
+  const intervals: TimelineInterval[] = [];
   for (const row of pauseRows) {
     if (!row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
     intervals.push({ kind: "pause", id: row.id, startAt: row.startAt, endAt: row.endAt });
@@ -717,13 +701,21 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         workDate: session.workDate,
         timezone,
       });
-      for (const interval of intervals) {
-        if (interval.kind === "marktbesuch" && interval.id === segmentId) continue;
-        if (isAllowedOverlap("marktbesuch", interval.kind)) continue;
-        if (intersects(targetStartAt, targetEndAt, interval.startAt, interval.endAt)) {
-          res.status(409).json({ error: "Zeit ueberschneidet sich mit einem bestehenden Eintrag." });
-          return;
-        }
+      const validation = validateTimelineInterval({
+        kind: "marktbesuch",
+        id: segmentId,
+        startAt: targetStartAt,
+        endAt: targetEndAt,
+        dayStartAt,
+        dayEndAt,
+        intervals,
+      });
+      if (!validation.ok) {
+        res.status(validation.code === "overlap" ? 409 : 400).json({
+          error: validation.message,
+          code: validation.code,
+        });
+        return;
       }
 
       await db
@@ -786,13 +778,21 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         workDate: session.workDate,
         timezone,
       });
-      for (const interval of intervals) {
-        if (interval.kind === "pause" && interval.id === segmentId) continue;
-        if (isAllowedOverlap("pause", interval.kind)) continue;
-        if (intersects(targetStartAt, targetEndAt, interval.startAt, interval.endAt)) {
-          res.status(409).json({ error: "Zeit ueberschneidet sich mit einem bestehenden Eintrag." });
-          return;
-        }
+      const validation = validateTimelineInterval({
+        kind: "pause",
+        id: segmentId,
+        startAt: targetStartAt,
+        endAt: targetEndAt,
+        dayStartAt,
+        dayEndAt,
+        intervals,
+      });
+      if (!validation.ok) {
+        res.status(validation.code === "overlap" ? 409 : 400).json({
+          error: validation.message,
+          code: validation.code,
+        });
+        return;
       }
 
       await db
@@ -857,13 +857,21 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         workDate: session.workDate,
         timezone,
       });
-      for (const interval of intervals) {
-        if (interval.kind === "zusatzzeit" && interval.id === segmentId) continue;
-        if (isAllowedOverlap("zusatzzeit", interval.kind)) continue;
-        if (intersects(targetStartAt, targetEndAt, interval.startAt, interval.endAt)) {
-          res.status(409).json({ error: "Zeit ueberschneidet sich mit einem bestehenden Eintrag." });
-          return;
-        }
+      const validation = validateTimelineInterval({
+        kind: "zusatzzeit",
+        id: segmentId,
+        startAt: targetStartAt,
+        endAt: targetEndAt,
+        dayStartAt,
+        dayEndAt,
+        intervals,
+      });
+      if (!validation.ok) {
+        res.status(validation.code === "overlap" ? 409 : 400).json({
+          error: validation.message,
+          code: validation.code,
+        });
+        return;
       }
 
       await db

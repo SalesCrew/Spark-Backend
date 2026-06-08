@@ -1218,6 +1218,9 @@ export const visitSessions = pgTable(
     index("visit_sessions_gm_market_submitted_idx")
       .on(table.gmUserId, table.marketId, table.submittedAt)
       .where(sql`${table.isDeleted} = false AND ${table.status} = 'submitted' AND ${table.submittedAt} IS NOT NULL`),
+    index("visit_sessions_gm_status_started_idx")
+      .on(table.gmUserId, table.status, table.startedAt)
+      .where(sql`${table.isDeleted} = false`),
     index("visit_sessions_deleted_idx").on(table.isDeleted),
     uniqueIndex("visit_sessions_client_token_active_unique")
       .on(table.gmUserId, table.clientSessionToken)

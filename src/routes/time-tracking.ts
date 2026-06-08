@@ -6,6 +6,10 @@ import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { ensureStartedDaySession } from "../lib/day-session.js";
 import {
+  respondTimelineValidationError,
+  validateGmTimelineInterval,
+} from "../lib/zeiterfassung-validation.js";
+import {
   timeTrackingEntries,
   timeTrackingEntryEvents,
   type timeTrackingActivityTypeEnum,
@@ -367,6 +371,14 @@ timeTrackingRouter.post("/entries/:id/submit", async (req: AuthedRequest, res, n
       return;
     }
     const now = new Date();
+    await validateGmTimelineInterval({
+      gmUserId: entry.gmUserId,
+      kind: "zusatzzeit",
+      id: entry.id,
+      startAt: entry.startAt,
+      endAt: entry.endAt,
+      now,
+    });
     const [updated] = await db
       .update(timeTrackingEntries)
       .set({
@@ -389,6 +401,7 @@ timeTrackingRouter.post("/entries/:id/submit", async (req: AuthedRequest, res, n
     });
     res.status(200).json({ entry: serializeEntry(updated) });
   } catch (error) {
+    if (respondTimelineValidationError(res, error)) return;
     next(error);
   }
 });
@@ -501,4 +514,3 @@ timeTrackingRouter.get("/entries/draft/active", async (req: AuthedRequest, res, 
 });
 
 export { timeTrackingRouter, normalizeActivityType };
-

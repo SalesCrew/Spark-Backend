@@ -13,6 +13,8 @@ const EXTRA_LABELS: Record<string, string> = {
 
 type SessionStatus = "started" | "ended" | "submitted";
 type TimelineKind = "anfahrt" | "fahrtzeit" | "marktbesuch" | "pause" | "zusatzzeit" | "heimfahrt";
+const TIMELINE_OVERLAP_ERROR_MESSAGE =
+  "Dieser Zeitraum ist nicht moeglich, weil er sich mit einem bestehenden Eintrag ueberschneidet.";
 
 type BaseAction = {
   id: string;
@@ -26,6 +28,24 @@ type BaseAction = {
   questionnaireType?: string;
   questionnaireTypes?: string[];
 };
+
+type TimelineIntervalKind = BaseAction["kind"];
+
+type TimelineInterval = {
+  id: string;
+  kind: TimelineIntervalKind;
+  startAt: Date;
+  endAt: Date;
+};
+
+type TimelineValidationResult =
+  | { ok: true }
+  | {
+      ok: false;
+      code: "invalid_interval" | "outside_day" | "overlap";
+      message: string;
+      conflict?: TimelineInterval;
+    };
 
 type BuildSessionInput = {
   sessionId: string;
@@ -167,6 +187,52 @@ function compareActionsByTime(a: BaseAction, b: BaseAction): number {
   return a.id.localeCompare(b.id);
 }
 
+function timelineIntervalsIntersect(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
+  return aStart.getTime() < bEnd.getTime() && aEnd.getTime() > bStart.getTime();
+}
+
+function isAllowedTimelineOverlap(kindA: TimelineIntervalKind, kindB: TimelineIntervalKind): boolean {
+  return (
+    (kindA === "pause" && kindB === "zusatzzeit") ||
+    (kindA === "zusatzzeit" && kindB === "pause")
+  );
+}
+
+function validateTimelineInterval(input: {
+  kind: TimelineIntervalKind;
+  id: string;
+  startAt: Date;
+  endAt: Date;
+  dayStartAt: Date;
+  dayEndAt: Date;
+  intervals: TimelineInterval[];
+}): TimelineValidationResult {
+  if (input.endAt.getTime() <= input.startAt.getTime()) {
+    return { ok: false, code: "invalid_interval", message: "Endzeit muss nach Startzeit liegen." };
+  }
+  if (
+    input.startAt.getTime() < input.dayStartAt.getTime() ||
+    input.endAt.getTime() > input.dayEndAt.getTime()
+  ) {
+    return { ok: false, code: "outside_day", message: "Zeit liegt ausserhalb des Arbeitstags." };
+  }
+
+  for (const interval of input.intervals) {
+    if (interval.kind === input.kind && interval.id === input.id) continue;
+    if (isAllowedTimelineOverlap(input.kind, interval.kind)) continue;
+    if (timelineIntervalsIntersect(input.startAt, input.endAt, interval.startAt, interval.endAt)) {
+      return {
+        ok: false,
+        code: "overlap",
+        message: TIMELINE_OVERLAP_ERROR_MESSAGE,
+        conflict: interval,
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
 function subtractPauseWindowsFromInterval(
   startAt: Date,
   endAt: Date,
@@ -284,22 +350,16 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
   const dayStartLabel = toHm(input.startAt, input.timezone);
   const dayEndLabel = toHm(input.endAt, input.timezone);
 
-  if (canonicalActions.length > 0) {
-    const first = canonicalActions[0];
-    if (first) {
-      const anfahrtDuration = diffMinutesAtLeastOne(input.startAt, first.startAt);
-      if (anfahrtDuration > 0) {
-        timeline.push({
-          id: `anfahrt-${input.sessionId}`,
-          kind: "anfahrt",
-          start: dayStartLabel,
-          end: toHm(first.startAt, input.timezone),
-          durationMin: anfahrtDuration,
-          title: "Anfahrt",
-        });
-      }
-    }
-  }
+  const firstAction = canonicalActions[0];
+  const anfahrtEndAt = firstAction?.startAt ?? input.endAt;
+  timeline.push({
+    id: `anfahrt-${input.sessionId}`,
+    kind: "anfahrt",
+    start: dayStartLabel,
+    end: toHm(anfahrtEndAt, input.timezone),
+    durationMin: diffMinutesAtLeastOne(input.startAt, anfahrtEndAt),
+    title: "Anfahrt",
+  });
 
   for (let index = 0; index < canonicalActions.length; index += 1) {
     const current = canonicalActions[index];
@@ -353,17 +413,14 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
     if (!last) {
       // no-op
     } else {
-    const heimfahrtDuration = diffMinutesAtLeastOne(last.endAt, input.endAt);
-    if (heimfahrtDuration > 0) {
       timeline.push({
         id: `heimfahrt-${input.sessionId}`,
         kind: "heimfahrt",
         start: toHm(last.endAt, input.timezone),
         end: dayEndLabel,
-        durationMin: heimfahrtDuration,
+        durationMin: diffMinutesAtLeastOne(last.endAt, input.endAt),
         title: "Heimfahrt",
       });
-    }
     }
   }
 
@@ -456,13 +513,20 @@ function buildGmAggregates(input: { sessions: DaySessionPayload[]; timezone: str
 }
 
 export {
+  TIMELINE_OVERLAP_ERROR_MESSAGE,
   buildDaySessionPayload,
   buildGmAggregates,
   formatExtraLabel,
+  isAllowedTimelineOverlap,
   resolvePrimaryQuestionnaireType,
   splitZusatzIntervalsByPauseOverlaps,
+  timelineIntervalsIntersect,
   toYmdInTimezone,
+  validateTimelineInterval,
   type AggregatePayload,
   type BaseAction,
   type DaySessionPayload,
+  type TimelineInterval,
+  type TimelineIntervalKind,
+  type TimelineValidationResult,
 };
