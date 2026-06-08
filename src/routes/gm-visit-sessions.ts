@@ -421,6 +421,7 @@ type SessionQuestionRow = {
   visitSessionSectionId: string;
   questionId: string;
   questionType: (typeof visitSessionQuestions.$inferSelect)["questionType"];
+  requiredSnapshot: boolean;
   questionConfigSnapshot: Record<string, unknown>;
 };
 
@@ -434,6 +435,7 @@ async function loadSiblingSessionQuestions(
       visitSessionSectionId: visitSessionSections.id,
       questionId: visitSessionQuestions.questionId,
       questionType: visitSessionQuestions.questionType,
+      requiredSnapshot: visitSessionQuestions.requiredSnapshot,
       questionConfigSnapshot: visitSessionQuestions.questionConfigSnapshot,
     })
     .from(visitSessionQuestions)
@@ -2668,6 +2670,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
         visitSessionQuestionId: visitAnswers.visitSessionQuestionId,
         sharedQuestionId: visitAnswers.questionId,
         questionType: visitAnswers.questionType,
+        requiredSnapshot: visitSessionQuestions.requiredSnapshot,
         questionConfigSnapshot: visitSessionQuestions.questionConfigSnapshot,
       })
       .from(visitAnswers)
@@ -2829,13 +2832,14 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
         siblingAnswers.map((row) => [row.visitSessionQuestionId, row]),
       );
 
-      const targetAnswers: Array<{ answerId: string; visitQuestionId: string; questionConfigSnapshot: Record<string, unknown> }> = [];
+      const targetAnswers: Array<{ answerId: string; visitQuestionId: string; requiredSnapshot: boolean; questionConfigSnapshot: Record<string, unknown> }> = [];
       for (const sibling of siblingQuestions) {
         const existing = siblingAnswerByVisitQuestionId.get(sibling.visitQuestionId);
         if (existing) {
           targetAnswers.push({
             answerId: existing.id,
             visitQuestionId: sibling.visitQuestionId,
+            requiredSnapshot: sibling.requiredSnapshot,
             questionConfigSnapshot: sibling.questionConfigSnapshot,
           });
           continue;
@@ -2864,6 +2868,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
         targetAnswers.push({
           answerId: created.id,
           visitQuestionId: sibling.visitQuestionId,
+          requiredSnapshot: sibling.requiredSnapshot,
           questionConfigSnapshot: sibling.questionConfigSnapshot,
         });
       }
@@ -2951,16 +2956,18 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
 
         const config = target.questionConfigSnapshot ?? {};
         const tagsEnabled = Boolean(config.tagsEnabled) && Array.isArray(config.tagIds) && (config.tagIds as unknown[]).length > 0;
+        const requiredPhotoQuestion = Boolean(target.requiredSnapshot);
+        const requiresTagSelection = requiredPhotoQuestion && tagsEnabled;
         const hasAtLeastOneTag = photoTagValues.length > 0;
         const isAnswered = inserted.length > 0;
-        const isValid = isAnswered && (!tagsEnabled || hasAtLeastOneTag);
+        const isValid = requiredPhotoQuestion ? isAnswered && (!tagsEnabled || hasAtLeastOneTag) : true;
 
         await tx
           .update(visitAnswers)
           .set({
             answerStatus: isAnswered ? (isValid ? "answered" : "invalid") : "unanswered",
             isValid,
-            validationError: isValid ? null : (tagsEnabled ? "Foto-Frage benötigt mindestens einen Tag." : null),
+            validationError: isValid ? null : (requiresTagSelection ? "Foto-Frage benötigt mindestens einen Tag." : null),
             valueJson: {
               storage: inserted.map((row) => ({
                 id: row.id,
