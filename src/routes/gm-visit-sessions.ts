@@ -2152,6 +2152,81 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
   }
 });
 
+gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/start", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungueltige Session-ID." });
+      return;
+    }
+    const parsed = z
+      .object({
+        startedAt: z.string().min(1),
+      })
+      .strict()
+      .safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltige Startzeit." });
+      return;
+    }
+    const requestedStartedAt = parseOptionalIsoTimestamp(parsed.data.startedAt);
+    if (!requestedStartedAt) {
+      res.status(400).json({ error: "Ungueltige Startzeit." });
+      return;
+    }
+    const now = new Date();
+    const requestedMs = requestedStartedAt.getTime();
+    if (requestedMs > now.getTime() + MAX_REQUESTED_VISIT_START_FUTURE_MS) {
+      res.status(400).json({ error: "Startzeit darf nicht in der Zukunft liegen." });
+      return;
+    }
+    if (requestedMs < now.getTime() - MAX_REQUESTED_VISIT_START_AGE_MS) {
+      res.status(400).json({ error: "Startzeit ist zu alt." });
+      return;
+    }
+
+    const [session] = await db
+      .select()
+      .from(visitSessions)
+      .where(and(eq(visitSessions.id, sessionId), eq(visitSessions.gmUserId, gmUserId), eq(visitSessions.isDeleted, false)))
+      .limit(1);
+    if (!session) {
+      res.status(404).json({ error: "Session nicht gefunden." });
+      return;
+    }
+    if (session.status !== "draft" || session.submittedAt) {
+      res.status(409).json({ error: "Startzeit kann nur bei laufenden Frageboegen geaendert werden." });
+      return;
+    }
+
+    await db
+      .update(visitSessions)
+      .set({
+        startedAt: requestedStartedAt,
+        lastSavedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(visitSessions.id, session.id));
+
+    res.status(200).json({
+      ok: true,
+      session: {
+        id: session.id,
+        status: "draft",
+        startedAt: requestedStartedAt.toISOString(),
+        submittedAt: null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/answers", async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;
