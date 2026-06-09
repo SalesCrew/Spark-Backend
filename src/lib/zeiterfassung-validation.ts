@@ -57,6 +57,10 @@ function normalizeEffectiveDayEnd(session: DaySessionForValidation, now: Date): 
   return now;
 }
 
+function toPgTimestampParam(date: Date): string {
+  return date.toISOString();
+}
+
 async function loadNearestStartedDaySession(input: {
   gmUserId: string;
   startAt: Date;
@@ -76,9 +80,9 @@ async function loadNearestStartedDaySession(input: {
       and(
         eq(gmDaySessions.gmUserId, input.gmUserId),
         eq(gmDaySessions.isDeleted, false),
-        inArray(gmDaySessions.status, ["started", "ended", "submitted"]),
+        sql`${gmDaySessions.status}::text in ('started', 'ended', 'submitted')`,
         isNotNull(gmDaySessions.dayStartedAt),
-        sql`${gmDaySessions.dayStartedAt} <= ${input.startAt}`,
+        sql`${gmDaySessions.dayStartedAt} <= ${toPgTimestampParam(input.startAt)}::timestamptz`,
       ),
     )
     .orderBy(desc(gmDaySessions.dayStartedAt))
@@ -101,6 +105,9 @@ async function loadValidationIntervalsForSession(input: {
   dayEndAt: Date;
   now: Date;
 }): Promise<TimelineInterval[]> {
+  const dayStartAt = toPgTimestampParam(input.dayStartAt);
+  const dayEndAt = toPgTimestampParam(input.dayEndAt);
+  const now = toPgTimestampParam(input.now);
   const [pauseRows, visitRows, extraRows] = await Promise.all([
     db
       .select({
@@ -114,8 +121,8 @@ async function loadValidationIntervalsForSession(input: {
           eq(gmDaySessionPauses.daySessionId, input.daySessionId),
           eq(gmDaySessionPauses.gmUserId, input.gmUserId),
           eq(gmDaySessionPauses.isDeleted, false),
-          sql`${gmDaySessionPauses.pauseStartedAt} < ${input.dayEndAt}`,
-          sql`coalesce(${gmDaySessionPauses.pauseEndedAt}, ${input.now}) > ${input.dayStartAt}`,
+          sql`${gmDaySessionPauses.pauseStartedAt} < ${dayEndAt}::timestamptz`,
+          sql`coalesce(${gmDaySessionPauses.pauseEndedAt}, ${now}::timestamptz) > ${dayStartAt}::timestamptz`,
         ),
       ),
     db
@@ -131,8 +138,8 @@ async function loadValidationIntervalsForSession(input: {
           eq(visitSessions.gmUserId, input.gmUserId),
           inArray(visitSessions.status, ["draft", "submitted"]),
           eq(visitSessions.isDeleted, false),
-          sql`${visitSessions.startedAt} < ${input.dayEndAt}`,
-          sql`coalesce(${visitSessions.submittedAt}, ${input.now}) > ${input.dayStartAt}`,
+          sql`${visitSessions.startedAt} < ${dayEndAt}::timestamptz`,
+          sql`coalesce(${visitSessions.submittedAt}, ${now}::timestamptz) > ${dayStartAt}::timestamptz`,
         ),
       ),
     db
@@ -149,8 +156,8 @@ async function loadValidationIntervalsForSession(input: {
           inArray(timeTrackingEntries.status, ["draft", "submitted"]),
           eq(timeTrackingEntries.isDeleted, false),
           isNotNull(timeTrackingEntries.startAt),
-          sql`${timeTrackingEntries.startAt} < ${input.dayEndAt}`,
-          sql`coalesce(${timeTrackingEntries.endAt}, ${input.now}) > ${input.dayStartAt}`,
+          sql`${timeTrackingEntries.startAt} < ${dayEndAt}::timestamptz`,
+          sql`coalesce(${timeTrackingEntries.endAt}, ${now}::timestamptz) > ${dayStartAt}::timestamptz`,
         ),
       ),
   ]);

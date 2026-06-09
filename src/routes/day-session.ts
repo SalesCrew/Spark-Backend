@@ -153,6 +153,10 @@ async function loadTodaySession(gmUserId: string, now: Date, timezone: string) {
   return getCurrentDaySessionForUser({ gmUserId, now, timezone });
 }
 
+async function loadCurrentWritableSession(gmUserId: string, now: Date, timezone: string) {
+  return (await loadTodaySession(gmUserId, now, timezone)) ?? (await loadAnyOpenSessionForUser(gmUserId));
+}
+
 async function loadAnyOpenSessionForUser(gmUserId: string) {
   const [row] = await db
     .select()
@@ -539,7 +543,7 @@ daySessionRouter.patch("/start-km", async (req: AuthedRequest, res, next) => {
       return;
     }
     const now = new Date();
-    const session = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
+    const session = await loadCurrentWritableSession(gmUserId, now, DEFAULT_TIMEZONE);
     if (!session || (session.status !== "started" && session.status !== "ended")) {
       res.status(409).json({ error: "Arbeitstag wurde noch nicht gestartet.", code: "day_not_started" });
       return;
@@ -569,7 +573,7 @@ daySessionRouter.patch("/start-km/defer", async (req: AuthedRequest, res, next) 
       return;
     }
     const now = new Date();
-    const session = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
+    const session = await loadCurrentWritableSession(gmUserId, now, DEFAULT_TIMEZONE);
     if (!session || (session.status !== "started" && session.status !== "ended")) {
       res.status(409).json({ error: "Arbeitstag wurde noch nicht gestartet.", code: "day_not_started" });
       return;
@@ -604,12 +608,28 @@ daySessionRouter.patch("/end", async (req: AuthedRequest, res, next) => {
       return;
     }
     const now = new Date();
-    const session = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
+    const session = await loadCurrentWritableSession(gmUserId, now, DEFAULT_TIMEZONE);
     if (!session || (session.status !== "started" && session.status !== "ended")) {
       res.status(409).json({ error: "Arbeitstag wurde noch nicht gestartet.", code: "day_not_started" });
       return;
     }
+    const sessionTimezone = session.timezone || DEFAULT_TIMEZONE;
+    const currentWorkDate = toYmdInTimezone(now, sessionTimezone);
+    if (session.workDate < currentWorkDate && !parsed.data.endAt) {
+      res.status(400).json({
+        error: "Bitte eine Endzeit fuer den offenen Arbeitstag erfassen.",
+        code: "stale_day_end_time_required",
+      });
+      return;
+    }
     const endAt = parsed.data.endAt ? new Date(parsed.data.endAt) : now;
+    if (toYmdInTimezone(endAt, sessionTimezone) !== session.workDate) {
+      res.status(400).json({
+        error: "Tagesende muss am selben Kalendertag wie der Tagesstart liegen.",
+        code: "day_end_wrong_work_date",
+      });
+      return;
+    }
     if (session.dayStartedAt && endAt.getTime() < session.dayStartedAt.getTime()) {
       res.status(400).json({ error: "Tagesende darf nicht vor Tagesstart liegen." });
       return;
@@ -643,7 +663,7 @@ daySessionRouter.patch("/end-km", async (req: AuthedRequest, res, next) => {
       return;
     }
     const now = new Date();
-    const session = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
+    const session = await loadCurrentWritableSession(gmUserId, now, DEFAULT_TIMEZONE);
     if (!session || (session.status !== "started" && session.status !== "ended")) {
       res.status(409).json({ error: "Der Arbeitstag wurde noch nicht gestartet.", code: "day_not_started" });
       return;
@@ -677,7 +697,7 @@ daySessionRouter.patch("/end-km/defer", async (req: AuthedRequest, res, next) =>
       return;
     }
     const now = new Date();
-    const session = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
+    const session = await loadCurrentWritableSession(gmUserId, now, DEFAULT_TIMEZONE);
     if (!session || (session.status !== "started" && session.status !== "ended")) {
       res.status(409).json({ error: "Der Arbeitstag wurde noch nicht gestartet.", code: "day_not_started" });
       return;
@@ -712,7 +732,7 @@ daySessionRouter.post("/submit", async (req: AuthedRequest, res, next) => {
       return;
     }
     const now = new Date();
-    const session = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
+    const session = await loadCurrentWritableSession(gmUserId, now, DEFAULT_TIMEZONE);
     if (!session || session.status !== "ended") {
       res.status(409).json({ error: "Der Arbeitstag muss zuerst beendet werden.", code: "day_not_ended" });
       return;
@@ -750,7 +770,7 @@ daySessionRouter.patch("/cancel", async (req: AuthedRequest, res, next) => {
       return;
     }
     const now = new Date();
-    const session = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
+    const session = await loadCurrentWritableSession(gmUserId, now, DEFAULT_TIMEZONE);
     if (!session) {
       res.status(404).json({ error: "Kein offener Arbeitstag gefunden." });
       return;

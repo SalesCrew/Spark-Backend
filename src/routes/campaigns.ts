@@ -311,7 +311,7 @@ async function loadActiveUniversumMarketIds(): Promise<string[]> {
       and(
         eq(markets.isDeleted, false),
         eq(markets.isActive, true),
-        eq(markets.marketType, "universum"),
+        inArray(markets.marketType, ["universum", "both"]),
       ),
     );
   return rows.map((row) => row.id);

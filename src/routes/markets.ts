@@ -858,7 +858,13 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
       db
         .select()
         .from(markets)
-        .where(eq(markets.isDeleted, false))
+        .where(
+          and(
+            eq(markets.isDeleted, false),
+            eq(markets.isActive, true),
+            inArray(markets.marketType, ["universum", "both"]),
+          ),
+        )
         .orderBy(desc(markets.createdAt)),
       db
         .select({

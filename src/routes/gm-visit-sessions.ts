@@ -1613,13 +1613,6 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
 
     const startValidationNow = new Date();
     const acceptedStartedAt = resolveAcceptedVisitStartAt(parsed.data.startedAt, startValidationNow);
-    await validateGmTimelineStartPoint({
-      gmUserId,
-      kind: "marktbesuch",
-      id: "pending-visit-session",
-      startAt: acceptedStartedAt,
-      now: startValidationNow,
-    });
 
     const resolvedSections = await resolveVisitSectionsForSelection({
       gmUserId,
