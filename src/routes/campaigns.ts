@@ -255,6 +255,114 @@ function calculateDurationMinutes(startedAt: Date | null, submittedAt: Date | nu
   return Math.round(deltaMs / 60000);
 }
 
+async function buildCampaignMarketVisitStatusBatch(campaignIds: string[]) {
+  const uniqueCampaignIds = normalizeUnique(campaignIds).filter(isUuid);
+  if (uniqueCampaignIds.length === 0) return [];
+
+  const assignmentRows = await db
+    .select({
+      campaignId: campaignMarketAssignments.campaignId,
+      marketId: campaignMarketAssignments.marketId,
+      visitTargetCount: campaignMarketAssignments.visitTargetCount,
+    })
+    .from(campaignMarketAssignments)
+    .where(and(inArray(campaignMarketAssignments.campaignId, uniqueCampaignIds), eq(campaignMarketAssignments.isDeleted, false)));
+
+  const targetByCampaignMarket = new Map<string, number>();
+  const marketsByCampaign = new Map<string, Set<string>>();
+  for (const row of assignmentRows) {
+    const key = `${row.campaignId}:${row.marketId}`;
+    targetByCampaignMarket.set(key, (targetByCampaignMarket.get(key) ?? 0) + row.visitTargetCount);
+    const markets = marketsByCampaign.get(row.campaignId) ?? new Set<string>();
+    markets.add(row.marketId);
+    marketsByCampaign.set(row.campaignId, markets);
+  }
+
+  if (targetByCampaignMarket.size === 0) {
+    return uniqueCampaignIds.map((campaignId) => ({ campaignId, markets: [] }));
+  }
+
+  const submittedRows = await db
+    .select({
+      campaignId: visitSessionSections.campaignId,
+      marketId: visitSessions.marketId,
+      sessionId: visitSessions.id,
+      gmUserId: visitSessions.gmUserId,
+      startedAt: visitSessions.startedAt,
+      submittedAt: visitSessions.submittedAt,
+      createdAt: visitSessions.createdAt,
+    })
+    .from(visitSessionSections)
+    .innerJoin(visitSessions, eq(visitSessions.id, visitSessionSections.visitSessionId))
+    .where(
+      and(
+        inArray(visitSessionSections.campaignId, uniqueCampaignIds),
+        eq(visitSessionSections.isDeleted, false),
+        eq(visitSessions.isDeleted, false),
+        eq(visitSessions.status, "submitted"),
+      ),
+    )
+    .orderBy(desc(visitSessions.submittedAt), desc(visitSessions.createdAt));
+
+  const submittedCountByCampaignMarket = new Map<string, number>();
+  const latestByCampaignMarket = new Map<string, (typeof submittedRows)[number]>();
+  const seenSubmittedSession = new Set<string>();
+  for (const row of submittedRows) {
+    const key = `${row.campaignId}:${row.marketId}`;
+    if (!targetByCampaignMarket.has(key)) continue;
+    const sessionKey = `${key}:${row.sessionId}`;
+    if (!seenSubmittedSession.has(sessionKey)) {
+      seenSubmittedSession.add(sessionKey);
+      submittedCountByCampaignMarket.set(key, (submittedCountByCampaignMarket.get(key) ?? 0) + 1);
+    }
+    if (!latestByCampaignMarket.has(key)) {
+      latestByCampaignMarket.set(key, row);
+    }
+  }
+
+  const gmUserIds = normalizeUnique(
+    Array.from(latestByCampaignMarket.values())
+      .map((entry) => entry.gmUserId)
+      .filter((entry): entry is string => Boolean(entry)),
+  );
+  const gmNameById = new Map<string, string>();
+  if (gmUserIds.length > 0) {
+    const gmRows = await db
+      .select({ id: users.id, firstName: users.firstName, lastName: users.lastName })
+      .from(users)
+      .where(inArray(users.id, gmUserIds));
+    for (const row of gmRows) {
+      gmNameById.set(row.id, `${row.firstName} ${row.lastName}`.trim());
+    }
+  }
+
+  return uniqueCampaignIds.map((campaignId) => {
+    const marketIds = Array.from(marketsByCampaign.get(campaignId) ?? []);
+    return {
+      campaignId,
+      markets: marketIds.map((marketId) => {
+        const key = `${campaignId}:${marketId}`;
+        const targetVisitCount = targetByCampaignMarket.get(key) ?? 0;
+        const submittedVisitCount = submittedCountByCampaignMarket.get(key) ?? 0;
+        const latest = latestByCampaignMarket.get(key) ?? null;
+        return {
+          marketId,
+          targetVisitCount,
+          submittedVisitCount,
+          isComplete: targetVisitCount > 0 && submittedVisitCount >= targetVisitCount,
+          hasSubmittedVisit: submittedVisitCount > 0,
+          sessionId: latest?.sessionId ?? null,
+          startedAt: latest?.startedAt?.toISOString() ?? null,
+          submittedAt: latest?.submittedAt?.toISOString() ?? null,
+          durationMinutes: latest ? calculateDurationMinutes(latest.startedAt, latest.submittedAt) : null,
+          gmUserId: latest?.gmUserId ?? null,
+          gmName: latest?.gmUserId ? gmNameById.get(latest.gmUserId) ?? null : null,
+        };
+      }),
+    };
+  });
+}
+
 function parseIsoDateOrThrow(raw: string, field: "startDate" | "endDate"): string {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
     throw new CampaignDomainError("schedule_invalid", 400, `${field} muss im Format YYYY-MM-DD sein.`);
@@ -869,21 +977,37 @@ async function mergeCampaignAssignment(
   });
 }
 
-async function buildCampaignMarketVisitSummaries(campaignId: string) {
+async function buildCampaignMarketVisitSummaries(
+  campaignId: string,
+  options?: { marketIds?: string[]; sessionId?: string | null },
+) {
+  const scopedMarketIds = normalizeUnique(options?.marketIds ?? []).filter(isUuid);
+  const assignedConditions = [
+    eq(campaignMarketAssignments.campaignId, campaignId),
+    eq(campaignMarketAssignments.isDeleted, false),
+  ];
+  if (scopedMarketIds.length > 0) {
+    assignedConditions.push(inArray(campaignMarketAssignments.marketId, scopedMarketIds));
+  }
   const assignedRows = await db
     .select({
       marketId: campaignMarketAssignments.marketId,
     })
     .from(campaignMarketAssignments)
-    .where(
-      and(
-        eq(campaignMarketAssignments.campaignId, campaignId),
-        eq(campaignMarketAssignments.isDeleted, false),
-      ),
-    );
+    .where(and(...assignedConditions));
   const assignedMarketIds = normalizeUnique(assignedRows.map((row) => row.marketId));
   if (assignedMarketIds.length === 0) return [];
 
+  const submittedConditions = [
+    eq(visitSessionSections.campaignId, campaignId),
+    eq(visitSessionSections.isDeleted, false),
+    eq(visitSessions.isDeleted, false),
+    eq(visitSessions.status, "submitted"),
+    inArray(visitSessions.marketId, assignedMarketIds),
+  ];
+  if (options?.sessionId && isUuid(options.sessionId)) {
+    submittedConditions.push(eq(visitSessions.id, options.sessionId));
+  }
   const submittedSectionRows = await db
     .select({
       marketId: visitSessions.marketId,
@@ -895,15 +1019,7 @@ async function buildCampaignMarketVisitSummaries(campaignId: string) {
     })
     .from(visitSessionSections)
     .innerJoin(visitSessions, eq(visitSessions.id, visitSessionSections.visitSessionId))
-    .where(
-      and(
-        eq(visitSessionSections.campaignId, campaignId),
-        eq(visitSessionSections.isDeleted, false),
-        eq(visitSessions.isDeleted, false),
-        eq(visitSessions.status, "submitted"),
-        inArray(visitSessions.marketId, assignedMarketIds),
-      ),
-    )
+    .where(and(...submittedConditions))
     .orderBy(desc(visitSessions.submittedAt), desc(visitSessions.createdAt));
 
   const latestByMarket = new Map<string, (typeof submittedSectionRows)[number]>();
@@ -1360,6 +1476,29 @@ adminCampaignsRouter.get("/campaigns", async (req, res, next) => {
   }
 });
 
+adminCampaignsRouter.get("/campaigns/market-visit-status", async (req, res, next) => {
+  try {
+    const rawCampaignIds = String(req.query.campaignIds ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const campaignIds = normalizeUnique(rawCampaignIds);
+    if (campaignIds.length === 0 || campaignIds.some((campaignId) => !isUuid(campaignId))) {
+      res.status(400).json({ error: "Ungueltige Kampagnen-IDs.", code: "invalid_campaign_ids" });
+      return;
+    }
+    if (campaignIds.length > 50) {
+      res.status(400).json({ error: "Maximal 50 Kampagnen pro Status-Anfrage erlaubt.", code: "campaign_status_batch_too_large" });
+      return;
+    }
+
+    const statusRows = await buildCampaignMarketVisitStatusBatch(campaignIds);
+    res.status(200).json({ campaigns: statusRows });
+  } catch (error) {
+    next(error);
+  }
+});
+
 adminCampaignsRouter.get("/campaigns/:id/market-visits", async (req, res, next) => {
   try {
     const campaignId = String(req.params.id ?? "");
@@ -1383,6 +1522,39 @@ adminCampaignsRouter.get("/campaigns/:id/market-visits", async (req, res, next) 
       campaignId,
       markets: summaries,
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminCampaignsRouter.get("/campaigns/:campaignId/markets/:marketId/visit-detail", async (req, res, next) => {
+  try {
+    const campaignId = String(req.params.campaignId ?? "");
+    const marketId = String(req.params.marketId ?? "");
+    const sessionId = typeof req.query.sessionId === "string" && req.query.sessionId.trim()
+      ? req.query.sessionId.trim()
+      : null;
+    if (!isUuid(campaignId) || !isUuid(marketId) || (sessionId != null && !isUuid(sessionId))) {
+      res.status(400).json({ error: "Ungueltige Detail-Anfrage.", code: "invalid_id" });
+      return;
+    }
+
+    const [campaign] = await db
+      .select({ id: campaigns.id })
+      .from(campaigns)
+      .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
+      .limit(1);
+    if (!campaign) {
+      res.status(404).json({ error: "Kampagne nicht gefunden.", code: "campaign_not_found" });
+      return;
+    }
+
+    const [detail] = await buildCampaignMarketVisitSummaries(campaignId, { marketIds: [marketId], sessionId });
+    if (!detail) {
+      res.status(404).json({ error: "Markt ist dieser Kampagne nicht zugewiesen.", code: "campaign_market_not_found" });
+      return;
+    }
+    res.status(200).json({ market: detail });
   } catch (error) {
     next(error);
   }

@@ -295,6 +295,9 @@ export const campaignMarketAssignments = pgTable(
     uniqueIndex("campaign_market_assignments_campaign_market_unassigned_active_unique")
       .on(table.campaignId, table.marketId, table.assignmentSlot)
       .where(sql`${table.isDeleted} = false and ${table.gmUserId} is null`),
+    index("campaign_market_assignments_campaign_market_active_idx")
+      .on(table.campaignId, table.marketId)
+      .where(sql`${table.isDeleted} = false`),
     index("campaign_market_assignments_market_idx").on(table.marketId),
     index("campaign_market_assignments_gm_deleted_idx").on(table.gmUserId, table.isDeleted),
     index("campaign_market_assignments_campaign_deleted_idx").on(table.campaignId, table.isDeleted),
@@ -1218,6 +1221,9 @@ export const visitSessions = pgTable(
     index("visit_sessions_gm_market_submitted_idx")
       .on(table.gmUserId, table.marketId, table.submittedAt)
       .where(sql`${table.isDeleted} = false AND ${table.status} = 'submitted' AND ${table.submittedAt} IS NOT NULL`),
+    index("visit_sessions_market_submitted_active_idx")
+      .on(table.marketId, table.submittedAt, table.createdAt)
+      .where(sql`${table.isDeleted} = false AND ${table.status} = 'submitted' AND ${table.submittedAt} IS NOT NULL`),
     index("visit_sessions_gm_status_started_idx")
       .on(table.gmUserId, table.status, table.startedAt)
       .where(sql`${table.isDeleted} = false`),
@@ -1389,6 +1395,9 @@ export const visitSessionSections = pgTable(
   (table) => [
     index("visit_session_sections_session_idx").on(table.visitSessionId, table.orderIndex),
     index("visit_session_sections_campaign_idx").on(table.campaignId),
+    index("visit_session_sections_campaign_session_active_idx")
+      .on(table.campaignId, table.visitSessionId)
+      .where(sql`${table.isDeleted} = false`),
     index("visit_session_sections_deleted_idx").on(table.isDeleted),
   ],
 );
