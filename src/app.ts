@@ -22,6 +22,7 @@ import { adminFragebogenRouter } from "./routes/fragebogen.js";
 import { gmVisitSessionsRouter } from "./routes/gm-visit-sessions.js";
 import { adminIppRouter } from "./routes/ipp.js";
 import { adminMarketsRouter, marketsRouter } from "./routes/markets.js";
+import { adminPhotosRouter } from "./routes/admin-photos.js";
 import { adminPraemienRouter } from "./routes/praemien.js";
 import { adminRedMonthRouter, redMonthRouter } from "./routes/red-month.js";
 import { timeTrackingRouter } from "./routes/time-tracking.js";
@@ -158,6 +159,7 @@ function createApp() {
   app.use("/admin", adminLagerRouter);
   app.use("/admin", adminFragebogenRouter);
   app.use("/admin", adminCampaignsRouter);
+  app.use("/admin", adminPhotosRouter);
   app.use("/admin", adminIppRouter);
   app.use("/admin/praemien", adminPraemienRouter);
   app.use("/admin", adminRedMonthRouter);
