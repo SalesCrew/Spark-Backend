@@ -13,6 +13,10 @@ import {
   marketKuehlerUnits,
   markets,
   photoTags,
+  visitAnswerPhotos,
+  visitAnswers,
+  visitQuestionComments,
+  visitSessionQuestions,
   visitSessionSections,
   visitSessions,
   users,
@@ -765,6 +769,35 @@ type ProgressSectionPayload = {
   markets: ProgressMarketRow[];
 };
 
+type GmMarketDetailSection = ActiveNowCampaignSummary["section"];
+
+type GmMarketDetailCampaign = {
+  campaignId: string;
+  campaignName: string;
+  section: GmMarketDetailSection;
+  targetVisitCount: number;
+  submittedVisitCount: number;
+  isComplete: boolean;
+  isStartable: boolean;
+};
+
+type GmMarketDetailDraft = {
+  sessionId: string;
+  startedAt: string;
+  campaignIds: string[];
+  campaignNames: string[];
+};
+
+type GmMarketPastVisitSection = {
+  section: GmMarketDetailSection;
+  campaignId: string;
+  campaignName: string;
+  fragebogenName: string;
+  answeredQuestionCount: number;
+  photoCount: number;
+  commentCount: number;
+};
+
 function campaignIsLiveNowCondition() {
   return sql`(
     (
@@ -789,6 +822,27 @@ function campaignIsLiveNowCondition() {
       and ${campaigns.endDate} >= current_date
     )
   )`;
+}
+
+function redPeriodEndExclusive(endDate: Date): Date {
+  const next = new Date(endDate);
+  next.setDate(next.getDate() + 1);
+  next.setHours(0, 0, 0, 0);
+  return next;
+}
+
+function toIsoOrNull(value: Date | string | null | undefined): string | null {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function durationMinutes(startedAt: Date | string | null | undefined, endedAt: Date | string | null | undefined): number | null {
+  const start = startedAt instanceof Date ? startedAt : startedAt ? new Date(startedAt) : null;
+  const end = endedAt instanceof Date ? endedAt : endedAt ? new Date(endedAt) : null;
+  if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
 }
 
 async function resolveActiveStandardGmNamesByMarketIds(marketIds: string[]) {
@@ -1058,6 +1112,358 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
         ...mapMarketRow(row),
         plannedByActiveStandardGmName: gmNamesByMarketId.get(row.id) ?? null,
         activeNowCampaigns: activeFlexCampaigns,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    if (req.authUser?.role === "sm") {
+      res.status(403).json({ error: "Nur GMs (oder Admin zur Einsicht) duerfen diese Daten abrufen." });
+      return;
+    }
+
+    const parsed = z.object({ marketId: z.string().uuid() }).safeParse(req.params);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltige Markt-ID." });
+      return;
+    }
+    const { marketId } = parsed.data;
+
+    await refreshRedMonthCalendarConfig();
+    const redPeriod = getCurrentRedPeriod();
+    const redEndExclusive = redPeriodEndExclusive(redPeriod.end);
+
+    const [marketRow] = await db
+      .select()
+      .from(markets)
+      .where(and(eq(markets.id, marketId), eq(markets.isDeleted, false)))
+      .limit(1);
+
+    if (!marketRow) {
+      res.status(404).json({ error: "Markt nicht gefunden." });
+      return;
+    }
+
+    const assignedCampaignRows = await db
+      .select({
+        campaignId: campaigns.id,
+        campaignName: campaigns.name,
+        section: campaigns.section,
+        currentFragebogenId: campaigns.currentFragebogenId,
+        visitTargetCount: campaignMarketAssignments.visitTargetCount,
+      })
+      .from(campaignMarketAssignments)
+      .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
+      .where(
+        and(
+          eq(campaignMarketAssignments.gmUserId, gmUserId),
+          eq(campaignMarketAssignments.marketId, marketId),
+          eq(campaignMarketAssignments.isDeleted, false),
+          eq(campaigns.isDeleted, false),
+          campaignIsLiveNowCondition(),
+        ),
+      )
+      .orderBy(asc(campaigns.section), asc(campaigns.name));
+
+    const activeByCampaignId = new Map<
+      string,
+      {
+        campaignId: string;
+        campaignName: string;
+        section: GmMarketDetailSection;
+        currentFragebogenId: string | null;
+        targetVisitCount: number;
+      }
+    >();
+
+    for (const row of assignedCampaignRows) {
+      const existing = activeByCampaignId.get(row.campaignId);
+      if (existing) {
+        existing.targetVisitCount += Math.max(1, Number(row.visitTargetCount ?? 1));
+        continue;
+      }
+      activeByCampaignId.set(row.campaignId, {
+        campaignId: row.campaignId,
+        campaignName: row.campaignName,
+        section: row.section,
+        currentFragebogenId: row.currentFragebogenId,
+        targetVisitCount: Math.max(1, Number(row.visitTargetCount ?? 1)),
+      });
+    }
+
+    if (marketRow.isActive && (marketRow.marketType === "universum" || marketRow.marketType === "both")) {
+      const activeFlexRows = await db
+        .select({
+          campaignId: campaigns.id,
+          campaignName: campaigns.name,
+          section: campaigns.section,
+          currentFragebogenId: campaigns.currentFragebogenId,
+        })
+        .from(campaigns)
+        .where(
+          and(
+            eq(campaigns.section, "flex"),
+            eq(campaigns.isDeleted, false),
+            isNotNull(campaigns.currentFragebogenId),
+            campaignIsLiveNowCondition(),
+          ),
+        )
+        .orderBy(asc(campaigns.name));
+
+      for (const row of activeFlexRows) {
+        if (activeByCampaignId.has(row.campaignId)) continue;
+        activeByCampaignId.set(row.campaignId, {
+          campaignId: row.campaignId,
+          campaignName: row.campaignName,
+          section: row.section,
+          currentFragebogenId: row.currentFragebogenId,
+          targetVisitCount: 1,
+        });
+      }
+    }
+
+    const activeCampaignIds = Array.from(activeByCampaignId.keys());
+    if (activeCampaignIds.length === 0) {
+      res.status(403).json({ error: "Dieser Markt ist fuer dich aktuell nicht startbar." });
+      return;
+    }
+
+    const submittedRows = await db
+      .select({
+        campaignId: visitSessionSections.campaignId,
+        visitSessionId: visitSessionSections.visitSessionId,
+      })
+      .from(visitSessionSections)
+      .innerJoin(visitSessions, eq(visitSessions.id, visitSessionSections.visitSessionId))
+      .where(
+        and(
+          inArray(visitSessionSections.campaignId, activeCampaignIds),
+          eq(visitSessionSections.isDeleted, false),
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.marketId, marketId),
+          eq(visitSessions.status, "submitted"),
+          eq(visitSessions.isDeleted, false),
+          sql`${visitSessions.submittedAt} is not null`,
+          sql`${visitSessions.submittedAt} >= ${redPeriod.start}`,
+          sql`${visitSessions.submittedAt} < ${redEndExclusive}`,
+        ),
+      );
+
+    const submittedByCampaign = new Map<string, Set<string>>();
+    for (const row of submittedRows) {
+      const bucket = submittedByCampaign.get(row.campaignId) ?? new Set<string>();
+      bucket.add(row.visitSessionId);
+      submittedByCampaign.set(row.campaignId, bucket);
+    }
+
+    const activeCampaigns: GmMarketDetailCampaign[] = Array.from(activeByCampaignId.values())
+      .map((row) => {
+        const submittedVisitCount = submittedByCampaign.get(row.campaignId)?.size ?? 0;
+        const isComplete = submittedVisitCount >= row.targetVisitCount;
+        return {
+          campaignId: row.campaignId,
+          campaignName: row.campaignName,
+          section: row.section,
+          targetVisitCount: row.targetVisitCount,
+          submittedVisitCount,
+          isComplete,
+          isStartable: Boolean(row.currentFragebogenId),
+        };
+      })
+      .sort((left, right) => {
+        const sectionDiff = SECTION_ORDER.indexOf(left.section) - SECTION_ORDER.indexOf(right.section);
+        return sectionDiff || left.campaignName.localeCompare(right.campaignName, "de");
+      });
+
+    const draftSessionRows = await db
+      .select({
+        sessionId: visitSessions.id,
+        startedAt: visitSessions.startedAt,
+      })
+      .from(visitSessions)
+      .where(
+        and(
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.marketId, marketId),
+          eq(visitSessions.status, "draft"),
+          eq(visitSessions.isDeleted, false),
+          sql`${visitSessions.submittedAt} is null`,
+        ),
+      )
+      .orderBy(desc(visitSessions.startedAt))
+      .limit(5);
+
+    const draftSessionIds = draftSessionRows.map((row) => row.sessionId);
+    const draftSectionsBySession = new Map<string, Array<{ campaignId: string; campaignName: string }>>();
+    if (draftSessionIds.length > 0) {
+      const draftSectionRows = await db
+        .select({
+          visitSessionId: visitSessionSections.visitSessionId,
+          campaignId: visitSessionSections.campaignId,
+          campaignName: campaigns.name,
+        })
+        .from(visitSessionSections)
+        .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+        .where(and(inArray(visitSessionSections.visitSessionId, draftSessionIds), eq(visitSessionSections.isDeleted, false)))
+        .orderBy(asc(visitSessionSections.orderIndex));
+
+      for (const row of draftSectionRows) {
+        const bucket = draftSectionsBySession.get(row.visitSessionId) ?? [];
+        bucket.push({ campaignId: row.campaignId, campaignName: row.campaignName });
+        draftSectionsBySession.set(row.visitSessionId, bucket);
+      }
+    }
+
+    const drafts: GmMarketDetailDraft[] = draftSessionRows.map((row) => {
+      const sections = draftSectionsBySession.get(row.sessionId) ?? [];
+      return {
+        sessionId: row.sessionId,
+        startedAt: row.startedAt.toISOString(),
+        campaignIds: sections.map((section) => section.campaignId),
+        campaignNames: sections.map((section) => section.campaignName),
+      };
+    });
+
+    const pastSessionRows = await db
+      .select({
+        sessionId: visitSessions.id,
+        startedAt: visitSessions.startedAt,
+        submittedAt: visitSessions.submittedAt,
+      })
+      .from(visitSessions)
+      .where(
+        and(
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.marketId, marketId),
+          eq(visitSessions.status, "submitted"),
+          eq(visitSessions.isDeleted, false),
+          sql`${visitSessions.submittedAt} is not null`,
+        ),
+      )
+      .orderBy(desc(visitSessions.submittedAt), desc(visitSessions.createdAt))
+      .limit(10);
+
+    const pastSessionIds = pastSessionRows.map((row) => row.sessionId);
+    const pastSectionsBySession = new Map<string, GmMarketPastVisitSection[]>();
+    if (pastSessionIds.length > 0) {
+      const pastSectionRows = await db
+        .select({
+          sectionId: visitSessionSections.id,
+          visitSessionId: visitSessionSections.visitSessionId,
+          section: visitSessionSections.section,
+          campaignId: visitSessionSections.campaignId,
+          campaignName: campaigns.name,
+          fragebogenName: visitSessionSections.fragebogenNameSnapshot,
+        })
+        .from(visitSessionSections)
+        .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+        .where(and(inArray(visitSessionSections.visitSessionId, pastSessionIds), eq(visitSessionSections.isDeleted, false)))
+        .orderBy(asc(visitSessionSections.orderIndex));
+
+      const answerCountsBySection = new Map<string, number>();
+      const photoCountsBySection = new Map<string, number>();
+      const commentCountsBySection = new Map<string, number>();
+
+      const answerRows = await db
+        .select({
+          answerId: visitAnswers.id,
+          sectionId: visitAnswers.visitSessionSectionId,
+        })
+        .from(visitAnswers)
+        .where(
+          and(
+            inArray(visitAnswers.visitSessionId, pastSessionIds),
+            eq(visitAnswers.isDeleted, false),
+            eq(visitAnswers.answerStatus, "answered"),
+          ),
+        );
+
+      const answerIds = answerRows.map((row) => row.answerId);
+      const sectionByAnswerId = new Map(answerRows.map((row) => [row.answerId, row.sectionId]));
+      for (const row of answerRows) {
+        answerCountsBySection.set(row.sectionId, (answerCountsBySection.get(row.sectionId) ?? 0) + 1);
+      }
+
+      if (answerIds.length > 0) {
+        const photoRows = await db
+          .select({
+            answerId: visitAnswerPhotos.visitAnswerId,
+            photoId: visitAnswerPhotos.id,
+          })
+          .from(visitAnswerPhotos)
+          .where(and(inArray(visitAnswerPhotos.visitAnswerId, answerIds), eq(visitAnswerPhotos.isDeleted, false)));
+
+        for (const row of photoRows) {
+          const sectionId = sectionByAnswerId.get(row.answerId);
+          if (!sectionId) continue;
+          photoCountsBySection.set(sectionId, (photoCountsBySection.get(sectionId) ?? 0) + 1);
+        }
+      }
+
+      const commentRows = await db
+        .select({
+          sectionId: visitSessionQuestions.visitSessionSectionId,
+          commentId: visitQuestionComments.id,
+        })
+        .from(visitQuestionComments)
+        .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitQuestionComments.visitSessionQuestionId))
+        .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+        .where(
+          and(
+            inArray(visitSessionSections.visitSessionId, pastSessionIds),
+            eq(visitQuestionComments.isDeleted, false),
+            eq(visitSessionQuestions.isDeleted, false),
+            eq(visitSessionSections.isDeleted, false),
+            sql`trim(${visitQuestionComments.commentText}) <> ''`,
+          ),
+        );
+
+      for (const row of commentRows) {
+        commentCountsBySection.set(row.sectionId, (commentCountsBySection.get(row.sectionId) ?? 0) + 1);
+      }
+
+      for (const row of pastSectionRows) {
+        const bucket = pastSectionsBySession.get(row.visitSessionId) ?? [];
+        bucket.push({
+          section: row.section,
+          campaignId: row.campaignId,
+          campaignName: row.campaignName,
+          fragebogenName: row.fragebogenName,
+          answeredQuestionCount: answerCountsBySection.get(row.sectionId) ?? 0,
+          photoCount: photoCountsBySection.get(row.sectionId) ?? 0,
+          commentCount: commentCountsBySection.get(row.sectionId) ?? 0,
+        });
+        pastSectionsBySession.set(row.visitSessionId, bucket);
+      }
+    }
+
+    const gmNamesByMarketId = await resolveActiveStandardGmNamesByMarketIds([marketId]);
+    res.status(200).json({
+      period: {
+        startDate: toYmd(redPeriod.start),
+        endDate: toYmd(redPeriod.end),
+      },
+      market: {
+        ...mapMarketRow(marketRow),
+        plannedByActiveStandardGmName: gmNamesByMarketId.get(marketId) ?? null,
+      },
+      activeCampaigns,
+      drafts,
+      pastVisits: pastSessionRows.map((row) => ({
+        sessionId: row.sessionId,
+        startedAt: row.startedAt.toISOString(),
+        submittedAt: toIsoOrNull(row.submittedAt),
+        durationMinutes: durationMinutes(row.startedAt, row.submittedAt),
+        sections: pastSectionsBySession.get(row.sessionId) ?? [],
       })),
     });
   } catch (err) {
