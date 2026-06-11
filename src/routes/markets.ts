@@ -36,9 +36,12 @@ type ImportFieldKey =
   | "emEh"
   | "region"
   | "employee"
+  | "currentGmName"
   | "universeMarket"
   | "visitFrequencyPerYear"
-  | "infoFlag";
+  | "infoFlag"
+  | "infoNote"
+  | "isActive";
 
 type MarketDraft = Partial<
   Record<
@@ -46,7 +49,7 @@ type MarketDraft = Partial<
     string | number | boolean
   >
 >;
-type ImportDatasetType = "universum" | "kuehler";
+type ImportDatasetType = "universum" | "kuehler" | "update";
 
 const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
 
@@ -154,8 +157,30 @@ const kuehlerImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; requi
   { key: "employee", label: "Mitarbeiter", required: false, isIdentity: false },
 ];
 
+const updateImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; required: boolean; isIdentity: boolean }> = [
+  { key: "flexNumber", label: "Flex-Nummer", required: true, isIdentity: true },
+  { key: "standardMarketNumber", label: "Standardmarkt Nr", required: false, isIdentity: false },
+  { key: "cokeMasterNumber", label: "Stammnr. von Coke", required: false, isIdentity: false },
+  { key: "name", label: "Name", required: false, isIdentity: false },
+  { key: "dbName", label: "Name f. DB", required: false, isIdentity: false },
+  { key: "address", label: "Adresse", required: false, isIdentity: false },
+  { key: "postalCode", label: "Postleitzahl", required: false, isIdentity: false },
+  { key: "city", label: "Ort", required: false, isIdentity: false },
+  { key: "region", label: "Region", required: false, isIdentity: false },
+  { key: "emEh", label: "EM/EH", required: false, isIdentity: false },
+  { key: "employee", label: "Mitarbeiter", required: false, isIdentity: false },
+  { key: "currentGmName", label: "GM", required: false, isIdentity: false },
+  { key: "universeMarket", label: "Universums-Markt", required: false, isIdentity: false },
+  { key: "visitFrequencyPerYear", label: "Besuchsrhythmus", required: false, isIdentity: false },
+  { key: "infoFlag", label: "Info", required: false, isIdentity: false },
+  { key: "infoNote", label: "Info-Notiz", required: false, isIdentity: false },
+  { key: "isActive", label: "Status aktiv", required: false, isIdentity: false },
+];
+
 function getImportFieldSpecs(importType: ImportDatasetType) {
-  return importType === "kuehler" ? kuehlerImportFieldSpecs : universumImportFieldSpecs;
+  if (importType === "kuehler") return kuehlerImportFieldSpecs;
+  if (importType === "update") return updateImportFieldSpecs;
+  return universumImportFieldSpecs;
 }
 
 const mappingSchema = z
@@ -177,15 +202,18 @@ const mappingSchema = z
     emEh: z.string().optional(),
     region: z.string().optional(),
     employee: z.string().optional(),
+    currentGmName: z.string().optional(),
     universeMarket: z.string().optional(),
     visitFrequencyPerYear: z.string().optional(),
     infoFlag: z.string().optional(),
+    infoNote: z.string().optional(),
+    isActive: z.string().optional(),
   })
   .strict();
 
 const importMarketsSchema = z
   .object({
-    importType: z.enum(["universum", "kuehler"]).optional().default("universum"),
+    importType: z.enum(["universum", "kuehler", "update"]).optional().default("universum"),
     fileName: z.string().min(1),
     sheetName: z.string().min(1),
     rows: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))).min(1),
@@ -292,9 +320,20 @@ const listQuerySchema = z
   })
   .strict();
 
+function parseImportBoolean(value: string): boolean | null {
+  const token = value
+    .trim()
+    .toLowerCase()
+    .replace(/[\u00a0\s]+/g, "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "");
+  if (["ja", "j", "true", "wahr", "1", "yes", "y", "x"].includes(token)) return true;
+  if (["nein", "n", "false", "falsch", "0", "no"].includes(token)) return false;
+  return null;
+}
+
 function normBool(v: string): boolean {
-  const s = v.trim().toLowerCase();
-  return s === "ja" || s === "true" || s === "1" || s === "yes";
+  return parseImportBoolean(v) ?? false;
 }
 
 function normNum(v: string): number {
@@ -471,8 +510,10 @@ function mapRowToDraft(
     const idx = excelColToIndex(col);
     const raw = row[idx]?.trim() ?? "";
     if (!raw) continue;
-    if (spec.key === "universeMarket" || spec.key === "infoFlag") {
-      draft[spec.key] = normBool(raw);
+    if (spec.key === "universeMarket" || spec.key === "infoFlag" || spec.key === "isActive") {
+      const parsed = parseImportBoolean(raw);
+      if (parsed == null) continue;
+      draft[spec.key] = parsed;
       continue;
     }
     if (spec.key === "visitFrequencyPerYear") {
@@ -486,6 +527,27 @@ function mapRowToDraft(
     draft[spec.key] = raw;
   }
   return draft;
+}
+
+function getMappedRawCell(row: string[], mapping: z.infer<typeof mappingSchema>, key: ImportFieldKey): string {
+  const col = mapping[key];
+  if (!col || !isValidColLetter(col)) return "";
+  const idx = excelColToIndex(col);
+  return row[idx]?.trim() ?? "";
+}
+
+function findInvalidBooleanUpdateValue(
+  row: string[],
+  mapping: z.infer<typeof mappingSchema>,
+  mappedFields: ImportFieldKey[],
+): { key: ImportFieldKey; raw: string } | null {
+  for (const key of mappedFields) {
+    if (key !== "universeMarket" && key !== "infoFlag" && key !== "isActive") continue;
+    const raw = getMappedRawCell(row, mapping, key);
+    if (!raw) continue;
+    if (parseImportBoolean(raw) === null) return { key, raw };
+  }
+  return null;
 }
 
 function buildSkipMeta(
@@ -516,6 +578,107 @@ function buildSkipMeta(
   }
 
   return { missingFields, missingFieldKeys, fetchedFields };
+}
+
+const updateImportPatchKeys: ImportFieldKey[] = [
+  "standardMarketNumber",
+  "cokeMasterNumber",
+  "name",
+  "dbName",
+  "address",
+  "postalCode",
+  "city",
+  "region",
+  "emEh",
+  "employee",
+  "currentGmName",
+  "universeMarket",
+  "visitFrequencyPerYear",
+  "infoFlag",
+  "infoNote",
+  "isActive",
+];
+
+function getMappedUpdateFields(mapping: z.infer<typeof mappingSchema>): ImportFieldKey[] {
+  return updateImportPatchKeys.filter((key) => isValidColLetter(mapping[key] ?? ""));
+}
+
+function buildUpdateOnlyMarketPatch(
+  draft: MarketDraft,
+  mappedFields: ImportFieldKey[],
+  normalizedRegion: RegionNormalizationResult | null,
+): Partial<typeof markets.$inferInsert> {
+  const mapped = new Set(mappedFields);
+  const patch: Partial<typeof markets.$inferInsert> = {};
+
+  if (mapped.has("standardMarketNumber") && draft.standardMarketNumber != null) {
+    patch.standardMarketNumber = normalizeIdentity(String(draft.standardMarketNumber));
+  }
+  if (mapped.has("cokeMasterNumber") && draft.cokeMasterNumber != null) {
+    patch.cokeMasterNumber = normalizeIdentity(String(draft.cokeMasterNumber));
+  }
+  if (mapped.has("name") && draft.name != null) patch.name = String(draft.name);
+  if (mapped.has("dbName") && draft.dbName != null) {
+    patch.dbName = normalizeOptionalText(String(draft.dbName)) ?? "";
+  }
+  if (mapped.has("address") && draft.address != null) patch.address = String(draft.address);
+  if (mapped.has("postalCode") && draft.postalCode != null) patch.postalCode = String(draft.postalCode);
+  if (mapped.has("city") && draft.city != null) patch.city = String(draft.city);
+  if (mapped.has("region") && draft.region != null && normalizedRegion?.ok) {
+    patch.region = normalizedRegion.canonical;
+  }
+  if (mapped.has("emEh") && draft.emEh != null) {
+    patch.emEh = normalizeOptionalText(String(draft.emEh)) ?? "";
+  }
+  if (mapped.has("employee") && draft.employee != null) {
+    patch.employee = normalizeOptionalText(String(draft.employee)) ?? "";
+  }
+  if (mapped.has("currentGmName") && draft.currentGmName != null) {
+    patch.currentGmName = normalizeOptionalText(String(draft.currentGmName)) ?? "";
+  }
+  if (mapped.has("universeMarket") && draft.universeMarket != null) {
+    patch.universeMarket = Boolean(draft.universeMarket);
+  }
+  if (mapped.has("visitFrequencyPerYear") && draft.visitFrequencyPerYear != null) {
+    patch.visitFrequencyPerYear = Number(draft.visitFrequencyPerYear);
+  }
+  if (mapped.has("infoFlag") && draft.infoFlag != null) {
+    patch.infoFlag = Boolean(draft.infoFlag);
+  }
+  if (mapped.has("infoNote") && draft.infoNote != null) {
+    patch.infoNote = normalizeOptionalText(String(draft.infoNote)) ?? "";
+  }
+  if (mapped.has("isActive") && draft.isActive != null) {
+    patch.isActive = Boolean(draft.isActive);
+  }
+
+  return patch;
+}
+
+function marketPatchHasChanges(
+  market: typeof markets.$inferSelect,
+  patch: Partial<typeof markets.$inferInsert>,
+): boolean {
+  return Object.entries(patch).some(([key, value]) => {
+    const current = market[key as keyof typeof market];
+    if (typeof value === "boolean" || typeof value === "number") return current !== value;
+    const nextText = value == null ? "" : String(value);
+    const currentText = current == null ? "" : String(current);
+    return currentText !== nextText;
+  });
+}
+
+async function updateMarketIdsInChunks(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  ids: string[],
+  patch: Partial<typeof markets.$inferInsert>,
+): Promise<void> {
+  const BATCH_SIZE = 500;
+  for (let offset = 0; offset < ids.length; offset += BATCH_SIZE) {
+    const batch = ids.slice(offset, offset + BATCH_SIZE);
+    if (batch.length === 0) continue;
+    await tx.update(markets).set(patch).where(inArray(markets.id, batch));
+  }
 }
 
 function mapMarketRow(row: typeof markets.$inferSelect) {
@@ -1371,6 +1534,16 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       res.status(400).json({ error: "Für Kühlermärkte muss 'Stammnr' gemappt sein." });
       return;
     }
+    if (importType === "update") {
+      if (!isValidColLetter(payload.mapping.flexNumber ?? "")) {
+        res.status(400).json({ error: "Für Markt-Updates muss 'Flex-Nummer' gemappt sein." });
+        return;
+      }
+      if (getMappedUpdateFields(payload.mapping).length === 0) {
+        res.status(400).json({ error: "Bitte mindestens ein Feld zum Aktualisieren mappen." });
+        return;
+      }
+    }
     const rowsAsStrings = payload.rows.map((row) => row.map((cell) => (cell == null ? "" : String(cell))));
     const summary: {
       fileName: string;
@@ -1380,6 +1553,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       created: number;
       updated: number;
       skipped: number;
+      unchanged: number;
       duplicateInputRowsMerged: number;
       kuehlerUnitsCreated: number;
       kuehlerUnitsUpdated: number;
@@ -1402,6 +1576,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       created: 0,
       updated: 0,
       skipped: 0,
+      unchanged: 0,
       duplicateInputRowsMerged: 0,
       kuehlerUnitsCreated: 0,
       kuehlerUnitsUpdated: 0,
@@ -1424,6 +1599,237 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         totalRows: dataRows.length,
       },
     });
+
+    if (importType === "update") {
+      const mappedUpdateFields = getMappedUpdateFields(payload.mapping);
+      const bulkUniverseMarketOnly =
+        mappedUpdateFields.length === 1 && mappedUpdateFields[0] === "universeMarket";
+      await db.transaction(async (tx) => {
+        await tx.execute(sql`set local lock_timeout = '5s'`);
+        await tx.execute(sql`set local statement_timeout = '90s'`);
+        const importLock = await tx.execute<{ locked: boolean }>(
+          sql`select pg_try_advisory_xact_lock(47110333) as locked`,
+        );
+        if (!importLock[0]?.locked) {
+          throw new Error("IMPORT_IN_PROGRESS");
+        }
+
+        const existingMarkets = await tx.select().from(markets).where(eq(markets.isDeleted, false));
+        const byFlex = new Map<string, Array<typeof markets.$inferSelect>>();
+        for (const market of existingMarkets) {
+          const key = normStr(normalizeIdentity(market.flexNumber) ?? "");
+          if (!key) continue;
+          const bucket = byFlex.get(key) ?? [];
+          bucket.push(market);
+          byFlex.set(key, bucket);
+        }
+
+        const universeMarketUpdatesByMarketId = new Map<string, boolean>();
+        let recognizedUniverseMarketTrueRows = 0;
+        let recognizedUniverseMarketFalseRows = 0;
+
+        for (let i = 0; i < dataRows.length; i += 1) {
+          if (i > 0 && i % 500 === 0) {
+            logger.debug("market_update_import_progress", {
+              action: "market_import",
+              result: "progress",
+              importedRows: i,
+              totalRows: dataRows.length,
+              requestId: (req as { requestId?: string }).requestId ?? null,
+              appUserId: req.authUser?.appUserId ?? null,
+              role: req.authUser?.role ?? null,
+            });
+          }
+
+          const row = dataRows[i];
+          if (!row) continue;
+          const rowNum = i + 2;
+          if (row.every((cell) => !cell || !cell.trim())) {
+            summary.skipped += 1;
+            continue;
+          }
+
+          const draft = mapRowToDraft(row, payload.mapping, importType);
+          const sampleText = String(draft.name ?? draft.city ?? row.find((cell) => cell?.trim()) ?? "");
+          const invalidBoolean = findInvalidBooleanUpdateValue(row, payload.mapping, mappedUpdateFields);
+          if (invalidBoolean) {
+            summary.skipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `Ungültiger Ja/Nein-Wert für ${invalidBoolean.key}: ${invalidBoolean.raw}`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+          const flexIdentity = normalizeIdentity(draft.flexNumber);
+          const flexKey = normStr(flexIdentity ?? "");
+          if (!flexKey) {
+            summary.skipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              const { missingFields, missingFieldKeys, fetchedFields } = buildSkipMeta(
+                draft,
+                payload.mapping,
+                importType,
+              );
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: "Flex-Nummer fehlt oder ist leer",
+                sample: sampleText,
+                draft,
+                missingFields,
+                missingFieldKeys,
+                fetchedFields,
+              });
+            }
+            continue;
+          }
+
+          const matches = byFlex.get(flexKey) ?? [];
+          if (matches.length === 0) {
+            summary.skipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `Kein bestehender Markt mit Flex-Nummer ${String(draft.flexNumber ?? flexIdentity)} gefunden`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+          if (matches.length > 1) {
+            summary.skipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `Flex-Nummer ${String(draft.flexNumber ?? flexIdentity)} ist nicht eindeutig`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+
+          const normalizedDraftRegion =
+            draft.region != null ? normalizeRegionValue(String(draft.region)) : null;
+          if (normalizedDraftRegion && !normalizedDraftRegion.ok) {
+            summary.skipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `Region konnte nicht normalisiert werden (${normalizedDraftRegion.raw || "leer"})`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+
+          const patch = buildUpdateOnlyMarketPatch(draft, mappedUpdateFields, normalizedDraftRegion);
+          if (Object.keys(patch).length === 0) {
+            summary.unchanged += 1;
+            continue;
+          }
+          if (bulkUniverseMarketOnly && patch.universeMarket != null) {
+            if (Boolean(patch.universeMarket)) recognizedUniverseMarketTrueRows += 1;
+            else recognizedUniverseMarketFalseRows += 1;
+          }
+
+          const matched = matches[0];
+          if (!matched) {
+            summary.skipped += 1;
+            continue;
+          }
+          if (!marketPatchHasChanges(matched, patch)) {
+            summary.unchanged += 1;
+            continue;
+          }
+          if (bulkUniverseMarketOnly) {
+            const value = Boolean(patch.universeMarket);
+            universeMarketUpdatesByMarketId.set(matched.id, value);
+            continue;
+          }
+          const [updated] = await tx
+            .update(markets)
+            .set({
+              ...patch,
+              importSourceFileName: payload.fileName,
+              importedAt,
+              updatedAt: new Date(),
+            })
+            .where(eq(markets.id, matched.id))
+            .returning();
+
+          if (updated) {
+            summary.updated += 1;
+            summary.matchedBy.flexNumber += 1;
+          }
+        }
+
+        if (bulkUniverseMarketOnly) {
+          const now = new Date();
+          const trueIds: string[] = [];
+          const falseIds: string[] = [];
+          for (const [marketId, value] of universeMarketUpdatesByMarketId) {
+            if (value) trueIds.push(marketId);
+            else falseIds.push(marketId);
+          }
+          await updateMarketIdsInChunks(tx, trueIds, {
+            universeMarket: true,
+            importSourceFileName: payload.fileName,
+            importedAt,
+            updatedAt: now,
+          });
+          await updateMarketIdsInChunks(tx, falseIds, {
+            universeMarket: false,
+            importSourceFileName: payload.fileName,
+            importedAt,
+            updatedAt: now,
+          });
+          const updatedCount = trueIds.length + falseIds.length;
+          summary.updated += updatedCount;
+          summary.matchedBy.flexNumber += updatedCount;
+          logAction("info", "market_update_import_universe_market_counts", {
+            req,
+            action: "market_import",
+            result: "success",
+            startedAtNs,
+            details: {
+              trueRows: recognizedUniverseMarketTrueRows,
+              falseRows: recognizedUniverseMarketFalseRows,
+              trueUpdates: trueIds.length,
+              falseUpdates: falseIds.length,
+            },
+          });
+        }
+      });
+
+      const fresh = await db
+        .select()
+        .from(markets)
+        .where(eq(markets.isDeleted, false))
+        .orderBy(desc(markets.createdAt));
+      logAction("info", "market_import_completed", {
+        req,
+        action: "market_import",
+        result: "success",
+        statusCode: 200,
+        requestClass: "success",
+        startedAtNs,
+        details: {
+          importType,
+          created: summary.created,
+          updated: summary.updated,
+          skipped: summary.skipped,
+          unchanged: summary.unchanged,
+        },
+      });
+      res.status(200).json({ markets: fresh.map(mapMarketRow), summary });
+      return;
+    }
 
     if (importType === "kuehler") {
       await db.transaction(async (tx) => {
