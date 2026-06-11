@@ -21,8 +21,16 @@ const adminPhotosRouter = Router();
 adminPhotosRouter.use(requireAuth(["admin"]));
 
 const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd"]);
+const photoSignVariantSchema = z.enum(["preview", "original"]);
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SIGNED_URL_TTL_SECONDS = 15 * 60;
+const SIGNED_URL_CACHE_TTL_MS = 12 * 60 * 1000;
+const SIGNED_URL_CACHE_MAX_ENTRIES = 1000;
+const PREVIEW_TRANSFORM = {
+  width: 640,
+  quality: 65,
+  resize: "contain" as const,
+};
 
 const photoListQuerySchema = z.object({
   page: z.coerce.number().int().min(1).max(10000).default(1),
@@ -46,6 +54,12 @@ const photoListQuerySchema = z.object({
 });
 
 type PhotoListQuery = z.infer<typeof photoListQuerySchema>;
+type PhotoSignVariant = z.infer<typeof photoSignVariantSchema>;
+
+const photoSignedUrlsBodySchema = z.object({
+  photoIds: z.array(z.string().regex(uuidRegex)).min(1).max(40),
+  variant: photoSignVariantSchema,
+});
 
 type PhotoRow = {
   id: string;
@@ -94,20 +108,79 @@ type PhotoTagRow = {
   label: string;
 };
 
+type SignedUrlCacheEntry = {
+  signedUrl: string | null;
+  expiresAt: string;
+  cacheUntilMs: number;
+};
+
+const signedUrlCache = new Map<string, SignedUrlCacheEntry>();
+
 function cleanStoragePath(path: string): string {
   return path.trim().replace(/^\/+/, "");
 }
 
-async function createSignedReadUrl(bucket: string, storagePath: string): Promise<{ signedUrl: string | null; expiresAt: string }> {
-  const expiresAt = new Date(Date.now() + SIGNED_URL_TTL_SECONDS * 1000).toISOString();
-  const normalizedPath = cleanStoragePath(storagePath);
-  if (!bucket.trim() || !normalizedPath) return { signedUrl: null, expiresAt };
+function signedUrlCacheKey(input: {
+  photoId: string;
+  bucket: string;
+  storagePath: string;
+  variant: PhotoSignVariant;
+}): string {
+  return [
+    input.photoId,
+    input.variant,
+    input.bucket.trim(),
+    cleanStoragePath(input.storagePath),
+    input.variant === "preview" ? `w${PREVIEW_TRANSFORM.width}-q${PREVIEW_TRANSFORM.quality}-${PREVIEW_TRANSFORM.resize}` : "original",
+  ].join(":");
+}
+
+function pruneSignedUrlCache(nowMs = Date.now()): void {
+  if (signedUrlCache.size <= SIGNED_URL_CACHE_MAX_ENTRIES) return;
+  for (const [key, entry] of signedUrlCache) {
+    if (entry.cacheUntilMs <= nowMs) signedUrlCache.delete(key);
+  }
+  if (signedUrlCache.size <= SIGNED_URL_CACHE_MAX_ENTRIES) return;
+  const overflow = signedUrlCache.size - SIGNED_URL_CACHE_MAX_ENTRIES;
+  let removed = 0;
+  for (const key of signedUrlCache.keys()) {
+    signedUrlCache.delete(key);
+    removed += 1;
+    if (removed >= overflow) break;
+  }
+}
+
+async function createSignedReadUrl(input: {
+  photoId: string;
+  bucket: string;
+  storagePath: string;
+  variant: PhotoSignVariant;
+}): Promise<{ signedUrl: string | null; expiresAt: string }> {
+  const nowMs = Date.now();
+  const cacheKey = signedUrlCacheKey(input);
+  const cached = signedUrlCache.get(cacheKey);
+  if (cached && cached.cacheUntilMs > nowMs) {
+    return { signedUrl: cached.signedUrl, expiresAt: cached.expiresAt };
+  }
+
+  const expiresAt = new Date(nowMs + SIGNED_URL_TTL_SECONDS * 1000).toISOString();
+  const normalizedPath = cleanStoragePath(input.storagePath);
+  if (!input.bucket.trim() || !normalizedPath) return { signedUrl: null, expiresAt };
 
   const { data, error } = await supabaseAdmin.storage
-    .from(bucket)
-    .createSignedUrl(normalizedPath, SIGNED_URL_TTL_SECONDS);
-  if (error || !data?.signedUrl) return { signedUrl: null, expiresAt };
-  return { signedUrl: data.signedUrl, expiresAt };
+    .from(input.bucket)
+    .createSignedUrl(
+      normalizedPath,
+      SIGNED_URL_TTL_SECONDS,
+      input.variant === "preview" ? { transform: PREVIEW_TRANSFORM } : undefined,
+    );
+  const result = { signedUrl: error || !data?.signedUrl ? null : data.signedUrl, expiresAt };
+  signedUrlCache.set(cacheKey, {
+    ...result,
+    cacheUntilMs: nowMs + SIGNED_URL_CACHE_TTL_MS,
+  });
+  pruneSignedUrlCache(nowMs);
+  return result;
 }
 
 function asNumber(value: unknown): number {
@@ -291,11 +364,18 @@ async function loadTagsByPhotoId(photoIds: string[]): Promise<Map<string, PhotoT
   return byPhotoId;
 }
 
-async function mapPhotoRows(rows: PhotoRow[]) {
+async function mapPhotoRows(rows: PhotoRow[], options: { signOriginal?: boolean } = {}) {
   const tagsByPhotoId = await loadTagsByPhotoId(rows.map((row) => row.id));
   return Promise.all(
     rows.map(async (row) => {
-      const signed = await createSignedReadUrl(row.storageBucket, row.storagePath);
+      const signed = options.signOriginal
+        ? await createSignedReadUrl({
+            photoId: row.id,
+            bucket: row.storageBucket,
+            storagePath: row.storagePath,
+            variant: "original",
+          })
+        : { signedUrl: null, expiresAt: new Date(Date.now() + SIGNED_URL_TTL_SECONDS * 1000).toISOString() };
       return {
         id: row.id,
         visitAnswerId: row.visitAnswerId,
@@ -446,7 +526,7 @@ adminPhotosRouter.get("/photos", async (req, res, next) => {
     const where = buildPhotoWhere(filters);
     const offset = (filters.page - 1) * filters.pageSize;
 
-    const [rows, totalRows, statsRows, facets] = await Promise.all([
+    const [rows, totalRows, statsRows] = await Promise.all([
       basePhotoSelect(where)
         .orderBy(desc(visitSessions.submittedAt), desc(visitAnswerPhotos.uploadedAt))
         .limit(filters.pageSize)
@@ -476,7 +556,6 @@ adminPhotosRouter.get("/photos", async (req, res, next) => {
         .innerJoin(markets, eq(markets.id, visitSessions.marketId))
         .innerJoin(users, eq(users.id, visitSessions.gmUserId))
         .where(where),
-      loadFacets(),
     ]);
 
     res.status(200).json({
@@ -488,8 +567,52 @@ adminPhotosRouter.get("/photos", async (req, res, next) => {
         visitedMarkets: asNumber(statsRows[0]?.visitedMarkets),
         campaigns: asNumber(statsRows[0]?.campaigns),
       },
-      facets,
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminPhotosRouter.get("/photos/facets", async (_req, res, next) => {
+  try {
+    res.status(200).json({ facets: await loadFacets() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminPhotosRouter.post("/photos/signed-urls", async (req, res, next) => {
+  try {
+    const parsed = photoSignedUrlsBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltige Foto-URL-Anfrage.", code: "invalid_photo_signed_url_request" });
+      return;
+    }
+
+    const uniquePhotoIds = Array.from(new Set(parsed.data.photoIds));
+    const where = and(
+      buildPhotoWhere({ page: 1, pageSize: 1 }),
+      inArray(visitAnswerPhotos.id, uniquePhotoIds),
+    ) ?? sql`false`;
+    const rows = (await basePhotoSelect(where)) as PhotoRow[];
+    const urls = await Promise.all(
+      rows.map(async (row) => {
+        const signed = await createSignedReadUrl({
+          photoId: row.id,
+          bucket: row.storageBucket,
+          storagePath: row.storagePath,
+          variant: parsed.data.variant,
+        });
+        return {
+          photoId: row.id,
+          variant: parsed.data.variant,
+          signedUrl: signed.signedUrl,
+          expiresAt: signed.expiresAt,
+        };
+      }),
+    );
+
+    res.status(200).json({ urls });
   } catch (error) {
     next(error);
   }
@@ -510,7 +633,7 @@ adminPhotosRouter.get("/photos/:photoId", async (req, res, next) => {
       return;
     }
 
-    const [photo] = await mapPhotoRows(rows);
+    const [photo] = await mapPhotoRows(rows, { signOriginal: true });
     res.status(200).json({ photo });
   } catch (error) {
     next(error);
