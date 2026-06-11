@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, ilike, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, ilike, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
@@ -1252,9 +1252,9 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
           eq(visitSessions.marketId, marketId),
           eq(visitSessions.status, "submitted"),
           eq(visitSessions.isDeleted, false),
-          sql`${visitSessions.submittedAt} is not null`,
-          sql`${visitSessions.submittedAt} >= ${redPeriod.start}`,
-          sql`${visitSessions.submittedAt} < ${redEndExclusive}`,
+          isNotNull(visitSessions.submittedAt),
+          gte(visitSessions.submittedAt, redPeriod.start),
+          lt(visitSessions.submittedAt, redEndExclusive),
         ),
       );
 
@@ -1296,7 +1296,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
           eq(visitSessions.marketId, marketId),
           eq(visitSessions.status, "draft"),
           eq(visitSessions.isDeleted, false),
-          sql`${visitSessions.submittedAt} is null`,
+          isNull(visitSessions.submittedAt),
         ),
       )
       .orderBy(desc(visitSessions.startedAt))
@@ -1346,7 +1346,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
           eq(visitSessions.marketId, marketId),
           eq(visitSessions.status, "submitted"),
           eq(visitSessions.isDeleted, false),
-          sql`${visitSessions.submittedAt} is not null`,
+          isNotNull(visitSessions.submittedAt),
         ),
       )
       .orderBy(desc(visitSessions.submittedAt), desc(visitSessions.createdAt))
