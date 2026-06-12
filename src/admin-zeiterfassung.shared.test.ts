@@ -83,6 +83,26 @@ test("admin zeiterfassung timeline with no real actions shows one anfahrt row on
   );
 });
 
+test("admin zeiterfassung stats subtract default pause for finished days without submitted pause", () => {
+  const session = buildSession({ start: "10:00", end: "14:15", actions: [] });
+
+  assert.equal(session.stats.arbeitstag, 255);
+  assert.equal(session.stats.pauseMin, 30);
+  assert.equal(session.stats.reineArbeitszeit, 225);
+});
+
+test("admin zeiterfassung stats keep submitted pause instead of default pause", () => {
+  const session = buildSession({
+    start: "10:00",
+    end: "14:15",
+    actions: [{ id: "pause-1", kind: "pause", startAt: at("12:00"), endAt: at("12:20") }],
+  });
+
+  assert.equal(session.stats.arbeitstag, 255);
+  assert.equal(session.stats.pauseMin, 20);
+  assert.equal(session.stats.reineArbeitszeit, 235);
+});
+
 test("admin zeiterfassung timeline splits zusatz around overlapping pause", () => {
   const session = buildSession({
     start: "09:00",

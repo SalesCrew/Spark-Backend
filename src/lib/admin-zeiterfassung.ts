@@ -13,6 +13,7 @@ const EXTRA_LABELS: Record<string, string> = {
 
 type SessionStatus = "started" | "ended" | "submitted";
 type TimelineKind = "anfahrt" | "fahrtzeit" | "marktbesuch" | "pause" | "zusatzzeit" | "heimfahrt";
+const DEFAULT_FINISHED_DAY_PAUSE_MIN = 30;
 const TIMELINE_OVERLAP_ERROR_MESSAGE =
   "Dieser Zeitraum ist nicht moeglich, weil er sich mit einem bestehenden Eintrag ueberschneidet.";
 
@@ -425,7 +426,13 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
   }
 
   const arbeitstag = diffMinutes(input.startAt, input.endAt);
-  const pauseMin = entries.filter((entry) => entry.kind === "pause").reduce((sum, entry) => sum + entry.durationMin, 0);
+  const submittedPauseMin = entries
+    .filter((entry) => entry.kind === "pause")
+    .reduce((sum, entry) => sum + entry.durationMin, 0);
+  const pauseMin =
+    submittedPauseMin > 0 || input.status === "started"
+      ? submittedPauseMin
+      : DEFAULT_FINISHED_DAY_PAUSE_MIN;
   const reineArbeitszeit = Math.max(0, arbeitstag - pauseMin);
   const kmGefahren =
     input.startKm != null && input.endKm != null && input.endKm >= input.startKm
