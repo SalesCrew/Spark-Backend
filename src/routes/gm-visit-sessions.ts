@@ -67,12 +67,19 @@ gmVisitSessionsRouter.use((req, res, next) => {
 
 const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
 const VISIT_PHOTOS_BUCKET = "visit-photos";
+const VISIT_PHOTO_READ_URL_TTL_SECONDS = 30 * 60;
+const VISIT_PHOTO_READ_URL_TIMEOUT_MS = 1800;
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const isUuid = (value: string | null | undefined): value is string => Boolean(value && uuidRegex.test(value));
 const SINGLE_CHOICE_AVAILABILITY_TYPES = ["Cooler", "SingleServe", "MultiServe", "Promos", "Warehouse"] as const;
 type SingleChoiceAvailabilityType = (typeof SINGLE_CHOICE_AVAILABILITY_TYPES)[number];
 const QUESTION_TYPES = ["single", "yesno", "yesnomulti", "multiple", "likert", "text", "numeric", "slider", "photo", "matrix"] as const;
 const QUESTION_TYPE_SET = new Set<string>(QUESTION_TYPES);
+type VisitPhotoSignedReadResult = {
+  signedUrl: string | null;
+  errorMessage: string | null;
+  timedOut: boolean;
+};
 
 function parseOptionalIsoTimestamp(value: string | undefined): Date | null {
   if (!value) return null;
@@ -92,6 +99,52 @@ function resolveAcceptedVisitStartAt(startedAt: string | undefined, now: Date): 
   if (requestedMs > nowMs + MAX_REQUESTED_VISIT_START_FUTURE_MS) return now;
   if (requestedMs < nowMs - MAX_REQUESTED_VISIT_START_AGE_MS) return now;
   return requested;
+}
+
+function cleanStoragePath(path: string): string {
+  return path.replace(/^\/+/, "").trim();
+}
+
+async function createVisitPhotoReadUrl(input: {
+  photoId: string;
+  storageBucket: string;
+  storagePath: string;
+}): Promise<{ signedUrl: string | null; expiresAt: string | null }> {
+  const expiresAt = new Date(Date.now() + VISIT_PHOTO_READ_URL_TTL_SECONDS * 1000).toISOString();
+  if (input.storageBucket !== VISIT_PHOTOS_BUCKET) return { signedUrl: null, expiresAt: null };
+  const normalizedPath = cleanStoragePath(input.storagePath);
+  if (!normalizedPath) return { signedUrl: null, expiresAt: null };
+  const signed = await Promise.race<VisitPhotoSignedReadResult>([
+    supabaseAdmin.storage
+      .from(input.storageBucket)
+      .createSignedUrl(normalizedPath, VISIT_PHOTO_READ_URL_TTL_SECONDS)
+      .then(({ data, error }) => ({
+        signedUrl: error || !data?.signedUrl ? null : data.signedUrl,
+        errorMessage: error?.message ?? null,
+        timedOut: false,
+      }))
+      .catch((error: unknown) => ({
+        signedUrl: null,
+        errorMessage: error instanceof Error ? error.message : "unknown_error",
+        timedOut: false,
+      })),
+    new Promise<VisitPhotoSignedReadResult>((resolve) => {
+      setTimeout(() => {
+        resolve({ signedUrl: null, errorMessage: "signed_url_timeout", timedOut: true });
+      }, VISIT_PHOTO_READ_URL_TIMEOUT_MS);
+    }),
+  ]);
+  if (!signed.signedUrl) {
+    logger.warn("gm_visit_photo_signed_url_failed", {
+      photoId: input.photoId,
+      storageBucket: input.storageBucket,
+      storagePath: input.storagePath,
+      error: signed.errorMessage,
+      timedOut: signed.timedOut,
+    });
+    return { signedUrl: null, expiresAt: null };
+  }
+  return { signedUrl: signed.signedUrl, expiresAt };
 }
 
 let visitSessionQuestionAvailabilityTypeSnapshotColumnReady: boolean | null = null;
@@ -2068,6 +2121,19 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
       bucket.push(q);
       questionsBySectionId.set(q.visitSessionSectionId, bucket);
     }
+    const signedPhotoUrlById = new Map<string, { signedUrl: string | null; expiresAt: string | null }>();
+    await Promise.all(
+      answerPhotos.map(async (photo) => {
+        signedPhotoUrlById.set(
+          photo.id,
+          await createVisitPhotoReadUrl({
+            photoId: photo.id,
+            storageBucket: photo.storageBucket,
+            storagePath: photo.storagePath,
+          }),
+        );
+      }),
+    );
 
     res.status(200).json({
       session: {
@@ -2139,6 +2205,8 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
                     id: photo.id,
                     storageBucket: photo.storageBucket,
                     storagePath: photo.storagePath,
+                    signedUrl: signedPhotoUrlById.get(photo.id)?.signedUrl ?? null,
+                    signedUrlExpiresAt: signedPhotoUrlById.get(photo.id)?.expiresAt ?? null,
                     mimeType: photo.mimeType ?? null,
                     byteSize: photo.byteSize ?? null,
                     widthPx: photo.widthPx ?? null,
