@@ -2,6 +2,7 @@ import { and, count, desc, eq, ilike, inArray, isNotNull, or, sql, type SQL } fr
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../lib/db.js";
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
@@ -18,7 +19,8 @@ import {
 } from "../lib/schema.js";
 
 const adminPhotosRouter = Router();
-adminPhotosRouter.use(requireAuth(["admin"]));
+adminPhotosRouter.use(requireAuth(["admin", "kunde"]));
+adminPhotosRouter.use(requireKundeAdminPermission);
 
 const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd"]);
 const photoSignVariantSchema = z.enum(["preview", "original"]);

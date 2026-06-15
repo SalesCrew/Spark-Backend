@@ -12,6 +12,7 @@ import {
   startActionTimer,
 } from "../lib/logger.js";
 import { enqueueIppRecalcForQuestionScoringChanges } from "../lib/ipp-finalizer.js";
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
   fragebogenKuehler,
@@ -41,7 +42,8 @@ import {
 } from "../lib/schema.js";
 
 const adminFragebogenRouter = Router();
-adminFragebogenRouter.use(requireAuth(["admin"]));
+adminFragebogenRouter.use(requireAuth(["admin", "kunde"]));
+adminFragebogenRouter.use(requireKundeAdminPermission);
 adminFragebogenRouter.use((req, res, next) => {
   if (req.method.toUpperCase() === "GET") {
     next();

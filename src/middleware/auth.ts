@@ -29,7 +29,7 @@ export function requireAuth(allowedRoles?: UserRole[]) {
         const bypassRoleEnv = process.env.BYPASS_AUTH_ROLE;
         const bypassUserIdEnv = process.env.BYPASS_AUTH_USER_ID;
         const bypassRole: UserRole =
-          bypassRoleEnv === "admin" || bypassRoleEnv === "gm" || bypassRoleEnv === "sm"
+          bypassRoleEnv === "admin" || bypassRoleEnv === "gm" || bypassRoleEnv === "sm" || bypassRoleEnv === "kunde"
             ? bypassRoleEnv
             : "admin";
         req.authUser = {
@@ -47,7 +47,7 @@ export function requireAuth(allowedRoles?: UserRole[]) {
         logger.warn("auth_missing_access_token", {
           ...getRequestLogMeta(req),
         });
-        res.status(401).json({ error: "Missing access token." });
+        res.status(401).json({ error: "Missing access token.", code: "auth_missing_access_token" });
         return;
       }
 
@@ -56,7 +56,7 @@ export function requireAuth(allowedRoles?: UserRole[]) {
         logger.warn("auth_invalid_access_token", {
           ...getRequestLogMeta(req),
         });
-        res.status(401).json({ error: "Invalid access token." });
+        res.status(401).json({ error: "Invalid access token.", code: "auth_invalid_access_token" });
         return;
       }
 
@@ -72,7 +72,7 @@ export function requireAuth(allowedRoles?: UserRole[]) {
           ...getRequestLogMeta(req),
           supabaseAuthId: authId,
         });
-        res.status(403).json({ error: "User is deactivated or missing." });
+        res.status(403).json({ error: "User is deactivated or missing.", code: "account_inactive" });
         return;
       }
 
@@ -83,7 +83,7 @@ export function requireAuth(allowedRoles?: UserRole[]) {
           role: appUser.role,
           allowedRoles,
         });
-        res.status(403).json({ error: "Role is not allowed for this endpoint." });
+        res.status(403).json({ error: "Role is not allowed for this endpoint.", code: "role_not_allowed" });
         return;
       }
 

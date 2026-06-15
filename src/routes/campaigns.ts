@@ -4,6 +4,7 @@ import { z } from "zod";
 import { finalizeBonusForSubmittedVisitSessionTx } from "../lib/bonus-finalizer.js";
 import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { aggregateHighVolumeLoad, logAction, logger, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { type AuthedRequest, requireAuth } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
@@ -1432,7 +1433,8 @@ function respondDomainError(res: Response, error: CampaignDomainError) {
 }
 
 const adminCampaignsRouter = Router();
-adminCampaignsRouter.use(requireAuth(["admin"]));
+adminCampaignsRouter.use(requireAuth(["admin", "kunde"]));
+adminCampaignsRouter.use(requireKundeAdminPermission);
 adminCampaignsRouter.use((req, res, next) => {
   if (req.method.toUpperCase() === "GET") {
     next();

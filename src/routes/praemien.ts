@@ -3,6 +3,7 @@ import { type Response, Router } from "express";
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { db, sql as pgSql } from "../lib/db.js";
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import {
   buildSourceCatalog,
@@ -23,7 +24,8 @@ import {
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const adminPraemienRouter = Router();
-adminPraemienRouter.use(requireAuth(["admin"]));
+adminPraemienRouter.use(requireAuth(["admin", "kunde"]));
+adminPraemienRouter.use(requireKundeAdminPermission);
 adminPraemienRouter.use((req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {

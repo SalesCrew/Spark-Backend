@@ -4,7 +4,7 @@ import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const clientTelemetryRouter = Router();
-clientTelemetryRouter.use(requireAuth(["admin", "gm", "sm"]));
+clientTelemetryRouter.use(requireAuth(["admin", "gm", "sm", "kunde"]));
 
 const telemetrySchema = z
   .object({

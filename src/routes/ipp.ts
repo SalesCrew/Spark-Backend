@@ -2,6 +2,7 @@ import { and, asc, eq, gte, inArray, isNotNull, lt } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { computeMarketIppForPeriod } from "../lib/ipp.js";
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { logAction, startActionTimer } from "../lib/logger.js";
 import { addDays, getRedPeriodForDate, getRedPeriodLabel, getRedYear, startOfDay } from "../lib/red-monat.js";
 import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
@@ -10,7 +11,8 @@ import { ippMarketRedmonthResults, markets, users, visitSessions } from "../lib/
 import { requireAuth } from "../middleware/auth.js";
 
 const adminIppRouter = Router();
-adminIppRouter.use(requireAuth(["admin"]));
+adminIppRouter.use(requireAuth(["admin", "kunde"]));
+adminIppRouter.use(requireKundeAdminPermission);
 adminIppRouter.use((req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {

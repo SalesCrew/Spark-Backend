@@ -21,6 +21,7 @@ import { daySessionRouter } from "./routes/day-session.js";
 import { adminFragebogenRouter } from "./routes/fragebogen.js";
 import { gmVisitSessionsRouter } from "./routes/gm-visit-sessions.js";
 import { adminIppRouter } from "./routes/ipp.js";
+import { kundenUsersRouter } from "./routes/kunden-users.js";
 import { adminMarketsRouter, marketsRouter } from "./routes/markets.js";
 import { adminPhotosRouter } from "./routes/admin-photos.js";
 import { adminPraemienRouter } from "./routes/praemien.js";
@@ -154,6 +155,7 @@ function createApp() {
   app.use("/time-tracking", timeTrackingRouter);
   app.use("/telemetry", clientTelemetryRouter);
   app.use("/red-month", redMonthRouter);
+  app.use("/admin/kunden-users", kundenUsersRouter);
   app.use("/admin/users", adminUsersRouter);
   app.use("/admin/markets", adminMarketsRouter);
   app.use("/admin", adminLagerRouter);

@@ -16,7 +16,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 
-export const userRoleEnum = pgEnum("user_role", ["admin", "gm", "sm"]);
+export const userRoleEnum = pgEnum("user_role", ["admin", "gm", "sm", "kunde"]);
 export const fragebogenSectionEnum = pgEnum("fragebogen_section", ["standard", "flex", "billa", "kuehler", "mhd"]);
 export const fragebogenMainSectionEnum = pgEnum("fragebogen_main_section", ["standard", "flex", "billa"]);
 export const campaignSectionEnum = pgEnum("campaign_section", ["standard", "flex", "billa", "kuehler", "mhd"]);
@@ -98,6 +98,28 @@ export const users = pgTable(
     uniqueIndex("users_email_unique").on(table.email),
     index("users_role_idx").on(table.role),
     index("users_active_idx").on(table.isActive),
+  ],
+);
+
+export type KundePermissionAction = "read" | "write" | "update";
+export type KundePagePermissions = Record<string, KundePermissionAction[]>;
+
+export const kundeUsers = pgTable(
+  "kunde_users",
+  {
+    userId: uuid("user_id")
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    pagePermissions: jsonb("page_permissions").$type<KundePagePermissions>().notNull().default(sql`'{}'::jsonb`),
+    createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("kunde_users_created_by_idx").on(table.createdByUserId),
+    index("kunde_users_deleted_idx").on(table.isDeleted),
   ],
 );
 
@@ -1663,6 +1685,8 @@ export const visitAnswerEvents = pgTable(
 export type UserRole = (typeof userRoleEnum.enumValues)[number];
 export type UserRow = typeof users.$inferSelect;
 export type NewUserRow = typeof users.$inferInsert;
+export type KundeUserRow = typeof kundeUsers.$inferSelect;
+export type NewKundeUserRow = typeof kundeUsers.$inferInsert;
 export type MarketRow = typeof markets.$inferSelect;
 export type NewMarketRow = typeof markets.$inferInsert;
 export type MarketKuehlerUnitRow = typeof marketKuehlerUnits.$inferSelect;

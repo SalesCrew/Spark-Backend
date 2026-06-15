@@ -2,6 +2,7 @@ import { and, asc, desc, eq, gt, gte, ilike, inArray, isNotNull, isNull, lt, or,
 import { Router } from "express";
 import { z } from "zod";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { aggregateHighVolumeLoad, logAction, logger, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
@@ -882,7 +883,18 @@ async function resolveActiveStandardGmNamesByMarketIds(marketIds: string[]) {
 const marketsRouter = Router();
 const adminMarketsRouter = Router();
 
-marketsRouter.use(requireAuth(["admin", "gm", "sm"]));
+marketsRouter.use(requireAuth(["admin", "gm", "sm", "kunde"]));
+marketsRouter.use((req: AuthedRequest, res, next) => {
+  if (req.authUser?.role !== "kunde") {
+    next();
+    return;
+  }
+  if (req.method.toUpperCase() === "GET" && req.path === "/") {
+    requireKundeAdminPermission(req, res, next);
+    return;
+  }
+  res.status(403).json({ error: "Fuer diese Aktion ist kein Kundenzugriff freigeschaltet.", code: "kunde_permission_denied" });
+});
 marketsRouter.use((req, res, next) => {
   const shouldTrackRead = req.method.toUpperCase() === "GET" && req.path.startsWith("/gm/");
   if (!shouldTrackRead) {
@@ -1895,7 +1907,8 @@ marketsRouter.get("/gm/visit-start", async (req: AuthedRequest, res, next) => {
   }
 });
 
-adminMarketsRouter.use(requireAuth(["admin"]));
+adminMarketsRouter.use(requireAuth(["admin", "kunde"]));
+adminMarketsRouter.use(requireKundeAdminPermission);
 adminMarketsRouter.use((req, res, next) => {
   if (req.method.toUpperCase() === "GET") {
     next();

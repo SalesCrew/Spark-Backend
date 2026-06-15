@@ -12,6 +12,7 @@ import {
   type TimelineInterval,
 } from "../lib/admin-zeiterfassung.js";
 import { db } from "../lib/db.js";
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import {
   gmDaySessionPauses,
   gmDaySessions,
@@ -24,7 +25,8 @@ import {
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const adminZeiterfassungRouter = Router();
-adminZeiterfassungRouter.use(requireAuth(["admin"]));
+adminZeiterfassungRouter.use(requireAuth(["admin", "kunde"]));
+adminZeiterfassungRouter.use(requireKundeAdminPermission);
 adminZeiterfassungRouter.use((req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {

@@ -2,14 +2,16 @@ import { and, eq, isNull } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../lib/db.js";
+import { getKundePermissionsForUser } from "../lib/kunde-access.js";
 import { getRequestLogMeta, logAction, logger, markErrorAsLogged, serializeError, startActionTimer } from "../lib/logger.js";
 import { authAuditLogs, users } from "../lib/schema.js";
 import { supabaseAnon } from "../lib/supabase.js";
+import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
-  role: z.enum(["gm", "sm", "admin", "coke"]).optional(),
+  role: z.enum(["gm", "sm", "admin", "kunde"]).optional(),
 });
 
 const refreshSchema = z.object({
@@ -17,6 +19,34 @@ const refreshSchema = z.object({
 });
 
 const authRouter = Router();
+
+async function buildAuthUserPayload(appUser: typeof users.$inferSelect) {
+  return {
+    id: appUser.id,
+    role: appUser.role,
+    email: appUser.email,
+    firstName: appUser.firstName,
+    lastName: appUser.lastName,
+    permissions: appUser.role === "kunde" ? await getKundePermissionsForUser(appUser.id) : null,
+  };
+}
+
+authRouter.get("/me", requireAuth(["admin", "gm", "sm", "kunde"]), async (req: AuthedRequest, res, next) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+    const [appUser] = await db.select().from(users).where(eq(users.id, req.authUser.appUserId)).limit(1);
+    if (!appUser || !appUser.isActive || appUser.deletedAt) {
+      res.status(403).json({ error: "User account is inactive." });
+      return;
+    }
+    res.status(200).json({ user: await buildAuthUserPayload(appUser) });
+  } catch (err) {
+    next(err);
+  }
+});
 
 authRouter.post("/login", async (req, res, next) => {
   const startedAtNs = startActionTimer();
@@ -42,20 +72,6 @@ authRouter.post("/login", async (req, res, next) => {
     }
 
     const { email, password, role } = parsed.data;
-
-    if (role === "coke") {
-      logAction("warn", "auth_login_role_not_enabled", {
-        req,
-        action: "auth_login",
-        result: "rejected",
-        statusCode: 501,
-        requestClass: "client_error",
-        startedAtNs,
-        details: { role },
-      });
-      res.status(501).json({ error: "Coke login is not enabled yet." });
-      return;
-    }
 
     const { data, error } = await supabaseAnon.auth.signInWithPassword({
       email,
@@ -123,13 +139,7 @@ authRouter.post("/login", async (req, res, next) => {
     });
 
     res.status(200).json({
-      user: {
-        id: appUser.id,
-        role: appUser.role,
-        email: appUser.email,
-        firstName: appUser.firstName,
-        lastName: appUser.lastName,
-      },
+      user: await buildAuthUserPayload(appUser),
       session: {
         accessToken: data.session.access_token,
         refreshToken: data.session.refresh_token,
@@ -225,13 +235,7 @@ authRouter.post("/refresh", async (req, res, next) => {
     }
 
     res.status(200).json({
-      user: {
-        id: appUser.id,
-        role: appUser.role,
-        email: appUser.email,
-        firstName: appUser.firstName,
-        lastName: appUser.lastName,
-      },
+      user: await buildAuthUserPayload(appUser),
       session: {
         accessToken: data.session.access_token,
         refreshToken: data.session.refresh_token,

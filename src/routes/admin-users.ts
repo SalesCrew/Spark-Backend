@@ -1,7 +1,9 @@
 import { and, desc, eq } from "drizzle-orm";
+import type { NextFunction, Response } from "express";
 import { Router } from "express";
 import { z } from "zod";
 import { aggregateHighVolumeLoad, logAction, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
+import { getKundePermissionsForUser, hasKundePermission } from "../lib/kunde-access.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
@@ -40,7 +42,46 @@ const updateOwnPasswordSchema = z.object({
 
 const adminUsersRouter = Router();
 
-adminUsersRouter.use(requireAuth(["admin"]));
+async function requireAdminUsersAccess(req: AuthedRequest, res: Response, next: NextFunction) {
+  if (!req.authUser) {
+    res.status(401).json({ error: "Authentication required.", code: "auth_required" });
+    return;
+  }
+  if (req.authUser.role === "admin") {
+    next();
+    return;
+  }
+  if (req.authUser.role !== "kunde") {
+    res.status(403).json({ error: "Role is not allowed for this endpoint.", code: "role_not_allowed" });
+    return;
+  }
+
+  const method = req.method.toUpperCase();
+  if (method === "GET") {
+    next();
+    return;
+  }
+  if (req.path.endsWith("/password")) {
+    res.status(403).json({ error: "Password update is currently admin-only.", code: "role_not_allowed" });
+    return;
+  }
+
+  const action = method === "POST" ? "write" : "update";
+  const permissions = await getKundePermissionsForUser(req.authUser.appUserId);
+  if (hasKundePermission(permissions, "gebietsmanager", action)) {
+    next();
+    return;
+  }
+  res.status(403).json({
+    error: "Fuer diese Aktion ist kein Kundenzugriff freigeschaltet.",
+    code: "kunde_permission_denied",
+    pageKey: "gebietsmanager",
+    action,
+  });
+}
+
+adminUsersRouter.use(requireAuth(["admin", "kunde"]));
+adminUsersRouter.use(requireAdminUsersAccess);
 adminUsersRouter.use((req, res, next) => {
   if (req.method.toUpperCase() === "GET") {
     next();
@@ -65,7 +106,12 @@ adminUsersRouter.use((req, res, next) => {
 adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
   try {
     const roleParam = req.query.role;
-    const role = roleParam === "admin" || roleParam === "gm" || roleParam === "sm" ? roleParam : undefined;
+    const requestedRole = roleParam === "admin" || roleParam === "gm" || roleParam === "sm" ? roleParam : undefined;
+    if (req.authUser?.role === "kunde" && requestedRole && requestedRole !== "gm") {
+      res.status(200).json({ users: [] });
+      return;
+    }
+    const role = req.authUser?.role === "kunde" ? "gm" : requestedRole;
     const whereClause = role ? eq(users.role, role) : undefined;
 
     const rows = await db
@@ -147,6 +193,10 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
     }
 
     const payload = parsed.data;
+    if (req.authUser?.role === "kunde" && payload.role !== "gm") {
+      res.status(403).json({ error: "Kundenzugaenge duerfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
+      return;
+    }
     const password = generatePassword();
 
     const { data: authCreated, error: authError } = await supabaseAdmin.auth.admin.createUser({
@@ -315,6 +365,10 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         details: { targetUserId: id },
       });
       res.status(404).json({ error: "User not found." });
+      return;
+    }
+    if (req.authUser?.role === "kunde" && existing.role !== "gm") {
+      res.status(403).json({ error: "Kundenzugaenge duerfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
       return;
     }
 
@@ -575,6 +629,10 @@ adminUsersRouter.patch("/:id/deactivate", async (req: AuthedRequest, res, next) 
         details: { targetUserId: id },
       });
       res.status(404).json({ error: "User not found." });
+      return;
+    }
+    if (req.authUser?.role === "kunde" && target.role !== "gm") {
+      res.status(403).json({ error: "Kundenzugaenge duerfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
       return;
     }
 

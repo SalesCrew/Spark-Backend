@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray, ne, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { logAction, startActionTimer } from "../lib/logger.js";
 import { requireAuth } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
@@ -19,7 +20,8 @@ const updateLagerSchema = createLagerSchema;
 
 const adminLagerRouter = Router();
 
-adminLagerRouter.use(requireAuth(["admin"]));
+adminLagerRouter.use(requireAuth(["admin", "kunde"]));
+adminLagerRouter.use(requireKundeAdminPermission);
 adminLagerRouter.use((req, res, next) => {
   if (req.method.toUpperCase() === "GET") {
     next();

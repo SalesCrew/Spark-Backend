@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { logAction, startActionTimer } from "../lib/logger.js";
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { addDays, getRedPeriodForDate, getRedPeriodLabel, getRedYear, startOfDay } from "../lib/red-monat.js";
 import {
   getCachedRedMonthCalendarConfig,
@@ -96,8 +97,9 @@ function buildPeriodsBetween(input: { from: Date; to: Date; now: Date }): Return
   return periods;
 }
 
-redMonthRouter.use(requireAuth(["admin", "gm", "sm"]));
-adminRedMonthRouter.use(requireAuth(["admin"]));
+redMonthRouter.use(requireAuth(["admin", "gm", "sm", "kunde"]));
+adminRedMonthRouter.use(requireAuth(["admin", "kunde"]));
+adminRedMonthRouter.use(requireKundeAdminPermission);
 redMonthRouter.use((req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {
@@ -201,4 +203,3 @@ adminRedMonthRouter.patch("/red-month/config", async (req, res, next) => {
 });
 
 export { redMonthRouter, adminRedMonthRouter };
-
