@@ -13,6 +13,7 @@ import {
 } from "../lib/praemien-source-catalog.js";
 import {
   praemienWavePillars,
+  praemienWaveFlexScores,
   praemienWaveQualityScores,
   praemienWaveSources,
   praemienWaveThresholds,
@@ -94,6 +95,13 @@ const qualityScoreInputSchema = z.object({
   note: z.string().trim().max(2000).nullable().optional(),
 });
 
+const flexScoreInputSchema = z.object({
+  id: z.string().uuid().optional(),
+  gmUserId: z.string().uuid(),
+  totalPoints: z.number().int().min(0).max(100),
+  note: z.string().trim().max(2000).nullable().optional(),
+});
+
 const createWaveSchema = z.object({
   name: z.string().trim().min(1).max(180),
   year: z.number().int().min(2000).max(2100),
@@ -135,6 +143,11 @@ const replaceSourcesSchema = z.object({
 
 const replaceQualityScoresSchema = z.object({
   qualityScores: z.array(qualityScoreInputSchema),
+  expectedUpdatedAt: isoDatetimeSchema.optional(),
+});
+
+const replaceFlexScoresSchema = z.object({
+  flexScores: z.array(flexScoreInputSchema),
   expectedUpdatedAt: isoDatetimeSchema.optional(),
 });
 
@@ -190,6 +203,15 @@ const waveResponseSchema = z.object({
         reporting: z.number().int(),
         accuracy: z.number().int(),
       }),
+      totalPoints: z.number().int(),
+      note: z.string().optional(),
+      updatedAt: z.string().datetime({ offset: true }),
+    }),
+  ),
+  flexSubmissions: z.array(
+    z.object({
+      gmId: z.string().uuid(),
+      gmName: z.string(),
       totalPoints: z.number().int(),
       note: z.string().optional(),
       updatedAt: z.string().datetime({ offset: true }),
@@ -260,7 +282,7 @@ async function loadWaveGraph(waveId: string) {
     .limit(1);
   if (!wave) return null;
 
-  const [thresholds, pillars, sources, qualityRows] = await Promise.all([
+  const [thresholds, pillars, sources, qualityRows, flexRows] = await Promise.all([
     db
       .select()
       .from(praemienWaveThresholds)
@@ -293,6 +315,21 @@ async function loadWaveGraph(waveId: string) {
       .from(praemienWaveQualityScores)
       .innerJoin(users, eq(users.id, praemienWaveQualityScores.gmUserId))
       .where(and(eq(praemienWaveQualityScores.waveId, waveId), eq(praemienWaveQualityScores.isDeleted, false)))
+      .orderBy(asc(users.lastName), asc(users.firstName)),
+    db
+      .select({
+        id: praemienWaveFlexScores.id,
+        waveId: praemienWaveFlexScores.waveId,
+        gmUserId: praemienWaveFlexScores.gmUserId,
+        totalPoints: praemienWaveFlexScores.totalPoints,
+        note: praemienWaveFlexScores.note,
+        updatedAt: praemienWaveFlexScores.updatedAt,
+        gmFirstName: users.firstName,
+        gmLastName: users.lastName,
+      })
+      .from(praemienWaveFlexScores)
+      .innerJoin(users, eq(users.id, praemienWaveFlexScores.gmUserId))
+      .where(and(eq(praemienWaveFlexScores.waveId, waveId), eq(praemienWaveFlexScores.isDeleted, false)))
       .orderBy(asc(users.lastName), asc(users.firstName)),
   ]);
 
@@ -368,6 +405,13 @@ async function loadWaveGraph(waveId: string) {
         reporting: row.reporting,
         accuracy: row.accuracy,
       },
+      totalPoints: row.totalPoints,
+      note: row.note ?? undefined,
+      updatedAt: row.updatedAt.toISOString(),
+    })),
+    flexSubmissions: flexRows.map((row) => ({
+      gmId: row.gmUserId,
+      gmName: `${row.gmFirstName} ${row.gmLastName}`.trim(),
       totalPoints: row.totalPoints,
       note: row.note ?? undefined,
       updatedAt: row.updatedAt.toISOString(),
@@ -602,6 +646,42 @@ async function replaceQualityScoresTx(tx: Tx, waveId: string, qualityScores: z.i
   await touchWaveTx(tx, waveId, now);
 }
 
+async function replaceFlexScoresTx(tx: Tx, waveId: string, flexScores: z.infer<typeof flexScoreInputSchema>[]) {
+  const now = new Date();
+  const gmIds = Array.from(new Set(flexScores.map((entry) => entry.gmUserId)));
+  const gmUsers = gmIds.length
+    ? await tx
+        .select({ id: users.id, role: users.role })
+        .from(users)
+        .where(and(inArray(users.id, gmIds), eq(users.isActive, true), eq(users.role, "gm"), sql`${users.deletedAt} is null`))
+    : [];
+  const validGmIdSet = new Set(gmUsers.map((entry) => entry.id));
+  for (const entry of flexScores) {
+    if (!validGmIdSet.has(entry.gmUserId)) {
+      throw new PraemienDomainError("flex_invalid_gm", 400, "Mindestens eine Flexbewertung referenziert keinen gueltigen GM.");
+    }
+  }
+
+  await tx
+    .update(praemienWaveFlexScores)
+    .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+    .where(and(eq(praemienWaveFlexScores.waveId, waveId), eq(praemienWaveFlexScores.isDeleted, false)));
+
+  for (const entry of flexScores) {
+    await tx.insert(praemienWaveFlexScores).values({
+      waveId,
+      gmUserId: entry.gmUserId,
+      totalPoints: entry.totalPoints,
+      note: entry.note ?? null,
+      isDeleted: false,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+  await touchWaveTx(tx, waveId, now);
+}
+
 function readWaveIdParam(req: AuthedRequest): string | null {
   const raw = req.params.waveId;
   if (typeof raw === "string" && raw.length > 0) return raw;
@@ -624,13 +704,15 @@ async function ensurePraemienTablesReady(): Promise<boolean> {
     praemien_wave_thresholds: string | null;
     praemien_wave_sources: string | null;
     praemien_wave_quality_scores: string | null;
+    praemien_wave_flex_scores: string | null;
   }[]>`
     select
       to_regclass('public.praemien_waves') as praemien_waves,
       to_regclass('public.praemien_wave_pillars') as praemien_wave_pillars,
       to_regclass('public.praemien_wave_thresholds') as praemien_wave_thresholds,
       to_regclass('public.praemien_wave_sources') as praemien_wave_sources,
-      to_regclass('public.praemien_wave_quality_scores') as praemien_wave_quality_scores
+      to_regclass('public.praemien_wave_quality_scores') as praemien_wave_quality_scores,
+      to_regclass('public.praemien_wave_flex_scores') as praemien_wave_flex_scores
   `;
   const row = result[0];
   hasPraemienTables = Boolean(
@@ -638,7 +720,8 @@ async function ensurePraemienTablesReady(): Promise<boolean> {
     row?.praemien_wave_pillars &&
     row?.praemien_wave_thresholds &&
     row?.praemien_wave_sources &&
-    row?.praemien_wave_quality_scores,
+    row?.praemien_wave_quality_scores &&
+    row?.praemien_wave_flex_scores,
   );
   // Cache only positive readiness. If DB is pushed later in a running dev process,
   // the next request should re-check and unlock the feature automatically.
@@ -970,6 +1053,38 @@ adminPraemienRouter.put("/waves/:waveId/quality-scores", async (req: AuthedReque
     });
     const payload = await loadWaveGraph(waveId);
     logMutation(req, "replace_quality_scores", { waveId, count: parsed.data.qualityScores.length });
+    res.status(200).json({ wave: payload });
+  } catch (error) {
+    if (error instanceof PraemienDomainError) {
+      sendDomainError(res, error);
+      return;
+    }
+    next(error);
+  }
+});
+
+adminPraemienRouter.put("/waves/:waveId/flex-scores", async (req: AuthedRequest, res, next) => {
+  try {
+    if (!(await ensurePraemienTablesReady())) {
+      sendPraemienNotInitialized(res);
+      return;
+    }
+    const waveId = readWaveIdParam(req);
+    if (!waveId) {
+      res.status(400).json({ error: "Wave-ID fehlt.", code: "wave_id_missing" });
+      return;
+    }
+    const parsed = replaceFlexScoresSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltige Flexbewertungen.", code: "invalid_payload" });
+      return;
+    }
+    await db.transaction(async (tx) => {
+      await lockWaveTx(tx, waveId, parsed.data.expectedUpdatedAt);
+      await replaceFlexScoresTx(tx, waveId, parsed.data.flexScores);
+    });
+    const payload = await loadWaveGraph(waveId);
+    logMutation(req, "replace_flex_scores", { waveId, count: parsed.data.flexScores.length });
     res.status(200).json({ wave: payload });
   } catch (error) {
     if (error instanceof PraemienDomainError) {

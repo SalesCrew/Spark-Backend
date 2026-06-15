@@ -7,6 +7,7 @@ async function main() {
     praemien_wave_pillars: string | null;
     praemien_wave_sources: string | null;
     praemien_wave_quality_scores: string | null;
+    praemien_wave_flex_scores: string | null;
     praemien_gm_wave_contributions: string | null;
     praemien_gm_wave_totals: string | null;
   }[]>`
@@ -16,6 +17,7 @@ async function main() {
       to_regclass('public.praemien_wave_pillars') as praemien_wave_pillars,
       to_regclass('public.praemien_wave_sources') as praemien_wave_sources,
       to_regclass('public.praemien_wave_quality_scores') as praemien_wave_quality_scores,
+      to_regclass('public.praemien_wave_flex_scores') as praemien_wave_flex_scores,
       to_regclass('public.praemien_gm_wave_contributions') as praemien_gm_wave_contributions,
       to_regclass('public.praemien_gm_wave_totals') as praemien_gm_wave_totals
   `;
@@ -31,6 +33,7 @@ async function main() {
         'praemien_wave_pillars_wave_order_active_unique',
         'praemien_wave_sources_wave_question_score_active_unique',
         'praemien_wave_quality_scores_wave_gm_active_unique',
+        'praemien_wave_flex_scores_wave_gm_active_unique',
         'question_scoring_boni_active_idx',
         'praemien_gm_wave_contrib_dedupe_unique',
         'praemien_gm_wave_totals_wave_gm_unique'

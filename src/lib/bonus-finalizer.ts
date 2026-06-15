@@ -9,7 +9,9 @@ import {
   markets,
   praemienGmWaveContributions,
   praemienGmWaveTotals,
+  praemienWaveFlexScores,
   praemienWavePillars,
+  praemienWaveQualityScores,
   praemienWaveSources,
   praemienWaveThresholds,
   praemienWaves,
@@ -40,6 +42,8 @@ async function ensureBonusTablesReady(): Promise<boolean> {
     praemien_waves: string | null;
     praemien_wave_sources: string | null;
     praemien_wave_thresholds: string | null;
+    praemien_wave_quality_scores: string | null;
+    praemien_wave_flex_scores: string | null;
     praemien_gm_wave_contributions: string | null;
     praemien_gm_wave_totals: string | null;
   }[]>`
@@ -47,6 +51,8 @@ async function ensureBonusTablesReady(): Promise<boolean> {
       to_regclass('public.praemien_waves') as praemien_waves,
       to_regclass('public.praemien_wave_sources') as praemien_wave_sources,
       to_regclass('public.praemien_wave_thresholds') as praemien_wave_thresholds,
+      to_regclass('public.praemien_wave_quality_scores') as praemien_wave_quality_scores,
+      to_regclass('public.praemien_wave_flex_scores') as praemien_wave_flex_scores,
       to_regclass('public.praemien_gm_wave_contributions') as praemien_gm_wave_contributions,
       to_regclass('public.praemien_gm_wave_totals') as praemien_gm_wave_totals
   `;
@@ -55,6 +61,8 @@ async function ensureBonusTablesReady(): Promise<boolean> {
     row?.praemien_waves &&
     row?.praemien_wave_sources &&
     row?.praemien_wave_thresholds &&
+    row?.praemien_wave_quality_scores &&
+    row?.praemien_wave_flex_scores &&
     row?.praemien_gm_wave_contributions &&
     row?.praemien_gm_wave_totals,
   );
@@ -71,6 +79,8 @@ type GmBonusSummaryGoal = {
   points: number;
   maxPoints: number;
   percent: number;
+  isManual: boolean;
+  isPending: boolean;
 };
 
 export type GmBonusSummary = {
@@ -158,6 +168,23 @@ function pickRewardForPoints(
   const sorted = thresholds.slice().sort((left, right) => left.minPoints - right.minPoints);
   const matched = sorted.filter((entry) => totalPoints >= entry.minPoints).at(-1);
   return matched?.rewardEur ?? 0;
+}
+
+function normalizePillarName(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+}
+
+function isFlexPillarName(value: string): boolean {
+  return normalizePillarName(value).includes("flexziel");
+}
+
+function isQualityPillarName(value: string): boolean {
+  const normalized = normalizePillarName(value);
+  return normalized.includes("qualitatsziele") || normalized.includes("qualitaetsziele") || normalized.includes("qualitat");
 }
 
 async function loadActiveWaveForInstant(input: {
@@ -468,7 +495,7 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
     };
   }
 
-  const [pillars, sources, thresholds, totalRow, pillarRows] = await Promise.all([
+  const [pillars, sources, thresholds, pillarRows, qualityRows, flexRows] = await Promise.all([
     db
       .select()
       .from(praemienWavePillars)
@@ -489,11 +516,6 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
       .where(and(eq(praemienWaveThresholds.waveId, wave.id), eq(praemienWaveThresholds.isDeleted, false)))
       .orderBy(asc(praemienWaveThresholds.orderIndex)),
     db
-      .select()
-      .from(praemienGmWaveTotals)
-      .where(and(eq(praemienGmWaveTotals.waveId, wave.id), eq(praemienGmWaveTotals.gmUserId, gmUserId)))
-      .limit(1),
-    db
       .select({
         pillarId: praemienGmWaveContributions.pillarId,
         points: sql<number>`coalesce(sum(${praemienGmWaveContributions.appliedValue}), 0)`,
@@ -501,6 +523,24 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
       .from(praemienGmWaveContributions)
       .where(and(eq(praemienGmWaveContributions.waveId, wave.id), eq(praemienGmWaveContributions.gmUserId, gmUserId)))
       .groupBy(praemienGmWaveContributions.pillarId),
+    db
+      .select({ totalPoints: praemienWaveQualityScores.totalPoints })
+      .from(praemienWaveQualityScores)
+      .where(and(
+        eq(praemienWaveQualityScores.waveId, wave.id),
+        eq(praemienWaveQualityScores.gmUserId, gmUserId),
+        eq(praemienWaveQualityScores.isDeleted, false),
+      ))
+      .limit(1),
+    db
+      .select({ totalPoints: praemienWaveFlexScores.totalPoints })
+      .from(praemienWaveFlexScores)
+      .where(and(
+        eq(praemienWaveFlexScores.waveId, wave.id),
+        eq(praemienWaveFlexScores.gmUserId, gmUserId),
+        eq(praemienWaveFlexScores.isDeleted, false),
+      ))
+      .limit(1),
   ]);
 
   const maxByPillar = new Map<string, number>();
@@ -514,6 +554,36 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
   }
 
   const goals = pillars.map((pillar) => {
+    if (isQualityPillarName(pillar.name)) {
+      const qualityScore = qualityRows[0];
+      const points = qualityScore ? normalizeNumber(qualityScore.totalPoints) : 0;
+      const maxPoints = qualityScore ? 100 : 0;
+      return {
+        pillarId: pillar.id,
+        name: pillar.name,
+        color: pillar.color,
+        points,
+        maxPoints,
+        percent: maxPoints > 0 ? Math.max(0, Math.min(100, Math.round((points / maxPoints) * 100))) : 0,
+        isManual: true,
+        isPending: !qualityScore,
+      };
+    }
+    if (isFlexPillarName(pillar.name)) {
+      const flexScore = flexRows[0];
+      const points = flexScore ? normalizeNumber(flexScore.totalPoints) : 0;
+      const maxPoints = flexScore ? 100 : 0;
+      return {
+        pillarId: pillar.id,
+        name: pillar.name,
+        color: pillar.color,
+        points,
+        maxPoints,
+        percent: maxPoints > 0 ? Math.max(0, Math.min(100, Math.round((points / maxPoints) * 100))) : 0,
+        isManual: true,
+        isPending: !flexScore,
+      };
+    }
     const maxPoints = Number((maxByPillar.get(pillar.id) ?? 0).toFixed(4));
     const points = Number((pointsByPillar.get(pillar.id) ?? 0).toFixed(4));
     const percent = maxPoints > 0 ? Math.max(0, Math.min(100, Math.round((points / maxPoints) * 100))) : 0;
@@ -524,6 +594,8 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
       points,
       maxPoints,
       percent,
+      isManual: Boolean(pillar.isManual),
+      isPending: false,
     };
   });
 
@@ -532,18 +604,10 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
     minPoints: normalizeNumber(entry.minPoints),
     rewardEur: normalizeNumber(entry.rewardEur),
   }));
-  const totalPoints = totalRow[0] ? normalizeNumber(totalRow[0].totalPoints) : Number(
-    goals.reduce((sum, entry) => sum + entry.points, 0).toFixed(4),
-  );
+  const totalPoints = Number(goals.reduce((sum, entry) => sum + entry.points, 0).toFixed(4));
   const fullRewardEur = Math.max(0, ...normalizedThresholds.map((entry) => entry.rewardEur));
-  const currentRewardEur = totalRow[0]
-    ? normalizeNumber(totalRow[0].currentRewardEur)
-    : pickRewardForPoints(totalPoints, normalizedThresholds);
-  const totalMaxPoints = Math.max(
-    0,
-    ...normalizedThresholds.map((entry) => entry.minPoints),
-    Number(goals.reduce((sum, entry) => sum + entry.maxPoints, 0).toFixed(4)),
-  );
+  const currentRewardEur = pickRewardForPoints(totalPoints, normalizedThresholds);
+  const totalMaxPoints = Number(goals.reduce((sum, entry) => sum + entry.maxPoints, 0).toFixed(4));
 
   return {
     hasActiveWave: true,

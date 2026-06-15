@@ -755,6 +755,32 @@ export const praemienWaveQualityScores = pgTable(
   ],
 );
 
+export const praemienWaveFlexScores = pgTable(
+  "praemien_wave_flex_scores",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    waveId: uuid("wave_id")
+      .notNull()
+      .references(() => praemienWaves.id, { onDelete: "cascade" }),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    totalPoints: integer("total_points").notNull().default(0),
+    note: text("note"),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("praemien_wave_flex_scores_total_points_ck", sql`${table.totalPoints} between 0 and 100`),
+    uniqueIndex("praemien_wave_flex_scores_wave_gm_active_unique")
+      .on(table.waveId, table.gmUserId)
+      .where(sql`${table.isDeleted} = false`),
+    index("praemien_wave_flex_scores_wave_idx").on(table.waveId, table.isDeleted),
+  ],
+);
+
 export const praemienGmWaveTotals = pgTable(
   "praemien_gm_wave_totals",
   {
