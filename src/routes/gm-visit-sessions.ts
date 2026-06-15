@@ -3043,9 +3043,10 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
         const tagsEnabled = Boolean(config.tagsEnabled) && Array.isArray(config.tagIds) && (config.tagIds as unknown[]).length > 0;
         const requiredPhotoQuestion = Boolean(target.requiredSnapshot);
         const requiresTagSelection = requiredPhotoQuestion && tagsEnabled;
-        const hasAtLeastOneTag = photoTagValues.length > 0;
+        const taggedPhotoIds = new Set(photoTagValues.map((value) => value.visitAnswerPhotoId));
+        const everyPhotoHasTag = !tagsEnabled || inserted.every((photoRow) => taggedPhotoIds.has(photoRow.id));
         const isAnswered = inserted.length > 0;
-        const isValid = requiredPhotoQuestion ? isAnswered && (!tagsEnabled || hasAtLeastOneTag) : true;
+        const isValid = requiredPhotoQuestion ? isAnswered && everyPhotoHasTag : true;
 
         await tx
           .update(visitAnswers)
