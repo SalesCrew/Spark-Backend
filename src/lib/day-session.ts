@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { db, sql } from "./db.js";
 import { gmDaySessions } from "./schema.js";
 
@@ -39,6 +39,30 @@ async function getCurrentDaySessionForUser(input: {
   return row;
 }
 
+async function getCurrentWritableDaySessionForUser(input: {
+  gmUserId: string;
+  now?: Date;
+  timezone?: string;
+}) {
+  if (!(await ensureDaySessionTableReady())) return null;
+  const todaySession = await getCurrentDaySessionForUser(input);
+  if (todaySession) return todaySession;
+
+  const [openSession] = await db
+    .select()
+    .from(gmDaySessions)
+    .where(
+      and(
+        eq(gmDaySessions.gmUserId, input.gmUserId),
+        eq(gmDaySessions.isDeleted, false),
+        inArray(gmDaySessions.status, ["started", "ended"]),
+      ),
+    )
+    .orderBy(desc(gmDaySessions.dayStartedAt), desc(gmDaySessions.updatedAt))
+    .limit(1);
+  return openSession ?? null;
+}
+
 async function ensureDaySessionTableReady(): Promise<boolean> {
   if (checkedDaySessionTable) return hasDaySessionTable;
   const result = await sql<{ gm_day_sessions: string | null }[]>`
@@ -60,9 +84,9 @@ async function ensureStartedDaySession(input: {
   if (!(await ensureDaySessionTableReady())) {
     return { ok: true, session: null, skipped: true };
   }
-  const session = await getCurrentDaySessionForUser(input);
+  const session = await getCurrentWritableDaySessionForUser(input);
   if (!session) return { ok: false, reason: "day_not_started" };
-  if (!inArrayValue(session.status, ["started"])) return { ok: false, reason: "day_not_started" };
+  if (!inArrayValue(session.status, ["started", "ended"])) return { ok: false, reason: "day_not_started" };
   if (!session.dayStartedAt) return { ok: false, reason: "day_not_started" };
   return { ok: true, session, skipped: false };
 }
@@ -71,4 +95,11 @@ function inArrayValue<T extends string>(value: T, values: readonly T[]): boolean
   return values.includes(value);
 }
 
-export { DEFAULT_TIMEZONE, getCurrentDaySessionForUser, ensureDaySessionTableReady, ensureStartedDaySession, toYmdInTimezone };
+export {
+  DEFAULT_TIMEZONE,
+  getCurrentDaySessionForUser,
+  getCurrentWritableDaySessionForUser,
+  ensureDaySessionTableReady,
+  ensureStartedDaySession,
+  toYmdInTimezone,
+};
