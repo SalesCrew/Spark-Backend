@@ -11,8 +11,8 @@ import { db } from "../lib/db.js";
 import { ensureStartedDaySession } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
-import { addDays, getCurrentRedPeriod, startOfDay } from "../lib/red-monat.js";
-import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
+import { addDays, startOfDay } from "../lib/red-monat.js";
+import { resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import {
@@ -527,8 +527,7 @@ async function loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(input: {
   const questionIds = normalizeUnique(input.questionIds.filter((id) => isUuid(id)));
   if (questionIds.length === 0) return new Map();
 
-  await refreshRedMonthCalendarConfig();
-  const period = getCurrentRedPeriod(input.now ?? new Date());
+  const period = await resolveCurrentRedPeriod(input.now ?? new Date());
   const periodStart = startOfDay(period.start);
   const periodEndExclusive = addDays(startOfDay(period.end), 1);
 

@@ -4,8 +4,7 @@ import { z } from "zod";
 import { computeMarketIppForPeriod, computeMarketIppSummariesForPeriod } from "../lib/ipp.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { logAction, startActionTimer } from "../lib/logger.js";
-import { getRedPeriodForDate, getRedPeriodLabel, getRedYear } from "../lib/red-monat.js";
-import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
+import { redMonthPeriodToYmd, resolveCurrentRedPeriod, resolveRedPeriodForDate, type ResolvedRedMonthPeriod } from "../lib/red-month-periods.js";
 import { db, sql as pgSql } from "../lib/db.js";
 import { ippMarketRedmonthResults, markets, users } from "../lib/schema.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -54,6 +53,7 @@ type IppListRow = {
 };
 
 type IppPeriodPayload = {
+  redPeriodId?: string | null;
   redPeriodStart: string;
   redPeriodEnd: string;
   redMonatLabel: string;
@@ -95,13 +95,14 @@ function chunkArray<T>(values: T[], size = IPP_ROUTE_BATCH_SIZE): T[][] {
   return chunks;
 }
 
-function getCurrentIppPeriodPayload(now: Date): IppPeriodPayload {
-  const currentPeriod = getRedPeriodForDate(now);
+function buildIppPeriodPayload(period: ResolvedRedMonthPeriod): IppPeriodPayload {
+  const { startYmd, endYmd } = redMonthPeriodToYmd(period);
   return {
-    redPeriodStart: toYmd(currentPeriod.start),
-    redPeriodEnd: toYmd(currentPeriod.end),
-    redMonatLabel: getRedPeriodLabel(now),
-    redPeriodYear: getRedYear(now),
+    redPeriodId: period.redPeriodId,
+    redPeriodStart: startYmd,
+    redPeriodEnd: endYmd,
+    redMonatLabel: period.label,
+    redPeriodYear: period.redYear,
   };
 }
 
@@ -160,8 +161,6 @@ async function loadGmNameMapByIds(gmIds: string[]) {
 }
 
 async function buildArchivedIppRows(): Promise<IppListRow[]> {
-  await refreshRedMonthCalendarConfig();
-
   const archivedRows =
     (await ensureIppArchiveTableReady())
       ? await db
@@ -211,10 +210,8 @@ async function buildArchivedIppRows(): Promise<IppListRow[]> {
 }
 
 async function buildCurrentIppRows(now: Date): Promise<IppListRow[]> {
-  await refreshRedMonthCalendarConfig();
-
-  const currentPeriod = getRedPeriodForDate(now);
-  const currentMeta = getCurrentIppPeriodPayload(now);
+  const currentPeriod = await resolveCurrentRedPeriod(now);
+  const currentMeta = buildIppPeriodPayload(currentPeriod);
   const currentSummaries = await computeMarketIppSummariesForPeriod({
     periodStart: currentPeriod.start,
     periodEnd: currentPeriod.end,
@@ -276,7 +273,7 @@ adminIppRouter.get("/ipp", async (_req, res, next) => {
     res.status(200).json({
       rows,
       filters: buildIppFilters(rows),
-      currentPeriod: getCurrentIppPeriodPayload(now),
+      currentPeriod: buildIppPeriodPayload(await resolveCurrentRedPeriod(now)),
     });
   } catch (error) {
     next(error);
@@ -331,9 +328,9 @@ adminIppRouter.get("/ipp/:marketId/detail", async (req, res, next) => {
             .limit(1)
         : [];
 
-    const periodInfo = getRedPeriodForDate(periodStartDate);
+    const periodInfo = await resolveRedPeriodForDate(periodStartDate);
     const periodStart = parseYmdOrNull(parsed.data.periodStart) ?? periodInfo.start;
-    const currentStartYmd = toYmd(getRedPeriodForDate(new Date()).start);
+    const currentStartYmd = toYmd((await resolveCurrentRedPeriod(new Date())).start);
     const requestedStartYmd = toYmd(periodStart);
     const isCurrentPeriod = requestedStartYmd === currentStartYmd;
     const isClosedPeriod = requestedStartYmd < currentStartYmd;
@@ -395,10 +392,10 @@ adminIppRouter.get("/ipp/:marketId/detail", async (req, res, next) => {
         city: market.city,
         region: market.region,
         gmName: market.currentGmName ?? "",
-        redMonatLabel: getRedPeriodLabel(periodStart),
+        redMonatLabel: periodInfo.label,
         redPeriodStart: toYmd(periodStart),
         redPeriodEnd: toYmd(periodEnd),
-        redPeriodYear: getRedYear(periodStart),
+        redPeriodYear: periodInfo.redYear,
         marketIpp,
         includedInAverage: marketIpp > 0,
         isFinalized: false,

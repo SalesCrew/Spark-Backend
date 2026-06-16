@@ -69,6 +69,7 @@ export const gmDaySessionStatusEnum = pgEnum("gm_day_session_status", [
 ]);
 export const praemienWaveStatusEnum = pgEnum("praemien_wave_status", ["draft", "active", "archived"]);
 export const praemienDistributionFreqRuleEnum = pgEnum("praemien_distribution_freq_rule", ["lt8", "gt8"]);
+export const redMonthYearStatusEnum = pgEnum("red_month_year_status", ["draft", "active", "locked"]);
 
 export const users = pgTable(
   "users",
@@ -407,6 +408,74 @@ export const redMonthCalendarConfig = pgTable(
   ],
 );
 
+export const redMonthYears = pgTable(
+  "red_month_years",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    redYear: integer("red_year").notNull(),
+    anchorStart: date("anchor_start").notNull(),
+    cycleWeeks: integer("cycle_weeks").array().notNull(),
+    periodCount: integer("period_count").notNull().default(13),
+    timezone: text("timezone").notNull().default("Europe/Vienna"),
+    status: redMonthYearStatusEnum("status").notNull().default("draft"),
+    createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("red_month_years_cycle_weeks_not_empty_ck", sql`cardinality(${table.cycleWeeks}) > 0`),
+    check("red_month_years_period_count_positive_ck", sql`${table.periodCount} >= 1`),
+    check("red_month_years_status_ck", sql`${table.status} in ('draft','active','locked')`),
+    uniqueIndex("red_month_years_year_active_unique")
+      .on(table.redYear)
+      .where(sql`${table.isDeleted} = false`),
+    index("red_month_years_status_idx").on(table.status, table.isDeleted),
+    index("red_month_years_anchor_idx").on(table.anchorStart),
+    index("red_month_years_created_by_idx").on(table.createdByUserId),
+  ],
+);
+
+export const redMonthPeriods = pgTable(
+  "red_month_periods",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    redMonthYearId: uuid("red_month_year_id")
+      .notNull()
+      .references(() => redMonthYears.id, { onDelete: "cascade" }),
+    redYear: integer("red_year").notNull(),
+    periodIndex: integer("period_index").notNull(),
+    label: text("label").notNull(),
+    startDate: date("start_date").notNull(),
+    endDate: date("end_date").notNull(),
+    lookupEndDate: date("lookup_end_date").notNull(),
+    cycleIndex: integer("cycle_index").notNull(),
+    cycleWeeks: integer("cycle_weeks").notNull(),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("red_month_periods_period_index_positive_ck", sql`${table.periodIndex} >= 1`),
+    check("red_month_periods_cycle_weeks_positive_ck", sql`${table.cycleWeeks} >= 1`),
+    check("red_month_periods_date_order_ck", sql`${table.startDate} <= ${table.endDate} and ${table.endDate} <= ${table.lookupEndDate}`),
+    uniqueIndex("red_month_periods_year_period_unique")
+      .on(table.redMonthYearId, table.periodIndex)
+      .where(sql`${table.isDeleted} = false`),
+    uniqueIndex("red_month_periods_year_label_unique")
+      .on(table.redMonthYearId, table.label)
+      .where(sql`${table.isDeleted} = false`),
+    uniqueIndex("red_month_periods_start_date_unique")
+      .on(table.startDate)
+      .where(sql`${table.isDeleted} = false`),
+    index("red_month_periods_lookup_idx").on(table.startDate, table.lookupEndDate),
+    index("red_month_periods_red_year_idx").on(table.redYear, table.periodIndex),
+    index("red_month_periods_year_id_idx").on(table.redMonthYearId),
+  ],
+);
+
 export const ippMarketRedmonthResults = pgTable(
   "ipp_market_redmonth_results",
   {
@@ -414,6 +483,7 @@ export const ippMarketRedmonthResults = pgTable(
     marketId: uuid("market_id")
       .notNull()
       .references(() => markets.id, { onDelete: "cascade" }),
+    redPeriodId: uuid("red_period_id").references(() => redMonthPeriods.id, { onDelete: "set null" }),
     redPeriodStart: date("red_period_start").notNull(),
     redPeriodEnd: date("red_period_end").notNull(),
     redPeriodLabel: text("red_period_label").notNull(),
@@ -441,6 +511,9 @@ export const ippMarketRedmonthResults = pgTable(
     index("ipp_market_redmonth_results_period_market_active_idx")
       .on(table.redPeriodStart, table.marketId)
       .where(sql`${table.isDeleted} = false`),
+    index("ipp_market_redmonth_results_red_period_market_idx")
+      .on(table.redPeriodId, table.marketId)
+      .where(sql`${table.isDeleted} = false`),
     index("ipp_market_redmonth_results_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -452,6 +525,7 @@ export const ippRecalcQueue = pgTable(
     marketId: uuid("market_id")
       .notNull()
       .references(() => markets.id, { onDelete: "cascade" }),
+    redPeriodId: uuid("red_period_id").references(() => redMonthPeriods.id, { onDelete: "set null" }),
     redPeriodStart: date("red_period_start").notNull(),
     redPeriodEnd: date("red_period_end").notNull(),
     reason: text("reason").notNull().default("unspecified"),
@@ -476,6 +550,9 @@ export const ippRecalcQueue = pgTable(
       .where(sql`${table.isDeleted} = false and ${table.status} in ('pending','processing')`),
     index("ipp_recalc_queue_status_idx").on(table.status, table.queuedAt),
     index("ipp_recalc_queue_market_period_idx").on(table.marketId, table.redPeriodStart),
+    index("ipp_recalc_queue_red_period_market_idx")
+      .on(table.redPeriodId, table.marketId)
+      .where(sql`${table.isDeleted} = false and ${table.status} in ('pending','processing')`),
     index("ipp_recalc_queue_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -854,6 +931,7 @@ export const praemienGmWaveContributions = pgTable(
       .notNull()
       .references(() => praemienWavePillars.id, { onDelete: "cascade" }),
     visitSessionId: uuid("visit_session_id"),
+    redPeriodId: uuid("red_period_id").references(() => redMonthPeriods.id, { onDelete: "set null" }),
     redPeriodStart: date("red_period_start").notNull(),
     redPeriodEnd: date("red_period_end").notNull(),
     questionId: uuid("question_id").notNull(),
@@ -868,6 +946,7 @@ export const praemienGmWaveContributions = pgTable(
       .on(table.waveId, table.gmUserId, table.marketId, table.redPeriodStart, table.sourceId),
     index("praemien_gm_wave_contrib_wave_gm_idx").on(table.waveId, table.gmUserId, table.updatedAt),
     index("praemien_gm_wave_contrib_source_idx").on(table.sourceId, table.updatedAt),
+    index("praemien_gm_wave_contrib_red_period_idx").on(table.redPeriodId, table.gmUserId),
   ],
 );
 

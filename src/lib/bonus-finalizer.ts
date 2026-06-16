@@ -3,8 +3,7 @@ import { db, sql as pgSql } from "./db.js";
 import { DEFAULT_TIMEZONE, toYmdInTimezone } from "./day-session.js";
 import { recomputeGmKpiCache } from "./gm-kpi-cache.js";
 import { logAction, logger, serializeError, startActionTimer } from "./logger.js";
-import { getCurrentRedPeriod } from "./red-monat.js";
-import { refreshRedMonthCalendarConfig } from "./red-month-calendar.js";
+import { redMonthPeriodToYmd, resolveCurrentRedPeriod, resolveRedPeriodForDate } from "./red-month-periods.js";
 import {
   markets,
   praemienGmWaveContributions,
@@ -222,12 +221,12 @@ async function finalizeBonusForSubmittedVisitSessionWithExecutor(
   input: FinalizeBonusInput,
 ): Promise<BonusFinalizeResult> {
   if (!(await ensureBonusTablesReady())) return { applied: false, waveId: null };
-  const calendarConfig = await refreshRedMonthCalendarConfig();
   const submittedAt = input.submittedAt;
+  const redPeriod = await resolveRedPeriodForDate(submittedAt);
   const wave = await loadActiveWaveForInstant({
     at: submittedAt,
     executor,
-    fallbackTimezone: calendarConfig.timezone,
+    fallbackTimezone: redPeriod.timezone || DEFAULT_TIMEZONE,
   });
   if (!wave) return { applied: false, waveId: null };
 
@@ -304,10 +303,9 @@ async function finalizeBonusForSubmittedVisitSessionWithExecutor(
     optionsByAnswerId.set(option.visitAnswerId, bucket);
   }
 
-  const redPeriod = getCurrentRedPeriod(submittedAt);
-  const redMonthTimezone = calendarConfig.timezone?.trim() || DEFAULT_TIMEZONE;
-  const redPeriodStart = toYmdInTimezone(redPeriod.start, redMonthTimezone);
-  const redPeriodEnd = toYmdInTimezone(redPeriod.end, redMonthTimezone);
+  const redPeriodDates = redMonthPeriodToYmd(redPeriod);
+  const redPeriodStart = redPeriodDates.startYmd;
+  const redPeriodEnd = redPeriodDates.endYmd;
 
   const contributionPayload = filteredSources.flatMap((source) => {
     const questionRowId = questionBySectionAndId.get(`${source.sectionType}:${source.questionId}`);
@@ -328,6 +326,7 @@ async function finalizeBonusForSubmittedVisitSessionWithExecutor(
       sourceId: source.sourceId,
       pillarId: source.pillarId,
       visitSessionId: input.sessionId,
+      redPeriodId: redPeriod.redPeriodId,
       redPeriodStart,
       redPeriodEnd,
       questionId: source.questionId,
@@ -471,11 +470,10 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
       thresholds: [],
     };
   }
-  const calendarConfig = await refreshRedMonthCalendarConfig();
   const wave = await loadActiveWaveForInstant({
     at: now,
     executor: db,
-    fallbackTimezone: calendarConfig.timezone,
+    fallbackTimezone: (await resolveCurrentRedPeriod(now)).timezone || DEFAULT_TIMEZONE,
   });
   if (!wave) {
     return {

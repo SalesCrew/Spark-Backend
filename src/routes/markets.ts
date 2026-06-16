@@ -6,8 +6,7 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { aggregateHighVolumeLoad, logAction, logger, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
-import { getCurrentRedPeriod } from "../lib/red-monat.js";
-import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
+import { resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
 import {
   campaignMarketAssignments,
   campaigns,
@@ -130,8 +129,8 @@ function toYmd(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-function getCurrentRedPeriodBounds(now = new Date()): { startYmd: string; endYmd: string } {
-  const period = getCurrentRedPeriod(now);
+async function getCurrentRedPeriodBounds(now = new Date()): Promise<{ startYmd: string; endYmd: string }> {
+  const period = await resolveCurrentRedPeriod(now);
   return {
     startYmd: toYmd(period.start),
     endYmd: toYmd(period.end),
@@ -1012,7 +1011,6 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
       return;
     }
 
-    await refreshRedMonthCalendarConfig();
     const rows = await db
       .select()
       .from(markets)
@@ -1090,7 +1088,6 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
       return;
     }
 
-    await refreshRedMonthCalendarConfig();
     const [gmUser] = await db
       .select({ isBillaGm: users.isBillaGm })
       .from(users)
@@ -1165,8 +1162,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
     }
     const { marketId } = parsed.data;
 
-    await refreshRedMonthCalendarConfig();
-    const redPeriod = getCurrentRedPeriod();
+    const redPeriod = await resolveCurrentRedPeriod();
     const redEndExclusive = redPeriodEndExclusive(redPeriod.end);
 
     const [marketRow] = await db
@@ -1520,8 +1516,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
       return;
     }
 
-    await refreshRedMonthCalendarConfig();
-    const { startYmd: redStartYmd, endYmd: redEndYmd } = getCurrentRedPeriodBounds();
+    const { startYmd: redStartYmd, endYmd: redEndYmd } = await getCurrentRedPeriodBounds();
 
     const assignmentRows = await db
       .select({

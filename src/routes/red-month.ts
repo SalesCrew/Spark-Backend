@@ -1,14 +1,25 @@
 import { Router } from "express";
 import { z } from "zod";
-import { logAction, startActionTimer } from "../lib/logger.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
-import { addDays, getRedPeriodForDate, getRedPeriodLabel, getRedYear, startOfDay } from "../lib/red-monat.js";
+import { logAction, startActionTimer } from "../lib/logger.js";
 import {
-  getCachedRedMonthCalendarConfig,
+  activateRedMonthYear,
+  createRedMonthYear,
+  generateRedMonthPeriodsPreview,
+  listRedMonthPeriods,
+  listRedMonthYears,
+  redMonthPeriodToYmd,
+  resolveCurrentRedPeriod,
+  updateDraftRedMonthYear,
+  type GeneratedRedMonthPeriod,
+  type RedMonthYearRecord,
+  type ResolvedRedMonthPeriod,
+} from "../lib/red-month-periods.js";
+import {
   refreshRedMonthCalendarConfig,
   setActiveRedMonthCalendarConfig,
 } from "../lib/red-month-calendar.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const redMonthRouter = Router();
 const adminRedMonthRouter = Router();
@@ -20,17 +31,32 @@ const getCalendarQuerySchema = z.object({
   to: z.string().regex(ymdRegex).optional(),
 });
 
-function isMondayYmd(value: string): boolean {
-  const parsed = parseYmd(value);
-  if (toYmd(parsed) !== value) return false;
-  return parsed.getDay() === 1;
-}
-
-const updateConfigSchema = z
+const previewYearSchema = z
   .object({
-    anchorStart: z.string().regex(ymdRegex).refine(isMondayYmd, {
-      message: "Anchor-Start muss ein Montag sein.",
-    }),
+    redYear: z.number().int().min(2000).max(2100),
+    anchorStart: z.string().regex(ymdRegex),
+    cycleWeeks: z.array(z.number().int().positive()).min(1).default([4, 4, 5]),
+    periodCount: z.number().int().positive().max(20).default(13),
+    timezone: z.string().trim().min(1).optional(),
+  })
+  .strict();
+
+const createYearSchema = previewYearSchema.extend({
+  status: z.enum(["draft", "active", "locked"]).optional(),
+});
+
+const updateYearSchema = z
+  .object({
+    anchorStart: z.string().regex(ymdRegex),
+    cycleWeeks: z.array(z.number().int().positive()).min(1),
+    periodCount: z.number().int().positive().max(20).default(13),
+    timezone: z.string().trim().min(1).optional(),
+  })
+  .strict();
+
+const updateLegacyConfigSchema = z
+  .object({
+    anchorStart: z.string().regex(ymdRegex),
     cycleWeeks: z.array(z.number().int().positive()).min(1),
     timezone: z.string().trim().min(1).optional(),
   })
@@ -43,63 +69,79 @@ function toYmd(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-function parseYmd(value: string): Date {
-  const [rawYear, rawMonth, rawDay] = value.split("-");
-  const year = Number(rawYear ?? "0");
-  const month = Number(rawMonth ?? "0");
-  const day = Number(rawDay ?? "0");
-  return new Date(year, Math.max(0, month - 1), Math.max(1, day));
-}
-
-function buildPeriodDto(input: { start: Date; end: Date; now: Date }) {
-  const start = startOfDay(input.start);
-  const end = startOfDay(input.end);
-  const today = startOfDay(input.now);
-  const currentPeriod = getRedPeriodForDate(today);
-  const periodInfo = getRedPeriodForDate(start);
+function formatPeriodDto(period: ResolvedRedMonthPeriod, current: ResolvedRedMonthPeriod) {
+  const { startYmd, endYmd } = redMonthPeriodToYmd(period);
+  const today = new Date();
+  const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
   return {
-    id: `${toYmd(start)}`,
-    label: getRedPeriodLabel(start),
-    periodIndexFromAnchor: periodInfo.periodIndexFromAnchor,
-    start: toYmd(start),
-    end: toYmd(end),
-    year: getRedYear(start),
-    isCurrent: periodInfo.periodIndexFromAnchor === currentPeriod.periodIndexFromAnchor,
-    daysUntilEnd: Math.max(0, Math.floor((end.getTime() - today.getTime()) / (24 * 60 * 60 * 1000))),
+    id: period.redPeriodId ?? startYmd,
+    redPeriodId: period.redPeriodId,
+    redMonthYearId: period.redMonthYearId,
+    label: period.label,
+    periodIndexFromAnchor: period.periodIndexFromAnchor,
+    periodIndex: period.periodIndex,
+    start: startYmd,
+    end: endYmd,
+    lookupEnd: toYmd(period.lookupEnd),
+    year: period.redYear,
+    status: period.status,
+    isCurrent: period.redPeriodId
+      ? period.redPeriodId === current.redPeriodId
+      : period.periodIndexFromAnchor === current.periodIndexFromAnchor && startYmd === toYmd(current.start),
+    daysUntilEnd: Math.max(0, Math.floor((period.end.getTime() - todayStart.getTime()) / (24 * 60 * 60 * 1000))),
   };
 }
 
-function buildPeriodsBetween(input: { from: Date; to: Date; now: Date }): ReturnType<typeof buildPeriodDto>[] {
-  const from = startOfDay(input.from);
-  const to = startOfDay(input.to);
-  if (from > to) return [];
-  const periods: ReturnType<typeof buildPeriodDto>[] = [];
-  let cursor = getRedPeriodForDate(from).start;
-  for (let i = 0; i < 500; i += 1) {
-    const info = getRedPeriodForDate(cursor);
-    if (info.start > to) break;
-    periods.push(buildPeriodDto({ start: info.start, end: info.end, now: input.now }));
-    let advanced = false;
-    let nextCursor = addDays(info.end, 1);
-    for (let guard = 0; guard < 7; guard += 1) {
-      const nextInfo = getRedPeriodForDate(nextCursor);
-      if (nextInfo.start.getTime() > info.start.getTime()) {
-        cursor = nextInfo.start;
-        advanced = true;
-        break;
-      }
-      nextCursor = addDays(nextCursor, 1);
-    }
-    if (!advanced) {
-      cursor = addDays(info.end, 3);
-    }
-  }
-  return periods;
+function formatGeneratedPeriodDto(period: GeneratedRedMonthPeriod) {
+  return {
+    id: `preview-${period.periodIndex}`,
+    redPeriodId: null,
+    redMonthYearId: null,
+    label: period.label,
+    periodIndexFromAnchor: period.periodIndex - 1,
+    periodIndex: period.periodIndex,
+    start: toYmd(period.start),
+    end: toYmd(period.end),
+    lookupEnd: toYmd(period.lookupEnd),
+    year: period.start.getFullYear(),
+    status: "draft",
+    isCurrent: false,
+    daysUntilEnd: 0,
+  };
+}
+
+function formatYearDto(year: RedMonthYearRecord) {
+  return {
+    id: year.id,
+    redMonthYearId: year.id,
+    redYear: year.redYear,
+    anchorStart: toYmd(year.anchorStart),
+    cycleWeeks: year.cycleWeeks,
+    periodCount: year.periodCount,
+    timezone: year.timezone,
+    status: year.status,
+    createdAt: year.createdAt.toISOString(),
+    updatedAt: year.updatedAt.toISOString(),
+  };
+}
+
+function formatConfigDto(current: ResolvedRedMonthPeriod) {
+  return {
+    redMonthYearId: current.redMonthYearId,
+    redYear: current.redYear,
+    anchorStart: toYmd(current.anchorStart),
+    cycleWeeks: current.yearCycleWeeks,
+    periodCount: current.periodCount,
+    timezone: current.timezone,
+    status: current.status,
+    updatedAt: current.updatedAt?.toISOString() ?? null,
+  };
 }
 
 redMonthRouter.use(requireAuth(["admin", "gm", "sm", "kunde"]));
 adminRedMonthRouter.use(requireAuth(["admin", "kunde"]));
 adminRedMonthRouter.use(requireKundeAdminPermission);
+
 redMonthRouter.use((req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {
@@ -116,13 +158,14 @@ redMonthRouter.use((req, res, next) => {
   });
   next();
 });
+
 adminRedMonthRouter.use((req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {
     const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
     logAction(level, "red_month_admin_action_completed", {
       req,
-      action: "red_month_config_update",
+      action: "red_month_admin",
       result: res.statusCode >= 400 ? "failure" : "success",
       statusCode: res.statusCode,
       requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
@@ -135,18 +178,10 @@ adminRedMonthRouter.use((req, res, next) => {
 
 redMonthRouter.get("/current", async (_req, res, next) => {
   try {
-    await refreshRedMonthCalendarConfig();
-    const now = new Date();
-    const current = getRedPeriodForDate(now);
-    const config = getCachedRedMonthCalendarConfig();
+    const current = await resolveCurrentRedPeriod(new Date());
     res.status(200).json({
-      current: buildPeriodDto({ start: current.start, end: current.end, now }),
-      config: {
-        anchorStart: toYmd(config.anchorStart),
-        cycleWeeks: config.cycleWeeks,
-        timezone: config.timezone,
-        updatedAt: config.updatedAt?.toISOString() ?? null,
-      },
+      current: formatPeriodDto(current, current),
+      config: formatConfigDto(current),
     });
   } catch (error) {
     next(error);
@@ -155,19 +190,115 @@ redMonthRouter.get("/current", async (_req, res, next) => {
 
 redMonthRouter.get("/calendar", async (req, res, next) => {
   try {
-    await refreshRedMonthCalendarConfig();
     const parsed = getCalendarQuerySchema.safeParse(req.query ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: "Ungueltige Kalender-Parameter." });
       return;
     }
     const now = new Date();
-    const current = getRedPeriodForDate(now);
-    const from = parsed.data.from ? parseYmd(parsed.data.from) : addDays(current.start, -200);
-    const to = parsed.data.to ? parseYmd(parsed.data.to) : addDays(current.end, 400);
+    const current = await resolveCurrentRedPeriod(now);
+    const periodInput: { now: Date; from?: string; to?: string } = { now };
+    if (parsed.data.from) periodInput.from = parsed.data.from;
+    if (parsed.data.to) periodInput.to = parsed.data.to;
+    const periods = await listRedMonthPeriods(periodInput);
     res.status(200).json({
-      periods: buildPeriodsBetween({ from, to, now }),
+      periods: periods.map((period) => formatPeriodDto(period, current)),
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminRedMonthRouter.get("/red-month/years", async (_req, res, next) => {
+  try {
+    const [years, nowCurrent] = await Promise.all([listRedMonthYears(), resolveCurrentRedPeriod(new Date())]);
+    res.status(200).json({
+      years: years.map(formatYearDto),
+      current: formatPeriodDto(nowCurrent, nowCurrent),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminRedMonthRouter.post("/red-month/years/preview", async (req, res, next) => {
+  try {
+    const parsed = previewYearSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungueltiges RED-Jahr." });
+      return;
+    }
+    const periods = generateRedMonthPeriodsPreview(parsed.data);
+    res.status(200).json({
+      year: {
+        redYear: parsed.data.redYear,
+        anchorStart: parsed.data.anchorStart,
+        cycleWeeks: parsed.data.cycleWeeks,
+        periodCount: parsed.data.periodCount,
+        timezone: parsed.data.timezone ?? "Europe/Vienna",
+        status: "draft",
+      },
+      periods: periods.map(formatGeneratedPeriodDto),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminRedMonthRouter.post("/red-month/years", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = createYearSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungueltiges RED-Jahr." });
+      return;
+    }
+    const created = await createRedMonthYear({
+      redYear: parsed.data.redYear,
+      anchorStart: parsed.data.anchorStart,
+      cycleWeeks: parsed.data.cycleWeeks,
+      periodCount: parsed.data.periodCount,
+      ...(parsed.data.timezone ? { timezone: parsed.data.timezone } : {}),
+      ...(parsed.data.status ? { status: parsed.data.status } : {}),
+      createdByUserId: req.authUser?.appUserId ?? null,
+    });
+    const current = await resolveCurrentRedPeriod(new Date());
+    res.status(201).json({
+      year: formatYearDto(created.year),
+      periods: created.periods.map((period) => formatPeriodDto(period, current)),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminRedMonthRouter.patch("/red-month/years/:id", async (req, res, next) => {
+  try {
+    const parsed = updateYearSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungueltiges RED-Jahr." });
+      return;
+    }
+    const updated = await updateDraftRedMonthYear({
+      id: String(req.params.id ?? ""),
+      anchorStart: parsed.data.anchorStart,
+      cycleWeeks: parsed.data.cycleWeeks,
+      periodCount: parsed.data.periodCount,
+      ...(parsed.data.timezone ? { timezone: parsed.data.timezone } : {}),
+    });
+    const current = await resolveCurrentRedPeriod(new Date());
+    res.status(200).json({
+      year: formatYearDto(updated.year),
+      periods: updated.periods.map((period) => formatPeriodDto(period, current)),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminRedMonthRouter.post("/red-month/years/:id/activate", async (req, res, next) => {
+  try {
+    const year = await activateRedMonthYear(String(req.params.id ?? ""));
+    res.status(200).json({ year: formatYearDto(year) });
   } catch (error) {
     next(error);
   }
@@ -175,19 +306,28 @@ redMonthRouter.get("/calendar", async (req, res, next) => {
 
 adminRedMonthRouter.patch("/red-month/config", async (req, res, next) => {
   try {
-    const parsed = updateConfigSchema.safeParse(req.body ?? {});
+    const parsed = updateLegacyConfigSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      const firstIssue = parsed.error.issues[0]?.message;
-      res.status(400).json({ error: firstIssue || "Ungueltige RED-Monat Konfiguration." });
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungueltige RED-Monat Konfiguration." });
       return;
     }
+
+    const years = await listRedMonthYears();
+    if (years.length > 0) {
+      res.status(409).json({
+        error: "RED-Monate werden jetzt als Jahre gespeichert. Bitte den Plus-Button nutzen, statt die aktive Historie zu ueberschreiben.",
+        code: "red_month_immutable_years_enabled",
+      });
+      return;
+    }
+
     const updated = await setActiveRedMonthCalendarConfig({
       anchorStart: parsed.data.anchorStart,
       cycleWeeks: parsed.data.cycleWeeks,
       ...(parsed.data.timezone ? { timezone: parsed.data.timezone } : {}),
     });
-    const now = new Date();
-    const current = getRedPeriodForDate(now);
+    await refreshRedMonthCalendarConfig();
+    const current = await resolveCurrentRedPeriod(new Date());
     res.status(200).json({
       config: {
         anchorStart: toYmd(updated.anchorStart),
@@ -195,7 +335,7 @@ adminRedMonthRouter.patch("/red-month/config", async (req, res, next) => {
         timezone: updated.timezone,
         updatedAt: updated.updatedAt?.toISOString() ?? null,
       },
-      current: buildPeriodDto({ start: current.start, end: current.end, now }),
+      current: formatPeriodDto(current, current),
     });
   } catch (error) {
     next(error);

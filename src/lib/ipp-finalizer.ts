@@ -4,14 +4,19 @@ import { db, sql as pgSql } from "./db.js";
 import { recomputeGmKpiCacheForMarketPeriod } from "./gm-kpi-cache.js";
 import { computeMarketIppForPeriod } from "./ipp.js";
 import { logAction, logger, serializeError, startActionTimer } from "./logger.js";
-import { refreshRedMonthCalendarConfig } from "./red-month-calendar.js";
-import { getRedPeriodForDate, getRedPeriodLabel, getRedYear, startOfDay } from "./red-monat.js";
+import {
+  resolveCurrentRedPeriod,
+  resolveRedPeriodForDate,
+  type ResolvedRedMonthPeriod,
+} from "./red-month-periods.js";
+import { startOfDay } from "./red-monat.js";
 import { ippMarketRedmonthResults, ippRecalcQueue, visitAnswers, visitSessions } from "./schema.js";
 
 const IPP_FINALIZER_LOCK_KEY = 294_015_771;
 const DEFAULT_STARTUP_DELAY_MS = 15_000;
 
 type ClosedPeriod = {
+  redPeriodId: string | null;
   start: Date;
   end: Date;
   label: string;
@@ -45,9 +50,19 @@ function parseYmd(raw: string): Date {
   return new Date(`${raw}T12:00:00.000Z`);
 }
 
-function isClosedPeriod(period: { end: Date }, now: Date): boolean {
-  const currentStart = startOfDay(getRedPeriodForDate(now).start);
+async function isClosedPeriod(period: { end: Date }, now: Date): Promise<boolean> {
+  const currentStart = startOfDay((await resolveCurrentRedPeriod(now)).start);
   return isBeforeDay(period.end, currentStart);
+}
+
+function toClosedPeriod(period: ResolvedRedMonthPeriod): ClosedPeriod {
+  return {
+    redPeriodId: period.redPeriodId,
+    start: period.start,
+    end: period.end,
+    label: period.label,
+    year: period.redYear,
+  };
 }
 
 async function withPgAdvisoryLock<T>(key: number, runner: () => Promise<T>): Promise<{ locked: boolean; result?: T }> {
@@ -63,7 +78,7 @@ async function withPgAdvisoryLock<T>(key: number, runner: () => Promise<T>): Pro
 }
 
 async function loadClosedPeriodsWithSubmissions(now: Date): Promise<ClosedPeriod[]> {
-  const currentPeriod = getRedPeriodForDate(now);
+  const currentPeriod = await resolveCurrentRedPeriod(now);
   const currentStart = startOfDay(currentPeriod.start);
 
   const rows = await db
@@ -83,16 +98,11 @@ async function loadClosedPeriodsWithSubmissions(now: Date): Promise<ClosedPeriod
   const periodMap = new Map<string, ClosedPeriod>();
   for (const row of rows) {
     if (!row.submittedAt) continue;
-    const period = getRedPeriodForDate(row.submittedAt);
+    const period = await resolveRedPeriodForDate(row.submittedAt);
     if (!isBeforeDay(period.end, currentStart)) continue;
-    const key = toYmd(period.start);
+    const key = period.redPeriodId ?? toYmd(period.start);
     if (!periodMap.has(key)) {
-      periodMap.set(key, {
-        start: period.start,
-        end: period.end,
-        label: getRedPeriodLabel(period.start),
-        year: getRedYear(period.start),
-      });
+      periodMap.set(key, toClosedPeriod(period));
     }
   }
 
@@ -149,6 +159,7 @@ async function upsertArchivedMarketPeriodResult(input: {
     await db
       .update(ippMarketRedmonthResults)
       .set({
+        redPeriodId: input.period.redPeriodId,
         redPeriodEnd,
         redPeriodLabel: input.period.label,
         redPeriodYear: input.period.year,
@@ -168,6 +179,7 @@ async function upsertArchivedMarketPeriodResult(input: {
 
   await db.insert(ippMarketRedmonthResults).values({
     marketId: input.marketId,
+    redPeriodId: input.period.redPeriodId,
     redPeriodStart,
     redPeriodEnd,
     redPeriodLabel: input.period.label,
@@ -212,6 +224,7 @@ async function enqueueIppRecalcForPeriod(input: {
 
   await db.insert(ippRecalcQueue).values({
     marketId: input.marketId,
+    redPeriodId: input.period.redPeriodId,
     redPeriodStart,
     redPeriodEnd,
     reason: input.reason,
@@ -235,16 +248,11 @@ export async function enqueueIppRecalcForDate(
   reason: string,
   now = new Date(),
 ): Promise<boolean> {
-  const period = getRedPeriodForDate(changedAt);
-  if (!isClosedPeriod(period, now)) return false;
+  const period = await resolveRedPeriodForDate(changedAt);
+  if (!(await isClosedPeriod(period, now))) return false;
   return enqueueIppRecalcForPeriod({
     marketId,
-    period: {
-      start: period.start,
-      end: period.end,
-      label: getRedPeriodLabel(period.start),
-      year: getRedYear(period.start),
-    },
+    period: toClosedPeriod(period),
     reason,
   });
 }
@@ -277,18 +285,13 @@ export async function enqueueIppRecalcForQuestionScoringChanges(
   const keys = new Map<string, { marketId: string; period: ClosedPeriod }>();
   for (const row of rows) {
     if (!row.submittedAt) continue;
-    const periodInfo = getRedPeriodForDate(row.submittedAt);
-    if (!isClosedPeriod(periodInfo, now)) continue;
-    const key = `${row.marketId}::${toYmd(periodInfo.start)}`;
+    const periodInfo = await resolveRedPeriodForDate(row.submittedAt);
+    if (!(await isClosedPeriod(periodInfo, now))) continue;
+    const key = `${row.marketId}::${periodInfo.redPeriodId ?? toYmd(periodInfo.start)}`;
     if (!keys.has(key)) {
       keys.set(key, {
         marketId: row.marketId,
-        period: {
-          start: periodInfo.start,
-          end: periodInfo.end,
-          label: getRedPeriodLabel(periodInfo.start),
-          year: getRedYear(periodInfo.start),
-        },
+        period: toClosedPeriod(periodInfo),
       });
     }
   }
@@ -332,12 +335,7 @@ async function processRecalcQueue(now: Date): Promise<number> {
     if (!claimed) continue;
 
     try {
-      const period: ClosedPeriod = {
-        start: parseYmd(item.redPeriodStart),
-        end: parseYmd(item.redPeriodEnd),
-        label: getRedPeriodLabel(parseYmd(item.redPeriodStart)),
-        year: getRedYear(parseYmd(item.redPeriodStart)),
-      };
+      const period = toClosedPeriod(await resolveRedPeriodForDate(parseYmd(item.redPeriodStart)));
       const computed = await computeMarketIppForPeriod({
         marketId: item.marketId,
         periodStart: period.start,
@@ -392,7 +390,6 @@ async function processRecalcQueue(now: Date): Promise<number> {
 
 export async function runIppFinalizerOnce(now = new Date()): Promise<FinalizerRunResult> {
   const startedAtNs = startActionTimer();
-  await refreshRedMonthCalendarConfig();
   const lockResult = await withPgAdvisoryLock(IPP_FINALIZER_LOCK_KEY, async () => {
     const periods = await loadClosedPeriodsWithSubmissions(now);
     let rowsFinalized = 0;
@@ -409,7 +406,9 @@ export async function runIppFinalizerOnce(now = new Date()): Promise<FinalizerRu
         .from(ippMarketRedmonthResults)
         .where(
           and(
-            eq(ippMarketRedmonthResults.redPeriodStart, toYmd(period.start)),
+            period.redPeriodId
+              ? eq(ippMarketRedmonthResults.redPeriodId, period.redPeriodId)
+              : eq(ippMarketRedmonthResults.redPeriodStart, toYmd(period.start)),
             eq(ippMarketRedmonthResults.isDeleted, false),
             inArray(ippMarketRedmonthResults.marketId, marketIds),
           ),
@@ -537,4 +536,3 @@ export function startIppFinalizerScheduler(): () => void {
     clearInterval(interval);
   };
 }
-
