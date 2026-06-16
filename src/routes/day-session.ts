@@ -12,6 +12,11 @@ import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { DEFAULT_TIMEZONE, getCurrentDaySessionForUser, toYmdInTimezone } from "../lib/day-session.js";
 import {
+  TimelineValidationError,
+  respondTimelineValidationError,
+  validateGmTimelineInterval,
+} from "../lib/zeiterfassung-validation.js";
+import {
   gmDaySessionPauses,
   gmDaySessions,
   markets,
@@ -64,6 +69,13 @@ const setKmSchema = z
 const setEndSchema = z
   .object({
     endAt: isoDateTimeSchema.optional(),
+  })
+  .strict();
+
+const manualPauseSchema = z
+  .object({
+    startAt: isoDateTimeSchema,
+    endAt: isoDateTimeSchema,
   })
   .strict();
 
@@ -276,6 +288,73 @@ daySessionRouter.post("/pause/end", async (req: AuthedRequest, res, next) => {
     if (!updated) throw new Error("Pause konnte nicht beendet werden.");
     res.status(200).json({ pause: serializePause(updated) });
   } catch (error) {
+    next(error);
+  }
+});
+
+daySessionRouter.post("/pause/manual", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    const parsed = manualPauseSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Bitte gueltige Pausenzeiten uebermitteln.", code: "invalid_pause_time" });
+      return;
+    }
+    const startAt = new Date(parsed.data.startAt);
+    const endAt = new Date(parsed.data.endAt);
+    if (
+      !Number.isFinite(startAt.getTime()) ||
+      !Number.isFinite(endAt.getTime()) ||
+      endAt.getTime() <= startAt.getTime()
+    ) {
+      res.status(400).json({ error: "Endzeit muss nach Startzeit liegen.", code: "invalid_interval" });
+      return;
+    }
+
+    const { session } = await validateGmTimelineInterval({
+      gmUserId,
+      kind: "pause",
+      id: "manual-pause-preview",
+      startAt,
+      endAt,
+    });
+
+    if (session.status !== "started") {
+      res.status(409).json({ error: "Arbeitstag wurde noch nicht gestartet.", code: "day_not_started" });
+      return;
+    }
+
+    const openPause = await loadOpenPause(gmUserId, session.id);
+    if (openPause) {
+      res.status(409).json({ error: "Pause laeuft bereits.", code: "pause_already_started" });
+      return;
+    }
+
+    const [created] = await db
+      .insert(gmDaySessionPauses)
+      .values({
+        daySessionId: session.id,
+        gmUserId,
+        pauseStartedAt: startAt,
+        pauseEndedAt: endAt,
+      })
+      .returning();
+    if (!created) throw new Error("Pause konnte nicht gespeichert werden.");
+    res.status(200).json({ pause: serializePause(created) });
+  } catch (error) {
+    if (error instanceof TimelineValidationError && error.code === "overlap") {
+      res.status(409).json({
+        error:
+          "Diese Pause ist nicht moeglich, weil sie sich mit einem Marktbesuch oder einer anderen Pause ueberschneidet. Pausen duerfen nur Zusatzzeiterfassung schneiden.",
+        code: "overlap",
+      });
+      return;
+    }
+    if (respondTimelineValidationError(res, error)) return;
     next(error);
   }
 });
