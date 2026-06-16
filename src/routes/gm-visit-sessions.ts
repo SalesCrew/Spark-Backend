@@ -29,6 +29,7 @@ import {
   campaigns,
   markets,
   photoTags,
+  users,
   visitAnswerMatrixCells,
   visitAnswerOptions,
   visitAnswerPhotoTags,
@@ -68,6 +69,10 @@ gmVisitSessionsRouter.use((req, res, next) => {
 const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
 const VISIT_PHOTOS_BUCKET = "visit-photos";
 const VISIT_PHOTO_READ_URL_TTL_SECONDS = 30 * 60;
+
+function isBillaMarketRow(input: { name: string | null | undefined; dbName: string | null | undefined }): boolean {
+  return `${input.name ?? ""} ${input.dbName ?? ""}`.toUpperCase().includes("BILLA");
+}
 const VISIT_PHOTO_READ_URL_TIMEOUT_MS = 1800;
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const isUuid = (value: string | null | undefined): value is string => Boolean(value && uuidRegex.test(value));
@@ -680,11 +685,17 @@ async function resolveVisitSectionsForSelection(input: {
     )
   )`;
   const [marketRow] = await db
-    .select({ dbName: markets.dbName })
+    .select({ name: markets.name, dbName: markets.dbName })
     .from(markets)
     .where(and(eq(markets.id, input.marketId), eq(markets.isDeleted, false)))
     .limit(1);
   const marketChain = normalizeMarketChain(marketRow?.dbName ?? "");
+  const [gmUser] = await db
+    .select({ isBillaGm: users.isBillaGm })
+    .from(users)
+    .where(eq(users.id, input.gmUserId))
+    .limit(1);
+  const canUseGlobalFlexFallback = !gmUser?.isBillaGm || isBillaMarketRow(marketRow ?? { name: "", dbName: "" });
 
   const selectedRows = await db
     .select({
@@ -707,7 +718,9 @@ async function resolveVisitSectionsForSelection(input: {
     );
 
   const selectedById = new Map(selectedRows.map((row) => [row.campaignId, row]));
-  const missingAfterAssignment = input.campaignIds.filter((id) => !selectedById.has(id));
+  const missingAfterAssignment = canUseGlobalFlexFallback
+    ? input.campaignIds.filter((id) => !selectedById.has(id))
+    : [];
   if (missingAfterAssignment.length > 0) {
     const flexFallbackRows = await db
       .select({

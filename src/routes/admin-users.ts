@@ -22,6 +22,7 @@ const createUserSchema = z.object({
   postalCode: z.string().optional(),
   region: z.string().optional(),
   ipp: z.number().min(0).max(99.9).optional(),
+  isBillaGm: z.boolean().optional(),
 });
 
 const updateUserSchema = z.object({
@@ -34,6 +35,7 @@ const updateUserSchema = z.object({
   postalCode: z.string().optional(),
   region: z.string().optional(),
   ipp: z.number().min(0).max(99.9).optional(),
+  isBillaGm: z.boolean().optional(),
 });
 
 const updateOwnPasswordSchema = z.object({
@@ -163,6 +165,7 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
         city: row.city,
         postalCode: row.postalCode,
         region: row.region,
+        isBillaGm: row.role === "gm" ? row.isBillaGm : false,
         ...(row.role !== "gm" ? { ipp: row.ipp == null ? null : Number(row.ipp), ippSampleCount: null } : {}),
         isActive: row.isActive,
         deletedAt: row.deletedAt,
@@ -239,6 +242,7 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
           postalCode: payload.postalCode,
           region: payload.region,
           ipp: payload.ipp != null ? payload.ipp.toFixed(1) : null,
+          isBillaGm: payload.role === "gm" ? Boolean(payload.isBillaGm ?? false) : false,
         })
         .returning();
 
@@ -274,6 +278,7 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
           city: created.city,
           postalCode: created.postalCode,
           region: created.region,
+          isBillaGm: created.role === "gm" ? created.isBillaGm : false,
           ipp: created.role === "gm" ? gmKpi?.ipp ?? 0 : created.ipp == null ? null : Number(created.ipp),
           ippSampleCount: created.role === "gm" ? gmKpi?.ippSampleCount ?? 0 : null,
           isActive: created.isActive,
@@ -384,6 +389,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         postalCode: payload.postalCode,
         region: payload.region,
         ipp: payload.ipp != null ? payload.ipp.toFixed(1) : undefined,
+        isBillaGm: existing.role === "gm" ? payload.isBillaGm : undefined,
         updatedAt: new Date(),
       })
       .where(eq(users.id, id))
@@ -428,6 +434,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
     res.status(200).json({
       user: {
         ...updated,
+        isBillaGm: updated.role === "gm" ? updated.isBillaGm : false,
         ipp: updated.role === "gm" ? gmKpi?.ipp ?? 0 : updated.ipp == null ? null : Number(updated.ipp),
         ippSampleCount: updated.role === "gm" ? gmKpi?.ippSampleCount ?? 0 : null,
       },

@@ -88,6 +88,14 @@ function deriveChainLabel(input: { name: string; dbName: string }): string {
   return input.name.split(" ")[0]?.toUpperCase() || "MARKT";
 }
 
+function isBillaMarketRow(input: { name: string | null | undefined; dbName: string | null | undefined }): boolean {
+  return `${input.name ?? ""} ${input.dbName ?? ""}`.toUpperCase().includes("BILLA");
+}
+
+function billaMarketSqlCondition() {
+  return or(ilike(markets.name, "%billa%"), ilike(markets.dbName, "%billa%"));
+}
+
 function isQuestionApplicableToMarketChain(questionChains: string[] | null | undefined, marketChain: string): boolean {
   const normalizedChains = normalizeQuestionChains(questionChains);
   if (normalizedChains.length === 0) return true;
@@ -1083,6 +1091,12 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
     }
 
     await refreshRedMonthCalendarConfig();
+    const [gmUser] = await db
+      .select({ isBillaGm: users.isBillaGm })
+      .from(users)
+      .where(eq(users.id, gmUserId))
+      .limit(1);
+    const isBillaGm = Boolean(gmUser?.isBillaGm);
     const [rows, activeFlexCampaignRows] = await Promise.all([
       db
         .select()
@@ -1092,6 +1106,7 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
             eq(markets.isDeleted, false),
             eq(markets.isActive, true),
             inArray(markets.marketType, ["universum", "both"]),
+            isBillaGm ? billaMarketSqlCondition() : undefined,
           ),
         )
         .orderBy(desc(markets.createdAt)),
@@ -1164,6 +1179,12 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
       res.status(404).json({ error: "Markt nicht gefunden." });
       return;
     }
+    const [gmUser] = await db
+      .select({ isBillaGm: users.isBillaGm })
+      .from(users)
+      .where(eq(users.id, gmUserId))
+      .limit(1);
+    const isBillaGm = Boolean(gmUser?.isBillaGm);
 
     const assignedCampaignRows = await db
       .select({
@@ -1212,7 +1233,11 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
       });
     }
 
-    if (marketRow.isActive && (marketRow.marketType === "universum" || marketRow.marketType === "both")) {
+    if (
+      marketRow.isActive &&
+      (marketRow.marketType === "universum" || marketRow.marketType === "both") &&
+      (!isBillaGm || isBillaMarketRow(marketRow))
+    ) {
       const activeFlexRows = await db
         .select({
           campaignId: campaigns.id,

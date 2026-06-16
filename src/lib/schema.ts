@@ -86,6 +86,7 @@ export const users = pgTable(
     postalCode: text("postal_code"),
     region: text("region"),
     ipp: numeric("ipp", { precision: 4, scale: 1 }),
+    isBillaGm: boolean("is_billa_gm").notNull().default(false),
 
     isActive: boolean("is_active").notNull().default(true),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
@@ -98,6 +99,7 @@ export const users = pgTable(
     uniqueIndex("users_email_unique").on(table.email),
     index("users_role_idx").on(table.role),
     index("users_active_idx").on(table.isActive),
+    index("users_billa_gm_idx").on(table.isBillaGm),
   ],
 );
 
