@@ -438,6 +438,9 @@ export const ippMarketRedmonthResults = pgTable(
     index("ipp_market_redmonth_results_period_idx").on(table.redPeriodStart, table.redPeriodEnd),
     index("ipp_market_redmonth_results_year_idx").on(table.redPeriodYear, table.isDeleted),
     index("ipp_market_redmonth_results_market_year_idx").on(table.marketId, table.redPeriodYear),
+    index("ipp_market_redmonth_results_period_market_active_idx")
+      .on(table.redPeriodStart, table.marketId)
+      .where(sql`${table.isDeleted} = false`),
     index("ipp_market_redmonth_results_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -625,6 +628,9 @@ export const questionScoring = pgTable(
     index("question_scoring_mitbewerberabfrage_active_idx")
       .on(table.questionId, table.mitbewerberabfrage)
       .where(sql`${table.isDeleted} = false and ${table.mitbewerberabfrage} is not null`),
+    index("question_scoring_ipp_question_key_active_idx")
+      .on(table.questionId, table.scoreKey)
+      .where(sql`${table.isDeleted} = false and ${table.ipp} is not null`),
     index("question_scoring_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -1274,6 +1280,9 @@ export const visitSessions = pgTable(
     index("visit_sessions_market_submitted_active_idx")
       .on(table.marketId, table.submittedAt, table.createdAt)
       .where(sql`${table.isDeleted} = false AND ${table.status} = 'submitted' AND ${table.submittedAt} IS NOT NULL`),
+    index("visit_sessions_submitted_period_market_gm_idx")
+      .on(table.submittedAt, table.marketId, table.gmUserId)
+      .where(sql`${table.isDeleted} = false AND ${table.status} = 'submitted' AND ${table.submittedAt} IS NOT NULL`),
     index("visit_sessions_gm_status_started_idx")
       .on(table.gmUserId, table.status, table.startedAt)
       .where(sql`${table.isDeleted} = false`),
@@ -1535,6 +1544,9 @@ export const visitAnswers = pgTable(
     index("visit_answers_question_session_active_idx")
       .on(table.questionId, table.visitSessionId)
       .where(sql`${table.isDeleted} = false`),
+    index("visit_answers_session_question_changed_active_idx")
+      .on(table.visitSessionId, table.questionId, table.changedAt, table.updatedAt, table.createdAt)
+      .where(sql`${table.isDeleted} = false`),
     index("visit_answers_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -1556,6 +1568,9 @@ export const visitAnswerOptions = pgTable(
   },
   (table) => [
     index("visit_answer_options_answer_idx").on(table.visitAnswerId, table.orderIndex),
+    index("visit_answer_options_answer_order_active_idx")
+      .on(table.visitAnswerId, table.orderIndex)
+      .where(sql`${table.isDeleted} = false`),
     index("visit_answer_options_deleted_idx").on(table.isDeleted),
   ],
 );

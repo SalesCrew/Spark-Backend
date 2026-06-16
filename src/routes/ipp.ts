@@ -1,13 +1,13 @@
-import { and, asc, eq, gte, inArray, isNotNull, lt } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
-import { computeMarketIppForPeriod } from "../lib/ipp.js";
+import { computeMarketIppForPeriod, computeMarketIppSummariesForPeriod } from "../lib/ipp.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { logAction, startActionTimer } from "../lib/logger.js";
-import { addDays, getRedPeriodForDate, getRedPeriodLabel, getRedYear, startOfDay } from "../lib/red-monat.js";
+import { getRedPeriodForDate, getRedPeriodLabel, getRedYear } from "../lib/red-monat.js";
 import { refreshRedMonthCalendarConfig } from "../lib/red-month-calendar.js";
 import { db, sql as pgSql } from "../lib/db.js";
-import { ippMarketRedmonthResults, markets, users, visitSessions } from "../lib/schema.js";
+import { ippMarketRedmonthResults, markets, users } from "../lib/schema.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const adminIppRouter = Router();
@@ -31,6 +31,7 @@ adminIppRouter.use((req, res, next) => {
 });
 let checkedIppArchiveTableReadiness = false;
 let hasIppArchiveTable = false;
+const IPP_ROUTE_BATCH_SIZE = 500;
 
 type IppListRow = {
   id: string;
@@ -50,6 +51,13 @@ type IppListRow = {
   isFinalized: boolean;
   sourceSubmissionCount: number;
   contributingQuestionCount: number;
+};
+
+type IppPeriodPayload = {
+  redPeriodStart: string;
+  redPeriodEnd: string;
+  redMonatLabel: string;
+  redPeriodYear: number;
 };
 
 function toYmd(date: Date): string {
@@ -79,6 +87,40 @@ function normalizeUnique(values: string[]): string[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter((value) => value.length > 0)));
 }
 
+function chunkArray<T>(values: T[], size = IPP_ROUTE_BATCH_SIZE): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function getCurrentIppPeriodPayload(now: Date): IppPeriodPayload {
+  const currentPeriod = getRedPeriodForDate(now);
+  return {
+    redPeriodStart: toYmd(currentPeriod.start),
+    redPeriodEnd: toYmd(currentPeriod.end),
+    redMonatLabel: getRedPeriodLabel(now),
+    redPeriodYear: getRedYear(now),
+  };
+}
+
+function sortIppRows(rows: IppListRow[]): IppListRow[] {
+  return [...rows].sort((left, right) => {
+    if (left.redPeriodStart !== right.redPeriodStart) return right.redPeriodStart.localeCompare(left.redPeriodStart);
+    return left.marketName.localeCompare(right.marketName, "de");
+  });
+}
+
+function buildIppFilters(rows: IppListRow[]) {
+  return {
+    regions: normalizeUnique(rows.map((row) => row.region)).sort((a, b) => a.localeCompare(b, "de")),
+    gms: normalizeUnique(rows.map((row) => row.gmName)).sort((a, b) => a.localeCompare(b, "de")),
+    chains: normalizeUnique(rows.map((row) => row.chain)).sort((a, b) => a.localeCompare(b, "de")),
+    redMonats: normalizeUnique(rows.map((row) => row.redMonatLabel)),
+  };
+}
+
 async function ensureIppArchiveTableReady(): Promise<boolean> {
   if (checkedIppArchiveTableReadiness) return hasIppArchiveTable;
   const result = await pgSql<{ ipp_market_redmonth_results: string | null }[]>`
@@ -89,93 +131,62 @@ async function ensureIppArchiveTableReady(): Promise<boolean> {
   return hasIppArchiveTable;
 }
 
-async function loadCurrentPeriodLatestGmByMarket(input: {
-  periodStart: Date;
-  periodEnd: Date;
-}): Promise<Map<string, string>> {
-  const start = startOfDay(input.periodStart);
-  const endExclusive = addDays(startOfDay(input.periodEnd), 1);
-  const rows = await db
-    .select({
-      marketId: visitSessions.marketId,
-      gmUserId: visitSessions.gmUserId,
-      submittedAt: visitSessions.submittedAt,
-    })
-    .from(visitSessions)
-    .where(
-      and(
-        eq(visitSessions.status, "submitted"),
-        eq(visitSessions.isDeleted, false),
-        isNotNull(visitSessions.submittedAt),
-        gte(visitSessions.submittedAt, start),
-        lt(visitSessions.submittedAt, endExclusive),
-      ),
-    )
-    .orderBy(asc(visitSessions.marketId));
-
-  const byMarket = new Map<string, { gmUserId: string; submittedAt: Date }>();
-  for (const row of rows) {
-    if (!row.submittedAt) continue;
-    const previous = byMarket.get(row.marketId);
-    if (!previous || previous.submittedAt.getTime() < row.submittedAt.getTime()) {
-      byMarket.set(row.marketId, { gmUserId: row.gmUserId, submittedAt: row.submittedAt });
-    }
+async function loadMarketMapByIds(marketIds: string[]) {
+  const rows: Array<typeof markets.$inferSelect> = [];
+  for (const chunk of chunkArray(normalizeUnique(marketIds))) {
+    const chunkRows = await db
+      .select()
+      .from(markets)
+      .where(and(inArray(markets.id, chunk), eq(markets.isDeleted, false)));
+    rows.push(...chunkRows);
   }
-
-  const gmIds = normalizeUnique(Array.from(byMarket.values()).map((entry) => entry.gmUserId));
-  const gmRows =
-    gmIds.length === 0
-      ? []
-      : await db
-          .select({
-            id: users.id,
-            firstName: users.firstName,
-            lastName: users.lastName,
-          })
-          .from(users)
-          .where(inArray(users.id, gmIds));
-  const gmNameById = new Map(gmRows.map((row) => [row.id, `${row.firstName} ${row.lastName}`.trim()]));
-
-  const output = new Map<string, string>();
-  for (const [marketId, value] of byMarket.entries()) {
-    output.set(marketId, gmNameById.get(value.gmUserId) ?? "");
-  }
-  return output;
+  return new Map(rows.map((row) => [row.id, row]));
 }
 
-async function buildIppRows(now: Date): Promise<IppListRow[]> {
+async function loadGmNameMapByIds(gmIds: string[]) {
+  const rows: Array<{ id: string; firstName: string; lastName: string }> = [];
+  for (const chunk of chunkArray(normalizeUnique(gmIds))) {
+    const chunkRows = await db
+      .select({
+        id: users.id,
+        firstName: users.firstName,
+        lastName: users.lastName,
+      })
+      .from(users)
+      .where(inArray(users.id, chunk));
+    rows.push(...chunkRows);
+  }
+  return new Map(rows.map((row) => [row.id, `${row.firstName} ${row.lastName}`.trim()]));
+}
+
+async function buildArchivedIppRows(): Promise<IppListRow[]> {
   await refreshRedMonthCalendarConfig();
-  const marketRows = await db
-    .select()
-    .from(markets)
-    .where(eq(markets.isDeleted, false));
-  const marketById = new Map(marketRows.map((row) => [row.id, row]));
-
-  const currentPeriod = getRedPeriodForDate(now);
-  const currentStartYmd = toYmd(currentPeriod.start);
-  const currentEndYmd = toYmd(currentPeriod.end);
-  const currentLabel = getRedPeriodLabel(now);
-  const currentYear = getRedYear(now);
-
-  const currentLatestGmByMarket = await loadCurrentPeriodLatestGmByMarket({
-    periodStart: currentPeriod.start,
-    periodEnd: currentPeriod.end,
-  });
 
   const archivedRows =
     (await ensureIppArchiveTableReady())
       ? await db
-          .select()
+          .select({
+            marketId: ippMarketRedmonthResults.marketId,
+            redPeriodStart: ippMarketRedmonthResults.redPeriodStart,
+            redPeriodEnd: ippMarketRedmonthResults.redPeriodEnd,
+            redPeriodLabel: ippMarketRedmonthResults.redPeriodLabel,
+            redPeriodYear: ippMarketRedmonthResults.redPeriodYear,
+            marketIpp: ippMarketRedmonthResults.marketIpp,
+            isFinalized: ippMarketRedmonthResults.isFinalized,
+            sourceSubmissionCount: ippMarketRedmonthResults.sourceSubmissionCount,
+            contributingQuestionCount: ippMarketRedmonthResults.contributingQuestionCount,
+          })
           .from(ippMarketRedmonthResults)
           .where(and(eq(ippMarketRedmonthResults.isDeleted, false), eq(ippMarketRedmonthResults.isFinalized, true)))
       : [];
+  const marketById = await loadMarketMapByIds(archivedRows.map((row) => row.marketId));
 
-  const output = new Map<string, IppListRow>();
+  const output: IppListRow[] = [];
   for (const row of archivedRows) {
     const market = marketById.get(row.marketId);
     if (!market) continue;
     const rowKey = `${row.marketId}::${row.redPeriodStart}`;
-    output.set(rowKey, {
+    output.push({
       id: rowKey,
       marketId: row.marketId,
       marketName: market.name,
@@ -196,32 +207,31 @@ async function buildIppRows(now: Date): Promise<IppListRow[]> {
     });
   }
 
-  const currentMarketRows = await db
-    .select({
-      marketId: visitSessions.marketId,
-    })
-    .from(visitSessions)
-    .where(
-      and(
-        eq(visitSessions.status, "submitted"),
-        eq(visitSessions.isDeleted, false),
-        isNotNull(visitSessions.submittedAt),
-        gte(visitSessions.submittedAt, startOfDay(currentPeriod.start)),
-        lt(visitSessions.submittedAt, addDays(startOfDay(currentPeriod.end), 1)),
-      ),
-    );
-  const currentMarketIds = normalizeUnique(currentMarketRows.map((row) => row.marketId));
+  return sortIppRows(output);
+}
 
-  for (const marketId of currentMarketIds) {
+async function buildCurrentIppRows(now: Date): Promise<IppListRow[]> {
+  await refreshRedMonthCalendarConfig();
+
+  const currentPeriod = getRedPeriodForDate(now);
+  const currentMeta = getCurrentIppPeriodPayload(now);
+  const currentSummaries = await computeMarketIppSummariesForPeriod({
+    periodStart: currentPeriod.start,
+    periodEnd: currentPeriod.end,
+  });
+  const currentSummaryRows = Array.from(currentSummaries.values());
+  const marketById = await loadMarketMapByIds(currentSummaryRows.map((row) => row.marketId));
+  const currentGmNameById = await loadGmNameMapByIds(
+    currentSummaryRows.map((row) => row.latestGmUserId ?? ""),
+  );
+
+  const output: IppListRow[] = [];
+  for (const computed of currentSummaryRows) {
+    const marketId = computed.marketId;
     const market = marketById.get(marketId);
     if (!market) continue;
-    const computed = await computeMarketIppForPeriod({
-      marketId,
-      periodStart: currentPeriod.start,
-      periodEnd: currentPeriod.end,
-    });
-    const rowKey = `${marketId}::${currentStartYmd}`;
-    output.set(rowKey, {
+    const rowKey = `${marketId}::${currentMeta.redPeriodStart}`;
+    output.push({
       id: rowKey,
       marketId,
       marketName: market.name,
@@ -229,11 +239,13 @@ async function buildIppRows(now: Date): Promise<IppListRow[]> {
       postalCode: market.postalCode,
       city: market.city,
       region: market.region,
-      gmName: currentLatestGmByMarket.get(marketId) ?? market.currentGmName ?? "",
-      redMonatLabel: currentLabel,
-      redPeriodStart: currentStartYmd,
-      redPeriodEnd: currentEndYmd,
-      redPeriodYear: currentYear,
+      gmName: computed.latestGmUserId
+        ? currentGmNameById.get(computed.latestGmUserId) ?? market.currentGmName ?? ""
+        : market.currentGmName ?? "",
+      redMonatLabel: currentMeta.redMonatLabel,
+      redPeriodStart: currentMeta.redPeriodStart,
+      redPeriodEnd: currentMeta.redPeriodEnd,
+      redPeriodYear: currentMeta.redPeriodYear,
       marketIpp: computed.marketIpp,
       includedInAverage: computed.marketIpp > 0,
       isFinalized: false,
@@ -242,22 +254,30 @@ async function buildIppRows(now: Date): Promise<IppListRow[]> {
     });
   }
 
-  return Array.from(output.values()).sort((left, right) => {
-    if (left.redPeriodStart !== right.redPeriodStart) return right.redPeriodStart.localeCompare(left.redPeriodStart);
-    return left.marketName.localeCompare(right.marketName, "de");
-  });
+  return sortIppRows(output);
+}
+
+function mergeIppRows(rows: IppListRow[]): IppListRow[] {
+  const byId = new Map<string, IppListRow>();
+  for (const row of rows) {
+    byId.set(row.id, row);
+  }
+  return sortIppRows(Array.from(byId.values()));
 }
 
 adminIppRouter.get("/ipp", async (_req, res, next) => {
   try {
-    const rows = await buildIppRows(new Date());
-    const filters = {
-      regions: normalizeUnique(rows.map((row) => row.region)).sort((a, b) => a.localeCompare(b, "de")),
-      gms: normalizeUnique(rows.map((row) => row.gmName)).sort((a, b) => a.localeCompare(b, "de")),
-      chains: normalizeUnique(rows.map((row) => row.chain)).sort((a, b) => a.localeCompare(b, "de")),
-      redMonats: normalizeUnique(rows.map((row) => row.redMonatLabel)),
-    };
-    res.status(200).json({ rows, filters });
+    const now = new Date();
+    const [archivedRows, currentRows] = await Promise.all([
+      buildArchivedIppRows(),
+      buildCurrentIppRows(now),
+    ]);
+    const rows = mergeIppRows([...archivedRows, ...currentRows]);
+    res.status(200).json({
+      rows,
+      filters: buildIppFilters(rows),
+      currentPeriod: getCurrentIppPeriodPayload(now),
+    });
   } catch (error) {
     next(error);
   }

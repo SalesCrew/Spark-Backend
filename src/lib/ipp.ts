@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, gte, inArray, isNotNull, lt } from "drizzle-orm";
 import { addDays, startOfDay } from "./red-monat.js";
-import { db } from "./db.js";
+import { db, sql as pgSql } from "./db.js";
 import {
   questionScoring,
   visitAnswerOptions,
@@ -45,6 +45,42 @@ type LatestAnswerRow = {
   section: typeof visitSessionSections.$inferSelect;
   session: typeof visitSessions.$inferSelect;
 };
+
+type MarketPeriodSummarySqlRow = {
+  market_id: string;
+  source_submission_count: number | string;
+  latest_gm_user_id: string | null;
+};
+
+type LatestMarketAnswerSqlRow = {
+  answer_id: string;
+  question_id: string;
+  question_type: string;
+  value_text: string | null;
+  value_number: string | number | null;
+  value_json: Record<string, unknown> | null;
+  market_id: string;
+};
+
+export type IppMarketPeriodSummary = {
+  marketId: string;
+  periodStart: Date;
+  periodEnd: Date;
+  marketIpp: number;
+  sourceSubmissionCount: number;
+  contributingQuestionCount: number;
+  latestGmUserId: string | null;
+};
+
+const IPP_BATCH_SIZE = 500;
+
+function chunkArray<T>(values: T[], size = IPP_BATCH_SIZE): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
 
 function toFiniteNumber(input: unknown): number | null {
   if (typeof input === "number" && Number.isFinite(input)) return input;
@@ -165,6 +201,160 @@ function pickLatestAnswersByQuestionId(rows: LatestAnswerRow[]): LatestAnswerRow
   return Array.from(byQuestionId.values());
 }
 
+async function loadOptionsForAnswers(answerIds: string[]): Promise<Array<typeof visitAnswerOptions.$inferSelect>> {
+  const rows: Array<typeof visitAnswerOptions.$inferSelect> = [];
+  for (const chunk of chunkArray(answerIds)) {
+    const chunkRows = await db
+      .select()
+      .from(visitAnswerOptions)
+      .where(and(inArray(visitAnswerOptions.visitAnswerId, chunk), eq(visitAnswerOptions.isDeleted, false)))
+      .orderBy(asc(visitAnswerOptions.visitAnswerId), asc(visitAnswerOptions.orderIndex));
+    rows.push(...chunkRows);
+  }
+  return rows;
+}
+
+async function loadIppScoringForQuestions(questionIds: string[]): Promise<Array<typeof questionScoring.$inferSelect>> {
+  const rows: Array<typeof questionScoring.$inferSelect> = [];
+  for (const chunk of chunkArray(questionIds)) {
+    const chunkRows = await db
+      .select()
+      .from(questionScoring)
+      .where(
+        and(
+          inArray(questionScoring.questionId, chunk),
+          eq(questionScoring.isDeleted, false),
+          isNotNull(questionScoring.ipp),
+        ),
+      );
+    rows.push(...chunkRows);
+  }
+  return rows;
+}
+
+function buildOptionsByAnswerId(optionRows: Array<typeof visitAnswerOptions.$inferSelect>) {
+  const optionsByAnswerId = new Map<string, Array<typeof visitAnswerOptions.$inferSelect>>();
+  for (const row of optionRows) {
+    const bucket = optionsByAnswerId.get(row.visitAnswerId) ?? [];
+    bucket.push(row);
+    optionsByAnswerId.set(row.visitAnswerId, bucket);
+  }
+  return optionsByAnswerId;
+}
+
+function buildScoringByQuestion(scoringRows: Array<typeof questionScoring.$inferSelect>) {
+  const scoringByQuestion = new Map<string, Record<string, number>>();
+  for (const row of scoringRows) {
+    if (row.ipp == null) continue;
+    const bucket = scoringByQuestion.get(row.questionId) ?? {};
+    bucket[row.scoreKey] = Number(row.ipp);
+    scoringByQuestion.set(row.questionId, bucket);
+  }
+  return scoringByQuestion;
+}
+
+export async function computeMarketIppSummariesForPeriod(input: {
+  periodStart: Date;
+  periodEnd: Date;
+}): Promise<Map<string, IppMarketPeriodSummary>> {
+  const { start, endExclusive } = toPeriodBounds(input.periodStart, input.periodEnd);
+  const periodEnd = addDays(endExclusive, -1);
+  const startIso = start.toISOString();
+  const endExclusiveIso = endExclusive.toISOString();
+  const summaryRows = await pgSql<MarketPeriodSummarySqlRow[]>`
+    select
+      vs.market_id::text as market_id,
+      count(*)::int as source_submission_count,
+      (array_agg(vs.gm_user_id::text order by vs.submitted_at desc))[1] as latest_gm_user_id
+    from visit_sessions vs
+    where vs.is_deleted = false
+      and vs.status = 'submitted'
+      and vs.submitted_at is not null
+      and vs.submitted_at >= ${startIso}::timestamptz
+      and vs.submitted_at < ${endExclusiveIso}::timestamptz
+    group by vs.market_id
+  `;
+
+  const summaries = new Map<string, IppMarketPeriodSummary>();
+  for (const row of summaryRows) {
+    summaries.set(row.market_id, {
+      marketId: row.market_id,
+      periodStart: start,
+      periodEnd,
+      marketIpp: 0,
+      sourceSubmissionCount: Number(row.source_submission_count ?? 0),
+      contributingQuestionCount: 0,
+      latestGmUserId: row.latest_gm_user_id,
+    });
+  }
+
+  if (summaryRows.length === 0) return summaries;
+
+  const latestAnswers = await pgSql<LatestMarketAnswerSqlRow[]>`
+    select distinct on (vs.market_id, va.question_id)
+      va.id::text as answer_id,
+      va.question_id::text as question_id,
+      va.question_type::text as question_type,
+      va.value_text as value_text,
+      va.value_number::text as value_number,
+      va.value_json as value_json,
+      vs.market_id::text as market_id
+    from visit_sessions vs
+    inner join visit_answers va
+      on va.visit_session_id = vs.id
+      and va.is_deleted = false
+    inner join visit_session_questions vsq
+      on vsq.id = va.visit_session_question_id
+      and vsq.is_deleted = false
+    inner join visit_session_sections vss
+      on vss.id = va.visit_session_section_id
+      and vss.is_deleted = false
+    where vs.is_deleted = false
+      and vs.status = 'submitted'
+      and vs.submitted_at is not null
+      and vs.submitted_at >= ${startIso}::timestamptz
+      and vs.submitted_at < ${endExclusiveIso}::timestamptz
+    order by
+      vs.market_id,
+      va.question_id,
+      vs.submitted_at desc,
+      va.changed_at desc,
+      va.updated_at desc,
+      va.created_at desc
+  `;
+  if (latestAnswers.length === 0) return summaries;
+
+  const latestAnswerIds = latestAnswers.map((row) => row.answer_id);
+  const questionIds = normalizeUnique(latestAnswers.map((row) => row.question_id));
+  const [optionRows, scoringRows] = await Promise.all([
+    loadOptionsForAnswers(latestAnswerIds),
+    loadIppScoringForQuestions(questionIds),
+  ]);
+  const optionsByAnswerId = buildOptionsByAnswerId(optionRows);
+  const scoringByQuestion = buildScoringByQuestion(scoringRows);
+
+  for (const row of latestAnswers) {
+    const summary = summaries.get(row.market_id);
+    if (!summary) continue;
+    const options = optionsByAnswerId.get(row.answer_id) ?? [];
+    const scoringByKey = scoringByQuestion.get(row.question_id) ?? {};
+    const computed = computeAppliedIpp({
+      questionType: row.question_type,
+      valueText: row.value_text,
+      valueNumber: row.value_number,
+      valueJson: (row.value_json as Record<string, unknown> | null) ?? null,
+      options,
+      scoringByKey,
+    });
+    if (computed.appliedIpp > 0) {
+      summary.marketIpp = Number((summary.marketIpp + computed.appliedIpp).toFixed(4));
+      summary.contributingQuestionCount += 1;
+    }
+  }
+
+  return summaries;
+}
+
 export async function computeMarketIppForPeriod(input: {
   marketId: string;
   periodStart: Date;
@@ -249,41 +439,11 @@ export async function computeMarketIppForPeriod(input: {
   const questionIds = normalizeUnique(latestAnswers.map((row) => row.answer.questionId));
 
   const [optionRows, scoringRows] = await Promise.all([
-    latestAnswerIds.length === 0
-      ? Promise.resolve([])
-      : db
-          .select()
-          .from(visitAnswerOptions)
-          .where(and(inArray(visitAnswerOptions.visitAnswerId, latestAnswerIds), eq(visitAnswerOptions.isDeleted, false)))
-          .orderBy(asc(visitAnswerOptions.visitAnswerId), asc(visitAnswerOptions.orderIndex)),
-    questionIds.length === 0
-      ? Promise.resolve([])
-      : db
-          .select()
-          .from(questionScoring)
-          .where(
-            and(
-              inArray(questionScoring.questionId, questionIds),
-              eq(questionScoring.isDeleted, false),
-              isNotNull(questionScoring.ipp),
-            ),
-          ),
+    loadOptionsForAnswers(latestAnswerIds),
+    loadIppScoringForQuestions(questionIds),
   ]);
-
-  const optionsByAnswerId = new Map<string, Array<typeof visitAnswerOptions.$inferSelect>>();
-  for (const row of optionRows) {
-    const bucket = optionsByAnswerId.get(row.visitAnswerId) ?? [];
-    bucket.push(row);
-    optionsByAnswerId.set(row.visitAnswerId, bucket);
-  }
-
-  const scoringByQuestion = new Map<string, Record<string, number>>();
-  for (const row of scoringRows) {
-    if (row.ipp == null) continue;
-    const bucket = scoringByQuestion.get(row.questionId) ?? {};
-    bucket[row.scoreKey] = Number(row.ipp);
-    scoringByQuestion.set(row.questionId, bucket);
-  }
+  const optionsByAnswerId = buildOptionsByAnswerId(optionRows);
+  const scoringByQuestion = buildScoringByQuestion(scoringRows);
 
   const questionRows: IppQuestionBreakdownRow[] = latestAnswers.map((row) => {
     const options = optionsByAnswerId.get(row.answer.id) ?? [];
