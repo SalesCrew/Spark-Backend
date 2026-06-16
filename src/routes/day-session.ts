@@ -4,8 +4,10 @@ import { z } from "zod";
 import {
   buildDaySessionPayload,
   resolvePrimaryQuestionnaireType,
+  validateTimelineInterval,
   type BaseAction,
   type DaySessionPayload,
+  type TimelineInterval,
 } from "../lib/admin-zeiterfassung.js";
 import { logAction, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
@@ -52,6 +54,7 @@ daySessionRouter.use((req, res, next) => {
 const timezoneSchema = z.string().trim().min(1).max(120);
 const kmSchema = z.number().int().min(0).max(2_000_000);
 const isoDateTimeSchema = z.string().datetime();
+const hhmmRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 const startSchema = z
   .object({
@@ -76,6 +79,25 @@ const manualPauseSchema = z
   .object({
     startAt: isoDateTimeSchema,
     endAt: isoDateTimeSchema,
+  })
+  .strict();
+
+const editableReviewSegmentKindSchema = z.enum(["day_start", "day_end", "marktbesuch", "pause", "zusatzzeit"]);
+const reviewEditsSchema = z
+  .object({
+    sessionId: z.string().uuid(),
+    edits: z
+      .array(
+        z
+          .object({
+            kind: editableReviewSegmentKindSchema,
+            segmentId: z.string().uuid(),
+            startTime: z.string().regex(hhmmRegex),
+            endTime: z.string().regex(hhmmRegex),
+          })
+          .strict(),
+      )
+      .max(80),
   })
   .strict();
 
@@ -199,6 +221,136 @@ async function loadOpenPause(gmUserId: string, daySessionId: string) {
     .orderBy(desc(gmDaySessionPauses.pauseStartedAt))
     .limit(1);
   return row ?? null;
+}
+
+function getTimeZoneOffsetMs(date: Date, timeZone: string): number {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(date);
+  const map = new Map(parts.map((part) => [part.type, part.value]));
+  const year = Number(map.get("year") ?? "0");
+  const month = Number(map.get("month") ?? "1");
+  const day = Number(map.get("day") ?? "1");
+  const hour = Number(map.get("hour") ?? "0");
+  const minute = Number(map.get("minute") ?? "0");
+  const second = Number(map.get("second") ?? "0");
+  const asUtcEpoch = Date.UTC(year, month - 1, day, hour, minute, second, 0);
+  return asUtcEpoch - date.getTime();
+}
+
+function parseWorkDateHmToUtc(workDate: string, hm: string, timeZone: string): Date | null {
+  const match = hhmmRegex.exec(hm.trim());
+  if (!match) return null;
+  const [yearRaw, monthRaw, dayRaw] = workDate.split("-");
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (
+    !Number.isFinite(year) ||
+    !Number.isFinite(month) ||
+    !Number.isFinite(day) ||
+    !Number.isFinite(hour) ||
+    !Number.isFinite(minute)
+  ) {
+    return null;
+  }
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
+  const firstOffset = getTimeZoneOffsetMs(utcGuess, timeZone);
+  let candidateEpoch = utcGuess.getTime() - firstOffset;
+  const secondOffset = getTimeZoneOffsetMs(new Date(candidateEpoch), timeZone);
+  if (secondOffset !== firstOffset) {
+    candidateEpoch = utcGuess.getTime() - secondOffset;
+  }
+  const candidate = new Date(candidateEpoch);
+  if (toYmdInTimezone(candidate, timeZone) !== workDate) return null;
+  return candidate;
+}
+
+async function loadReviewIntervals(input: {
+  daySessionId: string;
+  gmUserId: string;
+  workDate: string;
+  timezone: string;
+}): Promise<TimelineInterval[]> {
+  const dayStartExpr = sql`(${input.workDate}::timestamp at time zone ${input.timezone})`;
+  const dayEndExpr = sql`((${input.workDate}::timestamp at time zone ${input.timezone}) + interval '1 day')`;
+  const [pauseRows, visitRows, extraRows] = await Promise.all([
+    db
+      .select({
+        id: gmDaySessionPauses.id,
+        startAt: gmDaySessionPauses.pauseStartedAt,
+        endAt: gmDaySessionPauses.pauseEndedAt,
+      })
+      .from(gmDaySessionPauses)
+      .where(
+        and(
+          eq(gmDaySessionPauses.daySessionId, input.daySessionId),
+          eq(gmDaySessionPauses.gmUserId, input.gmUserId),
+          eq(gmDaySessionPauses.isDeleted, false),
+          isNotNull(gmDaySessionPauses.pauseEndedAt),
+        ),
+      ),
+    db
+      .select({
+        id: visitSessions.id,
+        startAt: visitSessions.startedAt,
+        endAt: visitSessions.submittedAt,
+      })
+      .from(visitSessions)
+      .where(
+        and(
+          eq(visitSessions.gmUserId, input.gmUserId),
+          eq(visitSessions.status, "submitted"),
+          eq(visitSessions.isDeleted, false),
+          sql`${visitSessions.startedAt} >= ${dayStartExpr}`,
+          sql`${visitSessions.startedAt} < ${dayEndExpr}`,
+          isNotNull(visitSessions.submittedAt),
+        ),
+      ),
+    db
+      .select({
+        id: timeTrackingEntries.id,
+        startAt: timeTrackingEntries.startAt,
+        endAt: timeTrackingEntries.endAt,
+      })
+      .from(timeTrackingEntries)
+      .where(
+        and(
+          eq(timeTrackingEntries.gmUserId, input.gmUserId),
+          eq(timeTrackingEntries.status, "submitted"),
+          eq(timeTrackingEntries.isDeleted, false),
+          isNotNull(timeTrackingEntries.startAt),
+          isNotNull(timeTrackingEntries.endAt),
+          sql`${timeTrackingEntries.startAt} >= ${dayStartExpr}`,
+          sql`${timeTrackingEntries.startAt} < ${dayEndExpr}`,
+        ),
+      ),
+  ]);
+
+  const intervals: TimelineInterval[] = [];
+  for (const row of pauseRows) {
+    if (!row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
+    intervals.push({ kind: "pause", id: row.id, startAt: row.startAt, endAt: row.endAt });
+  }
+  for (const row of visitRows) {
+    if (!row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
+    intervals.push({ kind: "marktbesuch", id: row.id, startAt: row.startAt, endAt: row.endAt });
+  }
+  for (const row of extraRows) {
+    if (!row.startAt || !row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
+    intervals.push({ kind: "zusatzzeit", id: row.id, startAt: row.startAt, endAt: row.endAt });
+  }
+  return intervals;
 }
 
 daySessionRouter.get("/current", async (req: AuthedRequest, res, next) => {
@@ -355,6 +507,219 @@ daySessionRouter.post("/pause/manual", async (req: AuthedRequest, res, next) => 
       return;
     }
     if (respondTimelineValidationError(res, error)) return;
+    next(error);
+  }
+});
+
+daySessionRouter.patch("/review-edits", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    const parsed = reviewEditsSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltige Zeitkorrekturen.", code: "invalid_review_edits" });
+      return;
+    }
+
+    const { sessionId, edits } = parsed.data;
+    if (edits.length === 0) {
+      res.status(200).json({ ok: true });
+      return;
+    }
+
+    const [session] = await db
+      .select({
+        id: gmDaySessions.id,
+        gmUserId: gmDaySessions.gmUserId,
+        workDate: gmDaySessions.workDate,
+        timezone: gmDaySessions.timezone,
+        status: gmDaySessions.status,
+        dayStartedAt: gmDaySessions.dayStartedAt,
+        dayEndedAt: gmDaySessions.dayEndedAt,
+      })
+      .from(gmDaySessions)
+      .where(
+        and(
+          eq(gmDaySessions.id, sessionId),
+          eq(gmDaySessions.gmUserId, gmUserId),
+          eq(gmDaySessions.isDeleted, false),
+        ),
+      )
+      .limit(1);
+
+    if (!session) {
+      res.status(404).json({ error: "Arbeitstag nicht gefunden.", code: "day_not_found" });
+      return;
+    }
+    if (session.status !== "ended") {
+      res.status(409).json({
+        error: "Zeitkorrekturen sind erst nach Tagesende und vor Tag abschliessen moeglich.",
+        code: "day_not_in_review",
+      });
+      return;
+    }
+    if (!session.dayStartedAt || !session.dayEndedAt) {
+      res.status(409).json({ error: "Arbeitstag ist unvollstaendig.", code: "day_incomplete" });
+      return;
+    }
+
+    const timezone = session.timezone || DEFAULT_TIMEZONE;
+    const currentIntervals = await loadReviewIntervals({
+      daySessionId: session.id,
+      gmUserId,
+      workDate: session.workDate,
+      timezone,
+    });
+    const intervalByKey = new Map(currentIntervals.map((interval) => [`${interval.kind}:${interval.id}`, interval]));
+    const nextIntervals = currentIntervals.map((interval) => ({ ...interval }));
+    const updates = new Map<
+      string,
+      {
+        kind: "marktbesuch" | "pause" | "zusatzzeit";
+        id: string;
+        startAt: Date;
+        endAt: Date;
+      }
+    >();
+    let nextDayStartAt = session.dayStartedAt;
+    let nextDayEndAt = session.dayEndedAt;
+    const daySessionUpdates: { dayStartedAt?: Date; dayEndedAt?: Date } = {};
+
+    for (const edit of edits) {
+      if (edit.kind === "day_start" || edit.kind === "day_end") {
+        if (edit.segmentId !== session.id) {
+          res.status(404).json({ error: "Arbeitstag nicht gefunden.", code: "day_segment_not_found" });
+          return;
+        }
+        const editedAt = parseWorkDateHmToUtc(
+          session.workDate,
+          edit.kind === "day_start" ? edit.startTime : edit.endTime,
+          timezone,
+        );
+        if (!editedAt) {
+          res.status(400).json({ error: "Bitte gueltige Uhrzeiten im Format HH:MM eingeben.", code: "invalid_time" });
+          return;
+        }
+        if (edit.kind === "day_start") {
+          nextDayStartAt = editedAt;
+          daySessionUpdates.dayStartedAt = editedAt;
+        } else {
+          nextDayEndAt = editedAt;
+          daySessionUpdates.dayEndedAt = editedAt;
+        }
+        continue;
+      }
+
+      const key = `${edit.kind}:${edit.segmentId}`;
+      const current = intervalByKey.get(key);
+      if (!current) {
+        res.status(404).json({ error: "Zeiteintrag nicht gefunden.", code: "segment_not_found" });
+        return;
+      }
+      const startAt = parseWorkDateHmToUtc(session.workDate, edit.startTime, timezone);
+      const endAt = parseWorkDateHmToUtc(session.workDate, edit.endTime, timezone);
+      if (!startAt || !endAt) {
+        res.status(400).json({ error: "Bitte gueltige Uhrzeiten im Format HH:MM eingeben.", code: "invalid_time" });
+        return;
+      }
+      const index = nextIntervals.findIndex((interval) => interval.kind === edit.kind && interval.id === edit.segmentId);
+      if (index < 0) {
+        res.status(404).json({ error: "Zeiteintrag nicht gefunden.", code: "segment_not_found" });
+        return;
+      }
+      const existingInterval = nextIntervals[index];
+      if (!existingInterval) {
+        res.status(404).json({ error: "Zeiteintrag nicht gefunden.", code: "segment_not_found" });
+        return;
+      }
+      nextIntervals[index] = { ...existingInterval, startAt, endAt };
+      updates.set(key, { kind: edit.kind, id: edit.segmentId, startAt, endAt });
+    }
+
+    if (nextDayEndAt.getTime() <= nextDayStartAt.getTime()) {
+      res.status(400).json({ error: "Tagesende muss nach Tagesstart liegen.", code: "invalid_day_interval" });
+      return;
+    }
+
+    for (const interval of nextIntervals) {
+      const validation = validateTimelineInterval({
+        kind: interval.kind,
+        id: interval.id,
+        startAt: interval.startAt,
+        endAt: interval.endAt,
+        dayStartAt: nextDayStartAt,
+        dayEndAt: nextDayEndAt,
+        intervals: nextIntervals,
+      });
+      if (!validation.ok) {
+        const message =
+          validation.code === "overlap"
+            ? "Dieser Zeitraum ist nicht moeglich, weil er sich mit einem bestehenden Eintrag ueberschneidet."
+            : validation.code === "outside_day"
+              ? "Tagesstart und Tagesende muessen alle Eintraege vollstaendig umfassen."
+            : validation.message;
+        res.status(validation.code === "overlap" ? 409 : 400).json({
+          error: message,
+          code: validation.code,
+        });
+        return;
+      }
+    }
+
+    const now = new Date();
+    await db.transaction(async (tx) => {
+      if (daySessionUpdates.dayStartedAt || daySessionUpdates.dayEndedAt) {
+        await tx
+          .update(gmDaySessions)
+          .set({
+            ...daySessionUpdates,
+            updatedAt: now,
+          })
+          .where(and(eq(gmDaySessions.id, session.id), eq(gmDaySessions.gmUserId, gmUserId)));
+      }
+      for (const update of updates.values()) {
+        if (update.kind === "marktbesuch") {
+          await tx
+            .update(visitSessions)
+            .set({
+              startedAt: update.startAt,
+              submittedAt: update.endAt,
+              updatedAt: now,
+            })
+            .where(and(eq(visitSessions.id, update.id), eq(visitSessions.gmUserId, gmUserId)));
+        } else if (update.kind === "pause") {
+          await tx
+            .update(gmDaySessionPauses)
+            .set({
+              pauseStartedAt: update.startAt,
+              pauseEndedAt: update.endAt,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(gmDaySessionPauses.id, update.id),
+                eq(gmDaySessionPauses.daySessionId, session.id),
+                eq(gmDaySessionPauses.gmUserId, gmUserId),
+              ),
+            );
+        } else {
+          await tx
+            .update(timeTrackingEntries)
+            .set({
+              startAt: update.startAt,
+              endAt: update.endAt,
+              updatedAt: now,
+            })
+            .where(and(eq(timeTrackingEntries.id, update.id), eq(timeTrackingEntries.gmUserId, gmUserId)));
+        }
+      }
+    });
+
+    res.status(200).json({ ok: true });
+  } catch (error) {
     next(error);
   }
 });
