@@ -5,7 +5,7 @@ import { db } from "../lib/db.js";
 import { getKundePermissionsForUser } from "../lib/kunde-access.js";
 import { getRequestLogMeta, logAction, logger, markErrorAsLogged, serializeError, startActionTimer } from "../lib/logger.js";
 import { authAuditLogs, users } from "../lib/schema.js";
-import { supabaseAnon } from "../lib/supabase.js";
+import { supabaseAdmin, supabaseAnon } from "../lib/supabase.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const loginSchema = z.object({
@@ -16,6 +16,11 @@ const loginSchema = z.object({
 
 const refreshSchema = z.object({
   refreshToken: z.string().min(1),
+});
+
+const updatePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(8).max(128),
 });
 
 const authRouter = Router();
@@ -44,6 +49,111 @@ authRouter.get("/me", requireAuth(["admin", "gm", "sm", "kunde"]), async (req: A
     }
     res.status(200).json({ user: await buildAuthUserPayload(appUser) });
   } catch (err) {
+    next(err);
+  }
+});
+
+authRouter.patch("/password", requireAuth(["admin", "gm", "sm", "kunde"]), async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ error: "Authentication required.", code: "auth_required" });
+      return;
+    }
+
+    const parsed = updatePasswordSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logAction("warn", "auth_password_invalid_payload", {
+        req,
+        action: "auth_password_update",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(400).json({ error: "Passwort muss mindestens 8 Zeichen enthalten.", code: "invalid_password_payload" });
+      return;
+    }
+
+    const [appUser] = await db
+      .select()
+      .from(users)
+      .where(and(eq(users.id, req.authUser.appUserId), isNull(users.deletedAt)))
+      .limit(1);
+    if (!appUser || !appUser.isActive) {
+      res.status(403).json({ error: "User account is inactive.", code: "account_inactive" });
+      return;
+    }
+
+    const { currentPassword, newPassword } = parsed.data;
+    const { data: currentLogin, error: currentLoginError } = await supabaseAnon.auth.signInWithPassword({
+      email: appUser.email,
+      password: currentPassword,
+    });
+    if (currentLoginError || currentLogin.user?.id !== appUser.supabaseAuthId) {
+      logAction("warn", "auth_password_current_invalid", {
+        req,
+        action: "auth_password_update",
+        result: "rejected",
+        statusCode: 401,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { targetUserId: appUser.id },
+      });
+      res.status(401).json({ error: "Aktuelles Passwort ist nicht korrekt.", code: "current_password_invalid" });
+      return;
+    }
+
+    const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(appUser.supabaseAuthId, {
+      password: newPassword,
+    });
+    if (updateError) {
+      logAction("warn", "auth_password_supabase_failed", {
+        req,
+        action: "auth_password_update",
+        result: "failure",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { reason: updateError.message },
+      });
+      res.status(400).json({ error: updateError.message || "Passwort konnte nicht aktualisiert werden.", code: "password_update_failed" });
+      return;
+    }
+
+    await db
+      .update(users)
+      .set({ updatedAt: new Date() })
+      .where(eq(users.id, appUser.id));
+
+    await db.insert(authAuditLogs).values({
+      actorUserId: appUser.id,
+      targetUserId: appUser.id,
+      eventType: "password_updated",
+      details: "scope=self_verified",
+    });
+
+    res.status(200).json({ ok: true });
+    logAction("info", "auth_password_success", {
+      req,
+      action: "auth_password_update",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { targetUserId: appUser.id },
+    });
+  } catch (err) {
+    logAction("error", "auth_password_failed", {
+      req,
+      action: "auth_password_update",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });
