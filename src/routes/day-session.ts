@@ -72,8 +72,12 @@ const setKmSchema = z
 const setEndSchema = z
   .object({
     endAt: isoDateTimeSchema.optional(),
+    endTime: z.string().regex(hhmmRegex).optional(),
   })
-  .strict();
+  .strict()
+  .refine((value) => !(value.endAt && value.endTime), {
+    message: "endAt and endTime cannot be sent together.",
+  });
 
 const manualPauseSchema = z
   .object({
@@ -1074,14 +1078,25 @@ daySessionRouter.patch("/end", async (req: AuthedRequest, res, next) => {
     }
     const sessionTimezone = session.timezone || DEFAULT_TIMEZONE;
     const currentWorkDate = toYmdInTimezone(now, sessionTimezone);
-    if (session.workDate < currentWorkDate && !parsed.data.endAt) {
+    if (session.workDate < currentWorkDate && !parsed.data.endAt && !parsed.data.endTime) {
       res.status(400).json({
         error: "Bitte eine Endzeit fuer den offenen Arbeitstag erfassen.",
         code: "stale_day_end_time_required",
       });
       return;
     }
-    const endAt = parsed.data.endAt ? new Date(parsed.data.endAt) : now;
+    const endAt = parsed.data.endTime
+      ? parseWorkDateHmToUtc(session.workDate, parsed.data.endTime, sessionTimezone)
+      : parsed.data.endAt
+        ? new Date(parsed.data.endAt)
+        : now;
+    if (!endAt || !Number.isFinite(endAt.getTime())) {
+      res.status(400).json({
+        error: "Endzeit konnte nicht auf den Arbeitstag gesetzt werden.",
+        code: "invalid_day_end_time",
+      });
+      return;
+    }
     if (toYmdInTimezone(endAt, sessionTimezone) !== session.workDate) {
       res.status(400).json({
         error: "Tagesende muss am selben Kalendertag wie der Tagesstart liegen.",
