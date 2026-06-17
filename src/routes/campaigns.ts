@@ -112,6 +112,21 @@ const migrateMarketsSchema = z
   })
   .strict();
 
+const reassignCampaignGmsSchema = z
+  .object({
+    reassignments: z
+      .array(
+        z
+          .object({
+            fromGmUserId: z.string().uuid(),
+            toGmUserId: z.string().uuid(),
+          })
+          .strict(),
+      )
+      .min(1),
+  })
+  .strict();
+
 const HARD_DELETE_CAMPAIGN_CONFIRMATION_TEXT = "Ich bin mir sicher, dass ich alle Daten zu dieser Kampagne Löschen will!";
 const adminSubmittedVisitAnswerPatchSchema = z
   .object({
@@ -2886,6 +2901,229 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
     logAction("error", "campaign_markets_migrate_failed", {
       req,
       action: "campaign_markets_migrate",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
+    next(error);
+  }
+});
+
+adminCampaignsRouter.patch("/campaigns/:id/gm-reassignments", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    const campaignId = String(req.params.id ?? "");
+    if (!isUuid(campaignId)) {
+      logAction("warn", "campaign_gm_reassign_invalid_id", {
+        req,
+        action: "campaign_gm_reassign",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      return;
+    }
+
+    const parsed = reassignCampaignGmsSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logAction("warn", "campaign_gm_reassign_invalid_payload", {
+        req,
+        action: "campaign_gm_reassign",
+        result: "rejected",
+        statusCode: 400,
+        requestClass: "client_error",
+        startedAtNs,
+      });
+      res.status(400).json({ error: "Ungueltige GM-Umstellung.", code: "invalid_payload" });
+      return;
+    }
+
+    const reassignmentsBySource = new Map<string, string>();
+    for (const reassignment of parsed.data.reassignments) {
+      if (reassignment.fromGmUserId === reassignment.toGmUserId) continue;
+      reassignmentsBySource.set(reassignment.fromGmUserId, reassignment.toGmUserId);
+    }
+    const reassignments = Array.from(reassignmentsBySource.entries()).map(([fromGmUserId, toGmUserId]) => ({
+      fromGmUserId,
+      toGmUserId,
+    }));
+
+    if (reassignments.length === 0) {
+      const [row] = await db
+        .select()
+        .from(campaigns)
+        .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
+        .limit(1);
+      if (!row) {
+        res.status(404).json({ error: "Kampagne nicht gefunden.", code: "campaign_not_found" });
+        return;
+      }
+      const [campaign] = await mapCampaignRows([row]);
+      res.status(200).json({ campaign, reassigned: 0 });
+      return;
+    }
+
+    const [campaignRow] = await db
+      .select({ id: campaigns.id, section: campaigns.section })
+      .from(campaigns)
+      .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
+      .limit(1);
+    if (!campaignRow) {
+      throw new CampaignDomainError("campaign_not_found", 404, "Kampagne nicht gefunden.");
+    }
+
+    await ensureGmUsersExist(reassignments.map((entry) => entry.toGmUserId));
+
+    const sourceGmIds = reassignments.map((entry) => entry.fromGmUserId);
+    const now = new Date();
+    const auditUserId = await resolveAuditUserId(req.authUser?.appUserId);
+    let movedRowsCount = 0;
+    let movedVisitTargetsCount = 0;
+
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT ${campaigns.id} FROM ${campaigns} WHERE ${campaigns.id} = ${campaignId} FOR UPDATE`);
+
+      const affectedAssignments = await tx
+        .select({
+          id: campaignMarketAssignments.id,
+          marketId: campaignMarketAssignments.marketId,
+          gmUserId: campaignMarketAssignments.gmUserId,
+          assignmentSlot: campaignMarketAssignments.assignmentSlot,
+          visitTargetCount: campaignMarketAssignments.visitTargetCount,
+          currentVisitsCount: campaignMarketAssignments.currentVisitsCount,
+        })
+        .from(campaignMarketAssignments)
+        .where(
+          and(
+            eq(campaignMarketAssignments.campaignId, campaignId),
+            inArray(campaignMarketAssignments.gmUserId, sourceGmIds),
+            eq(campaignMarketAssignments.isDeleted, false),
+          ),
+        )
+        .orderBy(asc(campaignMarketAssignments.assignedAt), asc(campaignMarketAssignments.assignmentSlot));
+
+      if (affectedAssignments.length === 0) {
+        throw new CampaignDomainError(
+          "invalid_payload",
+          409,
+          "Keine aktiven Zuordnungen fuer die ausgewaehlten GMs gefunden. Bitte Daten neu laden.",
+        );
+      }
+
+      const affectedIds = affectedAssignments.map((assignment) => assignment.id);
+      await tx
+        .update(campaignMarketAssignments)
+        .set({
+          isDeleted: true,
+          deletedAt: now,
+          updatedAt: now,
+        })
+        .where(inArray(campaignMarketAssignments.id, affectedIds));
+
+      for (const assignment of affectedAssignments) {
+        if (!assignment.gmUserId) continue;
+        const nextGmUserId = reassignmentsBySource.get(assignment.gmUserId);
+        if (!nextGmUserId || nextGmUserId === assignment.gmUserId) continue;
+
+        const updated = await tx
+          .update(campaignMarketAssignments)
+          .set({
+            visitTargetCount: sql`${campaignMarketAssignments.visitTargetCount} + ${assignment.visitTargetCount}`,
+            currentVisitsCount: sql`${campaignMarketAssignments.currentVisitsCount} + ${assignment.currentVisitsCount}`,
+            assignedAt: now,
+            assignedByUserId: auditUserId,
+            isDeleted: false,
+            deletedAt: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(campaignMarketAssignments.campaignId, campaignId),
+              eq(campaignMarketAssignments.marketId, assignment.marketId),
+              eq(campaignMarketAssignments.gmUserId, nextGmUserId),
+              eq(campaignMarketAssignments.assignmentSlot, assignment.assignmentSlot),
+              eq(campaignMarketAssignments.isDeleted, false),
+            ),
+          )
+          .returning({ id: campaignMarketAssignments.id });
+
+        if (updated.length === 0) {
+          await tx.insert(campaignMarketAssignments).values({
+            campaignId,
+            marketId: assignment.marketId,
+            gmUserId: nextGmUserId,
+            assignmentSlot: assignment.assignmentSlot,
+            visitTargetCount: assignment.visitTargetCount,
+            currentVisitsCount: assignment.currentVisitsCount,
+            assignedAt: now,
+            assignedByUserId: auditUserId,
+            isDeleted: false,
+            deletedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+
+        movedRowsCount += 1;
+        movedVisitTargetsCount += Math.max(1, Number(assignment.visitTargetCount ?? 1));
+
+        await tx.insert(campaignMarketAssignmentHistory).values({
+          marketId: assignment.marketId,
+          section: campaignRow.section,
+          fromCampaignId: campaignId,
+          toCampaignId: campaignId,
+          fromGmUserId: assignment.gmUserId,
+          toGmUserId: nextGmUserId,
+          migratedByUserId: auditUserId,
+          migratedAt: now,
+          reason: "campaign_gm_reassignment",
+          createdAt: now,
+        });
+      }
+    });
+
+    const [row] = await db
+      .select()
+      .from(campaigns)
+      .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
+      .limit(1);
+    if (!row) {
+      res.status(404).json({ error: "Kampagne nicht gefunden.", code: "campaign_not_found" });
+      return;
+    }
+    const [campaign] = await mapCampaignRows([row]);
+    res.status(200).json({ campaign, reassigned: movedRowsCount, visitTargets: movedVisitTargetsCount });
+    logAction("info", "campaign_gm_reassign_success", {
+      req,
+      action: "campaign_gm_reassign",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { campaignId, reassigned: movedRowsCount, visitTargets: movedVisitTargetsCount },
+    });
+  } catch (error) {
+    if (error instanceof CampaignDomainError) {
+      logAction("warn", "campaign_gm_reassign_domain_error", {
+        req,
+        action: "campaign_gm_reassign",
+        result: "rejected",
+        statusCode: error.status,
+        requestClass: "client_error",
+        startedAtNs,
+        details: { code: error.code, message: error.message },
+      });
+      respondDomainError(res, error);
+      return;
+    }
+    logAction("error", "campaign_gm_reassign_failed", {
+      req,
+      action: "campaign_gm_reassign",
       result: "failure",
       statusCode: 500,
       requestClass: "server_error",
