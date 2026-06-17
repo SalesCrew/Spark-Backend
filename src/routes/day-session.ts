@@ -245,6 +245,18 @@ async function loadOpenPause(gmUserId: string, daySessionId: string) {
   return row ?? null;
 }
 
+function isOpenPauseUniqueConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const maybeDbError = error as { code?: unknown; constraint_name?: unknown; constraint?: unknown };
+  const constraintName =
+    typeof maybeDbError.constraint_name === "string"
+      ? maybeDbError.constraint_name
+      : typeof maybeDbError.constraint === "string"
+        ? maybeDbError.constraint
+        : null;
+  return maybeDbError.code === "23505" && constraintName === "gm_day_session_pauses_one_open_per_gm_unique";
+}
+
 function getTimeZoneOffsetMs(date: Date, timeZone: string): number {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -429,6 +441,10 @@ daySessionRouter.post("/pause/start", async (req: AuthedRequest, res, next) => {
     if (!created) throw new Error("Pause konnte nicht gestartet werden.");
     res.status(200).json({ pause: serializePause(created) });
   } catch (error) {
+    if (isOpenPauseUniqueConflict(error)) {
+      res.status(409).json({ error: "Pause laeuft bereits.", code: "pause_already_started" });
+      return;
+    }
     next(error);
   }
 });
