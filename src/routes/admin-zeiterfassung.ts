@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, lt, lte, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { logAction, startActionTimer } from "../lib/logger.js";
@@ -56,6 +56,13 @@ const querySchema = z
     timezone: z.string().trim().min(1).max(120).optional(),
   })
   .strict();
+const diaetenExportQuerySchema = z
+  .object({
+    month: z.coerce.number().int().min(0).max(11),
+    year: z.coerce.number().int().min(2020).max(2100),
+    timezone: z.string().trim().min(1).max(120).optional(),
+  })
+  .strict();
 
 const editableSegmentKindSchema = z.enum(["marktbesuch", "pause", "zusatzzeit"]);
 const hhmmRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -100,6 +107,21 @@ function addDaysToYmd(ymd: string, days: number): string {
   return date.toISOString().slice(0, 10);
 }
 
+function toMonthYmd(year: number, month: number, day: number): string {
+  const date = new Date(Date.UTC(year, month, day, 12, 0, 0, 0));
+  return date.toISOString().slice(0, 10);
+}
+
+function getMonthBounds(year: number, month: number): { from: string; to: string; next: string } {
+  const from = toMonthYmd(year, month, 1);
+  const next = toMonthYmd(year, month + 1, 1);
+  return { from, next, to: addDaysToYmd(next, -1) };
+}
+
+function serializeDate(value: Date | null | undefined): string | null {
+  return value ? value.toISOString() : null;
+}
+
 function parseQuery(req: AuthedRequest): QueryInput | null {
   const raw = {
     from: typeof req.query.from === "string" ? req.query.from : undefined,
@@ -132,6 +154,35 @@ function parseQuery(req: AuthedRequest): QueryInput | null {
   };
 }
 
+function resolveDiaetenReasonLabel(reason: string): string {
+  switch (reason) {
+    case "marktbesuch":
+      return "Marktbesuch";
+    case "sonderaufgabe":
+      return "Sonderaufgabe";
+    case "werkstatt":
+      return "Werkstatt";
+    case "lager":
+      return "Lager";
+    case "hotel":
+    case "hoteluebernachtung":
+      return "Hotel";
+    case "dienstreise":
+      return "Dienstreise";
+    case "heimfahrt":
+      return "Heimfahrt";
+    case "schulung":
+      return "Schulung (Auto)";
+    case "arzt":
+    case "arztbesuch":
+      return "Arztbesuch";
+    case "homeoffice":
+      return "Homeoffice";
+    default:
+      return reason;
+  }
+}
+
 type DayRow = {
   sessionId: string;
   gmId: string;
@@ -146,6 +197,47 @@ type DayRow = {
   gmFirstName: string;
   gmLastName: string;
   gmRegion: string | null;
+};
+
+type DiaetenGmBucket = {
+  gmId: string;
+  firstName: string;
+  lastName: string;
+  dayTrackings: Array<{
+    id: string;
+    date: string;
+    dayStartAt: string | null;
+    dayEndAt: string | null;
+    startKm: number | null;
+    endKm: number | null;
+  }>;
+  marketVisits: Array<{
+    id: string;
+    createdAt: string;
+    startAt: string;
+    endAt: string;
+    marketName: string;
+    marketAddress: string;
+    marketCity: string;
+    marketPostalCode: string;
+  }>;
+  zusatzEntries: Array<{
+    id: string;
+    entryDate: string;
+    reason: string;
+    reasonLabel: string;
+    startAt: string;
+    endAt: string;
+    isWorkTimeDeduction: boolean;
+    marketName: string | null;
+    schulungOrt: string | null;
+  }>;
+  pauses: Array<{
+    id: string;
+    date: string;
+    startAt: string;
+    endAt: string;
+  }>;
 };
 
 function getTimeZoneOffsetMs(date: Date, timeZone: string): number {
@@ -570,6 +662,225 @@ adminZeiterfassungRouter.get("/gm-aggregates", async (req: AuthedRequest, res, n
         timezone: parsed.timezone,
         totalGms: rows.length,
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminZeiterfassungRouter.get("/diaeten-export", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = diaetenExportQuerySchema.safeParse({
+      month: typeof req.query.month === "string" ? req.query.month : undefined,
+      year: typeof req.query.year === "string" ? req.query.year : undefined,
+      timezone: typeof req.query.timezone === "string" ? req.query.timezone : undefined,
+    });
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltiger Monat fuer den Diaeten-Export." });
+      return;
+    }
+
+    const { month, year } = parsed.data;
+    const timezone = parsed.data.timezone ?? "Europe/Vienna";
+    const bounds = getMonthBounds(year, month);
+    const rangeStart = parseWorkDateHmToUtc(bounds.from, "00:00", timezone);
+    const rangeEnd = parseWorkDateHmToUtc(bounds.next, "00:00", timezone);
+    if (!rangeStart || !rangeEnd) {
+      res.status(400).json({ error: "Zeitraum konnte nicht berechnet werden." });
+      return;
+    }
+
+    const [visitRows, zusatzRows] = await Promise.all([
+      db
+        .select({
+          id: visitSessions.id,
+          gmId: visitSessions.gmUserId,
+          firstName: users.firstName,
+          lastName: users.lastName,
+          createdAt: visitSessions.createdAt,
+          startAt: visitSessions.startedAt,
+          endAt: visitSessions.submittedAt,
+          marketName: markets.name,
+          marketAddress: markets.address,
+          marketCity: markets.city,
+          marketPostalCode: markets.postalCode,
+        })
+        .from(visitSessions)
+        .innerJoin(users, eq(users.id, visitSessions.gmUserId))
+        .innerJoin(markets, eq(markets.id, visitSessions.marketId))
+        .where(
+          and(
+            eq(users.role, "gm"),
+            eq(visitSessions.status, "submitted"),
+            eq(visitSessions.isDeleted, false),
+            isNotNull(visitSessions.submittedAt),
+            gte(visitSessions.startedAt, rangeStart),
+            lt(visitSessions.startedAt, rangeEnd),
+          ),
+        )
+        .orderBy(asc(users.lastName), asc(users.firstName), asc(visitSessions.startedAt)),
+      db
+        .select({
+          id: timeTrackingEntries.id,
+          gmId: timeTrackingEntries.gmUserId,
+          firstName: users.firstName,
+          lastName: users.lastName,
+          activityType: timeTrackingEntries.activityType,
+          comment: timeTrackingEntries.comment,
+          startAt: timeTrackingEntries.startAt,
+          endAt: timeTrackingEntries.endAt,
+          marketName: markets.name,
+        })
+        .from(timeTrackingEntries)
+        .innerJoin(users, eq(users.id, timeTrackingEntries.gmUserId))
+        .leftJoin(markets, eq(markets.id, timeTrackingEntries.marketId))
+        .where(
+          and(
+            eq(users.role, "gm"),
+            eq(timeTrackingEntries.status, "submitted"),
+            eq(timeTrackingEntries.isDeleted, false),
+            isNotNull(timeTrackingEntries.startAt),
+            isNotNull(timeTrackingEntries.endAt),
+            gte(timeTrackingEntries.startAt, rangeStart),
+            lt(timeTrackingEntries.startAt, rangeEnd),
+          ),
+        )
+        .orderBy(asc(users.lastName), asc(users.firstName), asc(timeTrackingEntries.startAt)),
+    ]);
+
+    const buckets = new Map<string, DiaetenGmBucket>();
+    const ensureBucket = (gmId: string, firstName: string, lastName: string): DiaetenGmBucket => {
+      const existing = buckets.get(gmId);
+      if (existing) return existing;
+      const created: DiaetenGmBucket = {
+        gmId,
+        firstName,
+        lastName,
+        dayTrackings: [],
+        marketVisits: [],
+        zusatzEntries: [],
+        pauses: [],
+      };
+      buckets.set(gmId, created);
+      return created;
+    };
+
+    for (const row of visitRows) {
+      if (!row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
+      const bucket = ensureBucket(row.gmId, row.firstName, row.lastName);
+      bucket.marketVisits.push({
+        id: row.id,
+        createdAt: row.createdAt.toISOString(),
+        startAt: row.startAt.toISOString(),
+        endAt: row.endAt.toISOString(),
+        marketName: row.marketName,
+        marketAddress: row.marketAddress,
+        marketCity: row.marketCity,
+        marketPostalCode: row.marketPostalCode,
+      });
+    }
+
+    for (const row of zusatzRows) {
+      if (!row.startAt || !row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
+      const bucket = ensureBucket(row.gmId, row.firstName, row.lastName);
+      const reason = row.activityType;
+      bucket.zusatzEntries.push({
+        id: row.id,
+        entryDate: toYmdInTimezone(row.startAt, timezone),
+        reason,
+        reasonLabel: resolveDiaetenReasonLabel(reason),
+        startAt: row.startAt.toISOString(),
+        endAt: row.endAt.toISOString(),
+        isWorkTimeDeduction: false,
+        marketName: row.marketName ?? null,
+        schulungOrt: null,
+      });
+    }
+
+    const gmIds = Array.from(buckets.keys());
+    if (gmIds.length > 0) {
+      const [dayRows, pauseRows] = await Promise.all([
+        db
+          .select({
+            id: gmDaySessions.id,
+            gmId: gmDaySessions.gmUserId,
+            workDate: gmDaySessions.workDate,
+            dayStartedAt: gmDaySessions.dayStartedAt,
+            dayEndedAt: gmDaySessions.dayEndedAt,
+            startKm: gmDaySessions.startKm,
+            endKm: gmDaySessions.endKm,
+          })
+          .from(gmDaySessions)
+          .where(
+            and(
+              inArray(gmDaySessions.gmUserId, gmIds),
+              eq(gmDaySessions.isDeleted, false),
+              gte(gmDaySessions.workDate, bounds.from),
+              lte(gmDaySessions.workDate, bounds.to),
+            ),
+          )
+          .orderBy(asc(gmDaySessions.workDate)),
+        db
+          .select({
+            id: gmDaySessionPauses.id,
+            gmId: gmDaySessionPauses.gmUserId,
+            workDate: gmDaySessions.workDate,
+            startAt: gmDaySessionPauses.pauseStartedAt,
+            endAt: gmDaySessionPauses.pauseEndedAt,
+          })
+          .from(gmDaySessionPauses)
+          .innerJoin(gmDaySessions, eq(gmDaySessions.id, gmDaySessionPauses.daySessionId))
+          .where(
+            and(
+              inArray(gmDaySessionPauses.gmUserId, gmIds),
+              eq(gmDaySessionPauses.isDeleted, false),
+              eq(gmDaySessions.isDeleted, false),
+              isNotNull(gmDaySessionPauses.pauseEndedAt),
+              gte(gmDaySessions.workDate, bounds.from),
+              lte(gmDaySessions.workDate, bounds.to),
+            ),
+          )
+          .orderBy(asc(gmDaySessionPauses.pauseStartedAt)),
+      ]);
+
+      for (const row of dayRows) {
+        const bucket = buckets.get(row.gmId);
+        if (!bucket) continue;
+        bucket.dayTrackings.push({
+          id: row.id,
+          date: row.workDate,
+          dayStartAt: serializeDate(row.dayStartedAt),
+          dayEndAt: serializeDate(row.dayEndedAt),
+          startKm: row.startKm,
+          endKm: row.endKm,
+        });
+      }
+
+      for (const row of pauseRows) {
+        if (!row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
+        const bucket = buckets.get(row.gmId);
+        if (!bucket) continue;
+        bucket.pauses.push({
+          id: row.id,
+          date: row.workDate,
+          startAt: row.startAt.toISOString(),
+          endAt: row.endAt.toISOString(),
+        });
+      }
+    }
+
+    const gls = Array.from(buckets.values()).sort((a, b) => {
+      const last = a.lastName.localeCompare(b.lastName, "de-AT");
+      if (last !== 0) return last;
+      return a.firstName.localeCompare(b.firstName, "de-AT");
+    });
+
+    res.status(200).json({
+      month,
+      year,
+      timezone,
+      range: bounds,
+      gls,
     });
   } catch (error) {
     next(error);
