@@ -48,7 +48,6 @@ const activityTypeSchema = z.enum([
   "homeoffice",
   "schulung",
   "lager",
-  "heimfahrt",
   "hotel",
   "hoteluebernachtung",
 ]);
@@ -89,7 +88,6 @@ const activityTypeMap: Record<z.infer<typeof activityTypeSchema>, CanonicalActiv
   homeoffice: "homeoffice",
   schulung: "schulung",
   lager: "lager",
-  heimfahrt: "heimfahrt",
   hotel: "hoteluebernachtung",
   hoteluebernachtung: "hoteluebernachtung",
 };

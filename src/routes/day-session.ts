@@ -3,6 +3,7 @@ import { Router } from "express";
 import { z } from "zod";
 import {
   buildDaySessionPayload,
+  buildGmAggregates,
   resolvePrimaryQuestionnaireType,
   validateTimelineInterval,
   type BaseAction,
@@ -18,6 +19,7 @@ import {
   respondTimelineValidationError,
   validateGmTimelineInterval,
 } from "../lib/zeiterfassung-validation.js";
+import { loadZeiterfassungDaySessions } from "../lib/zeiterfassung-days.js";
 import {
   gmDaySessionPauses,
   gmDaySessions,
@@ -55,11 +57,21 @@ const timezoneSchema = z.string().trim().min(1).max(120);
 const kmSchema = z.number().int().min(0).max(2_000_000);
 const isoDateTimeSchema = z.string().datetime();
 const hhmmRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const ymdRegex = /^\d{4}-\d{2}-\d{2}$/;
 
 const startSchema = z
   .object({
     timezone: timezoneSchema.optional(),
     startedAt: isoDateTimeSchema.optional(),
+  })
+  .strict();
+
+const zeiterfassungQuerySchema = z
+  .object({
+    from: z.string().regex(ymdRegex).optional(),
+    to: z.string().regex(ymdRegex).optional(),
+    includeLive: z.string().optional(),
+    timezone: timezoneSchema.optional(),
   })
   .strict();
 
@@ -183,6 +195,12 @@ function timelineSegmentToLegacyItem(segment: DaySessionPayload["timeline"][numb
     label: segment.title,
     timeText: `${segment.start} - ${segment.end}`,
   };
+}
+
+function addDaysToYmd(ymd: string, days: number): string {
+  const date = new Date(`${ymd}T12:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
 }
 
 async function loadTodaySession(gmUserId: string, now: Date, timezone: string) {
@@ -923,6 +941,56 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
         endTime: payload.endTime,
         startKm: payload.startKm,
         endKm: payload.endKm,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+daySessionRouter.get("/zeiterfassung", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    const parsed = zeiterfassungQuerySchema.safeParse({
+      from: typeof req.query.from === "string" ? req.query.from : undefined,
+      to: typeof req.query.to === "string" ? req.query.to : undefined,
+      includeLive: typeof req.query.includeLive === "string" ? req.query.includeLive : undefined,
+      timezone: typeof req.query.timezone === "string" ? req.query.timezone : undefined,
+    });
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltige Abfrage fuer Zeiterfassung." });
+      return;
+    }
+
+    const timezone = parsed.data.timezone ?? DEFAULT_TIMEZONE;
+    const now = new Date();
+    const defaultTo = toYmdInTimezone(now, timezone);
+    const to = parsed.data.to ?? defaultTo;
+    const from = parsed.data.from ?? addDaysToYmd(to, -30);
+    const includeLive = parsed.data.includeLive ? parsed.data.includeLive !== "false" : true;
+
+    const sessions = await loadZeiterfassungDaySessions({
+      from,
+      to,
+      gmUserIds: [gmUserId],
+      includeLive,
+      timezone,
+    });
+    const aggregate = buildGmAggregates({ sessions, timezone, now })[0] ?? null;
+
+    res.status(200).json({
+      sessions,
+      aggregate,
+      meta: {
+        from,
+        to,
+        includeLive,
+        timezone,
+        totalSessions: sessions.length,
       },
     });
   } catch (error) {
