@@ -88,6 +88,9 @@ export const users = pgTable(
     region: text("region"),
     ipp: numeric("ipp", { precision: 4, scale: 1 }),
     isBillaGm: boolean("is_billa_gm").notNull().default(false),
+    profilePhotoBucket: text("profile_photo_bucket"),
+    profilePhotoPath: text("profile_photo_path"),
+    profilePhotoUpdatedAt: timestamp("profile_photo_updated_at", { withTimezone: true }),
 
     isActive: boolean("is_active").notNull().default(true),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),

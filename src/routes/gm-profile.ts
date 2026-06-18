@@ -1,15 +1,29 @@
+import crypto from "node:crypto";
 import { and, desc, eq, gte, isNotNull, lt, sql } from "drizzle-orm";
 import { Router } from "express";
+import { z } from "zod";
 import { ensureAndGetGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { redMonthPeriodToYmd, resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
 import { loadZeiterfassungDaySessions } from "../lib/zeiterfassung-days.js";
 import { db } from "../lib/db.js";
 import { markets, users, visitSessions } from "../lib/schema.js";
+import { supabaseAdmin } from "../lib/supabase.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const gmProfileRouter = Router();
 
 const VIENNA_TIMEZONE = "Europe/Vienna";
+const GM_PROFILE_PHOTOS_BUCKET = "gm-profile-photos";
+const PROFILE_PHOTO_SIGNED_URL_SECONDS = 60 * 60;
+const PROFILE_PHOTO_MAX_BYTES = 5 * 1024 * 1024;
+const PROFILE_PHOTO_MIME_BY_EXT: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  heic: "image/heic",
+  heif: "image/heif",
+};
 
 function ymdInTimezone(date: Date, timezone = VIENNA_TIMEZONE): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -38,6 +52,53 @@ function addOneDay(date: Date): Date {
 }
 
 gmProfileRouter.use(requireAuth(["gm"]));
+
+function cleanStoragePath(path: string): string {
+  return path.replace(/^\/+/, "").replace(/\\/g, "/");
+}
+
+function normalizeProfilePhotoExt(input?: { extension?: string | undefined; mimeType?: string | undefined }): string {
+  const rawExt = (input?.extension ?? "").trim().toLowerCase().replace(/^\./, "");
+  if (rawExt && PROFILE_PHOTO_MIME_BY_EXT[rawExt]) return rawExt === "jpeg" ? "jpg" : rawExt;
+  const mime = (input?.mimeType ?? "").trim().toLowerCase();
+  const match = Object.entries(PROFILE_PHOTO_MIME_BY_EXT).find(([, value]) => value === mime);
+  if (match) return match[0] === "jpeg" ? "jpg" : match[0];
+  return "jpg";
+}
+
+function isAllowedProfilePhotoMime(mimeType: string | null | undefined): boolean {
+  if (!mimeType) return true;
+  return Object.values(PROFILE_PHOTO_MIME_BY_EXT).includes(mimeType.toLowerCase());
+}
+
+async function signProfilePhotoUrl(input: {
+  storageBucket: string | null;
+  storagePath: string | null;
+}): Promise<{ storageBucket: string; storagePath: string; signedUrl: string; expiresAt: string } | null> {
+  if (!input.storageBucket || !input.storagePath) return null;
+  if (input.storageBucket !== GM_PROFILE_PHOTOS_BUCKET) return null;
+  const normalizedPath = cleanStoragePath(input.storagePath);
+  const { data, error } = await supabaseAdmin.storage
+    .from(GM_PROFILE_PHOTOS_BUCKET)
+    .createSignedUrl(normalizedPath, PROFILE_PHOTO_SIGNED_URL_SECONDS);
+  if (error || !data?.signedUrl) return null;
+  return {
+    storageBucket: GM_PROFILE_PHOTOS_BUCKET,
+    storagePath: normalizedPath,
+    signedUrl: data.signedUrl,
+    expiresAt: new Date(Date.now() + PROFILE_PHOTO_SIGNED_URL_SECONDS * 1000).toISOString(),
+  };
+}
+
+async function verifyStorageObjectExists(bucket: string, storagePath: string): Promise<boolean> {
+  const normalized = cleanStoragePath(storagePath);
+  const lastSlash = normalized.lastIndexOf("/");
+  const folder = lastSlash >= 0 ? normalized.slice(0, lastSlash) : "";
+  const fileName = lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
+  const { data, error } = await supabaseAdmin.storage.from(bucket).list(folder, { search: fileName, limit: 10 });
+  if (error) return false;
+  return (data ?? []).some((entry) => entry.name === fileName);
+}
 
 gmProfileRouter.get("/profile", async (req: AuthedRequest, res, next) => {
   try {
@@ -144,6 +205,10 @@ gmProfileRouter.get("/profile", async (req: AuthedRequest, res, next) => {
         postalCode: user.postalCode ?? "",
         region: user.region ?? "",
         isBillaGm: user.isBillaGm,
+        profilePhoto: await signProfilePhotoUrl({
+          storageBucket: user.profilePhotoBucket,
+          storagePath: user.profilePhotoPath,
+        }),
         createdAt: user.createdAt.toISOString(),
         updatedAt: user.updatedAt.toISOString(),
       },
@@ -177,6 +242,133 @@ gmProfileRouter.get("/profile", async (req: AuthedRequest, res, next) => {
         averageWorkdayMin,
         trackedWeekDays: weekSessions.length,
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmProfileRouter.post("/profile/photo/presign", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+
+    const parsed = z
+      .object({
+        extension: z.string().max(12).optional(),
+        mimeType: z.string().max(80).optional(),
+      })
+      .strict()
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültiges Profilfoto-Payload." });
+      return;
+    }
+    if (!isAllowedProfilePhotoMime(parsed.data.mimeType)) {
+      res.status(400).json({ error: "Profilfoto muss ein Bild im Format JPG, PNG oder WebP sein." });
+      return;
+    }
+
+    const ext = normalizeProfilePhotoExt(parsed.data);
+    const path = `${GM_PROFILE_PHOTOS_BUCKET}/${gmUserId}/${crypto.randomUUID()}.${ext}`;
+    const { data, error } = await supabaseAdmin.storage.from(GM_PROFILE_PHOTOS_BUCKET).createSignedUploadUrl(path);
+    if (error || !data) {
+      res.status(500).json({ error: "Upload-Link konnte nicht erstellt werden." });
+      return;
+    }
+
+    res.status(200).json({
+      upload: {
+        bucket: GM_PROFILE_PHOTOS_BUCKET,
+        path: data.path,
+        signedUrl: data.signedUrl,
+        token: data.token,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmProfileRouter.post("/profile/photo/commit", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+
+    const parsed = z
+      .object({
+        storageBucket: z.literal(GM_PROFILE_PHOTOS_BUCKET),
+        storagePath: z.string().min(1),
+        mimeType: z.string().max(80).optional(),
+        byteSize: z.number().int().min(1).max(PROFILE_PHOTO_MAX_BYTES).optional(),
+      })
+      .strict()
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Profilfoto konnte nicht gespeichert werden." });
+      return;
+    }
+    if (!isAllowedProfilePhotoMime(parsed.data.mimeType)) {
+      res.status(400).json({ error: "Profilfoto muss ein Bild im Format JPG, PNG oder WebP sein." });
+      return;
+    }
+
+    const normalizedPath = cleanStoragePath(parsed.data.storagePath);
+    const expectedPrefix = `${GM_PROFILE_PHOTOS_BUCKET}/${gmUserId}/`;
+    if (!normalizedPath.startsWith(expectedPrefix)) {
+      res.status(403).json({ error: "Dieses Profilfoto gehört nicht zu deinem Account." });
+      return;
+    }
+    const exists = await verifyStorageObjectExists(GM_PROFILE_PHOTOS_BUCKET, normalizedPath);
+    if (!exists) {
+      res.status(400).json({ error: "Profilfoto wurde noch nicht vollständig hochgeladen." });
+      return;
+    }
+
+    const [previousUser] = await db
+      .select({
+        profilePhotoBucket: users.profilePhotoBucket,
+        profilePhotoPath: users.profilePhotoPath,
+      })
+      .from(users)
+      .where(eq(users.id, gmUserId))
+      .limit(1);
+
+    const [updatedUser] = await db
+      .update(users)
+      .set({
+        profilePhotoBucket: GM_PROFILE_PHOTOS_BUCKET,
+        profilePhotoPath: normalizedPath,
+        profilePhotoUpdatedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(users.id, gmUserId))
+      .returning({
+        profilePhotoBucket: users.profilePhotoBucket,
+        profilePhotoPath: users.profilePhotoPath,
+      });
+
+    const previousPath = previousUser?.profilePhotoPath ? cleanStoragePath(previousUser.profilePhotoPath) : null;
+    if (
+      previousUser?.profilePhotoBucket === GM_PROFILE_PHOTOS_BUCKET &&
+      previousPath &&
+      previousPath !== normalizedPath
+    ) {
+      void supabaseAdmin.storage.from(GM_PROFILE_PHOTOS_BUCKET).remove([previousPath]);
+    }
+
+    res.status(200).json({
+      ok: true,
+      profilePhoto: await signProfilePhotoUrl({
+        storageBucket: updatedUser?.profilePhotoBucket ?? GM_PROFILE_PHOTOS_BUCKET,
+        storagePath: updatedUser?.profilePhotoPath ?? normalizedPath,
+      }),
     });
   } catch (error) {
     next(error);
