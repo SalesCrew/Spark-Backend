@@ -23,6 +23,7 @@ import {
   visitAnswerOptions,
   visitAnswerPhotoTags,
   visitAnswerPhotos,
+  visitAnswerChangeRequests,
   visitAnswers,
   visitAnswerEvents,
   visitQuestionComments,
@@ -135,6 +136,11 @@ const adminSubmittedVisitAnswerPatchSchema = z
     comment: z.string().max(4000).optional(),
   })
   .strict();
+const adminChangeRequestDecisionSchema = z
+  .object({
+    adminNote: z.string().trim().max(700).optional(),
+  })
+  .strict();
 
 function deriveVisitAnswerEventType(input: {
   previousStatus: "unanswered" | "answered" | "invalid" | "hidden_by_rule" | "skipped" | null;
@@ -210,6 +216,77 @@ function isUuid(value: string) {
 
 function normalizeUnique(values: string[]): string[] {
   return Array.from(new Set(values.map((v) => v.trim()).filter((v) => v.length > 0)));
+}
+
+function asPlainRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? normalizeUnique(value.filter((entry): entry is string => typeof entry === "string")) : [];
+}
+
+function normalizeChangeRequestAnswerPayload(input: {
+  questionType: string;
+  payload: Record<string, unknown>;
+}): { ok: true; answer: unknown } | { ok: false; error: string; code: string } {
+  const payload = input.payload;
+  if ("rawAnswer" in payload) return { ok: true, answer: payload.rawAnswer };
+
+  if (input.questionType === "single" || input.questionType === "yesno" || input.questionType === "text") {
+    const value = typeof payload.value === "string" ? payload.value.trim() : "";
+    if (!value) return { ok: false, error: "Anfrage enthaelt keinen direkt anwendbaren Antwortwert.", code: "change_request_not_applicable" };
+    return { ok: true, answer: value };
+  }
+
+  if (input.questionType === "multiple") {
+    const values = stringList(payload.values);
+    if (values.length > 0) return { ok: true, answer: values };
+    const value = typeof payload.value === "string" ? payload.value.trim() : "";
+    if (!value) return { ok: false, error: "Anfrage enthaelt keine Mehrfachauswahl.", code: "change_request_not_applicable" };
+    return { ok: true, answer: [value] };
+  }
+
+  if (input.questionType === "yesnomulti") {
+    const top = typeof payload.top === "string"
+      ? payload.top.trim()
+      : typeof payload.sel === "string"
+        ? payload.sel.trim()
+        : "";
+    const subs = stringList(payload.subs);
+    if (!top) return { ok: false, error: "Anfrage enthaelt keine Ja/Nein-Auswahl.", code: "change_request_not_applicable" };
+    return { ok: true, answer: JSON.stringify({ sel: top, subs }) };
+  }
+
+  if (input.questionType === "likert" || input.questionType === "numeric" || input.questionType === "slider") {
+    const value = payload.value;
+    if (typeof value !== "number" && typeof value !== "string") {
+      return { ok: false, error: "Anfrage enthaelt keinen Zahlenwert.", code: "change_request_not_applicable" };
+    }
+    return { ok: true, answer: value };
+  }
+
+  if (input.questionType === "matrix") {
+    const value = payload.value;
+    if (Array.isArray(value) || (typeof value === "string" && value.trim().startsWith("{"))) {
+      return { ok: true, answer: value };
+    }
+    return {
+      ok: false,
+      error: "Matrix-Anfragen muessen manuell geprueft werden, weil kein strukturierter Matrixwert vorliegt.",
+      code: "change_request_manual_review_required",
+    };
+  }
+
+  if (input.questionType === "photo") {
+    return {
+      ok: false,
+      error: "Foto-Anfragen koennen ohne neue Datei nicht automatisch angewendet werden.",
+      code: "change_request_manual_review_required",
+    };
+  }
+
+  return { ok: false, error: "Dieser Fragetyp kann nicht automatisch angewendet werden.", code: "change_request_not_applicable" };
 }
 
 function normalizeQuestionChains(chains: string[] | null | undefined): string[] {
@@ -1573,6 +1650,470 @@ adminCampaignsRouter.get("/campaigns/:campaignId/markets/:marketId/visit-detail"
     }
     res.status(200).json({ market: detail });
   } catch (error) {
+    next(error);
+  }
+});
+
+adminCampaignsRouter.get("/campaigns/answer-change-requests", async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins koennen Aenderungsanfragen pruefen.", code: "admin_required" });
+      return;
+    }
+
+    const rows = await db
+      .select({
+        id: visitAnswerChangeRequests.id,
+        visitSessionId: visitAnswerChangeRequests.visitSessionId,
+        visitSessionQuestionId: visitAnswerChangeRequests.visitSessionQuestionId,
+        visitAnswerId: visitAnswerChangeRequests.visitAnswerId,
+        questionType: visitAnswerChangeRequests.questionType,
+        questionTextSnapshot: visitAnswerChangeRequests.questionTextSnapshot,
+        currentAnswerSnapshot: visitAnswerChangeRequests.currentAnswerSnapshot,
+        requestedAnswerPayload: visitAnswerChangeRequests.requestedAnswerPayload,
+        requestedAnswerSummary: visitAnswerChangeRequests.requestedAnswerSummary,
+        requestNote: visitAnswerChangeRequests.requestNote,
+        status: visitAnswerChangeRequests.status,
+        reviewedByUserId: visitAnswerChangeRequests.reviewedByUserId,
+        reviewedAt: visitAnswerChangeRequests.reviewedAt,
+        adminNote: visitAnswerChangeRequests.adminNote,
+        createdAt: visitAnswerChangeRequests.createdAt,
+        updatedAt: visitAnswerChangeRequests.updatedAt,
+        gmUserId: users.id,
+        gmFirstName: users.firstName,
+        gmLastName: users.lastName,
+        gmEmail: users.email,
+        gmRegion: users.region,
+        marketId: markets.id,
+        marketName: markets.name,
+        marketAddress: markets.address,
+        marketPostalCode: markets.postalCode,
+        marketCity: markets.city,
+        marketRegion: markets.region,
+        sessionStartedAt: visitSessions.startedAt,
+        sessionSubmittedAt: visitSessions.submittedAt,
+        section: visitSessionSections.section,
+        campaignId: visitSessionSections.campaignId,
+        campaignName: campaigns.name,
+        fragebogenName: visitSessionSections.fragebogenNameSnapshot,
+      })
+      .from(visitAnswerChangeRequests)
+      .innerJoin(users, eq(users.id, visitAnswerChangeRequests.gmUserId))
+      .innerJoin(markets, eq(markets.id, visitAnswerChangeRequests.marketId))
+      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswerChangeRequests.visitSessionId))
+      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswerChangeRequests.visitSessionSectionId))
+      .leftJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+      .where(eq(visitAnswerChangeRequests.isDeleted, false))
+      .orderBy(
+        sql`case when ${visitAnswerChangeRequests.status} = 'pending' then 0 else 1 end`,
+        desc(visitAnswerChangeRequests.createdAt),
+      )
+      .limit(250);
+
+    const requests = rows.map((row) => {
+      const applicability = normalizeChangeRequestAnswerPayload({
+        questionType: row.questionType,
+        payload: asPlainRecord(row.requestedAnswerPayload),
+      });
+      return {
+        id: row.id,
+        status: row.status,
+        createdAt: row.createdAt.toISOString(),
+        updatedAt: row.updatedAt.toISOString(),
+        reviewedByUserId: row.reviewedByUserId,
+        reviewedAt: row.reviewedAt?.toISOString() ?? null,
+        adminNote: row.adminNote,
+        visitSessionId: row.visitSessionId,
+        visitSessionQuestionId: row.visitSessionQuestionId,
+        visitAnswerId: row.visitAnswerId,
+        questionType: row.questionType,
+        questionText: row.questionTextSnapshot,
+        currentAnswerSnapshot: row.currentAnswerSnapshot ?? {},
+        requestedAnswerPayload: row.requestedAnswerPayload ?? {},
+        requestedAnswerSummary: row.requestedAnswerSummary,
+        requestNote: row.requestNote,
+        autoApplicable: applicability.ok,
+        autoApplicabilityError: applicability.ok ? null : applicability.error,
+        gm: {
+          id: row.gmUserId,
+          name: [row.gmFirstName, row.gmLastName].filter(Boolean).join(" ").trim() || row.gmEmail,
+          email: row.gmEmail,
+          region: row.gmRegion,
+        },
+        market: {
+          id: row.marketId,
+          name: row.marketName,
+          address: row.marketAddress,
+          postalCode: row.marketPostalCode,
+          city: row.marketCity,
+          region: row.marketRegion,
+        },
+        session: {
+          id: row.visitSessionId,
+          startedAt: row.sessionStartedAt?.toISOString() ?? null,
+          submittedAt: row.sessionSubmittedAt?.toISOString() ?? null,
+        },
+        section: {
+          section: row.section,
+          campaignId: row.campaignId,
+          campaignName: row.campaignName ?? "",
+          fragebogenName: row.fragebogenName,
+        },
+      };
+    });
+
+    res.status(200).json({ requests });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/reject", async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins koennen Aenderungsanfragen pruefen.", code: "admin_required" });
+      return;
+    }
+
+    const requestId = String(req.params.requestId ?? "");
+    if (!isUuid(requestId)) {
+      res.status(400).json({ error: "Ungueltige Anfrage-ID.", code: "invalid_request_id" });
+      return;
+    }
+    const parsed = adminChangeRequestDecisionSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltiges Entscheidungs-Payload.", code: "invalid_payload" });
+      return;
+    }
+    const now = new Date();
+    const [updated] = await db
+      .update(visitAnswerChangeRequests)
+      .set({
+        status: "rejected",
+        reviewedByUserId: req.authUser?.appUserId ?? null,
+        reviewedAt: now,
+        adminNote: parsed.data.adminNote || null,
+        updatedAt: now,
+      })
+      .where(and(eq(visitAnswerChangeRequests.id, requestId), eq(visitAnswerChangeRequests.status, "pending"), eq(visitAnswerChangeRequests.isDeleted, false)))
+      .returning({
+        id: visitAnswerChangeRequests.id,
+        status: visitAnswerChangeRequests.status,
+        updatedAt: visitAnswerChangeRequests.updatedAt,
+      });
+    if (!updated) {
+      res.status(404).json({ error: "Offene Anfrage wurde nicht gefunden.", code: "request_not_found" });
+      return;
+    }
+    res.status(200).json({ ok: true, request: { id: updated.id, status: updated.status, updatedAt: updated.updatedAt.toISOString() } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve", async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins koennen Aenderungsanfragen pruefen.", code: "admin_required" });
+      return;
+    }
+
+    const requestId = String(req.params.requestId ?? "");
+    if (!isUuid(requestId)) {
+      res.status(400).json({ error: "Ungueltige Anfrage-ID.", code: "invalid_request_id" });
+      return;
+    }
+    const parsed = adminChangeRequestDecisionSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltiges Entscheidungs-Payload.", code: "invalid_payload" });
+      return;
+    }
+    const actorUserId = req.authUser?.appUserId ?? null;
+    const now = new Date();
+
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from ${visitAnswerChangeRequests} where ${visitAnswerChangeRequests.id} = ${requestId} for update`);
+      const [requestRow] = await tx
+        .select()
+        .from(visitAnswerChangeRequests)
+        .where(and(eq(visitAnswerChangeRequests.id, requestId), eq(visitAnswerChangeRequests.isDeleted, false)))
+        .limit(1);
+      if (!requestRow || requestRow.status !== "pending") {
+        const error = new Error("Offene Anfrage wurde nicht gefunden.") as Error & { status?: number; code?: string };
+        error.status = 404;
+        error.code = "request_not_found";
+        throw error;
+      }
+
+      const [session] = await tx
+        .select({
+          id: visitSessions.id,
+          gmUserId: visitSessions.gmUserId,
+          marketId: visitSessions.marketId,
+          status: visitSessions.status,
+          submittedAt: visitSessions.submittedAt,
+        })
+        .from(visitSessions)
+        .where(and(eq(visitSessions.id, requestRow.visitSessionId), eq(visitSessions.isDeleted, false)))
+        .limit(1);
+      if (!session || session.status !== "submitted") {
+        const error = new Error("Nur abgeschlossene Sessions koennen bearbeitet werden.") as Error & { status?: number; code?: string };
+        error.status = 409;
+        error.code = "session_not_submitted";
+        throw error;
+      }
+
+      const [visitQuestion] = await tx
+        .select({
+          visitQuestionId: visitSessionQuestions.id,
+          visitSessionSectionId: visitSessionSections.id,
+          questionId: visitSessionQuestions.questionId,
+          questionType: visitSessionQuestions.questionType,
+          questionConfigSnapshot: visitSessionQuestions.questionConfigSnapshot,
+        })
+        .from(visitSessionQuestions)
+        .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+        .where(
+          and(
+            eq(visitSessionQuestions.id, requestRow.visitSessionQuestionId),
+            eq(visitSessionQuestions.isDeleted, false),
+            eq(visitSessionSections.visitSessionId, session.id),
+            eq(visitSessionSections.isDeleted, false),
+          ),
+        )
+        .limit(1);
+      if (!visitQuestion) {
+        const error = new Error("Frage in Session nicht gefunden.") as Error & { status?: number; code?: string };
+        error.status = 404;
+        error.code = "question_not_found";
+        throw error;
+      }
+
+      const rawAnswer = normalizeChangeRequestAnswerPayload({
+        questionType: visitQuestion.questionType,
+        payload: asPlainRecord(requestRow.requestedAnswerPayload),
+      });
+      if (!rawAnswer.ok) {
+        const error = new Error(rawAnswer.error) as Error & { status?: number; code?: string };
+        error.status = rawAnswer.code === "change_request_manual_review_required" ? 422 : 400;
+        error.code = rawAnswer.code;
+        throw error;
+      }
+
+      const validation = buildVisitAnswerValidationResult(
+        visitQuestion.questionType,
+        (visitQuestion.questionConfigSnapshot ?? {}) as Record<string, unknown>,
+        rawAnswer.answer,
+      );
+      if (validation.answerStatus !== "answered" || !validation.isValid) {
+        const error = new Error(validation.validationError ?? "Angefragte Antwort ist nicht gueltig.") as Error & { status?: number; code?: string };
+        error.status = 400;
+        error.code = "requested_answer_invalid";
+        throw error;
+      }
+
+      await tx.execute(sql`select id from ${visitSessionQuestions} where ${visitSessionQuestions.id} = ${visitQuestion.visitQuestionId} for update`);
+      const [existing] = await tx
+        .select()
+        .from(visitAnswers)
+        .where(and(eq(visitAnswers.visitSessionQuestionId, visitQuestion.visitQuestionId), eq(visitAnswers.isDeleted, false)))
+        .limit(1);
+      const beforeSnapshot = existing
+        ? {
+            answerStatus: existing.answerStatus,
+            valueText: existing.valueText,
+            valueNumber: existing.valueNumber == null ? null : String(existing.valueNumber),
+            valueJson: (existing.valueJson as Record<string, unknown> | null) ?? null,
+            isValid: existing.isValid,
+            validationError: existing.validationError,
+            version: existing.version,
+          }
+        : null;
+
+      let answerId = existing?.id ?? null;
+      let afterVersion = 1;
+      if (existing) {
+        const [updatedAnswer] = await tx
+          .update(visitAnswers)
+          .set({
+            answerStatus: validation.answerStatus,
+            valueText: validation.valueText,
+            valueNumber: validation.valueNumber,
+            valueJson: validation.valueJson,
+            isValid: validation.isValid,
+            validationError: validation.validationError,
+            answeredAt: now,
+            changedAt: now,
+            version: existing.version + 1,
+            updatedAt: now,
+          })
+          .where(eq(visitAnswers.id, existing.id))
+          .returning({ id: visitAnswers.id, version: visitAnswers.version });
+        answerId = updatedAnswer?.id ?? existing.id;
+        afterVersion = updatedAnswer?.version ?? (existing.version + 1);
+      } else {
+        const [createdAnswer] = await tx
+          .insert(visitAnswers)
+          .values({
+            visitSessionId: session.id,
+            visitSessionSectionId: visitQuestion.visitSessionSectionId,
+            visitSessionQuestionId: visitQuestion.visitQuestionId,
+            questionId: visitQuestion.questionId,
+            questionType: visitQuestion.questionType,
+            answerStatus: validation.answerStatus,
+            valueText: validation.valueText,
+            valueNumber: validation.valueNumber,
+            valueJson: validation.valueJson,
+            isValid: validation.isValid,
+            validationError: validation.validationError,
+            answeredAt: now,
+            changedAt: now,
+            version: 1,
+            isDeleted: false,
+            deletedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning({ id: visitAnswers.id, version: visitAnswers.version });
+        answerId = createdAnswer?.id ?? null;
+        afterVersion = createdAnswer?.version ?? 1;
+      }
+      if (!answerId) throw new Error("Antwort konnte nicht gespeichert werden.");
+
+      await tx
+        .update(visitAnswerOptions)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(eq(visitAnswerOptions.visitAnswerId, answerId), eq(visitAnswerOptions.isDeleted, false)));
+      if (validation.options.length > 0) {
+        await tx.insert(visitAnswerOptions).values(
+          validation.options.map((opt) => ({
+            visitAnswerId: answerId as string,
+            optionRole: opt.optionRole,
+            optionValue: opt.optionValue,
+            orderIndex: opt.orderIndex,
+            isDeleted: false,
+            deletedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          })),
+        );
+      }
+
+      await tx
+        .update(visitAnswerMatrixCells)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(eq(visitAnswerMatrixCells.visitAnswerId, answerId), eq(visitAnswerMatrixCells.isDeleted, false)));
+      if (validation.matrixCells.length > 0) {
+        await tx.insert(visitAnswerMatrixCells).values(
+          validation.matrixCells.map((cell) => ({
+            visitAnswerId: answerId as string,
+            rowKey: cell.rowKey,
+            columnKey: cell.columnKey,
+            cellValueText: cell.cellValueText,
+            cellValueDate: cell.cellValueDate,
+            cellSelected: cell.cellSelected,
+            orderIndex: cell.orderIndex,
+            isDeleted: false,
+            deletedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          })),
+        );
+      }
+
+      await tx.insert(visitAnswerEvents).values({
+        visitAnswerId: answerId as string,
+        eventType: deriveVisitAnswerEventType({
+          previousStatus: beforeSnapshot?.answerStatus ?? null,
+          nextStatus: validation.answerStatus,
+        }),
+        payload: {
+          source: "admin_change_request_approved",
+          requestId: requestRow.id,
+          sessionId: session.id,
+          visitQuestionId: visitQuestion.visitQuestionId,
+          questionId: visitQuestion.questionId,
+          before: beforeSnapshot,
+          after: {
+            answerStatus: validation.answerStatus,
+            valueText: validation.valueText,
+            valueNumber: validation.valueNumber,
+            valueJson: validation.valueJson,
+            isValid: validation.isValid,
+            validationError: validation.validationError,
+            version: afterVersion,
+          },
+        },
+        actorUserId,
+        createdAt: now,
+      });
+
+      await tx
+        .update(visitAnswerChangeRequests)
+        .set({
+          visitAnswerId: answerId as string,
+          status: "approved",
+          reviewedByUserId: actorUserId,
+          reviewedAt: now,
+          adminNote: parsed.data.adminNote || null,
+          updatedAt: now,
+        })
+        .where(eq(visitAnswerChangeRequests.id, requestRow.id));
+
+      await tx
+        .update(visitSessions)
+        .set({ lastSavedAt: now, updatedAt: now })
+        .where(eq(visitSessions.id, session.id));
+
+      await finalizeBonusForSubmittedVisitSessionTx(tx, {
+        sessionId: session.id,
+        gmUserId: session.gmUserId,
+        marketId: session.marketId,
+        submittedAt: session.submittedAt ?? now,
+      });
+
+      return {
+        requestId: requestRow.id,
+        answerId: answerId as string,
+        sessionId: session.id,
+        gmUserId: session.gmUserId,
+        marketId: session.marketId,
+        submittedAt: session.submittedAt ?? now,
+      };
+    });
+
+    try {
+      await enqueueIppRecalcForDate(result.marketId, result.submittedAt, "visit_answer_change_request_approved");
+    } catch (enqueueError) {
+      logger.error("answer_change_request_ipp_enqueue_failed", {
+        action: "answer_change_request_approved",
+        result: "failure",
+        requestId: result.requestId,
+        sessionId: result.sessionId,
+        marketId: result.marketId,
+        error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
+      });
+    }
+    try {
+      await recomputeGmKpiCache(result.gmUserId);
+    } catch (kpiError) {
+      logger.error("answer_change_request_kpi_recompute_failed", {
+        action: "answer_change_request_approved",
+        result: "failure",
+        requestId: result.requestId,
+        sessionId: result.sessionId,
+        gmUserId: result.gmUserId,
+        error: kpiError instanceof Error ? kpiError.message : String(kpiError),
+      });
+    }
+
+    res.status(200).json({ ok: true, request: { id: result.requestId, status: "approved" }, answerId: result.answerId });
+  } catch (error) {
+    const err = error as Error & { status?: number; code?: string };
+    if (err.status) {
+      res.status(err.status).json({ error: err.message, code: err.code });
+      return;
+    }
     next(error);
   }
 });

@@ -89,6 +89,9 @@ type PhotoRow = {
   campaignEndDate: string | null;
   marketId: string;
   marketName: string;
+  marketStandardMarketNumber: string | null;
+  marketCokeMasterNumber: string | null;
+  marketKuehlerStammnr: string | null;
   marketAddress: string;
   marketPostalCode: string;
   marketCity: string;
@@ -311,6 +314,9 @@ function basePhotoSelect(where: SQL) {
       campaignEndDate: campaigns.endDate,
       marketId: markets.id,
       marketName: markets.name,
+      marketStandardMarketNumber: markets.standardMarketNumber,
+      marketCokeMasterNumber: markets.cokeMasterNumber,
+      marketKuehlerStammnr: markets.kuehlerStammnr,
       marketAddress: markets.address,
       marketPostalCode: markets.postalCode,
       marketCity: markets.city,
@@ -415,6 +421,9 @@ async function mapPhotoRows(rows: PhotoRow[], options: { signOriginal?: boolean 
         market: {
           id: row.marketId,
           name: row.marketName,
+          standardMarketNumber: row.marketStandardMarketNumber,
+          cokeMasterNumber: row.marketCokeMasterNumber,
+          kuehlerStammnr: row.marketKuehlerStammnr,
           address: row.marketAddress,
           postalCode: row.marketPostalCode,
           city: row.marketCity,

@@ -41,6 +41,7 @@ export const visitSectionStatusEnum = pgEnum("visit_section_status", ["draft", "
 export const visitAnswerStatusEnum = pgEnum("visit_answer_status", ["unanswered", "answered", "hidden_by_rule", "skipped", "invalid"]);
 export const visitAnswerOptionRoleEnum = pgEnum("visit_answer_option_role", ["top", "sub"]);
 export const visitAnswerEventTypeEnum = pgEnum("visit_answer_event_type", ["set", "clear", "status_change"]);
+export const visitAnswerChangeRequestStatusEnum = pgEnum("visit_answer_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
 export const marketTypeEnum = pgEnum("market_type", ["universum", "kuehler", "both"]);
 export const timeTrackingActivityTypeEnum = pgEnum("time_tracking_activity_type", [
   "sonderaufgabe",
@@ -1761,6 +1762,55 @@ export const visitAnswerPhotoTags = pgTable(
     index("visit_answer_photo_tags_photo_idx").on(table.visitAnswerPhotoId),
     index("visit_answer_photo_tags_photo_deleted_idx").on(table.visitAnswerPhotoId, table.isDeleted),
     index("visit_answer_photo_tags_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const visitAnswerChangeRequests = pgTable(
+  "visit_answer_change_requests",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    visitSessionId: uuid("visit_session_id")
+      .notNull()
+      .references(() => visitSessions.id, { onDelete: "cascade" }),
+    visitSessionSectionId: uuid("visit_session_section_id")
+      .notNull()
+      .references(() => visitSessionSections.id, { onDelete: "cascade" }),
+    visitSessionQuestionId: uuid("visit_session_question_id")
+      .notNull()
+      .references(() => visitSessionQuestions.id, { onDelete: "cascade" }),
+    visitAnswerId: uuid("visit_answer_id").references(() => visitAnswers.id, { onDelete: "set null" }),
+    questionId: uuid("question_id")
+      .notNull()
+      .references(() => questionBankShared.id, { onDelete: "restrict" }),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    marketId: uuid("market_id")
+      .notNull()
+      .references(() => markets.id, { onDelete: "cascade" }),
+    questionType: questionTypeEnum("question_type").notNull(),
+    questionTextSnapshot: text("question_text_snapshot").notNull().default(""),
+    currentAnswerSnapshot: jsonb("current_answer_snapshot").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    requestedAnswerPayload: jsonb("requested_answer_payload").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    requestedAnswerSummary: text("requested_answer_summary").notNull().default(""),
+    requestNote: text("request_note"),
+    status: visitAnswerChangeRequestStatusEnum("status").notNull().default("pending"),
+    reviewedByUserId: uuid("reviewed_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    adminNote: text("admin_note"),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("visit_answer_change_requests_pending_question_unique")
+      .on(table.gmUserId, table.visitSessionQuestionId)
+      .where(sql`${table.isDeleted} = false AND ${table.status} = 'pending'`),
+    index("visit_answer_change_requests_gm_status_idx").on(table.gmUserId, table.status, table.createdAt),
+    index("visit_answer_change_requests_session_idx").on(table.visitSessionId, table.createdAt),
+    index("visit_answer_change_requests_market_idx").on(table.marketId, table.createdAt),
+    index("visit_answer_change_requests_deleted_idx").on(table.isDeleted),
   ],
 );
 

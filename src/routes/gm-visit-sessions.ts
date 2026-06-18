@@ -30,6 +30,7 @@ import {
   markets,
   photoTags,
   users,
+  visitAnswerChangeRequests,
   visitAnswerMatrixCells,
   visitAnswerOptions,
   visitAnswerPhotoTags,
@@ -76,6 +77,12 @@ function isBillaMarketRow(input: { name: string | null | undefined; dbName: stri
 const VISIT_PHOTO_READ_URL_TIMEOUT_MS = 1800;
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const isUuid = (value: string | null | undefined): value is string => Boolean(value && uuidRegex.test(value));
+const changeRequestBodySchema = z.object({
+  visitQuestionId: z.string().regex(uuidRegex),
+  requestedAnswerPayload: z.record(z.string(), z.unknown()).default({}),
+  requestedAnswerSummary: z.string().trim().min(1).max(700),
+  requestNote: z.string().trim().max(700).optional(),
+});
 const SINGLE_CHOICE_AVAILABILITY_TYPES = ["Cooler", "SingleServe", "MultiServe", "Promos", "Warehouse"] as const;
 type SingleChoiceAvailabilityType = (typeof SINGLE_CHOICE_AVAILABILITY_TYPES)[number];
 const QUESTION_TYPES = ["single", "yesno", "yesnomulti", "multiple", "likert", "text", "numeric", "slider", "photo", "matrix"] as const;
@@ -325,6 +332,61 @@ function normalizeOptionsFromConfig(config: Record<string, unknown>): string[] {
 
 function normalizeUnique(values: string[]): string[] {
   return Array.from(new Set(values.map((v) => v.trim()).filter((v) => v.length > 0)));
+}
+
+function buildAnswerChangeRequestSnapshot(input: {
+  answer?: typeof visitAnswers.$inferSelect;
+  options: Array<typeof visitAnswerOptions.$inferSelect>;
+  matrixCells: Array<typeof visitAnswerMatrixCells.$inferSelect>;
+  photos: Array<typeof visitAnswerPhotos.$inferSelect>;
+}): Record<string, unknown> {
+  const answer = input.answer;
+  if (!answer) {
+    return {
+      answerStatus: "unanswered",
+      valueText: null,
+      valueNumber: null,
+      valueJson: null,
+      options: [],
+      matrixCells: [],
+      photos: [],
+    };
+  }
+  return {
+    answerId: answer.id,
+    answerStatus: answer.answerStatus,
+    valueText: answer.valueText,
+    valueNumber: answer.valueNumber,
+    valueJson: answer.valueJson ?? null,
+    isValid: answer.isValid,
+    validationError: answer.validationError,
+    version: answer.version,
+    answeredAt: answer.answeredAt?.toISOString() ?? null,
+    changedAt: answer.changedAt.toISOString(),
+    options: input.options.map((option) => ({
+      optionRole: option.optionRole,
+      optionValue: option.optionValue,
+      orderIndex: option.orderIndex,
+    })),
+    matrixCells: input.matrixCells.map((cell) => ({
+      rowKey: cell.rowKey,
+      columnKey: cell.columnKey,
+      cellValueText: cell.cellValueText,
+      cellValueDate: cell.cellValueDate,
+      cellSelected: cell.cellSelected,
+      orderIndex: cell.orderIndex,
+    })),
+    photos: input.photos.map((photo) => ({
+      id: photo.id,
+      storageBucket: photo.storageBucket,
+      storagePath: photo.storagePath,
+      mimeType: photo.mimeType,
+      byteSize: photo.byteSize,
+      widthPx: photo.widthPx,
+      heightPx: photo.heightPx,
+      uploadedAt: photo.uploadedAt.toISOString(),
+    })),
+  };
 }
 
 function normalizeMarketChain(value: string | null | undefined): string {
@@ -1987,6 +2049,333 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       res.status(err.status).json({ error: err.message ?? "visit session Fehler", code: err.code, details: err.details });
       return;
     }
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.get("/gm/visit-sessions/completed", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+
+    const requestedLimit = Number(Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit ?? 80);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(120, Math.floor(requestedLimit)))
+      : 80;
+
+    const sessionRows = await db
+      .select({
+        id: visitSessions.id,
+        startedAt: visitSessions.startedAt,
+        submittedAt: visitSessions.submittedAt,
+        marketId: markets.id,
+        marketName: markets.name,
+        marketAddress: markets.address,
+        marketPostalCode: markets.postalCode,
+        marketCity: markets.city,
+      })
+      .from(visitSessions)
+      .innerJoin(markets, eq(markets.id, visitSessions.marketId))
+      .where(and(
+        eq(visitSessions.gmUserId, gmUserId),
+        eq(visitSessions.status, "submitted"),
+        isNotNull(visitSessions.submittedAt),
+        eq(visitSessions.isDeleted, false),
+        eq(markets.isDeleted, false),
+      ))
+      .orderBy(desc(visitSessions.submittedAt), desc(visitSessions.startedAt))
+      .limit(limit);
+
+    const sessionIds = sessionRows.map((row) => row.id);
+    if (sessionIds.length === 0) {
+      res.status(200).json({ visits: [] });
+      return;
+    }
+
+    const sectionRows = await db
+      .select({
+        id: visitSessionSections.id,
+        visitSessionId: visitSessionSections.visitSessionId,
+        section: visitSessionSections.section,
+        campaignId: visitSessionSections.campaignId,
+        campaignName: campaigns.name,
+        fragebogenName: visitSessionSections.fragebogenNameSnapshot,
+        orderIndex: visitSessionSections.orderIndex,
+      })
+      .from(visitSessionSections)
+      .leftJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+      .where(and(inArray(visitSessionSections.visitSessionId, sessionIds), eq(visitSessionSections.isDeleted, false)))
+      .orderBy(asc(visitSessionSections.orderIndex));
+
+    const sectionIds = sectionRows.map((row) => row.id);
+    const questionRows = sectionIds.length === 0
+      ? []
+      : await db
+          .select({
+            sectionId: visitSessionQuestions.visitSessionSectionId,
+            questionId: visitSessionQuestions.id,
+            answerId: visitAnswers.id,
+            answerStatus: visitAnswers.answerStatus,
+            photoId: visitAnswerPhotos.id,
+          })
+          .from(visitSessionQuestions)
+          .leftJoin(
+            visitAnswers,
+            and(
+              eq(visitAnswers.visitSessionQuestionId, visitSessionQuestions.id),
+              eq(visitAnswers.isDeleted, false),
+            ),
+          )
+          .leftJoin(
+            visitAnswerPhotos,
+            and(
+              eq(visitAnswerPhotos.visitAnswerId, visitAnswers.id),
+              eq(visitAnswerPhotos.isDeleted, false),
+            ),
+          )
+          .where(and(inArray(visitSessionQuestions.visitSessionSectionId, sectionIds), eq(visitSessionQuestions.isDeleted, false)));
+
+    const sectionSummaryById = new Map<string, {
+      questionIds: Set<string>;
+      answeredQuestionIds: Set<string>;
+      photoIds: Set<string>;
+    }>();
+    for (const row of sectionRows) {
+      sectionSummaryById.set(row.id, {
+        questionIds: new Set<string>(),
+        answeredQuestionIds: new Set<string>(),
+        photoIds: new Set<string>(),
+      });
+    }
+    for (const row of questionRows) {
+      const summary = sectionSummaryById.get(row.sectionId);
+      if (!summary) continue;
+      summary.questionIds.add(row.questionId);
+      if (row.answerId && row.answerStatus !== "unanswered") {
+        summary.answeredQuestionIds.add(row.questionId);
+      }
+      if (row.photoId) summary.photoIds.add(row.photoId);
+    }
+
+    const sectionsBySessionId = new Map<string, typeof sectionRows>();
+    for (const row of sectionRows) {
+      const bucket = sectionsBySessionId.get(row.visitSessionId) ?? [];
+      bucket.push(row);
+      sectionsBySessionId.set(row.visitSessionId, bucket);
+    }
+
+    const visits = sessionRows.map((session) => {
+      const submittedAt = session.submittedAt;
+      const durationMinutes = submittedAt
+        ? Math.max(0, Math.round((submittedAt.getTime() - session.startedAt.getTime()) / 60000))
+        : null;
+      const sections = (sectionsBySessionId.get(session.id) ?? []).map((section) => {
+        const summary = sectionSummaryById.get(section.id);
+        return {
+          id: section.id,
+          section: section.section,
+          campaignId: section.campaignId,
+          campaignName: section.campaignName ?? "",
+          fragebogenName: section.fragebogenName,
+          questionCount: summary?.questionIds.size ?? 0,
+          answeredCount: summary?.answeredQuestionIds.size ?? 0,
+          photoCount: summary?.photoIds.size ?? 0,
+        };
+      });
+      return {
+        id: session.id,
+        startedAt: session.startedAt.toISOString(),
+        submittedAt: submittedAt?.toISOString() ?? null,
+        durationMinutes,
+        market: {
+          id: session.marketId,
+          name: session.marketName,
+          address: session.marketAddress,
+          postalCode: session.marketPostalCode,
+          city: session.marketCity,
+        },
+        sections,
+        totals: {
+          questionCount: sections.reduce((sum, section) => sum + section.questionCount, 0),
+          answeredCount: sections.reduce((sum, section) => sum + section.answeredCount, 0),
+          photoCount: sections.reduce((sum, section) => sum + section.photoCount, 0),
+        },
+      };
+    });
+
+    res.status(200).json({ visits });
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/change-requests", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungültige Session-ID." });
+      return;
+    }
+
+    const parsed = changeRequestBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Änderungsanfrage ist ungültig.", code: "invalid_change_request" });
+      return;
+    }
+    const now = new Date();
+
+    const [target] = await db
+      .select({
+        sessionId: visitSessions.id,
+        marketId: visitSessions.marketId,
+        visitSessionSectionId: visitSessionSections.id,
+        visitSessionQuestionId: visitSessionQuestions.id,
+        questionId: visitSessionQuestions.questionId,
+        questionType: visitSessionQuestions.questionType,
+        questionTextSnapshot: visitSessionQuestions.questionTextSnapshot,
+      })
+      .from(visitSessionQuestions)
+      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+      .innerJoin(visitSessions, eq(visitSessions.id, visitSessionSections.visitSessionId))
+      .where(
+        and(
+          eq(visitSessions.id, sessionId),
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.status, "submitted"),
+          isNotNull(visitSessions.submittedAt),
+          eq(visitSessions.isDeleted, false),
+          eq(visitSessionSections.isDeleted, false),
+          eq(visitSessionQuestions.id, parsed.data.visitQuestionId),
+          eq(visitSessionQuestions.isDeleted, false),
+        ),
+      )
+      .limit(1);
+
+    if (!target) {
+      res.status(404).json({ error: "Abgeschlossene Frage wurde nicht gefunden." });
+      return;
+    }
+
+    const [answer] = await db
+      .select()
+      .from(visitAnswers)
+      .where(and(eq(visitAnswers.visitSessionQuestionId, target.visitSessionQuestionId), eq(visitAnswers.isDeleted, false)))
+      .limit(1);
+
+    let answerOptions: Array<typeof visitAnswerOptions.$inferSelect> = [];
+    let answerMatrixCells: Array<typeof visitAnswerMatrixCells.$inferSelect> = [];
+    let answerPhotos: Array<typeof visitAnswerPhotos.$inferSelect> = [];
+    if (answer) {
+      [answerOptions, answerMatrixCells, answerPhotos] = await Promise.all([
+        db
+          .select()
+          .from(visitAnswerOptions)
+          .where(and(eq(visitAnswerOptions.visitAnswerId, answer.id), eq(visitAnswerOptions.isDeleted, false)))
+          .orderBy(asc(visitAnswerOptions.orderIndex)),
+        db
+          .select()
+          .from(visitAnswerMatrixCells)
+          .where(and(eq(visitAnswerMatrixCells.visitAnswerId, answer.id), eq(visitAnswerMatrixCells.isDeleted, false)))
+          .orderBy(asc(visitAnswerMatrixCells.orderIndex)),
+        db
+          .select()
+          .from(visitAnswerPhotos)
+          .where(and(eq(visitAnswerPhotos.visitAnswerId, answer.id), eq(visitAnswerPhotos.isDeleted, false)))
+          .orderBy(asc(visitAnswerPhotos.createdAt)),
+      ]);
+    }
+
+    const currentAnswerSnapshot = buildAnswerChangeRequestSnapshot({
+      ...(answer ? { answer } : {}),
+      options: answerOptions,
+      matrixCells: answerMatrixCells,
+      photos: answerPhotos,
+    });
+
+    const [saved] = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(visitAnswerChangeRequests)
+        .where(
+          and(
+            eq(visitAnswerChangeRequests.gmUserId, gmUserId),
+            eq(visitAnswerChangeRequests.visitSessionQuestionId, target.visitSessionQuestionId),
+            eq(visitAnswerChangeRequests.status, "pending"),
+            eq(visitAnswerChangeRequests.isDeleted, false),
+          ),
+        )
+        .limit(1);
+
+      if (existing) {
+        return tx
+          .update(visitAnswerChangeRequests)
+          .set({
+            visitAnswerId: answer?.id ?? null,
+            questionType: target.questionType,
+            questionTextSnapshot: target.questionTextSnapshot,
+            currentAnswerSnapshot,
+            requestedAnswerPayload: parsed.data.requestedAnswerPayload,
+            requestedAnswerSummary: parsed.data.requestedAnswerSummary,
+            requestNote: parsed.data.requestNote || null,
+            updatedAt: now,
+          })
+          .where(eq(visitAnswerChangeRequests.id, existing.id))
+          .returning({
+            id: visitAnswerChangeRequests.id,
+            status: visitAnswerChangeRequests.status,
+            createdAt: visitAnswerChangeRequests.createdAt,
+            updatedAt: visitAnswerChangeRequests.updatedAt,
+          });
+      }
+
+      return tx
+        .insert(visitAnswerChangeRequests)
+        .values({
+          visitSessionId: target.sessionId,
+          visitSessionSectionId: target.visitSessionSectionId,
+          visitSessionQuestionId: target.visitSessionQuestionId,
+          visitAnswerId: answer?.id ?? null,
+          questionId: target.questionId,
+          gmUserId,
+          marketId: target.marketId,
+          questionType: target.questionType,
+          questionTextSnapshot: target.questionTextSnapshot,
+          currentAnswerSnapshot,
+          requestedAnswerPayload: parsed.data.requestedAnswerPayload,
+          requestedAnswerSummary: parsed.data.requestedAnswerSummary,
+          requestNote: parsed.data.requestNote || null,
+          status: "pending",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning({
+          id: visitAnswerChangeRequests.id,
+          status: visitAnswerChangeRequests.status,
+          createdAt: visitAnswerChangeRequests.createdAt,
+          updatedAt: visitAnswerChangeRequests.updatedAt,
+        });
+    });
+
+    res.status(201).json({
+      ok: true,
+      request: saved
+        ? {
+            id: saved.id,
+            status: saved.status,
+            createdAt: saved.createdAt.toISOString(),
+            updatedAt: saved.updatedAt.toISOString(),
+          }
+        : null,
+    });
+  } catch (error) {
     next(error);
   }
 });
