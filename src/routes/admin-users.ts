@@ -75,7 +75,7 @@ async function requireAdminUsersAccess(req: AuthedRequest, res: Response, next: 
     return;
   }
   res.status(403).json({
-    error: "Fuer diese Aktion ist kein Kundenzugriff freigeschaltet.",
+    error: "Für diese Aktion ist kein Kundenzugriff freigeschaltet.",
     code: "kunde_permission_denied",
     pageKey: "gebietsmanager",
     action,

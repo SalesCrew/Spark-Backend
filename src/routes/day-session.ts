@@ -427,7 +427,7 @@ daySessionRouter.post("/pause/start", async (req: AuthedRequest, res, next) => {
     }
     const openPause = await loadOpenPause(gmUserId, session.id);
     if (openPause) {
-      res.status(409).json({ error: "Pause laeuft bereits.", code: "pause_already_started" });
+      res.status(409).json({ error: "Pause läuft bereits.", code: "pause_already_started" });
       return;
     }
     const [created] = await db
@@ -442,7 +442,7 @@ daySessionRouter.post("/pause/start", async (req: AuthedRequest, res, next) => {
     res.status(200).json({ pause: serializePause(created) });
   } catch (error) {
     if (isOpenPauseUniqueConflict(error)) {
-      res.status(409).json({ error: "Pause laeuft bereits.", code: "pause_already_started" });
+      res.status(409).json({ error: "Pause läuft bereits.", code: "pause_already_started" });
       return;
     }
     next(error);
@@ -491,7 +491,7 @@ daySessionRouter.post("/pause/manual", async (req: AuthedRequest, res, next) => 
     }
     const parsed = manualPauseSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Bitte gueltige Pausenzeiten uebermitteln.", code: "invalid_pause_time" });
+      res.status(400).json({ error: "Bitte gültige Pausenzeiten übermitteln.", code: "invalid_pause_time" });
       return;
     }
     const startAt = new Date(parsed.data.startAt);
@@ -520,7 +520,7 @@ daySessionRouter.post("/pause/manual", async (req: AuthedRequest, res, next) => 
 
     const openPause = await loadOpenPause(gmUserId, session.id);
     if (openPause) {
-      res.status(409).json({ error: "Pause laeuft bereits.", code: "pause_already_started" });
+      res.status(409).json({ error: "Pause läuft bereits.", code: "pause_already_started" });
       return;
     }
 
@@ -539,7 +539,7 @@ daySessionRouter.post("/pause/manual", async (req: AuthedRequest, res, next) => 
     if (error instanceof TimelineValidationError && error.code === "overlap") {
       res.status(409).json({
         error:
-          "Diese Pause ist nicht moeglich, weil sie sich mit einem Marktbesuch oder einer anderen Pause ueberschneidet. Pausen duerfen nur Zusatzzeiterfassung schneiden.",
+          "Diese Pause ist nicht möglich, weil sie sich mit einem Marktbesuch oder einer anderen Pause ?berschneidet. Pausen duerfen nur Zusatzzeiterfassung schneiden.",
         code: "overlap",
       });
       return;
@@ -558,7 +558,7 @@ daySessionRouter.patch("/review-edits", async (req: AuthedRequest, res, next) =>
     }
     const parsed = reviewEditsSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Zeitkorrekturen.", code: "invalid_review_edits" });
+      res.status(400).json({ error: "Ungültige Zeitkorrekturen.", code: "invalid_review_edits" });
       return;
     }
 
@@ -594,13 +594,13 @@ daySessionRouter.patch("/review-edits", async (req: AuthedRequest, res, next) =>
     }
     if (session.status !== "ended") {
       res.status(409).json({
-        error: "Zeitkorrekturen sind erst nach Tagesende und vor Tag abschliessen moeglich.",
+        error: "Zeitkorrekturen sind erst nach Tagesende und vor Tag abschließen möglich.",
         code: "day_not_in_review",
       });
       return;
     }
     if (!session.dayStartedAt || !session.dayEndedAt) {
-      res.status(409).json({ error: "Arbeitstag ist unvollstaendig.", code: "day_incomplete" });
+      res.status(409).json({ error: "Arbeitstag ist unvollständig.", code: "day_incomplete" });
       return;
     }
 
@@ -638,7 +638,7 @@ daySessionRouter.patch("/review-edits", async (req: AuthedRequest, res, next) =>
           timezone,
         );
         if (!editedAt) {
-          res.status(400).json({ error: "Bitte gueltige Uhrzeiten im Format HH:MM eingeben.", code: "invalid_time" });
+          res.status(400).json({ error: "Bitte gültige Uhrzeiten im Format HH:MM eingeben.", code: "invalid_time" });
           return;
         }
         if (edit.kind === "day_start") {
@@ -660,7 +660,7 @@ daySessionRouter.patch("/review-edits", async (req: AuthedRequest, res, next) =>
       const startAt = parseWorkDateHmToUtc(session.workDate, edit.startTime, timezone);
       const endAt = parseWorkDateHmToUtc(session.workDate, edit.endTime, timezone);
       if (!startAt || !endAt) {
-        res.status(400).json({ error: "Bitte gueltige Uhrzeiten im Format HH:MM eingeben.", code: "invalid_time" });
+        res.status(400).json({ error: "Bitte gültige Uhrzeiten im Format HH:MM eingeben.", code: "invalid_time" });
         return;
       }
       const index = nextIntervals.findIndex((interval) => interval.kind === edit.kind && interval.id === edit.segmentId);
@@ -695,9 +695,9 @@ daySessionRouter.patch("/review-edits", async (req: AuthedRequest, res, next) =>
       if (!validation.ok) {
         const message =
           validation.code === "overlap"
-            ? "Dieser Zeitraum ist nicht moeglich, weil er sich mit einem bestehenden Eintrag ueberschneidet."
+            ? "Dieser Zeitraum ist nicht möglich, weil er sich mit einem bestehenden Eintrag ?berschneidet."
             : validation.code === "outside_day"
-              ? "Tagesstart und Tagesende muessen alle Eintraege vollstaendig umfassen."
+              ? "Tagesstart und Tagesende müssen alle Einträge vollständig umfassen."
             : validation.message;
         res.status(validation.code === "overlap" ? 409 : 400).json({
           error: message,
@@ -978,7 +978,7 @@ daySessionRouter.get("/zeiterfassung", async (req: AuthedRequest, res, next) => 
       timezone: typeof req.query.timezone === "string" ? req.query.timezone : undefined,
     });
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Abfrage fuer Zeiterfassung." });
+      res.status(400).json({ error: "Ungültige Abfrage für Zeiterfassung." });
       return;
     }
 
@@ -1018,7 +1018,7 @@ daySessionRouter.post("/start", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = startSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Tagesstart-Daten." });
+      res.status(400).json({ error: "Ungültige Tagesstart-Daten." });
       return;
     }
     const gmUserId = req.authUser?.appUserId;
@@ -1081,7 +1081,7 @@ daySessionRouter.patch("/start-km", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = setKmSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiger Start-KM-Wert." });
+      res.status(400).json({ error: "Ungültiger Start-KM-Wert." });
       return;
     }
     const gmUserId = req.authUser?.appUserId;
@@ -1146,7 +1146,7 @@ daySessionRouter.patch("/end", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = setEndSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Tagesende-Daten." });
+      res.status(400).json({ error: "Ungültige Tagesende-Daten." });
       return;
     }
     const gmUserId = req.authUser?.appUserId;
@@ -1164,7 +1164,7 @@ daySessionRouter.patch("/end", async (req: AuthedRequest, res, next) => {
     const currentWorkDate = toYmdInTimezone(now, sessionTimezone);
     if (session.workDate < currentWorkDate && !parsed.data.endAt && !parsed.data.endTime) {
       res.status(400).json({
-        error: "Bitte eine Endzeit fuer den offenen Arbeitstag erfassen.",
+        error: "Bitte eine Endzeit für den offenen Arbeitstag erfassen.",
         code: "stale_day_end_time_required",
       });
       return;
@@ -1212,7 +1212,7 @@ daySessionRouter.patch("/end-km", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = setKmSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiger End-KM-Wert." });
+      res.status(400).json({ error: "Ungültiger End-KM-Wert." });
       return;
     }
     const gmUserId = req.authUser?.appUserId;
@@ -1281,7 +1281,7 @@ daySessionRouter.post("/submit", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = submitSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Speicherdaten fuer den Arbeitstag." });
+      res.status(400).json({ error: "Ungültige Speicherdaten für den Arbeitstag." });
       return;
     }
     const gmUserId = req.authUser?.appUserId;
@@ -1296,11 +1296,11 @@ daySessionRouter.post("/submit", async (req: AuthedRequest, res, next) => {
       return;
     }
     if (!session.dayStartedAt || !session.dayEndedAt) {
-      res.status(400).json({ error: "Tagesstart und Tagesende muessen gesetzt sein." });
+      res.status(400).json({ error: "Tagesstart und Tagesende müssen gesetzt sein." });
       return;
     }
     if (!session.isStartKmCompleted || !session.isEndKmCompleted) {
-      res.status(400).json({ error: "Start-KM und End-KM muessen gesetzt sein.", code: "km_required" });
+      res.status(400).json({ error: "Start-KM und End-KM müssen gesetzt sein.", code: "km_required" });
       return;
     }
     const [updated] = await db

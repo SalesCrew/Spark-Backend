@@ -235,7 +235,7 @@ function normalizeChangeRequestAnswerPayload(input: {
 
   if (input.questionType === "single" || input.questionType === "yesno" || input.questionType === "text") {
     const value = typeof payload.value === "string" ? payload.value.trim() : "";
-    if (!value) return { ok: false, error: "Anfrage enthaelt keinen direkt anwendbaren Antwortwert.", code: "change_request_not_applicable" };
+    if (!value) return { ok: false, error: "Anfrage enthält keinen direkt anwendbaren Antwortwert.", code: "change_request_not_applicable" };
     return { ok: true, answer: value };
   }
 
@@ -243,7 +243,7 @@ function normalizeChangeRequestAnswerPayload(input: {
     const values = stringList(payload.values);
     if (values.length > 0) return { ok: true, answer: values };
     const value = typeof payload.value === "string" ? payload.value.trim() : "";
-    if (!value) return { ok: false, error: "Anfrage enthaelt keine Mehrfachauswahl.", code: "change_request_not_applicable" };
+    if (!value) return { ok: false, error: "Anfrage enthält keine Mehrfachauswahl.", code: "change_request_not_applicable" };
     return { ok: true, answer: [value] };
   }
 
@@ -254,14 +254,14 @@ function normalizeChangeRequestAnswerPayload(input: {
         ? payload.sel.trim()
         : "";
     const subs = stringList(payload.subs);
-    if (!top) return { ok: false, error: "Anfrage enthaelt keine Ja/Nein-Auswahl.", code: "change_request_not_applicable" };
+    if (!top) return { ok: false, error: "Anfrage enthält keine Ja/Nein-Auswahl.", code: "change_request_not_applicable" };
     return { ok: true, answer: JSON.stringify({ sel: top, subs }) };
   }
 
   if (input.questionType === "likert" || input.questionType === "numeric" || input.questionType === "slider") {
     const value = payload.value;
     if (typeof value !== "number" && typeof value !== "string") {
-      return { ok: false, error: "Anfrage enthaelt keinen Zahlenwert.", code: "change_request_not_applicable" };
+      return { ok: false, error: "Anfrage enthält keinen Zahlenwert.", code: "change_request_not_applicable" };
     }
     return { ok: true, answer: value };
   }
@@ -273,7 +273,7 @@ function normalizeChangeRequestAnswerPayload(input: {
     }
     return {
       ok: false,
-      error: "Matrix-Anfragen muessen manuell geprueft werden, weil kein strukturierter Matrixwert vorliegt.",
+      error: "Matrix-Anfragen müssen manuell geprüft werden, weil kein strukturierter Matrixwert vorliegt.",
       code: "change_request_manual_review_required",
     };
   }
@@ -281,7 +281,7 @@ function normalizeChangeRequestAnswerPayload(input: {
   if (input.questionType === "photo") {
     return {
       ok: false,
-      error: "Foto-Anfragen koennen ohne neue Datei nicht automatisch angewendet werden.",
+      error: "Foto-Anfragen können ohne neue Datei nicht automatisch angewendet werden.",
       code: "change_request_manual_review_required",
     };
   }
@@ -462,11 +462,11 @@ function parseIsoDateOrThrow(raw: string, field: "startDate" | "endDate"): strin
   }
   const parsed = new Date(`${raw}T00:00:00.000Z`);
   if (Number.isNaN(parsed.getTime())) {
-    throw new CampaignDomainError("schedule_invalid", 400, `${field} ist ungueltig.`);
+    throw new CampaignDomainError("schedule_invalid", 400, `${field} ist ungültig.`);
   }
   const canonical = parsed.toISOString().slice(0, 10);
   if (canonical !== raw) {
-    throw new CampaignDomainError("schedule_invalid", 400, `${field} ist ungueltig.`);
+    throw new CampaignDomainError("schedule_invalid", 400, `${field} ist ungültig.`);
   }
   return raw;
 }
@@ -480,7 +480,7 @@ function normalizeSchedule(input: {
     return { scheduleType: "always" as const, startDate: null, endDate: null };
   }
   if (!input.startDate || !input.endDate) {
-    throw new CampaignDomainError("schedule_invalid", 400, "startDate und endDate sind fuer scheduleType=scheduled erforderlich.");
+    throw new CampaignDomainError("schedule_invalid", 400, "startDate und endDate sind für scheduleType=scheduled erforderlich.");
   }
   const startDate = parseIsoDateOrThrow(input.startDate, "startDate");
   const endDate = parseIsoDateOrThrow(input.endDate, "endDate");
@@ -500,7 +500,7 @@ async function ensureMarketsExist(marketIds: string[]) {
   const found = new Set(existing.map((row) => row.id));
   const missing = uniqueIds.filter((id) => !found.has(id));
   if (missing.length > 0) {
-    throw new CampaignDomainError("market_missing", 400, "Mindestens ein Markt existiert nicht oder ist geloescht.");
+    throw new CampaignDomainError("market_missing", 400, "Mindestens ein Markt existiert nicht oder ist gelöscht.");
   }
 }
 
@@ -757,7 +757,7 @@ async function ensureFragebogenMatchesSection(section: CampaignSection, fragebog
       .from(fragebogenKuehler)
       .where(and(eq(fragebogenKuehler.id, fragebogenId), eq(fragebogenKuehler.isDeleted, false)))
       .limit(1);
-    if (!row) throw new CampaignDomainError("fragebogen_mismatch", 400, "Fragebogen passt nicht zur Sektion oder ist geloescht.");
+    if (!row) throw new CampaignDomainError("fragebogen_mismatch", 400, "Fragebogen passt nicht zur Sektion oder ist gelöscht.");
     return;
   }
   if (section === "mhd") {
@@ -766,7 +766,7 @@ async function ensureFragebogenMatchesSection(section: CampaignSection, fragebog
       .from(fragebogenMhd)
       .where(and(eq(fragebogenMhd.id, fragebogenId), eq(fragebogenMhd.isDeleted, false)))
       .limit(1);
-    if (!row) throw new CampaignDomainError("fragebogen_mismatch", 400, "Fragebogen passt nicht zur Sektion oder ist geloescht.");
+    if (!row) throw new CampaignDomainError("fragebogen_mismatch", 400, "Fragebogen passt nicht zur Sektion oder ist gelöscht.");
     return;
   }
 
@@ -781,7 +781,7 @@ async function ensureFragebogenMatchesSection(section: CampaignSection, fragebog
       ),
     )
     .limit(1);
-  if (!row) throw new CampaignDomainError("fragebogen_mismatch", 400, "Fragebogen passt nicht zur Sektion oder ist geloescht.");
+  if (!row) throw new CampaignDomainError("fragebogen_mismatch", 400, "Fragebogen passt nicht zur Sektion oder ist gelöscht.");
 }
 
 async function getFragebogenNameBySection(section: CampaignSection, fragebogenId: string | null) {
@@ -1578,7 +1578,7 @@ adminCampaignsRouter.get("/campaigns/market-visit-status", async (req, res, next
       .filter(Boolean);
     const campaignIds = normalizeUnique(rawCampaignIds);
     if (campaignIds.length === 0 || campaignIds.some((campaignId) => !isUuid(campaignId))) {
-      res.status(400).json({ error: "Ungueltige Kampagnen-IDs.", code: "invalid_campaign_ids" });
+      res.status(400).json({ error: "Ungültige Kampagnen-IDs.", code: "invalid_campaign_ids" });
       return;
     }
     if (campaignIds.length > 50) {
@@ -1597,7 +1597,7 @@ adminCampaignsRouter.get("/campaigns/:id/market-visits", async (req, res, next) 
   try {
     const campaignId = String(req.params.id ?? "");
     if (!isUuid(campaignId)) {
-      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
 
@@ -1629,7 +1629,7 @@ adminCampaignsRouter.get("/campaigns/:campaignId/markets/:marketId/visit-detail"
       ? req.query.sessionId.trim()
       : null;
     if (!isUuid(campaignId) || !isUuid(marketId) || (sessionId != null && !isUuid(sessionId))) {
-      res.status(400).json({ error: "Ungueltige Detail-Anfrage.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige Detail-Anfrage.", code: "invalid_id" });
       return;
     }
 
@@ -1657,7 +1657,7 @@ adminCampaignsRouter.get("/campaigns/:campaignId/markets/:marketId/visit-detail"
 adminCampaignsRouter.get("/campaigns/answer-change-requests", async (req: AuthedRequest, res, next) => {
   try {
     if (req.authUser?.role !== "admin") {
-      res.status(403).json({ error: "Nur Admins koennen Aenderungsanfragen pruefen.", code: "admin_required" });
+      res.status(403).json({ error: "Nur Admins können ?nderungsanfragen prüfen.", code: "admin_required" });
       return;
     }
 
@@ -1771,18 +1771,18 @@ adminCampaignsRouter.get("/campaigns/answer-change-requests", async (req: Authed
 adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/reject", async (req: AuthedRequest, res, next) => {
   try {
     if (req.authUser?.role !== "admin") {
-      res.status(403).json({ error: "Nur Admins koennen Aenderungsanfragen pruefen.", code: "admin_required" });
+      res.status(403).json({ error: "Nur Admins können ?nderungsanfragen prüfen.", code: "admin_required" });
       return;
     }
 
     const requestId = String(req.params.requestId ?? "");
     if (!isUuid(requestId)) {
-      res.status(400).json({ error: "Ungueltige Anfrage-ID.", code: "invalid_request_id" });
+      res.status(400).json({ error: "Ungültige Anfrage-ID.", code: "invalid_request_id" });
       return;
     }
     const parsed = adminChangeRequestDecisionSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiges Entscheidungs-Payload.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültiges Entscheidungs-Payload.", code: "invalid_payload" });
       return;
     }
     const now = new Date();
@@ -1814,18 +1814,18 @@ adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/reject"
 adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve", async (req: AuthedRequest, res, next) => {
   try {
     if (req.authUser?.role !== "admin") {
-      res.status(403).json({ error: "Nur Admins koennen Aenderungsanfragen pruefen.", code: "admin_required" });
+      res.status(403).json({ error: "Nur Admins können ?nderungsanfragen prüfen.", code: "admin_required" });
       return;
     }
 
     const requestId = String(req.params.requestId ?? "");
     if (!isUuid(requestId)) {
-      res.status(400).json({ error: "Ungueltige Anfrage-ID.", code: "invalid_request_id" });
+      res.status(400).json({ error: "Ungültige Anfrage-ID.", code: "invalid_request_id" });
       return;
     }
     const parsed = adminChangeRequestDecisionSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiges Entscheidungs-Payload.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültiges Entscheidungs-Payload.", code: "invalid_payload" });
       return;
     }
     const actorUserId = req.authUser?.appUserId ?? null;
@@ -1857,7 +1857,7 @@ adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve
         .where(and(eq(visitSessions.id, requestRow.visitSessionId), eq(visitSessions.isDeleted, false)))
         .limit(1);
       if (!session || session.status !== "submitted") {
-        const error = new Error("Nur abgeschlossene Sessions koennen bearbeitet werden.") as Error & { status?: number; code?: string };
+        const error = new Error("Nur abgeschlossene Sessions können bearbeitet werden.") as Error & { status?: number; code?: string };
         error.status = 409;
         error.code = "session_not_submitted";
         throw error;
@@ -2583,7 +2583,7 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Kampagne.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Kampagne.", code: "invalid_payload" });
       return;
     }
 
@@ -2753,7 +2753,7 @@ adminCampaignsRouter.patch("/campaigns/:id", async (req: AuthedRequest, res, nex
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
     const parsed = updateCampaignSchema.safeParse(req.body);
@@ -2766,7 +2766,7 @@ adminCampaignsRouter.patch("/campaigns/:id", async (req: AuthedRequest, res, nex
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Kampagnen-Aenderung.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Kampagnen-?nderung.", code: "invalid_payload" });
       return;
     }
 
@@ -2928,7 +2928,7 @@ adminCampaignsRouter.patch("/campaigns/:id/delete", async (req, res, next) => {
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
     const now = new Date();
@@ -2975,7 +2975,7 @@ adminCampaignsRouter.delete("/campaigns/:id/hard-delete", async (req, res, next)
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
 
@@ -2989,7 +2989,7 @@ adminCampaignsRouter.delete("/campaigns/:id/hard-delete", async (req, res, next)
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltiger Request-Body.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültiger Request-Body.", code: "invalid_payload" });
       return;
     }
 
@@ -3003,7 +3003,7 @@ adminCampaignsRouter.delete("/campaigns/:id/hard-delete", async (req, res, next)
         startedAtNs,
         details: { campaignId },
       });
-      res.status(400).json({ error: "Bestaetigungstext stimmt nicht exakt ueberein.", code: "invalid_confirmation_text" });
+      res.status(400).json({ error: "Bestätigungstext stimmt nicht exakt überein.", code: "invalid_confirmation_text" });
       return;
     }
 
@@ -3095,7 +3095,7 @@ adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, r
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
     const parsed = assignMarketsSchema.safeParse(req.body);
@@ -3108,7 +3108,7 @@ adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, r
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Marktzuweisung.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Marktzuweisung.", code: "invalid_payload" });
       return;
     }
     const [campaignForValidation] = await db
@@ -3246,7 +3246,7 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
     const parsed = migrateMarketsSchema.safeParse(req.body);
@@ -3259,7 +3259,7 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Marktmigration.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Marktmigration.", code: "invalid_payload" });
       return;
     }
 
@@ -3466,7 +3466,7 @@ adminCampaignsRouter.patch("/campaigns/:id/gm-reassignments", async (req: Authed
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
 
@@ -3480,7 +3480,7 @@ adminCampaignsRouter.patch("/campaigns/:id/gm-reassignments", async (req: Authed
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige GM-Umstellung.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige GM-Umstellung.", code: "invalid_payload" });
       return;
     }
 
@@ -3552,7 +3552,7 @@ adminCampaignsRouter.patch("/campaigns/:id/gm-reassignments", async (req: Authed
         throw new CampaignDomainError(
           "invalid_payload",
           409,
-          "Keine aktiven Zuordnungen fuer die ausgewaehlten GMs gefunden. Bitte Daten neu laden.",
+          "Keine aktiven Zuordnungen für die ausgewählten GMs gefunden. Bitte Daten neu laden.",
         );
       }
 
@@ -3690,7 +3690,7 @@ adminCampaignsRouter.patch("/campaigns/:id/markets/:marketId/delete", async (req
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige ID.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige ID.", code: "invalid_id" });
       return;
     }
     const now = new Date();
@@ -3765,7 +3765,7 @@ adminCampaignsRouter.post("/campaigns/:id/fragebogen/switch", async (req: Authed
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Kampagnen-ID.", code: "invalid_id" });
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
       return;
     }
     const parsed = switchFragebogenSchema.safeParse(req.body);
@@ -3778,7 +3778,7 @@ adminCampaignsRouter.post("/campaigns/:id/fragebogen/switch", async (req: Authed
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltiger Fragebogen-Wechsel.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültiger Fragebogen-Wechsel.", code: "invalid_payload" });
       return;
     }
 

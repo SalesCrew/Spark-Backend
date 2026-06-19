@@ -146,7 +146,7 @@ timeTrackingRouter.post("/entries/draft/start", async (req: AuthedRequest, res, 
   try {
     const parsed = startDraftSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Startdaten fuer Zusatzzeiterfassung." });
+      res.status(400).json({ error: "Ungültige Startdaten für Zusatzzeiterfassung." });
       return;
     }
     const authUserId = req.authUser?.appUserId;
@@ -240,7 +240,7 @@ timeTrackingRouter.patch("/entries/:id/draft/end", async (req: AuthedRequest, re
     const idParse = uuidSchema.safeParse(req.params.id);
     const parsed = endDraftSchema.safeParse(req.body ?? {});
     if (!idParse.success || !parsed.success) {
-      res.status(400).json({ error: "Ungueltige Enddaten fuer Zusatzzeiterfassung." });
+      res.status(400).json({ error: "Ungültige Enddaten für Zusatzzeiterfassung." });
       return;
     }
     const [entry] = await db
@@ -253,11 +253,11 @@ timeTrackingRouter.patch("/entries/:id/draft/end", async (req: AuthedRequest, re
       return;
     }
     if (!canAccessEntry(req, entry.gmUserId)) {
-      res.status(403).json({ error: "Keine Berechtigung fuer diesen Eintrag." });
+      res.status(403).json({ error: "Keine Berechtigung für diesen Eintrag." });
       return;
     }
     if (entry.status !== "draft") {
-      res.status(409).json({ error: "Endzeit kann nur fuer Entwuerfe gesetzt werden." });
+      res.status(409).json({ error: "Endzeit kann nur für Entwürfe gesetzt werden." });
       return;
     }
     const endAt = parseIso(parsed.data.endAt);
@@ -293,7 +293,7 @@ timeTrackingRouter.patch("/entries/:id/draft/comment", async (req: AuthedRequest
     const idParse = uuidSchema.safeParse(req.params.id);
     const parsed = commentDraftSchema.safeParse(req.body ?? {});
     if (!idParse.success || !parsed.success) {
-      res.status(400).json({ error: "Ungueltiger Kommentar." });
+      res.status(400).json({ error: "Ungültiger Kommentar." });
       return;
     }
     const [entry] = await db
@@ -306,11 +306,11 @@ timeTrackingRouter.patch("/entries/:id/draft/comment", async (req: AuthedRequest
       return;
     }
     if (!canAccessEntry(req, entry.gmUserId)) {
-      res.status(403).json({ error: "Keine Berechtigung fuer diesen Eintrag." });
+      res.status(403).json({ error: "Keine Berechtigung für diesen Eintrag." });
       return;
     }
     if (entry.status !== "draft") {
-      res.status(409).json({ error: "Kommentar kann nur fuer Entwuerfe gesetzt werden." });
+      res.status(409).json({ error: "Kommentar kann nur für Entwürfe gesetzt werden." });
       return;
     }
     const [updated] = await db
@@ -340,7 +340,7 @@ timeTrackingRouter.post("/entries/:id/submit", async (req: AuthedRequest, res, n
   try {
     const idParse = uuidSchema.safeParse(req.params.id);
     if (!idParse.success) {
-      res.status(400).json({ error: "Ungueltige Eintrags-ID." });
+      res.status(400).json({ error: "Ungültige Eintrags-ID." });
       return;
     }
     const [entry] = await db
@@ -353,15 +353,15 @@ timeTrackingRouter.post("/entries/:id/submit", async (req: AuthedRequest, res, n
       return;
     }
     if (!canAccessEntry(req, entry.gmUserId)) {
-      res.status(403).json({ error: "Keine Berechtigung fuer diesen Eintrag." });
+      res.status(403).json({ error: "Keine Berechtigung für diesen Eintrag." });
       return;
     }
     if (entry.status !== "draft") {
-      res.status(409).json({ error: "Nur Entwuerfe koennen gespeichert werden." });
+      res.status(409).json({ error: "Nur Entwürfe können gespeichert werden." });
       return;
     }
     if (!entry.startAt || !entry.endAt) {
-      res.status(400).json({ error: "Start und Ende muessen gesetzt sein." });
+      res.status(400).json({ error: "Start und Ende müssen gesetzt sein." });
       return;
     }
     if (entry.endAt.getTime() < entry.startAt.getTime()) {
@@ -408,7 +408,7 @@ timeTrackingRouter.patch("/entries/:id/cancel", async (req: AuthedRequest, res, 
   try {
     const idParse = uuidSchema.safeParse(req.params.id);
     if (!idParse.success) {
-      res.status(400).json({ error: "Ungueltige Eintrags-ID." });
+      res.status(400).json({ error: "Ungültige Eintrags-ID." });
       return;
     }
     const [entry] = await db
@@ -421,7 +421,7 @@ timeTrackingRouter.patch("/entries/:id/cancel", async (req: AuthedRequest, res, 
       return;
     }
     if (!canAccessEntry(req, entry.gmUserId)) {
-      res.status(403).json({ error: "Keine Berechtigung fuer diesen Eintrag." });
+      res.status(403).json({ error: "Keine Berechtigung für diesen Eintrag." });
       return;
     }
     if (entry.status === "cancelled" || entry.isDeleted) {
@@ -429,7 +429,7 @@ timeTrackingRouter.patch("/entries/:id/cancel", async (req: AuthedRequest, res, 
       return;
     }
     if (entry.status !== "draft") {
-      res.status(409).json({ error: "Nur Entwuerfe koennen abgebrochen werden." });
+      res.status(409).json({ error: "Nur Entwürfe können abgebrochen werden." });
       return;
     }
     const now = new Date();
@@ -473,7 +473,7 @@ timeTrackingRouter.get("/entries/draft/active", async (req: AuthedRequest, res, 
   try {
     const parsed = activeDraftQuerySchema.safeParse(req.query ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Abfrage fuer aktive Entwuerfe." });
+      res.status(400).json({ error: "Ungültige Abfrage für aktive Entwürfe." });
       return;
     }
     const authUserId = req.authUser?.appUserId;

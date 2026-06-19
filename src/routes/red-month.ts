@@ -192,7 +192,7 @@ redMonthRouter.get("/calendar", async (req, res, next) => {
   try {
     const parsed = getCalendarQuerySchema.safeParse(req.query ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Kalender-Parameter." });
+      res.status(400).json({ error: "Ungültige Kalender-Parameter." });
       return;
     }
     const now = new Date();
@@ -225,7 +225,7 @@ adminRedMonthRouter.post("/red-month/years/preview", async (req, res, next) => {
   try {
     const parsed = previewYearSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungueltiges RED-Jahr." });
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungültiges RED-Jahr." });
       return;
     }
     const periods = generateRedMonthPeriodsPreview(parsed.data);
@@ -249,7 +249,7 @@ adminRedMonthRouter.post("/red-month/years", async (req: AuthedRequest, res, nex
   try {
     const parsed = createYearSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungueltiges RED-Jahr." });
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungültiges RED-Jahr." });
       return;
     }
     const created = await createRedMonthYear({
@@ -275,7 +275,7 @@ adminRedMonthRouter.patch("/red-month/years/:id", async (req, res, next) => {
   try {
     const parsed = updateYearSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungueltiges RED-Jahr." });
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungültiges RED-Jahr." });
       return;
     }
     const updated = await updateDraftRedMonthYear({
@@ -308,14 +308,14 @@ adminRedMonthRouter.patch("/red-month/config", async (req, res, next) => {
   try {
     const parsed = updateLegacyConfigSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungueltige RED-Monat Konfiguration." });
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Ungültige RED-Monat Konfiguration." });
       return;
     }
 
     const years = await listRedMonthYears();
     if (years.length > 0) {
       res.status(409).json({
-        error: "RED-Monate werden jetzt als Jahre gespeichert. Bitte den Plus-Button nutzen, statt die aktive Historie zu ueberschreiben.",
+        error: "RED-Monate werden jetzt als Jahre gespeichert. Bitte den Plus-Button nutzen, statt die aktive Historie zu ?berschreiben.",
         code: "red_month_immutable_years_enabled",
       });
       return;

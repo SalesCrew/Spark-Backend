@@ -900,7 +900,7 @@ marketsRouter.use((req: AuthedRequest, res, next) => {
     requireKundeAdminPermission(req, res, next);
     return;
   }
-  res.status(403).json({ error: "Fuer diese Aktion ist kein Kundenzugriff freigeschaltet.", code: "kunde_permission_denied" });
+  res.status(403).json({ error: "Für diese Aktion ist kein Kundenzugriff freigeschaltet.", code: "kunde_permission_denied" });
 });
 marketsRouter.use((req, res, next) => {
   const shouldTrackRead = req.method.toUpperCase() === "GET" && req.path.startsWith("/gm/");
@@ -1157,7 +1157,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
 
     const parsed = z.object({ marketId: z.string().uuid() }).safeParse(req.params);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Markt-ID." });
+      res.status(400).json({ error: "Ungültige Markt-ID." });
       return;
     }
     const { marketId } = parsed.data;
@@ -1266,7 +1266,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
 
     const activeCampaignIds = Array.from(activeByCampaignId.keys());
     if (activeCampaignIds.length === 0) {
-      res.status(403).json({ error: "Dieser Markt ist fuer dich aktuell nicht startbar." });
+      res.status(403).json({ error: "Dieser Markt ist für dich aktuell nicht startbar." });
       return;
     }
 
@@ -1688,7 +1688,7 @@ marketsRouter.get("/gm/visit-start", async (req: AuthedRequest, res, next) => {
       })
       .safeParse(req.query);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige visit-start Parameter." });
+      res.status(400).json({ error: "Ungültige visit-start Parameter." });
       return;
     }
 
@@ -1701,7 +1701,7 @@ marketsRouter.get("/gm/visit-start", async (req: AuthedRequest, res, next) => {
       ),
     );
     if (campaignIds.length === 0) {
-      res.status(400).json({ error: "Mindestens eine gueltige Kampagnen-ID ist erforderlich." });
+      res.status(400).json({ error: "Mindestens eine gültige Kampagnen-ID ist erforderlich." });
       return;
     }
 
@@ -3007,7 +3007,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         startedAtNs,
       });
       res.status(409).json({
-        error: "Ein anderer Import laeuft bereits. Bitte in wenigen Sekunden erneut versuchen.",
+        error: "Ein anderer Import läuft bereits. Bitte in wenigen Sekunden erneut versuchen.",
       });
       return;
     }

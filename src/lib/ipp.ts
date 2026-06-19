@@ -156,7 +156,7 @@ function computeAppliedIpp(input: {
   if (["numeric", "slider", "likert"].includes(questionType) && "__value__" in input.scoringByKey) {
     const numeric = toFiniteNumber(input.valueNumber);
     if (numeric === null) {
-      return { appliedIpp: 0, countedReason: "Kein gueltiger Zahlenwert fuer die IPP-Berechnung." };
+      return { appliedIpp: 0, countedReason: "Kein gültiger Zahlenwert für die IPP-Berechnung." };
     }
     const factor = input.scoringByKey["__value__"] ?? 0;
     const applied = Number((numeric * factor).toFixed(4));
@@ -181,7 +181,7 @@ function computeAppliedIpp(input: {
   const applied = Number(
     matchedKeys.reduce((sum, key) => sum + (input.scoringByKey[key] ?? 0), 0).toFixed(4),
   );
-  if (applied > 0) return { appliedIpp: applied, countedReason: "IPP-Wert aus Antwortschluessel uebernommen." };
+  if (applied > 0) return { appliedIpp: applied, countedReason: "IPP-Wert aus Antwortschluessel ?bernommen." };
   return { appliedIpp: 0, countedReason: "Gewaehlte Antwort ergibt IPP 0." };
 }
 

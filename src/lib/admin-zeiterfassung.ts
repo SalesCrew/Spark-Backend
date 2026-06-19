@@ -7,8 +7,8 @@ const EXTRA_LABELS: Record<string, string> = {
   homeoffice: "Homeoffice",
   lager: "Lager",
   heimfahrt: "Heimfahrt",
-  hotel: "Hoteluebernachtung",
-  hoteluebernachtung: "Hoteluebernachtung",
+  hotel: "Hotelübernachtung",
+  hoteluebernachtung: "Hotelübernachtung",
 };
 
 type SessionStatus = "started" | "ended" | "submitted";
@@ -16,7 +16,7 @@ type TimelineKind = "anfahrt" | "fahrtzeit" | "marktbesuch" | "pause" | "zusatzz
 const DEFAULT_FINISHED_DAY_PAUSE_MIN = 30;
 const DEFAULT_PAUSE_MINIMUM_WORKDAY_MIN = 6 * 60;
 const TIMELINE_OVERLAP_ERROR_MESSAGE =
-  "Dieser Zeitraum ist nicht moeglich, weil er sich mit einem bestehenden Eintrag ueberschneidet.";
+  "Dieser Zeitraum ist nicht möglich, weil er sich mit einem bestehenden Eintrag ?berschneidet.";
 
 type BaseAction = {
   id: string;

@@ -312,7 +312,7 @@ function normalizeChainDbNames(rawChains: string[] | undefined): string[] {
 function ensureAllUuids(ids: string[], fieldName: string) {
   const invalid = ids.filter((id) => !isUuid(id));
   if (invalid.length > 0) {
-    throw new DomainValidationError(`Ungueltige ${fieldName}-IDs gefunden.`);
+    throw new DomainValidationError(`Ungültige ${fieldName}-IDs gefunden.`);
   }
 }
 
@@ -326,14 +326,14 @@ function parseIsoDateOrThrow(value: string, fieldName: string): string {
   const day = Number(match[3]);
   const date = new Date(Date.UTC(year, month - 1, day));
   if (Number.isNaN(date.getTime())) {
-    throw new DomainValidationError(`${fieldName} ist kein gueltiges Datum.`);
+    throw new DomainValidationError(`${fieldName} ist kein gültiges Datum.`);
   }
   if (
     date.getUTCFullYear() !== year ||
     date.getUTCMonth() + 1 !== month ||
     date.getUTCDate() !== day
   ) {
-    throw new DomainValidationError(`${fieldName} ist kein gueltiges Kalenderdatum.`);
+    throw new DomainValidationError(`${fieldName} ist kein gültiges Kalenderdatum.`);
   }
   return value;
 }
@@ -342,13 +342,13 @@ function validateQuestionDomain(question: UiQuestion) {
   const config = (question.config ?? {}) as Record<string, unknown>;
   const scoringKeys = Object.keys(question.scoring ?? {});
   if (question.redSurvey === true && question.type !== "yesno") {
-    throw new DomainValidationError("Red Survey darf nur fuer Ja/Nein Fragen aktiviert werden.");
+    throw new DomainValidationError("Red Survey darf nur für Ja/Nein Fragen aktiviert werden.");
   }
   if (question.singleChoiceAvailability === true && question.type !== "single") {
-    throw new DomainValidationError("Verfuegbarkeitsabfrage darf nur fuer Single Choice Fragen aktiviert werden.");
+    throw new DomainValidationError("Verfügbarkeitsabfrage darf nur für Single Choice Fragen aktiviert werden.");
   }
   if (question.singleChoiceAvailabilityType != null && question.type !== "single") {
-    throw new DomainValidationError("Verfuegbarkeits-Typ darf nur fuer Single Choice Fragen gesetzt werden.");
+    throw new DomainValidationError("Verfügbarkeits-Typ darf nur für Single Choice Fragen gesetzt werden.");
   }
   if ((question.type === "numeric" || question.type === "slider") && scoringKeys.some((key) => key !== "__value__")) {
     throw new DomainValidationError("Numerische Fragen duerfen nur den Scoring-Key '__value__' verwenden.");
@@ -358,7 +358,7 @@ function validateQuestionDomain(question: UiQuestion) {
     const options = parseArrayField(config.options);
     const allowCanonicalAvailabilityOptions = question.type === "single" && question.singleChoiceAvailability === true;
     if (!allowCanonicalAvailabilityOptions && options.length === 0) {
-      throw new DomainValidationError("Auswahlfragen benoetigen mindestens eine Option.");
+      throw new DomainValidationError("Auswahlfragen benötigen mindestens eine Option.");
     }
   }
 
@@ -371,7 +371,7 @@ function validateQuestionDomain(question: UiQuestion) {
       .filter((entry) => entry.length > 0);
     const answers = Array.from(new Set(rawAnswers.length > 0 ? rawAnswers : legacyAnswers));
     if (answers.length === 0) {
-      throw new DomainValidationError("Yes/No-Multi Fragen benoetigen mindestens eine Antwort.");
+      throw new DomainValidationError("Yes/No-Multi Fragen benötigen mindestens eine Antwort.");
     }
 
     const branchEntries: Array<{ answer: string; enabled: boolean; options: string[] }> = [];
@@ -401,17 +401,17 @@ function validateQuestionDomain(question: UiQuestion) {
     }
     for (const branch of branchEntries) {
       if (!answers.includes(branch.answer)) {
-        throw new DomainValidationError("Yes/No-Multi Branch verweist auf eine ungueltige Antwort.");
+        throw new DomainValidationError("Yes/No-Multi Branch verweist auf eine ungültige Antwort.");
       }
       if (branch.enabled && branch.options.length === 0) {
-        throw new DomainValidationError("Yes/No-Multi Branches mit Multi-Auswahl benoetigen mindestens eine Option.");
+        throw new DomainValidationError("Yes/No-Multi Branches mit Multi-Auswahl benötigen mindestens eine Option.");
       }
     }
 
     const legacyTrigger = typeof config.triggerAnswer === "string" ? config.triggerAnswer.trim() : "";
     if (legacyTrigger) {
       if (!answers.includes(legacyTrigger)) {
-        throw new DomainValidationError("Yes/No-Multi Trigger verweist auf eine ungueltige Antwort.");
+        throw new DomainValidationError("Yes/No-Multi Trigger verweist auf eine ungültige Antwort.");
       }
       const legacyOptions = parseArrayField(config.options)
         .map((entry) => entry.trim())
@@ -429,7 +429,7 @@ function validateQuestionDomain(question: UiQuestion) {
     const validLabels = labels.length >= 2;
     const validRange = min != null && max != null && Number.isFinite(min) && Number.isFinite(max) && min < max;
     if (!validLabels && !validRange) {
-      throw new DomainValidationError("Likert-Fragen benoetigen Labels oder einen gueltigen min/max Bereich.");
+      throw new DomainValidationError("Likert-Fragen benötigen Labels oder einen gültigen min/max Bereich.");
     }
   }
 
@@ -437,7 +437,7 @@ function validateQuestionDomain(question: UiQuestion) {
     const tagsEnabled = Boolean(config.tagsEnabled);
     const tagIds = parseArrayField(config.tagIds);
     if (tagsEnabled && tagIds.length === 0) {
-      throw new DomainValidationError("Foto-Fragen mit aktivierten Tags benoetigen mindestens ein Tag.");
+      throw new DomainValidationError("Foto-Fragen mit aktivierten Tags benötigen mindestens ein Tag.");
     }
   }
 
@@ -451,7 +451,7 @@ function validateQuestionDomain(question: UiQuestion) {
       throw new DomainValidationError("Textfragen maxLength muss eine positive Ganzzahl sein.");
     }
     if (minLength != null && maxLength != null && minLength > maxLength) {
-      throw new DomainValidationError("Textfragen minLength darf nicht groesser als maxLength sein.");
+      throw new DomainValidationError("Textfragen minLength darf nicht gr??er als maxLength sein.");
     }
   }
 
@@ -459,13 +459,13 @@ function validateQuestionDomain(question: UiQuestion) {
     const min = typeof config.min === "number" ? config.min : undefined;
     const max = typeof config.max === "number" ? config.max : undefined;
     if (min != null && !Number.isFinite(min)) {
-      throw new DomainValidationError("Numerische Fragen min muss eine gueltige Zahl sein.");
+      throw new DomainValidationError("Numerische Fragen min muss eine gültige Zahl sein.");
     }
     if (max != null && !Number.isFinite(max)) {
-      throw new DomainValidationError("Numerische Fragen max muss eine gueltige Zahl sein.");
+      throw new DomainValidationError("Numerische Fragen max muss eine gültige Zahl sein.");
     }
     if (min != null && max != null && min > max) {
-      throw new DomainValidationError("Numerische Fragen min darf nicht groesser als max sein.");
+      throw new DomainValidationError("Numerische Fragen min darf nicht gr??er als max sein.");
     }
   }
 
@@ -473,7 +473,7 @@ function validateQuestionDomain(question: UiQuestion) {
     const rows = parseArrayField(config.rows);
     const columns = parseArrayField(config.columns);
     if (rows.length === 0 || columns.length === 0) {
-      throw new DomainValidationError("Matrix-Fragen benoetigen mindestens eine Zeile und eine Spalte.");
+      throw new DomainValidationError("Matrix-Fragen benötigen mindestens eine Zeile und eine Spalte.");
     }
   }
 }
@@ -488,7 +488,7 @@ async function ensureQuestionRefsExist(dbLike: DbLike, ids: string[]) {
   const found = new Set(rows.map((row) => row.id));
   const missing = uniqueIds.filter((id) => !found.has(id));
   if (missing.length > 0) {
-    throw new DomainValidationError("Mindestens eine referenzierte Frage existiert nicht oder ist geloescht.");
+    throw new DomainValidationError("Mindestens eine referenzierte Frage existiert nicht oder ist gelöscht.");
   }
 }
 
@@ -502,7 +502,7 @@ async function ensurePhotoTagsActive(dbLike: DbLike, ids: string[]) {
   const found = new Set(rows.map((row) => row.id));
   const missing = uniqueIds.filter((id) => !found.has(id));
   if (missing.length > 0) {
-    throw new DomainValidationError("Mindestens ein Foto-Tag ist ungueltig oder geloescht.");
+    throw new DomainValidationError("Mindestens ein Foto-Tag ist ungültig oder gelöscht.");
   }
 }
 
@@ -683,7 +683,7 @@ function remapAndValidateQuestionRules(
       for (const targetQuestionId of targetQuestionIds) {
         const targetOrderIndex = questionOrderById?.get(targetQuestionId);
         if (targetOrderIndex == null || targetOrderIndex <= sourceOrderIndex) {
-          throw new DomainValidationError("Betroffene Fragen muessen nach der ausloesenden Frage im Modul kommen.");
+          throw new DomainValidationError("Betroffene Fragen müssen nach der auslösenden Frage im Modul kommen.");
         }
       }
     }
@@ -885,11 +885,11 @@ async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen
     const parsed = questionSchema.parse(spezial);
     validateQuestionDomain(parsed);
     if (parsed.id && !isUuid(parsed.id)) {
-      throw new DomainValidationError("Spezialfrage-ID muss eine gueltige UUID sein.");
+      throw new DomainValidationError("Spezialfrage-ID muss eine gültige UUID sein.");
     }
     for (const rule of parsed.rules ?? []) {
       if (rule.triggerQuestionId && !isUuid(rule.triggerQuestionId)) {
-        throw new DomainValidationError("Spezialfrage-Regeltrigger muss eine gueltige UUID sein.");
+        throw new DomainValidationError("Spezialfrage-Regeltrigger muss eine gültige UUID sein.");
       }
       ensureAllUuids(rule.targetQuestionIds, "Spezialfrage-Regelziel");
       if (rule.triggerQuestionId) {
@@ -1194,7 +1194,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
   const rules = parsed.rules ?? [];
   for (const rule of rules) {
     if (rule.triggerQuestionId && !isUuid(rule.triggerQuestionId)) {
-      throw new DomainValidationError("Regel-Trigger muss eine gueltige Frage-ID sein.");
+      throw new DomainValidationError("Regel-Trigger muss eine gültige Frage-ID sein.");
     }
     ensureAllUuids(rule.targetQuestionIds, "Regel-Ziel");
   }
@@ -1257,7 +1257,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
     && !nextSingleChoiceAvailabilityType
     && !canKeepLegacyAvailabilityType
   ) {
-    throw new DomainValidationError("Bei aktiver Verfuegbarkeitsabfrage muss ein Typ ausgewaehlt werden.");
+    throw new DomainValidationError("Bei aktiver Verfügbarkeitsabfrage muss ein Typ ausgewählt werden.");
   }
 
   if (nextSingleChoiceAvailability === true) {
@@ -1496,7 +1496,7 @@ function normalizeSchedule(input: Pick<UiFragebogen, "scheduleType" | "startDate
     return { scheduleType: "always" as const, startDate: null, endDate: null };
   }
   if (!input.startDate || !input.endDate) {
-    throw new DomainValidationError("Geplante Frageboegen benoetigen Start- und Enddatum.");
+    throw new DomainValidationError("Geplante Fragebögen benötigen Start- und Enddatum.");
   }
   const startDate = parseIsoDateOrThrow(input.startDate, "startDate");
   const endDate = parseIsoDateOrThrow(input.endDate, "endDate");
@@ -1704,7 +1704,7 @@ adminFragebogenRouter.post("/photo-tags", async (req, res, next) => {
   try {
     const parsed = z.object({ label: z.string().trim().min(1) }).safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiger Tag." });
+      res.status(400).json({ error: "Ungültiger Tag." });
       return;
     }
     const now = new Date();
@@ -1738,7 +1738,7 @@ adminFragebogenRouter.patch("/photo-tags/:id", async (req, res, next) => {
       .strict()
       .safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiger Tag-Payload." });
+      res.status(400).json({ error: "Ungültiger Tag-Payload." });
       return;
     }
     const now = new Date();
@@ -1796,7 +1796,7 @@ adminFragebogenRouter.post("/questions", async (req, res, next) => {
   try {
     const parsed = questionSchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Frage." });
+      res.status(400).json({ error: "Ungültige Frage." });
       return;
     }
     const question = await db.transaction((tx) => upsertQuestionGraphTx(tx, parsed.data));
@@ -1812,12 +1812,12 @@ adminFragebogenRouter.post("/questions", async (req, res, next) => {
 adminFragebogenRouter.patch("/questions/:id", async (req, res, next) => {
   try {
     if (!isUuid(req.params.id)) {
-      res.status(400).json({ error: "Ungueltige Frage-ID." });
+      res.status(400).json({ error: "Ungültige Frage-ID." });
       return;
     }
     const partial = questionSchema.partial().safeParse(req.body);
     if (!partial.success) {
-      res.status(400).json({ error: "Ungueltige Frage." });
+      res.status(400).json({ error: "Ungültige Frage." });
       return;
     }
     const currentMap = await fetchQuestionsByIds(db, [req.params.id]);
@@ -1882,7 +1882,7 @@ adminFragebogenRouter.post("/modules/:scope", async (req, res, next) => {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
     const parsed = moduleSchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiges Modul." });
+      res.status(400).json({ error: "Ungültiges Modul." });
       return;
     }
     const payload = parsed.data;
@@ -1998,12 +1998,12 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
   try {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
     if (!isUuid(req.params.id)) {
-      res.status(400).json({ error: "Ungueltige Modul-ID." });
+      res.status(400).json({ error: "Ungültige Modul-ID." });
       return;
     }
     const parsed = moduleSchema.safeParse({ ...req.body, id: req.params.id });
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiges Modul." });
+      res.status(400).json({ error: "Ungültiges Modul." });
       return;
     }
     const now = new Date();
@@ -2284,7 +2284,7 @@ adminFragebogenRouter.patch("/modules/:scope/:id/delete", async (req, res, next)
   try {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
     if (!isUuid(req.params.id)) {
-      res.status(400).json({ error: "Ungueltige Modul-ID." });
+      res.status(400).json({ error: "Ungültige Modul-ID." });
       return;
     }
     const cfg = pickScopeConfig(scope);
@@ -2325,11 +2325,11 @@ adminFragebogenRouter.post("/fragebogen/:scope", async (req, res, next) => {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
     const parsed = fragebogenSchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiger Fragebogen." });
+      res.status(400).json({ error: "Ungültiger Fragebogen." });
       return;
     }
     if (scope !== "main" && parsed.data.spezialfragen.length > 0) {
-      res.status(400).json({ error: "Spezialfragen sind nur fuer den Main-Scope erlaubt." });
+      res.status(400).json({ error: "Spezialfragen sind nur für den Main-Scope erlaubt." });
       return;
     }
 
@@ -2402,16 +2402,16 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id", async (req, res, next) => 
   try {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
     if (!isUuid(req.params.id)) {
-      res.status(400).json({ error: "Ungueltige Fragebogen-ID." });
+      res.status(400).json({ error: "Ungültige Fragebogen-ID." });
       return;
     }
     const parsed = fragebogenSchema.safeParse({ ...req.body, id: req.params.id });
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiger Fragebogen." });
+      res.status(400).json({ error: "Ungültiger Fragebogen." });
       return;
     }
     if (scope !== "main" && parsed.data.spezialfragen.length > 0) {
-      res.status(400).json({ error: "Spezialfragen sind nur fuer den Main-Scope erlaubt." });
+      res.status(400).json({ error: "Spezialfragen sind nur für den Main-Scope erlaubt." });
       return;
     }
 
@@ -2518,7 +2518,7 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id/delete", async (req, res, ne
   try {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
     if (!isUuid(req.params.id)) {
-      res.status(400).json({ error: "Ungueltige Fragebogen-ID." });
+      res.status(400).json({ error: "Ungültige Fragebogen-ID." });
       return;
     }
     const cfg = pickScopeConfig(scope);
@@ -2545,7 +2545,7 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Fragebogen-ID." });
+      res.status(400).json({ error: "Ungültige Fragebogen-ID." });
       return;
     }
     const body = z
@@ -2565,7 +2565,7 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Duplicate-Payload." });
+      res.status(400).json({ error: "Ungültige Duplicate-Payload." });
       return;
     }
     const targetScope = body.data.targetScope ?? sourceScope;
@@ -2639,7 +2639,7 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Spezialfragen koennen nur im Main-Scope dupliziert werden." });
+      res.status(400).json({ error: "Spezialfragen können nur im Main-Scope dupliziert werden." });
       return;
     }
 
@@ -2656,7 +2656,7 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
             for (const sourceModuleId of source.moduleIds) {
               const sourceModule = sourceModuleById.get(sourceModuleId);
               if (!sourceModule) {
-                throw new DomainValidationError("Mindestens ein verknuepftes Modul der Quelle konnte nicht geladen werden.");
+                throw new DomainValidationError("Mindestens ein verknüpftes Modul der Quelle konnte nicht geladen werden.");
               }
 
               const [createdModule] = await tx
@@ -2694,7 +2694,7 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
                 const foundQuestionIds = new Set(existingQuestions.map((row) => row.id));
                 const missingQuestionIds = questionIds.filter((id) => !foundQuestionIds.has(id));
                 if (missingQuestionIds.length > 0) {
-                  throw new DomainValidationError("Mindestens eine verknuepfte Frage existiert nicht mehr.");
+                  throw new DomainValidationError("Mindestens eine verknüpfte Frage existiert nicht mehr.");
                 }
               }
 
@@ -2837,7 +2837,7 @@ adminFragebogenRouter.post("/modules/:scope/:id/duplicate", async (req, res, nex
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Modul-ID." });
+      res.status(400).json({ error: "Ungültige Modul-ID." });
       return;
     }
     const body = z
@@ -2856,7 +2856,7 @@ adminFragebogenRouter.post("/modules/:scope/:id/duplicate", async (req, res, nex
         requestClass: "client_error",
         startedAtNs,
       });
-      res.status(400).json({ error: "Ungueltige Duplicate-Payload." });
+      res.status(400).json({ error: "Ungültige Duplicate-Payload." });
       return;
     }
     const targetScope = body.data.targetScope ?? sourceScope;
@@ -2914,7 +2914,7 @@ adminFragebogenRouter.post("/modules/:scope/:id/duplicate", async (req, res, nex
         const found = new Set(existing.map((row) => row.id));
         const missing = questionIds.filter((id) => !found.has(id));
         if (missing.length > 0) {
-          throw new DomainValidationError("Mindestens eine verknuepfte Frage existiert nicht mehr.");
+          throw new DomainValidationError("Mindestens eine verknüpfte Frage existiert nicht mehr.");
         }
       }
       if (questionIds.length > 0) {
@@ -2981,7 +2981,7 @@ adminFragebogenRouter.get("/question-map", async (req, res, next) => {
       })
       .safeParse(req.query);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Query." });
+      res.status(400).json({ error: "Ungültige Query." });
       return;
     }
     const ids = (parsed.data.ids ?? "")
@@ -3016,7 +3016,7 @@ adminFragebogenRouter.use((err: unknown, req: Request, res: Response, next: Next
         path: issue.path.join("."),
       })),
     });
-    res.status(400).json({ error: "Ungueltige Eingabedaten." });
+    res.status(400).json({ error: "Ungültige Eingabedaten." });
     return;
   }
   logger.error("fragebogen_unhandled_router_error", {

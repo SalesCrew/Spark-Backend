@@ -81,7 +81,7 @@ function parseYmdDate(raw: string): Date {
   const parsed = new Date(year, Math.max(0, month - 1), Math.max(1, day));
   const normalized = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
   if (toYmd(normalized) !== raw) {
-    throw makeRedMonthError("Ungueltiges RED-Monat Datum.", "invalid_red_month_date", 400);
+    throw makeRedMonthError("Ungültiges RED-Monat Datum.", "invalid_red_month_date", 400);
   }
   return normalized;
 }
@@ -296,7 +296,7 @@ export async function resolveRedPeriodForDate(date = new Date()): Promise<Resolv
 
   if (row) return mapPeriodRow(row);
   throw makeRedMonthError(
-    "Fuer dieses Datum ist kein RED-Monat gespeichert. Bitte zuerst ein RED-Jahr im Kalender anlegen.",
+    "Für dieses Datum ist kein RED-Monat gespeichert. Bitte zuerst ein RED-Jahr im Kalender anlegen.",
     "red_month_period_missing",
   );
 }
@@ -466,7 +466,7 @@ export async function updateDraftRedMonthYear(input: {
       .limit(1);
     if (!existing) throw makeRedMonthError("RED-Jahr nicht gefunden.", "red_month_year_not_found", 404);
     if (existing.status !== "draft") {
-      throw makeRedMonthError("Nur zukuenftige Entwuerfe koennen bearbeitet werden.", "red_month_year_not_editable", 409);
+      throw makeRedMonthError("Nur zukünftige Entwürfe können bearbeitet werden.", "red_month_year_not_editable", 409);
     }
 
     const [yearRow] = await tx

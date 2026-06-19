@@ -251,12 +251,12 @@ function ensureThresholdsStrictlyAscending(thresholds: Array<{ label: string; or
   const labelSet = new Set<string>();
   for (const threshold of thresholds) {
     if (orderSet.has(threshold.orderIndex)) {
-      throw new PraemienDomainError("threshold_order_duplicate", 400, "Schwellwert-Reihenfolge enthaelt Duplikate.");
+      throw new PraemienDomainError("threshold_order_duplicate", 400, "Schwellwert-Reihenfolge enthält Duplikate.");
     }
     orderSet.add(threshold.orderIndex);
     const labelKey = threshold.label.trim().toLowerCase();
     if (labelSet.has(labelKey)) {
-      throw new PraemienDomainError("threshold_label_duplicate", 400, "Schwellwert-Labels muessen eindeutig sein.");
+      throw new PraemienDomainError("threshold_label_duplicate", 400, "Schwellwert-Labels müssen eindeutig sein.");
     }
     labelSet.add(labelKey);
   }
@@ -267,7 +267,7 @@ function ensureThresholdsStrictlyAscending(thresholds: Array<{ label: string; or
     const previous = sorted[index - 1];
     if (!current || !previous) continue;
     if (current.minPoints <= previous.minPoints) {
-      throw new PraemienDomainError("thresholds_not_strictly_ascending", 400, "Schwellwerte muessen strikt aufsteigend sein.");
+      throw new PraemienDomainError("thresholds_not_strictly_ascending", 400, "Schwellwerte müssen strikt aufsteigend sein.");
     }
   }
   const keinBonus = sorted.find((entry) => entry.label.trim().toLowerCase() === "kein bonus");
@@ -450,12 +450,12 @@ async function lockWaveTx(tx: Tx, waveId: string, expectedUpdatedAt?: string) {
     sql`select id, updated_at as "updatedAt" from praemien_waves where id = ${waveId} and is_deleted = false for update`,
   );
   const locked = lockRows[0];
-  if (!locked) throw new PraemienDomainError("wave_not_found", 404, "Praemien-Welle nicht gefunden.");
+  if (!locked) throw new PraemienDomainError("wave_not_found", 404, "Prämien-Welle nicht gefunden.");
   if (expectedUpdatedAt) {
     const current = parseDateish(locked.updatedAt);
     const expected = parseDateish(expectedUpdatedAt);
     if (!current || !expected || current.toISOString() !== expected.toISOString()) {
-      throw new PraemienDomainError("wave_stale_write", 409, "Die Praemien-Welle wurde zwischenzeitlich geaendert.");
+      throw new PraemienDomainError("wave_stale_write", 409, "Die Prämien-Welle wurde zwischenzeitlich geändert.");
     }
   }
 }
@@ -493,12 +493,12 @@ async function replacePillarsTx(tx: Tx, waveId: string, pillars: z.infer<typeof 
   const nameSet = new Set<string>();
   for (const pillar of pillars) {
     if (orderSet.has(pillar.orderIndex)) {
-      throw new PraemienDomainError("pillar_order_duplicate", 400, "Saeulen-Reihenfolge enthaelt Duplikate.");
+      throw new PraemienDomainError("pillar_order_duplicate", 400, "Säulen-Reihenfolge enthält Duplikate.");
     }
     orderSet.add(pillar.orderIndex);
     const normalizedName = pillar.name.trim().toLowerCase();
     if (nameSet.has(normalizedName)) {
-      throw new PraemienDomainError("pillar_name_duplicate", 400, "Saeulen-Namen muessen eindeutig sein.");
+      throw new PraemienDomainError("pillar_name_duplicate", 400, "Säulen-Namen müssen eindeutig sein.");
     }
     nameSet.add(normalizedName);
   }
@@ -547,7 +547,7 @@ async function replaceSourcesTx(tx: Tx, waveId: string, sources: z.infer<typeof 
       throw new PraemienDomainError("source_scoring_key_required", 400, "Quell-Scoring-Key fehlt.");
     }
     const pillar = pillarById.get(source.pillarId);
-    if (!pillar) throw new PraemienDomainError("source_invalid_pillar", 400, "Mindestens eine Quelle verweist auf eine ungueltige Saeule.");
+    if (!pillar) throw new PraemienDomainError("source_invalid_pillar", 400, "Mindestens eine Quelle verweist auf eine ungültige Säule.");
     const dedupeKey = `${source.questionId}__${scoringKey}`;
     if (dedupeKeySet.has(dedupeKey)) {
       throw new PraemienDomainError("source_duplicate_question_score", 400, "Eine Frage/Score-Kombination wurde mehrfach zugewiesen.");
@@ -563,7 +563,7 @@ async function replaceSourcesTx(tx: Tx, waveId: string, sources: z.infer<typeof 
     });
     const live = liveByKey.get(catalogKey);
     if (!live) {
-      throw new PraemienDomainError("source_not_in_live_catalog", 400, "Mindestens eine Quelle ist nicht mehr im gueltigen Boni-Katalog vorhanden.");
+      throw new PraemienDomainError("source_not_in_live_catalog", 400, "Mindestens eine Quelle ist nicht mehr im gültigen Boni-Katalog vorhanden.");
     }
     const sameBoni = Math.abs(live.boniValue - source.boniValue) < 0.0001;
     if (!sameBoni) {
@@ -572,7 +572,7 @@ async function replaceSourcesTx(tx: Tx, waveId: string, sources: z.infer<typeof 
 
     const isDistributionPillar = pillar.name === "Distributionsziel";
     if (!isDistributionPillar && source.distributionFreqRule != null) {
-      throw new PraemienDomainError("distribution_rule_invalid_target", 400, "Frequenzregel ist nur fuer Distributionsziel erlaubt.");
+      throw new PraemienDomainError("distribution_rule_invalid_target", 400, "Frequenzregel ist nur für Distributionsziel erlaubt.");
     }
   }
 
@@ -620,7 +620,7 @@ async function replaceQualityScoresTx(tx: Tx, waveId: string, qualityScores: z.i
   const validGmIdSet = new Set(gmUsers.map((entry) => entry.id));
   for (const entry of qualityScores) {
     if (!validGmIdSet.has(entry.gmUserId)) {
-      throw new PraemienDomainError("quality_invalid_gm", 400, "Mindestens eine Qualitaetsbewertung referenziert keinen gueltigen GM.");
+      throw new PraemienDomainError("quality_invalid_gm", 400, "Mindestens eine Qualitätsbewertung referenziert keinen gültigen GM.");
     }
   }
 
@@ -660,7 +660,7 @@ async function replaceFlexScoresTx(tx: Tx, waveId: string, flexScores: z.infer<t
   const validGmIdSet = new Set(gmUsers.map((entry) => entry.id));
   for (const entry of flexScores) {
     if (!validGmIdSet.has(entry.gmUserId)) {
-      throw new PraemienDomainError("flex_invalid_gm", 400, "Mindestens eine Flexbewertung referenziert keinen gueltigen GM.");
+      throw new PraemienDomainError("flex_invalid_gm", 400, "Mindestens eine Flexbewertung referenziert keinen gültigen GM.");
     }
   }
 
@@ -733,7 +733,7 @@ async function ensurePraemienTablesReady(): Promise<boolean> {
 
 function sendPraemienNotInitialized(res: Response) {
   res.status(503).json({
-    error: "Praemien-Backend ist noch nicht initialisiert.",
+    error: "Prämien-Backend ist noch nicht initialisiert.",
     code: "praemien_not_initialized",
   });
 }
@@ -749,7 +749,7 @@ adminPraemienRouter.get("/waves", async (req: AuthedRequest, res, next) => {
       })
       .safeParse(req.query);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Praemien-Wellen Filter." });
+      res.status(400).json({ error: "Ungültige Prämien-Wellen Filter." });
       return;
     }
     if (!(await ensurePraemienTablesReady())) {
@@ -803,7 +803,7 @@ adminPraemienRouter.post("/waves", async (req: AuthedRequest, res, next) => {
     }
     const parsed = createWaveSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Daten fuer Praemien-Welle.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Daten für Prämien-Welle.", code: "invalid_payload" });
       return;
     }
     ensureWaveDateRange(parsed.data.startDate, parsed.data.endDate);
@@ -850,7 +850,7 @@ adminPraemienRouter.post("/waves", async (req: AuthedRequest, res, next) => {
       return;
     }
     if (isPgUniqueViolation(error)) {
-      res.status(409).json({ error: "Fuer dieses Jahr/Quartal existiert bereits eine aktive Welle.", code: "wave_active_conflict" });
+      res.status(409).json({ error: "Für dieses Jahr/Quartal existiert bereits eine aktive Welle.", code: "wave_active_conflict" });
       return;
     }
     next(error);
@@ -870,7 +870,7 @@ adminPraemienRouter.get("/waves/:waveId", async (req: AuthedRequest, res, next) 
     }
     const payload = await loadWaveGraph(waveId);
     if (!payload) {
-      res.status(404).json({ error: "Praemien-Welle nicht gefunden.", code: "wave_not_found" });
+      res.status(404).json({ error: "Prämien-Welle nicht gefunden.", code: "wave_not_found" });
       return;
     }
     res.status(200).json({ wave: payload });
@@ -892,7 +892,7 @@ adminPraemienRouter.patch("/waves/:waveId", async (req: AuthedRequest, res, next
     }
     const parsed = updateWaveSchema.extend({ expectedUpdatedAt: isoDatetimeSchema.optional() }).safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Wellen-Aenderungen.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Wellen-?nderungen.", code: "invalid_payload" });
       return;
     }
     await db.transaction(async (tx) => {
@@ -902,7 +902,7 @@ adminPraemienRouter.patch("/waves/:waveId", async (req: AuthedRequest, res, next
         .from(praemienWaves)
         .where(and(eq(praemienWaves.id, waveId), eq(praemienWaves.isDeleted, false)))
         .limit(1);
-      if (!existing) throw new PraemienDomainError("wave_not_found", 404, "Praemien-Welle nicht gefunden.");
+      if (!existing) throw new PraemienDomainError("wave_not_found", 404, "Prämien-Welle nicht gefunden.");
       const nextStartDate = parsed.data.startDate ?? existing.startDate;
       const nextEndDate = parsed.data.endDate ?? existing.endDate;
       ensureWaveDateRange(nextStartDate, nextEndDate);
@@ -930,7 +930,7 @@ adminPraemienRouter.patch("/waves/:waveId", async (req: AuthedRequest, res, next
       return;
     }
     if (isPgUniqueViolation(error)) {
-      res.status(409).json({ error: "Fuer dieses Jahr/Quartal existiert bereits eine aktive Welle.", code: "wave_active_conflict" });
+      res.status(409).json({ error: "Für dieses Jahr/Quartal existiert bereits eine aktive Welle.", code: "wave_active_conflict" });
       return;
     }
     next(error);
@@ -950,7 +950,7 @@ adminPraemienRouter.put("/waves/:waveId/thresholds", async (req: AuthedRequest, 
     }
     const parsed = replaceThresholdsSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Schwellwerte.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Schwellwerte.", code: "invalid_payload" });
       return;
     }
     await db.transaction(async (tx) => {
@@ -982,7 +982,7 @@ adminPraemienRouter.put("/waves/:waveId/pillars", async (req: AuthedRequest, res
     }
     const parsed = replacePillarsSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Saeulen.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Säulen.", code: "invalid_payload" });
       return;
     }
     await db.transaction(async (tx) => {
@@ -1014,7 +1014,7 @@ adminPraemienRouter.put("/waves/:waveId/sources", async (req: AuthedRequest, res
     }
     const parsed = replaceSourcesSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Quellenzuordnung.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Quellenzuordnung.", code: "invalid_payload" });
       return;
     }
     await db.transaction(async (tx) => {
@@ -1046,7 +1046,7 @@ adminPraemienRouter.put("/waves/:waveId/quality-scores", async (req: AuthedReque
     }
     const parsed = replaceQualityScoresSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Qualitaetsbewertungen.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Qualitätsbewertungen.", code: "invalid_payload" });
       return;
     }
     await db.transaction(async (tx) => {
@@ -1078,7 +1078,7 @@ adminPraemienRouter.put("/waves/:waveId/flex-scores", async (req: AuthedRequest,
     }
     const parsed = replaceFlexScoresSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Flexbewertungen.", code: "invalid_payload" });
+      res.status(400).json({ error: "Ungültige Flexbewertungen.", code: "invalid_payload" });
       return;
     }
     await db.transaction(async (tx) => {
@@ -1115,7 +1115,7 @@ adminPraemienRouter.patch("/waves/:waveId/delete", async (req: AuthedRequest, re
       .where(and(eq(praemienWaves.id, waveId), eq(praemienWaves.isDeleted, false)))
       .returning({ id: praemienWaves.id });
     if (!updated) {
-      res.status(404).json({ error: "Praemien-Welle nicht gefunden.", code: "wave_not_found" });
+      res.status(404).json({ error: "Prämien-Welle nicht gefunden.", code: "wave_not_found" });
       return;
     }
     logMutation(req, "delete_wave", { waveId });

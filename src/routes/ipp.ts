@@ -288,18 +288,18 @@ adminIppRouter.get("/ipp/:marketId/detail", async (req, res, next) => {
   try {
     const marketId = String(req.params.marketId ?? "");
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(marketId)) {
-      res.status(400).json({ error: "Ungueltige Markt-ID.", code: "invalid_market_id" });
+      res.status(400).json({ error: "Ungültige Markt-ID.", code: "invalid_market_id" });
       return;
     }
     const parsed = detailQuerySchema.safeParse(req.query);
     if (!parsed.success) {
-      res.status(400).json({ error: "periodStart muss im Format YYYY-MM-DD uebergeben werden.", code: "invalid_period" });
+      res.status(400).json({ error: "periodStart muss im Format YYYY-MM-DD ?bergeben werden.", code: "invalid_period" });
       return;
     }
 
     const periodStartDate = parseYmdOrNull(parsed.data.periodStart);
     if (!periodStartDate) {
-      res.status(400).json({ error: "Ungueltiger periodStart.", code: "invalid_period" });
+      res.status(400).json({ error: "Ungültiger periodStart.", code: "invalid_period" });
       return;
     }
 
@@ -337,7 +337,7 @@ adminIppRouter.get("/ipp/:marketId/detail", async (req, res, next) => {
 
     if (isClosedPeriod && !archived) {
       res.status(404).json({
-        error: "Kein finalisierter Snapshot fuer diesen abgeschlossenen RED-Monat vorhanden.",
+        error: "Kein finalisierter Snapshot für diesen abgeschlossenen RED-Monat vorhanden.",
         code: "snapshot_not_found",
       });
       return;

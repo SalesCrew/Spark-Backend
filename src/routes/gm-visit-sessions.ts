@@ -1171,7 +1171,7 @@ async function buildVisitStartPayloadForSelection(input: {
   }));
 
   if (sections.flatMap((section) => section.questions).length === 0) {
-    const err = new Error("Fuer die ausgewaehlten Kampagnen wurden keine Besuchsfragen gefunden.");
+    const err = new Error("Für die ausgewählten Kampagnen wurden keine Besuchsfragen gefunden.");
     (err as { status?: number; code?: string; details?: unknown }).status = 409;
     (err as { status?: number; code?: string; details?: unknown }).code = "visit_start_no_questions";
     (err as { status?: number; code?: string; details?: unknown }).details = {
@@ -1536,7 +1536,7 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/latest-active", async (req: Authed
     }
     const payload = await buildVisitStartPayloadFromSession(draft);
     if (!payload) {
-      res.status(409).json({ error: "Bestehende Session verweist auf einen nicht mehr verfuegbaren Markt." });
+      res.status(409).json({ error: "Bestehende Session verweist auf einen nicht mehr verfügbaren Markt." });
       return;
     }
     res.status(200).json(payload);
@@ -1560,7 +1560,7 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/start-payload", async (req: Authed
       .strict()
       .safeParse(req.query);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige visit-start Parameter." });
+      res.status(400).json({ error: "Ungültige visit-start Parameter." });
       return;
     }
     const campaignIds = Array.from(
@@ -1572,7 +1572,7 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/start-payload", async (req: Authed
       ),
     );
     if (campaignIds.length === 0) {
-      res.status(400).json({ error: "Mindestens eine gueltige Kampagnen-ID ist erforderlich." });
+      res.status(400).json({ error: "Mindestens eine gültige Kampagnen-ID ist erforderlich." });
       return;
     }
 
@@ -1731,7 +1731,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
     if (existingDraft) {
       const existingPayload = await buildVisitStartPayloadFromSession(existingDraft);
       if (!existingPayload) {
-        res.status(409).json({ error: "Bestehende Session verweist auf einen nicht mehr verfuegbaren Markt." });
+        res.status(409).json({ error: "Bestehende Session verweist auf einen nicht mehr verfügbaren Markt." });
         return;
       }
       res.status(200).json(existingPayload);
@@ -1761,7 +1761,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
     }));
     if (sections.flatMap((section) => section.questions).length === 0) {
       res.status(409).json({
-        error: "Fuer die ausgewaehlten Kampagnen wurden keine Besuchsfragen gefunden.",
+        error: "Für die ausgewählten Kampagnen wurden keine Besuchsfragen gefunden.",
         code: "visit_start_no_questions",
         details: {
           marketId: market.id,
@@ -2640,7 +2640,7 @@ gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/start", async (req: A
       return;
     }
     if (!isUuid(sessionId)) {
-      res.status(400).json({ error: "Ungueltige Session-ID." });
+      res.status(400).json({ error: "Ungültige Session-ID." });
       return;
     }
     const parsed = z
@@ -2650,12 +2650,12 @@ gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/start", async (req: A
       .strict()
       .safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Startzeit." });
+      res.status(400).json({ error: "Ungültige Startzeit." });
       return;
     }
     const requestedStartedAt = parseOptionalIsoTimestamp(parsed.data.startedAt);
     if (!requestedStartedAt) {
-      res.status(400).json({ error: "Ungueltige Startzeit." });
+      res.status(400).json({ error: "Ungültige Startzeit." });
       return;
     }
     const now = new Date();
@@ -2679,7 +2679,7 @@ gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/start", async (req: A
       return;
     }
     if (session.status !== "draft" || session.submittedAt) {
-      res.status(409).json({ error: "Startzeit kann nur bei laufenden Frageboegen geaendert werden." });
+      res.status(409).json({ error: "Startzeit kann nur bei laufenden Fragebögen geändert werden." });
       return;
     }
 
@@ -3711,7 +3711,7 @@ gmVisitSessionsRouter.delete("/gm/visit-sessions/:sessionId", async (req: Authed
     }
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
     if (!isUuid(sessionId)) {
-      res.status(400).json({ error: "Ungueltige Visit-Session-ID." });
+      res.status(400).json({ error: "Ungültige Visit-Session-ID." });
       return;
     }
     const [session] = await db
@@ -3725,7 +3725,7 @@ gmVisitSessionsRouter.delete("/gm/visit-sessions/:sessionId", async (req: Authed
     }
     if (session.status !== "draft" || session.submittedAt != null) {
       res.status(409).json({
-        error: "Nur laufende, nicht abgeschlossene Frageboegen koennen abgebrochen werden.",
+        error: "Nur laufende, nicht abgeschlossene Fragebögen können abgebrochen werden.",
         code: "visit_cancel_not_draft",
       });
       return;

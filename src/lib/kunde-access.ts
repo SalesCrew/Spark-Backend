@@ -173,7 +173,7 @@ export function requireKundeAdminPermission(req: AuthedRequest, res: Response, n
         return;
       }
       res.status(403).json({
-        error: "Fuer diese Aktion ist kein Kundenzugriff freigeschaltet.",
+        error: "Für diese Aktion ist kein Kundenzugriff freigeschaltet.",
         code: "kunde_permission_denied",
         pageKey: requirement.pageKey,
         action: requirement.action,

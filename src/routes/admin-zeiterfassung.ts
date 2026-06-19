@@ -625,7 +625,7 @@ adminZeiterfassungRouter.get("/days", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = parseQuery(req);
     if (!parsed) {
-      res.status(400).json({ error: "Ungueltige Abfrage fuer Admin-Zeiterfassung." });
+      res.status(400).json({ error: "Ungültige Abfrage für Admin-Zeiterfassung." });
       return;
     }
     const sessions = await loadAdminDaySessions(parsed);
@@ -648,7 +648,7 @@ adminZeiterfassungRouter.get("/gm-aggregates", async (req: AuthedRequest, res, n
   try {
     const parsed = parseQuery(req);
     if (!parsed) {
-      res.status(400).json({ error: "Ungueltige Abfrage fuer Admin-Zeiterfassung." });
+      res.status(400).json({ error: "Ungültige Abfrage für Admin-Zeiterfassung." });
       return;
     }
     const sessions = await loadAdminDaySessions(parsed);
@@ -676,7 +676,7 @@ adminZeiterfassungRouter.get("/diaeten-export", async (req: AuthedRequest, res, 
       timezone: typeof req.query.timezone === "string" ? req.query.timezone : undefined,
     });
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltiger Monat fuer den Diaeten-Export." });
+      res.status(400).json({ error: "Ungültiger Monat für den Diäten-Export." });
       return;
     }
 
@@ -896,12 +896,12 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
     }
     const segmentId = String(req.params.segmentId ?? "").trim();
     if (!isUuid(segmentId)) {
-      res.status(400).json({ error: "Ungueltige Segment-ID." });
+      res.status(400).json({ error: "Ungültige Segment-ID." });
       return;
     }
     const parsed = segmentPatchSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Bearbeitungsdaten." });
+      res.status(400).json({ error: "Ungültige Bearbeitungsdaten." });
       return;
     }
     const kind = kindParse.data;
@@ -909,7 +909,7 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
     const hasAnyUpdate =
       body.startTime !== undefined || body.endTime !== undefined || body.comment !== undefined;
     if (!hasAnyUpdate) {
-      res.status(400).json({ error: "Keine Aenderung uebermittelt." });
+      res.status(400).json({ error: "Keine ?nderung ?bermittelt." });
       return;
     }
     if (body.comment !== undefined && kind !== "zusatzzeit") {
@@ -940,7 +940,7 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
       return;
     }
     if (session.status !== "submitted" && session.status !== "ended") {
-      res.status(409).json({ error: "Nur beendete/gespeicherte Arbeitstage koennen bearbeitet werden." });
+      res.status(409).json({ error: "Nur beendete/gespeicherte Arbeitstage können bearbeitet werden." });
       return;
     }
 
@@ -948,13 +948,13 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
     const dayStartAt = session.dayStartedAt;
     const dayEndAt = session.dayEndedAt;
     if (!dayStartAt || !dayEndAt) {
-      res.status(409).json({ error: "Arbeitstag ist unvollstaendig und kann nicht bearbeitet werden." });
+      res.status(409).json({ error: "Arbeitstag ist unvollständig und kann nicht bearbeitet werden." });
       return;
     }
 
     const now = new Date();
     if (dayEndAt.getTime() > now.getTime()) {
-      res.status(409).json({ error: "Zukuenftige Zeiten koennen nicht bearbeitet werden." });
+      res.status(409).json({ error: "Zukünftige Zeiten können nicht bearbeitet werden." });
       return;
     }
 
@@ -992,7 +992,7 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         ? parseWorkDateHmToUtc(session.workDate, body.endTime, timezone)
         : visit.endAt;
       if (!targetStartAt || !targetEndAt) {
-        res.status(400).json({ error: "Ungueltige Uhrzeit." });
+        res.status(400).json({ error: "Ungültige Uhrzeit." });
         return;
       }
       if (targetEndAt.getTime() <= targetStartAt.getTime()) {
@@ -1004,7 +1004,7 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         return;
       }
       if (targetEndAt.getTime() > now.getTime()) {
-        res.status(400).json({ error: "Zukuenftige Zeiten sind nicht erlaubt." });
+        res.status(400).json({ error: "Zukünftige Zeiten sind nicht erlaubt." });
         return;
       }
 
@@ -1069,7 +1069,7 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         ? parseWorkDateHmToUtc(session.workDate, body.endTime, timezone)
         : pause.endAt;
       if (!targetStartAt || !targetEndAt) {
-        res.status(400).json({ error: "Ungueltige Uhrzeit." });
+        res.status(400).json({ error: "Ungültige Uhrzeit." });
         return;
       }
       if (targetEndAt.getTime() <= targetStartAt.getTime()) {
@@ -1081,7 +1081,7 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         return;
       }
       if (targetEndAt.getTime() > now.getTime()) {
-        res.status(400).json({ error: "Zukuenftige Zeiten sind nicht erlaubt." });
+        res.status(400).json({ error: "Zukünftige Zeiten sind nicht erlaubt." });
         return;
       }
 
@@ -1148,7 +1148,7 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         ? parseWorkDateHmToUtc(session.workDate, body.endTime, timezone)
         : extra.endAt;
       if (!targetStartAt || !targetEndAt) {
-        res.status(400).json({ error: "Ungueltige Uhrzeit." });
+        res.status(400).json({ error: "Ungültige Uhrzeit." });
         return;
       }
       if (targetEndAt.getTime() <= targetStartAt.getTime()) {
@@ -1160,7 +1160,7 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         return;
       }
       if (targetEndAt.getTime() > now.getTime()) {
-        res.status(400).json({ error: "Zukuenftige Zeiten sind nicht erlaubt." });
+        res.status(400).json({ error: "Zukünftige Zeiten sind nicht erlaubt." });
         return;
       }
 

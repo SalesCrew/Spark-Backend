@@ -49,12 +49,12 @@ function parseYmdDate(raw: string): Date {
   const month = Number(rawMonth ?? "0");
   const day = Number(rawDay ?? "0");
   if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day) || month <= 0 || day <= 0) {
-    throw new Error("Ungueltiges RED-Monat Anchor-Startdatum.");
+    throw new Error("Ungültiges RED-Monat Anchor-Startdatum.");
   }
   const parsed = new Date(year, month - 1, day);
   const normalized = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
   if (toYmd(normalized) !== raw) {
-    throw new Error("Ungueltiges RED-Monat Anchor-Startdatum.");
+    throw new Error("Ungültiges RED-Monat Anchor-Startdatum.");
   }
   return normalized;
 }

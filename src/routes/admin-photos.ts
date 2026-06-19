@@ -529,7 +529,7 @@ adminPhotosRouter.get("/photos", async (req, res, next) => {
   try {
     const parsed = photoListQuerySchema.safeParse(req.query);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Fotoarchiv-Filter.", code: "invalid_filters" });
+      res.status(400).json({ error: "Ungültige Fotoarchiv-Filter.", code: "invalid_filters" });
       return;
     }
 
@@ -596,7 +596,7 @@ adminPhotosRouter.post("/photos/signed-urls", async (req, res, next) => {
   try {
     const parsed = photoSignedUrlsBodySchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungueltige Foto-URL-Anfrage.", code: "invalid_photo_signed_url_request" });
+      res.status(400).json({ error: "Ungültige Foto-URL-Anfrage.", code: "invalid_photo_signed_url_request" });
       return;
     }
 
@@ -633,7 +633,7 @@ adminPhotosRouter.get("/photos/:photoId", async (req, res, next) => {
   try {
     const photoId = String(req.params.photoId ?? "");
     if (!uuidRegex.test(photoId)) {
-      res.status(400).json({ error: "Ungueltige Foto-ID.", code: "invalid_photo_id" });
+      res.status(400).json({ error: "Ungültige Foto-ID.", code: "invalid_photo_id" });
       return;
     }
 
