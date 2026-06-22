@@ -12,7 +12,6 @@ import {
   visitAnswerPhotoTags,
   visitAnswerPhotos,
   visitAnswers,
-  visitQuestionComments,
   visitSessionQuestions,
   visitSessionSections,
   visitSessions,
@@ -331,7 +330,14 @@ function basePhotoSelect(where: SQL) {
         when ${visitSessions.startedAt} is null or ${visitSessions.submittedAt} is null then null
         else greatest(0, round(extract(epoch from (${visitSessions.submittedAt} - ${visitSessions.startedAt})) / 60))::int
       end`,
-      comment: visitQuestionComments.commentText,
+      comment: sql<string | null>`(
+        select vqc.comment_text
+        from visit_question_comments vqc
+        where vqc.visit_session_question_id = ${visitSessionQuestions.id}
+          and vqc.is_deleted = false
+        order by vqc.updated_at desc, vqc.created_at desc
+        limit 1
+      )`,
     })
     .from(visitAnswerPhotos)
     .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
@@ -341,13 +347,6 @@ function basePhotoSelect(where: SQL) {
     .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
     .innerJoin(markets, eq(markets.id, visitSessions.marketId))
     .innerJoin(users, eq(users.id, visitSessions.gmUserId))
-    .leftJoin(
-      visitQuestionComments,
-      and(
-        eq(visitQuestionComments.visitSessionQuestionId, visitSessionQuestions.id),
-        eq(visitQuestionComments.isDeleted, false),
-      ),
-    )
     .where(where);
 }
 
