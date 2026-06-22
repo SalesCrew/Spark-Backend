@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import { createHash } from "node:crypto";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../lib/db.js";
 import { getRequestLogMeta, logger, serializeError } from "../lib/logger.js";
@@ -20,6 +21,125 @@ function readBearerToken(req: Request): string | null {
   if (!authHeader.startsWith("Bearer ")) return null;
   const token = authHeader.slice("Bearer ".length).trim();
   return token.length > 0 ? token : null;
+}
+
+type VerifiedAccessTokenCacheEntry = {
+  authId: string;
+  expiresAtMs: number;
+};
+
+const VERIFIED_ACCESS_TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
+const VERIFIED_ACCESS_TOKEN_CACHE_MAX_ENTRIES = 500;
+const verifiedAccessTokenCache = new Map<string, VerifiedAccessTokenCacheEntry>();
+const pendingAccessTokenVerifications = new Map<string, Promise<string | null>>();
+
+function getAccessTokenCacheKey(accessToken: string): string {
+  return createHash("sha256").update(accessToken).digest("hex");
+}
+
+function readJwtExpirationMs(accessToken: string): number | null {
+  const [, payload] = accessToken.split(".");
+  if (!payload) return null;
+
+  try {
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const decoded = Buffer.from(padded, "base64").toString("utf8");
+    const parsed = JSON.parse(decoded) as { exp?: unknown };
+    return typeof parsed.exp === "number" ? parsed.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+function pruneVerifiedAccessTokenCache(nowMs = Date.now()) {
+  for (const [key, entry] of verifiedAccessTokenCache.entries()) {
+    if (entry.expiresAtMs <= nowMs) {
+      verifiedAccessTokenCache.delete(key);
+    }
+  }
+
+  if (verifiedAccessTokenCache.size <= VERIFIED_ACCESS_TOKEN_CACHE_MAX_ENTRIES) return;
+
+  const overflow = verifiedAccessTokenCache.size - VERIFIED_ACCESS_TOKEN_CACHE_MAX_ENTRIES;
+  let deleted = 0;
+  for (const key of verifiedAccessTokenCache.keys()) {
+    verifiedAccessTokenCache.delete(key);
+    deleted += 1;
+    if (deleted >= overflow) break;
+  }
+}
+
+function readVerifiedAccessToken(accessToken: string): string | null {
+  const nowMs = Date.now();
+  const key = getAccessTokenCacheKey(accessToken);
+  const cached = verifiedAccessTokenCache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAtMs <= nowMs) {
+    verifiedAccessTokenCache.delete(key);
+    return null;
+  }
+  return cached.authId;
+}
+
+function rememberVerifiedAccessToken(accessToken: string, authId: string) {
+  const nowMs = Date.now();
+  const jwtExpiresAtMs = readJwtExpirationMs(accessToken);
+  const ttlExpiresAtMs = nowMs + VERIFIED_ACCESS_TOKEN_CACHE_TTL_MS;
+  const expiresAtMs = jwtExpiresAtMs ? Math.min(ttlExpiresAtMs, jwtExpiresAtMs) : ttlExpiresAtMs;
+
+  if (expiresAtMs <= nowMs) return;
+
+  verifiedAccessTokenCache.set(getAccessTokenCacheKey(accessToken), { authId, expiresAtMs });
+  pruneVerifiedAccessTokenCache(nowMs);
+}
+
+function isRetryableAuthProviderError(error: unknown): boolean {
+  const err = error as { status?: unknown; code?: unknown; message?: unknown; name?: unknown; cause?: { code?: unknown; message?: unknown } };
+  const status = typeof err?.status === "number" ? err.status : null;
+  if (status !== null && status >= 500) return true;
+
+  const text = [err?.name, err?.message, err?.code, err?.cause?.code, err?.cause?.message]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  return (
+    text.includes("fetch failed") ||
+    text.includes("connect timeout") ||
+    text.includes("network") ||
+    text.includes("und_err_connect_timeout") ||
+    text.includes("econnreset") ||
+    text.includes("etimedout") ||
+    text.includes("econnrefused")
+  );
+}
+
+async function verifyAccessToken(accessToken: string): Promise<string | null> {
+  const cachedAuthId = readVerifiedAccessToken(accessToken);
+  if (cachedAuthId) return cachedAuthId;
+
+  const cacheKey = getAccessTokenCacheKey(accessToken);
+  const pending = pendingAccessTokenVerifications.get(cacheKey);
+  if (pending) return pending;
+
+  const verification = (async () => {
+    const { data, error } = await supabaseAdmin.auth.getUser(accessToken);
+    if (error || !data.user) {
+      if (error && isRetryableAuthProviderError(error)) throw error;
+      return null;
+    }
+
+    rememberVerifiedAccessToken(accessToken, data.user.id);
+    return data.user.id;
+  })();
+
+  pendingAccessTokenVerifications.set(cacheKey, verification);
+  try {
+    return await verification;
+  } finally {
+    pendingAccessTokenVerifications.delete(cacheKey);
+  }
 }
 
 export function requireAuth(allowedRoles?: UserRole[]) {
@@ -51,8 +171,26 @@ export function requireAuth(allowedRoles?: UserRole[]) {
         return;
       }
 
-      const { data, error } = await supabaseAdmin.auth.getUser(accessToken);
-      if (error || !data.user) {
+      let authId: string | null = null;
+      try {
+        authId = await verifyAccessToken(accessToken);
+      } catch (err) {
+        if (isRetryableAuthProviderError(err)) {
+          logger.warn("auth_provider_unreachable", {
+            ...getRequestLogMeta(req),
+            error: serializeError(err),
+          });
+          res.status(503).json({
+            error: "Auth provider is temporarily unavailable. Please retry.",
+            code: "auth_provider_unreachable",
+          });
+          return;
+        }
+
+        throw err;
+      }
+
+      if (!authId) {
         logger.warn("auth_invalid_access_token", {
           ...getRequestLogMeta(req),
         });
@@ -60,7 +198,6 @@ export function requireAuth(allowedRoles?: UserRole[]) {
         return;
       }
 
-      const authId = data.user.id;
       const [appUser] = await db
         .select()
         .from(users)
