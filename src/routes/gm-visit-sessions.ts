@@ -2750,11 +2750,6 @@ gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/answers", async (req:
       res.status(404).json({ error: "Session nicht gefunden." });
       return;
     }
-    if (session.status !== "draft") {
-      res.status(409).json({ error: "Nur Draft-Sessions können geändert werden." });
-      return;
-    }
-
     const [visitQuestion] = await db
       .select({
         visitQuestionId: visitSessionQuestions.id,
@@ -2776,6 +2771,15 @@ gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/answers", async (req:
       .limit(1);
     if (!visitQuestion) {
       res.status(404).json({ error: "Frage in Session nicht gefunden." });
+      return;
+    }
+    const isSubmittedPhotoInitializer =
+      session.status === "submitted"
+      && visitQuestion.questionType === "photo"
+      && parsed.data.answer === undefined
+      && parsed.data.comment === undefined;
+    if (session.status !== "draft" && !isSubmittedPhotoInitializer) {
+      res.status(409).json({ error: "Nur Foto-Antworten können in abgeschlossenen Sessions direkt aktualisiert werden." });
       return;
     }
 
@@ -3080,7 +3084,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/presign", async
           eq(visitAnswers.isDeleted, false),
           eq(visitSessions.id, sessionId),
           eq(visitSessions.gmUserId, gmUserId),
-          eq(visitSessions.status, "draft"),
+          inArray(visitSessions.status, ["draft", "submitted"]),
           eq(visitSessions.isDeleted, false),
         ),
       )
@@ -3168,7 +3172,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
           eq(visitAnswers.isDeleted, false),
           eq(visitSessions.id, sessionId),
           eq(visitSessions.gmUserId, gmUserId),
-          eq(visitSessions.status, "draft"),
+          inArray(visitSessions.status, ["draft", "submitted"]),
           eq(visitSessions.isDeleted, false),
         ),
       )
