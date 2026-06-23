@@ -22,6 +22,7 @@ export const KUNDE_ADMIN_PAGE_KEYS = [
   "maerkte",
   "lager",
   "gebietsmanager",
+  "shelfmerchandizer",
 ] as const;
 
 export type KundeAdminPageKey = (typeof KUNDE_ADMIN_PAGE_KEYS)[number];
