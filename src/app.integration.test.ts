@@ -1118,6 +1118,33 @@ test("invalid photo tag payload is mapped to 400", async () => {
   assert.equal(response.body.error, "Ungueltiger Tag.");
 });
 
+test("duplicate photo tag label is mapped to 409", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForFragebogenTests())) {
+    t.skip("Fragebogen tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const app = createApp();
+  const label = `Duplicate Tag ${Date.now()}`;
+  const [existingTag] = await db.insert(photoTags).values({
+    label,
+    isDeleted: false,
+    deletedAt: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }).returning({ id: photoTags.id });
+
+  try {
+    const response = await request(app).post("/admin/photo-tags").send({ label });
+    assert.equal(response.status, 409);
+    assert.equal(response.body.error, "Dieses Foto-Tag existiert bereits.");
+  } finally {
+    if (existingTag?.id) {
+      await db.delete(photoTags).where(eq(photoTags.id, existingTag.id));
+    }
+  }
+});
+
 test("invalid calendar day is rejected with 400", async () => {
   enableTestAuthBypass();
   const app = createApp();

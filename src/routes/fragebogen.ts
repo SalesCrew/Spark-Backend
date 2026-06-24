@@ -67,6 +67,14 @@ adminFragebogenRouter.use((req, res, next) => {
 
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const isUuid = (value: string | undefined | null): value is string => Boolean(value && uuidRegex.test(value));
+function isPhotoTagLabelConflict(error: unknown): error is { code: string; constraint?: string } {
+  if (!error || typeof error !== "object") return false;
+  return (
+    "code" in error &&
+    (error as { code?: string }).code === "23505" &&
+    (error as { constraint?: string }).constraint === "photo_tags_label_active_unique"
+  );
+}
 
 const scopeSchema = z.enum(["main", "kuehler", "mhd"]);
 const mainSectionSchema = z.enum(["standard", "flex", "billa"]);
@@ -1724,6 +1732,10 @@ adminFragebogenRouter.post("/photo-tags", async (req, res, next) => {
       },
     });
   } catch (error) {
+    if (isPhotoTagLabelConflict(error)) {
+      res.status(409).json({ error: "Dieses Foto-Tag existiert bereits." });
+      return;
+    }
     next(error);
   }
 });
