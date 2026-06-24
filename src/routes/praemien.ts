@@ -3,6 +3,8 @@ import { type Response, Router } from "express";
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { db, sql as pgSql } from "../lib/db.js";
+import { recomputeBonusWaveTx, type BonusWaveRecomputeResult } from "../lib/bonus-finalizer.js";
+import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import {
@@ -464,6 +466,64 @@ async function touchWaveTx(tx: Tx, waveId: string, now: Date) {
   await tx.update(praemienWaves).set({ updatedAt: now }).where(eq(praemienWaves.id, waveId));
 }
 
+async function refreshBonusKpiCachesAfterRecompute(result: BonusWaveRecomputeResult | null | undefined) {
+  if (!result?.applied || result.affectedGmUserIds.length === 0) return;
+  for (const gmUserId of result.affectedGmUserIds) {
+    try {
+      await recomputeGmKpiCache(gmUserId);
+    } catch (error) {
+      logger.error("praemien_recompute_kpi_refresh_failed", {
+        gmUserId,
+        waveId: result.waveId,
+        error,
+      });
+    }
+  }
+}
+
+const BONUS_WAVE_RECOMPUTE_DEBOUNCE_MS = 250;
+const bonusWaveRecomputeQueue = new Map<string, Promise<void>>();
+
+function scheduleBonusWaveRecompute(waveId: string, reason: string) {
+  const previous = bonusWaveRecomputeQueue.get(waveId) ?? Promise.resolve();
+  const queued = previous
+    .catch(() => undefined)
+    .then(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, BONUS_WAVE_RECOMPUTE_DEBOUNCE_MS);
+      });
+      const startedAtNs = startActionTimer();
+      const result = await db.transaction(async (tx) => recomputeBonusWaveTx(tx, waveId));
+      await refreshBonusKpiCachesAfterRecompute(result);
+      logAction("info", "praemien_bonus_wave_recompute_completed", {
+        action: "praemien_bonus_wave_recompute",
+        result: result.applied ? "success" : "skipped",
+        startedAtNs,
+        details: {
+          waveId,
+          reason,
+          processedSessions: result.processedSessions,
+          affectedGmUserIds: result.affectedGmUserIds.length,
+          skippedReason: result.skippedReason ?? null,
+        },
+      });
+    })
+    .catch((error) => {
+      logger.error("praemien_bonus_wave_recompute_failed", {
+        waveId,
+        reason,
+        error,
+      });
+    });
+
+  bonusWaveRecomputeQueue.set(waveId, queued);
+  void queued.finally(() => {
+    if (bonusWaveRecomputeQueue.get(waveId) === queued) {
+      bonusWaveRecomputeQueue.delete(waveId);
+    }
+  });
+}
+
 async function replaceThresholdsTx(tx: Tx, waveId: string, thresholds: z.infer<typeof thresholdInputSchema>[]) {
   ensureThresholdsStrictlyAscending(thresholds.map((entry) => ({ label: entry.label, orderIndex: entry.orderIndex, minPoints: entry.minPoints })));
   const now = new Date();
@@ -895,7 +955,7 @@ adminPraemienRouter.patch("/waves/:waveId", async (req: AuthedRequest, res, next
       res.status(400).json({ error: "Ungültige Wellen-?nderungen.", code: "invalid_payload" });
       return;
     }
-    await db.transaction(async (tx) => {
+    const shouldScheduleRecompute = await db.transaction(async (tx) => {
       await lockWaveTx(tx, waveId, parsed.data.expectedUpdatedAt);
       const [existing] = await tx
         .select()
@@ -906,6 +966,11 @@ adminPraemienRouter.patch("/waves/:waveId", async (req: AuthedRequest, res, next
       const nextStartDate = parsed.data.startDate ?? existing.startDate;
       const nextEndDate = parsed.data.endDate ?? existing.endDate;
       ensureWaveDateRange(nextStartDate, nextEndDate);
+      const shouldRecompute =
+        parsed.data.startDate !== undefined ||
+        parsed.data.endDate !== undefined ||
+        parsed.data.status !== undefined ||
+        parsed.data.timezone !== undefined;
       await tx
         .update(praemienWaves)
         .set({
@@ -920,9 +985,16 @@ adminPraemienRouter.patch("/waves/:waveId", async (req: AuthedRequest, res, next
           updatedAt: new Date(),
         })
         .where(eq(praemienWaves.id, waveId));
+      return shouldRecompute;
     });
+    if (shouldScheduleRecompute) {
+      scheduleBonusWaveRecompute(waveId, "patch_wave");
+    }
     const payload = await loadWaveGraph(waveId);
-    logMutation(req, "patch_wave", { waveId });
+    logMutation(req, "patch_wave", {
+      waveId,
+      recomputeScheduled: shouldScheduleRecompute,
+    });
     res.status(200).json({ wave: payload });
   } catch (error) {
     if (error instanceof PraemienDomainError) {
@@ -957,8 +1029,13 @@ adminPraemienRouter.put("/waves/:waveId/thresholds", async (req: AuthedRequest, 
       await lockWaveTx(tx, waveId, parsed.data.expectedUpdatedAt);
       await replaceThresholdsTx(tx, waveId, parsed.data.thresholds);
     });
+    scheduleBonusWaveRecompute(waveId, "replace_thresholds");
     const payload = await loadWaveGraph(waveId);
-    logMutation(req, "replace_thresholds", { waveId, count: parsed.data.thresholds.length });
+    logMutation(req, "replace_thresholds", {
+      waveId,
+      count: parsed.data.thresholds.length,
+      recomputeScheduled: true,
+    });
     res.status(200).json({ wave: payload });
   } catch (error) {
     if (error instanceof PraemienDomainError) {
@@ -989,8 +1066,13 @@ adminPraemienRouter.put("/waves/:waveId/pillars", async (req: AuthedRequest, res
       await lockWaveTx(tx, waveId, parsed.data.expectedUpdatedAt);
       await replacePillarsTx(tx, waveId, parsed.data.pillars);
     });
+    scheduleBonusWaveRecompute(waveId, "replace_pillars");
     const payload = await loadWaveGraph(waveId);
-    logMutation(req, "replace_pillars", { waveId, count: parsed.data.pillars.length });
+    logMutation(req, "replace_pillars", {
+      waveId,
+      count: parsed.data.pillars.length,
+      recomputeScheduled: true,
+    });
     res.status(200).json({ wave: payload });
   } catch (error) {
     if (error instanceof PraemienDomainError) {
@@ -1021,8 +1103,13 @@ adminPraemienRouter.put("/waves/:waveId/sources", async (req: AuthedRequest, res
       await lockWaveTx(tx, waveId, parsed.data.expectedUpdatedAt);
       await replaceSourcesTx(tx, waveId, parsed.data.sources);
     });
+    scheduleBonusWaveRecompute(waveId, "replace_sources");
     const payload = await loadWaveGraph(waveId);
-    logMutation(req, "replace_sources", { waveId, count: parsed.data.sources.length });
+    logMutation(req, "replace_sources", {
+      waveId,
+      count: parsed.data.sources.length,
+      recomputeScheduled: true,
+    });
     res.status(200).json({ wave: payload });
   } catch (error) {
     if (error instanceof PraemienDomainError) {

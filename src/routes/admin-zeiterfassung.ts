@@ -16,6 +16,8 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import {
   gmDaySessionPauses,
   gmDaySessions,
+  lager,
+  lagerGmAssignments,
   markets,
   timeTrackingEntries,
   users,
@@ -183,6 +185,11 @@ function resolveDiaetenReasonLabel(reason: string): string {
   }
 }
 
+function formatLagerLocation(input: { address: string; postalCode: string; city: string }): string {
+  const place = [input.postalCode, input.city].map((value) => value.trim()).filter(Boolean).join(" ");
+  return [input.address, place].map((value) => value.trim()).filter(Boolean).join(", ");
+}
+
 type DayRow = {
   sessionId: string;
   gmId: string;
@@ -230,6 +237,7 @@ type DiaetenGmBucket = {
     endAt: string;
     isWorkTimeDeduction: boolean;
     marketName: string | null;
+    location: string | null;
     schulungOrt: string | null;
   }>;
   pauses: Array<{
@@ -765,6 +773,52 @@ adminZeiterfassungRouter.get("/diaeten-export", async (req: AuthedRequest, res, 
       return created;
     };
 
+    const lagerGmIds = Array.from(new Set(zusatzRows.filter((row) => row.activityType === "lager").map((row) => row.gmId)));
+    const lagerLocationByGmId = new Map<string, string>();
+    if (lagerGmIds.length > 0) {
+      const assignedLagerRows = await db
+        .select({
+          gmId: lagerGmAssignments.gmUserId,
+          address: lager.address,
+          postalCode: lager.postalCode,
+          city: lager.city,
+        })
+        .from(lagerGmAssignments)
+        .innerJoin(lager, eq(lager.id, lagerGmAssignments.lagerId))
+        .where(
+          and(
+            inArray(lagerGmAssignments.gmUserId, lagerGmIds),
+            eq(lagerGmAssignments.isDeleted, false),
+            eq(lager.isDeleted, false),
+          ),
+        )
+        .orderBy(asc(lagerGmAssignments.createdAt));
+      for (const row of assignedLagerRows) {
+        if (!lagerLocationByGmId.has(row.gmId)) {
+          lagerLocationByGmId.set(row.gmId, formatLagerLocation(row));
+        }
+      }
+
+      const missingLegacyGmIds = lagerGmIds.filter((gmId) => !lagerLocationByGmId.has(gmId));
+      if (missingLegacyGmIds.length > 0) {
+        const legacyLagerRows = await db
+          .select({
+            gmId: lager.gmUserId,
+            address: lager.address,
+            postalCode: lager.postalCode,
+            city: lager.city,
+          })
+          .from(lager)
+          .where(and(inArray(lager.gmUserId, missingLegacyGmIds), eq(lager.isDeleted, false)))
+          .orderBy(asc(lager.createdAt));
+        for (const row of legacyLagerRows) {
+          if (row.gmId && !lagerLocationByGmId.has(row.gmId)) {
+            lagerLocationByGmId.set(row.gmId, formatLagerLocation(row));
+          }
+        }
+      }
+    }
+
     for (const row of visitRows) {
       if (!row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
       const bucket = ensureBucket(row.gmId, row.firstName, row.lastName);
@@ -784,6 +838,7 @@ adminZeiterfassungRouter.get("/diaeten-export", async (req: AuthedRequest, res, 
       if (!row.startAt || !row.endAt || row.endAt.getTime() <= row.startAt.getTime()) continue;
       const bucket = ensureBucket(row.gmId, row.firstName, row.lastName);
       const reason = row.activityType;
+      const location = reason === "lager" ? (lagerLocationByGmId.get(row.gmId) ?? null) : null;
       bucket.zusatzEntries.push({
         id: row.id,
         entryDate: toYmdInTimezone(row.startAt, timezone),
@@ -793,6 +848,7 @@ adminZeiterfassungRouter.get("/diaeten-export", async (req: AuthedRequest, res, 
         endAt: row.endAt.toISOString(),
         isWorkTimeDeduction: false,
         marketName: row.marketName ?? null,
+        location,
         schulungOrt: null,
       });
     }

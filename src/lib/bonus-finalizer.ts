@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { db, sql as pgSql } from "./db.js";
 import { DEFAULT_TIMEZONE, toYmdInTimezone } from "./day-session.js";
 import { recomputeGmKpiCache } from "./gm-kpi-cache.js";
@@ -26,10 +26,19 @@ type BonusFinalizeResult = {
   waveId: string | null;
 };
 
+export type BonusWaveRecomputeResult = {
+  applied: boolean;
+  waveId: string;
+  processedSessions: number;
+  affectedGmUserIds: string[];
+  skippedReason?: "tables_missing" | "wave_not_found" | "wave_not_active";
+};
+
 type BonusDbExecutor = {
   select: typeof db.select;
   insert: typeof db.insert;
   update: typeof db.update;
+  delete: typeof db.delete;
 };
 
 let checkedBonusTableReadiness = false;
@@ -230,6 +239,17 @@ async function finalizeBonusForSubmittedVisitSessionWithExecutor(
   });
   if (!wave) return { applied: false, waveId: null };
 
+  return finalizeBonusForSubmittedVisitSessionForWaveWithExecutor(executor, wave, redPeriod, input);
+}
+
+async function finalizeBonusForSubmittedVisitSessionForWaveWithExecutor(
+  executor: BonusDbExecutor,
+  wave: typeof praemienWaves.$inferSelect,
+  redPeriod: Awaited<ReturnType<typeof resolveRedPeriodForDate>>,
+  input: FinalizeBonusInput,
+): Promise<BonusFinalizeResult> {
+  const submittedAt = input.submittedAt;
+
   const [sources, marketRow] = await Promise.all([
     executor
       .select({
@@ -369,6 +389,14 @@ async function finalizeBonusForSubmittedVisitSessionWithExecutor(
       contributionCount: sql<number>`count(*)`,
     })
     .from(praemienGmWaveContributions)
+    .innerJoin(
+      praemienWaveSources,
+      and(
+        eq(praemienWaveSources.id, praemienGmWaveContributions.sourceId),
+        eq(praemienWaveSources.waveId, wave.id),
+        eq(praemienWaveSources.isDeleted, false),
+      ),
+    )
     .where(and(eq(praemienGmWaveContributions.waveId, wave.id), eq(praemienGmWaveContributions.gmUserId, input.gmUserId)));
   const thresholds = await executor
     .select({
@@ -411,6 +439,77 @@ async function finalizeBonusForSubmittedVisitSessionWithExecutor(
     });
 
   return { applied: true, waveId: wave.id };
+}
+
+export async function recomputeBonusWaveTx(
+  executor: BonusDbExecutor,
+  waveId: string,
+): Promise<BonusWaveRecomputeResult> {
+  if (!(await ensureBonusTablesReady())) {
+    return { applied: false, waveId, processedSessions: 0, affectedGmUserIds: [], skippedReason: "tables_missing" };
+  }
+
+  const [wave] = await executor
+    .select()
+    .from(praemienWaves)
+    .where(and(eq(praemienWaves.id, waveId), eq(praemienWaves.isDeleted, false)))
+    .limit(1);
+  if (!wave) {
+    return { applied: false, waveId, processedSessions: 0, affectedGmUserIds: [], skippedReason: "wave_not_found" };
+  }
+  if (wave.status !== "active") {
+    return { applied: false, waveId, processedSessions: 0, affectedGmUserIds: [], skippedReason: "wave_not_active" };
+  }
+
+  await executor.delete(praemienGmWaveContributions).where(eq(praemienGmWaveContributions.waveId, waveId));
+  await executor.delete(praemienGmWaveTotals).where(eq(praemienGmWaveTotals.waveId, waveId));
+
+  const activeSourceProbe = await executor
+    .select({ id: praemienWaveSources.id })
+    .from(praemienWaveSources)
+    .where(and(eq(praemienWaveSources.waveId, waveId), eq(praemienWaveSources.isDeleted, false)))
+    .limit(1);
+  if (activeSourceProbe.length === 0) {
+    return { applied: true, waveId, processedSessions: 0, affectedGmUserIds: [] };
+  }
+
+  const timezone = wave.timezone?.trim() || DEFAULT_TIMEZONE;
+  const sessions = await executor
+    .select({
+      sessionId: visitSessions.id,
+      gmUserId: visitSessions.gmUserId,
+      marketId: visitSessions.marketId,
+      submittedAt: visitSessions.submittedAt,
+    })
+    .from(visitSessions)
+    .where(and(
+      eq(visitSessions.status, "submitted"),
+      eq(visitSessions.isDeleted, false),
+      isNotNull(visitSessions.submittedAt),
+      sql`(${visitSessions.submittedAt} at time zone ${timezone})::date >= ${wave.startDate}::date`,
+      sql`(${visitSessions.submittedAt} at time zone ${timezone})::date <= ${wave.endDate}::date`,
+    ))
+    .orderBy(asc(visitSessions.submittedAt));
+
+  const affectedGmUserIdSet = new Set<string>();
+  for (const session of sessions) {
+    if (!session.submittedAt) continue;
+    const redPeriod = await resolveRedPeriodForDate(session.submittedAt);
+    await finalizeBonusForSubmittedVisitSessionForWaveWithExecutor(executor, wave, redPeriod, {
+      sessionId: session.sessionId,
+      gmUserId: session.gmUserId,
+      marketId: session.marketId,
+      submittedAt: session.submittedAt,
+    });
+    affectedGmUserIdSet.add(session.gmUserId);
+  }
+
+  return {
+    applied: true,
+    waveId,
+    processedSessions: sessions.length,
+    affectedGmUserIds: Array.from(affectedGmUserIdSet),
+  };
 }
 
 export async function finalizeBonusForSubmittedVisitSessionTx(
@@ -515,12 +614,20 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
       .orderBy(asc(praemienWaveThresholds.orderIndex)),
     db
       .select({
-        pillarId: praemienGmWaveContributions.pillarId,
+        pillarId: praemienWaveSources.pillarId,
         points: sql<number>`coalesce(sum(${praemienGmWaveContributions.appliedValue}), 0)`,
       })
       .from(praemienGmWaveContributions)
+      .innerJoin(
+        praemienWaveSources,
+        and(
+          eq(praemienWaveSources.id, praemienGmWaveContributions.sourceId),
+          eq(praemienWaveSources.waveId, wave.id),
+          eq(praemienWaveSources.isDeleted, false),
+        ),
+      )
       .where(and(eq(praemienGmWaveContributions.waveId, wave.id), eq(praemienGmWaveContributions.gmUserId, gmUserId)))
-      .groupBy(praemienGmWaveContributions.pillarId),
+      .groupBy(praemienWaveSources.pillarId),
     db
       .select({ totalPoints: praemienWaveQualityScores.totalPoints })
       .from(praemienWaveQualityScores)
