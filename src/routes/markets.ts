@@ -764,6 +764,7 @@ type ProgressMarketRow = {
   campaignName: string;
   chain: string;
   address: string;
+  stammnr: string | null;
   done: boolean;
   doneAt: string | null;
 };
@@ -1532,6 +1533,8 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
         marketAddress: markets.address,
         marketPostalCode: markets.postalCode,
         marketCity: markets.city,
+        marketKuehlerStammnr: markets.kuehlerStammnr,
+        marketCokeMasterNumber: markets.cokeMasterNumber,
       })
       .from(campaignMarketAssignments)
       .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
@@ -1557,6 +1560,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
         campaignName: string;
         chain: string;
         address: string;
+        stammnr: string | null;
       }
     >();
     const dateRangeBySection = new Map<ProgressSectionKey, { startDate: string; endDate: string }>([
@@ -1578,6 +1582,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
           dbName: row.marketDbName ?? "",
         }),
         address: `${row.marketAddress}, ${row.marketPostalCode} ${row.marketCity}`.trim(),
+        stammnr: row.marketKuehlerStammnr ?? row.marketCokeMasterNumber ?? null,
       });
       const currentRange = dateRangeBySection.get(section);
       if (!currentRange) continue;
@@ -1634,6 +1639,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
           campaignName: row.campaignName,
           chain: row.chain,
           address: row.address,
+          stammnr: row.stammnr,
           done: Boolean(doneAt),
           doneAt,
         };
