@@ -1343,6 +1343,7 @@ export const visitSessions = pgTable(
     marketId: uuid("market_id")
       .notNull()
       .references(() => markets.id, { onDelete: "cascade" }),
+    kuehlerUnitId: uuid("kuehler_unit_id").references(() => marketKuehlerUnits.id, { onDelete: "set null" }),
     status: visitSessionStatusEnum("status").notNull().default("draft"),
     startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
     submittedAt: timestamp("submitted_at", { withTimezone: true }),
@@ -1357,6 +1358,7 @@ export const visitSessions = pgTable(
   (table) => [
     index("visit_sessions_gm_status_idx").on(table.gmUserId, table.status),
     index("visit_sessions_market_idx").on(table.marketId),
+    index("visit_sessions_kuehler_unit_idx").on(table.kuehlerUnitId),
     index("visit_sessions_gm_market_submitted_idx")
       .on(table.gmUserId, table.marketId, table.submittedAt)
       .where(sql`${table.isDeleted} = false AND ${table.status} = 'submitted' AND ${table.submittedAt} IS NOT NULL`),

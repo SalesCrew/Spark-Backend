@@ -27,6 +27,7 @@ import {
 import {
   campaignMarketAssignments,
   campaigns,
+  marketKuehlerUnits,
   markets,
   photoTags,
   users,
@@ -1088,6 +1089,7 @@ async function loadDraftVisitForSelection(input: {
   gmUserId: string;
   marketId: string;
   campaignIds: string[];
+  kuehlerUnitId?: string | null;
 }): Promise<typeof visitSessions.$inferSelect | null> {
   const requestedCampaignIds = normalizeUnique(input.campaignIds);
   if (requestedCampaignIds.length === 0) return null;
@@ -1098,6 +1100,7 @@ async function loadDraftVisitForSelection(input: {
       and(
         eq(visitSessions.gmUserId, input.gmUserId),
         eq(visitSessions.marketId, input.marketId),
+        input.kuehlerUnitId ? eq(visitSessions.kuehlerUnitId, input.kuehlerUnitId) : isNull(visitSessions.kuehlerUnitId),
         eq(visitSessions.status, "draft"),
         isNull(visitSessions.submittedAt),
         eq(visitSessions.isDeleted, false),
@@ -1118,6 +1121,36 @@ async function loadDraftVisitForSelection(input: {
   return null;
 }
 
+async function resolveKuehlerUnitForVisit(input: {
+  marketId: string;
+  kuehlerUnitId?: string | null;
+}): Promise<string | null> {
+  const kuehlerUnitId = input.kuehlerUnitId?.trim() || null;
+  if (!kuehlerUnitId) return null;
+  const [unit] = await db
+    .select({ id: marketKuehlerUnits.id })
+    .from(marketKuehlerUnits)
+    .where(
+      and(
+        eq(marketKuehlerUnits.id, kuehlerUnitId),
+        eq(marketKuehlerUnits.marketId, input.marketId),
+        eq(marketKuehlerUnits.isDeleted, false),
+      ),
+    )
+    .limit(1);
+  if (!unit) {
+    const err = new Error("Kühler-Eintrag wurde für diesen Markt nicht gefunden.");
+    (err as { status?: number; code?: string; details?: unknown }).status = 400;
+    (err as { status?: number; code?: string; details?: unknown }).code = "invalid_kuehler_unit";
+    (err as { status?: number; code?: string; details?: unknown }).details = {
+      marketId: input.marketId,
+      kuehlerUnitId,
+    };
+    throw err;
+  }
+  return unit.id;
+}
+
 async function buildVisitStartPayloadFromSession(session: typeof visitSessions.$inferSelect) {
   const [market] = await db
     .select()
@@ -1131,6 +1164,7 @@ async function buildVisitStartPayloadFromSession(session: typeof visitSessions.$
       id: session.id,
       status: session.status,
       startedAt: session.startedAt.toISOString(),
+      kuehlerUnitId: session.kuehlerUnitId ?? null,
     },
     market: {
       id: market.id,
@@ -1471,6 +1505,7 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/active", async (req: AuthedRequest
       .object({
         marketId: z.string().uuid(),
         campaignIds: z.string().min(1),
+        kuehlerUnitId: z.string().uuid().optional(),
       })
       .strict()
       .safeParse(req.query);
@@ -1494,6 +1529,7 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/active", async (req: AuthedRequest
       gmUserId,
       marketId: parsed.data.marketId,
       campaignIds,
+      kuehlerUnitId: parsed.data.kuehlerUnitId ?? null,
     });
     if (!draft) {
       res.status(200).json({ session: null });
@@ -1556,6 +1592,7 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/start-payload", async (req: Authed
       .object({
         marketId: z.string().uuid(),
         campaignIds: z.string().min(1),
+        kuehlerUnitId: z.string().uuid().optional(),
       })
       .strict()
       .safeParse(req.query);
@@ -1611,6 +1648,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       .object({
         marketId: z.string().uuid(),
         campaignIds: z.array(z.string().uuid()).min(1),
+        kuehlerUnitId: z.string().uuid().optional(),
         clientSessionToken: z.string().trim().min(1).max(120).optional(),
         startedAt: z.string().optional(),
       })
@@ -1632,6 +1670,10 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
     }
 
     const campaignIds = Array.from(new Set(parsed.data.campaignIds));
+    const resolvedKuehlerUnitId = await resolveKuehlerUnitForVisit({
+      marketId: market.id,
+      kuehlerUnitId: parsed.data.kuehlerUnitId ?? null,
+    });
     const requestedToken = parsed.data.clientSessionToken?.trim() || undefined;
     if (requestedToken) {
       const [existingByToken] = await db
@@ -1662,6 +1704,19 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
               reason: "market_mismatch",
               expectedMarketId: existingByToken.marketId,
               requestedMarketId: parsed.data.marketId,
+              sessionId: existingByToken.id,
+            },
+          });
+          return;
+        }
+        if ((existingByToken.kuehlerUnitId ?? null) !== resolvedKuehlerUnitId) {
+          res.status(409).json({
+            error: "Session-Token gehört zu einer anderen Kühler-Auswahl.",
+            code: "visit_session_token_mismatch",
+            details: {
+              reason: "kuehler_unit_mismatch",
+              expectedKuehlerUnitId: existingByToken.kuehlerUnitId ?? null,
+              requestedKuehlerUnitId: resolvedKuehlerUnitId,
               sessionId: existingByToken.id,
             },
           });
@@ -1709,6 +1764,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
             id: existingByToken.id,
             status: existingByToken.status,
             startedAt: existingByToken.startedAt.toISOString(),
+            kuehlerUnitId: existingByToken.kuehlerUnitId ?? null,
           },
           market: {
             id: existingMarket.id,
@@ -1727,6 +1783,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       gmUserId,
       marketId: market.id,
       campaignIds,
+      kuehlerUnitId: resolvedKuehlerUnitId,
     });
     if (existingDraft) {
       const existingPayload = await buildVisitStartPayloadFromSession(existingDraft);
@@ -1795,6 +1852,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
         .values({
           gmUserId,
           marketId: market.id,
+          kuehlerUnitId: resolvedKuehlerUnitId,
           status: "draft",
           startedAt: acceptedStartedAt,
           lastSavedAt: now,
@@ -2009,6 +2067,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
         id: created.session.id,
         status: created.session.status,
         startedAt: created.session.startedAt.toISOString(),
+        kuehlerUnitId: created.session.kuehlerUnitId ?? null,
       },
       market: {
         id: market.id,
@@ -2076,6 +2135,7 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/completed", async (req: AuthedRequ
         marketAddress: markets.address,
         marketPostalCode: markets.postalCode,
         marketCity: markets.city,
+        kuehlerUnitId: visitSessions.kuehlerUnitId,
       })
       .from(visitSessions)
       .innerJoin(markets, eq(markets.id, visitSessions.marketId))
@@ -2093,6 +2153,22 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/completed", async (req: AuthedRequ
     if (sessionIds.length === 0) {
       res.status(200).json({ visits: [] });
       return;
+    }
+
+    const kuehlerUnitIds = normalizeUnique(
+      sessionRows.map((row) => row.kuehlerUnitId).filter((entry): entry is string => Boolean(entry)),
+    );
+    const kuehlerNumberByUnitId = new Map<string, string>();
+    if (kuehlerUnitIds.length > 0) {
+      const kuehlerUnitRows = await db
+        .select({ id: marketKuehlerUnits.id, kuehlerInternalId: marketKuehlerUnits.kuehlerInternalId })
+        .from(marketKuehlerUnits)
+        .where(and(inArray(marketKuehlerUnits.id, kuehlerUnitIds), eq(marketKuehlerUnits.isDeleted, false)));
+      for (const row of kuehlerUnitRows) {
+        if (row.kuehlerInternalId) {
+          kuehlerNumberByUnitId.set(row.id, row.kuehlerInternalId);
+        }
+      }
     }
 
     const sectionRows = await db
@@ -2190,6 +2266,8 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/completed", async (req: AuthedRequ
         startedAt: session.startedAt.toISOString(),
         submittedAt: submittedAt?.toISOString() ?? null,
         durationMinutes,
+        kuehlerUnitId: session.kuehlerUnitId ?? null,
+        kuehlerNumber: session.kuehlerUnitId ? kuehlerNumberByUnitId.get(session.kuehlerUnitId) ?? null : null,
         market: {
           id: session.marketId,
           name: session.marketName,
@@ -2412,6 +2490,22 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
       return;
     }
 
+    let kuehlerNumber: string | null = null;
+    if (session.kuehlerUnitId) {
+      const [kuehlerUnit] = await db
+        .select({ kuehlerInternalId: marketKuehlerUnits.kuehlerInternalId })
+        .from(marketKuehlerUnits)
+        .where(
+          and(
+            eq(marketKuehlerUnits.id, session.kuehlerUnitId),
+            eq(marketKuehlerUnits.marketId, session.marketId),
+            eq(marketKuehlerUnits.isDeleted, false),
+          ),
+        )
+        .limit(1);
+      kuehlerNumber = kuehlerUnit?.kuehlerInternalId ?? null;
+    }
+
     const sections = await db
       .select()
       .from(visitSessionSections)
@@ -2542,6 +2636,8 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
         status: session.status,
         startedAt: session.startedAt.toISOString(),
         submittedAt: session.submittedAt?.toISOString() ?? null,
+        kuehlerUnitId: session.kuehlerUnitId ?? null,
+        kuehlerNumber,
       },
       market: {
         id: market.id,

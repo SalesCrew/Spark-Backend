@@ -19,6 +19,7 @@ import {
   fragebogenMain,
   fragebogenMhd,
   markets,
+  marketKuehlerUnits,
   visitAnswerMatrixCells,
   visitAnswerOptions,
   visitAnswerPhotoTags,
@@ -348,9 +349,32 @@ function calculateDurationMinutes(startedAt: Date | null, submittedAt: Date | nu
   return Math.round(deltaMs / 60000);
 }
 
+type CampaignMarketVisitStatusRow = {
+  rowId: string;
+  marketId: string;
+  kuehlerUnitId: string | null;
+  kuehlerNumber: string | null;
+  targetVisitCount: number;
+  submittedVisitCount: number;
+  isComplete: boolean;
+  hasSubmittedVisit: boolean;
+  sessionId: string | null;
+  startedAt: string | null;
+  submittedAt: string | null;
+  durationMinutes: number | null;
+  gmUserId: string | null;
+  gmName: string | null;
+};
+
 async function buildCampaignMarketVisitStatusBatch(campaignIds: string[]) {
   const uniqueCampaignIds = normalizeUnique(campaignIds).filter(isUuid);
   if (uniqueCampaignIds.length === 0) return [];
+
+  const campaignRows = await db
+    .select({ id: campaigns.id, section: campaigns.section })
+    .from(campaigns)
+    .where(and(inArray(campaigns.id, uniqueCampaignIds), eq(campaigns.isDeleted, false)));
+  const campaignSectionById = new Map(campaignRows.map((row) => [row.id, row.section]));
 
   const assignmentRows = await db
     .select({
@@ -380,6 +404,7 @@ async function buildCampaignMarketVisitStatusBatch(campaignIds: string[]) {
       campaignId: visitSessionSections.campaignId,
       marketId: visitSessions.marketId,
       sessionId: visitSessions.id,
+      kuehlerUnitId: visitSessions.kuehlerUnitId,
       gmUserId: visitSessions.gmUserId,
       startedAt: visitSessions.startedAt,
       submittedAt: visitSessions.submittedAt,
@@ -399,17 +424,59 @@ async function buildCampaignMarketVisitStatusBatch(campaignIds: string[]) {
 
   const submittedCountByCampaignMarket = new Map<string, number>();
   const latestByCampaignMarket = new Map<string, (typeof submittedRows)[number]>();
+  const submittedCountByKuehlerUnit = new Map<string, number>();
+  const latestByKuehlerUnit = new Map<string, (typeof submittedRows)[number]>();
+  const submittedCountByLegacyKuehlerMarket = new Map<string, number>();
+  const latestByLegacyKuehlerMarket = new Map<string, (typeof submittedRows)[number]>();
   const seenSubmittedSession = new Set<string>();
   for (const row of submittedRows) {
     const key = `${row.campaignId}:${row.marketId}`;
     if (!targetByCampaignMarket.has(key)) continue;
+    const isKuehlerCampaign = campaignSectionById.get(row.campaignId) === "kuehler";
     const sessionKey = `${key}:${row.sessionId}`;
     if (!seenSubmittedSession.has(sessionKey)) {
       seenSubmittedSession.add(sessionKey);
       submittedCountByCampaignMarket.set(key, (submittedCountByCampaignMarket.get(key) ?? 0) + 1);
+      if (isKuehlerCampaign && row.kuehlerUnitId) {
+        const unitKey = `${key}:${row.kuehlerUnitId}`;
+        submittedCountByKuehlerUnit.set(unitKey, (submittedCountByKuehlerUnit.get(unitKey) ?? 0) + 1);
+      } else if (isKuehlerCampaign) {
+        submittedCountByLegacyKuehlerMarket.set(key, (submittedCountByLegacyKuehlerMarket.get(key) ?? 0) + 1);
+      }
     }
     if (!latestByCampaignMarket.has(key)) {
       latestByCampaignMarket.set(key, row);
+    }
+    if (isKuehlerCampaign && row.kuehlerUnitId) {
+      const unitKey = `${key}:${row.kuehlerUnitId}`;
+      if (!latestByKuehlerUnit.has(unitKey)) {
+        latestByKuehlerUnit.set(unitKey, row);
+      }
+    } else if (isKuehlerCampaign && !latestByLegacyKuehlerMarket.has(key)) {
+      latestByLegacyKuehlerMarket.set(key, row);
+    }
+  }
+
+  const kuehlerMarketIds = normalizeUnique(
+    Array.from(targetByCampaignMarket.keys())
+      .map((key) => {
+        const [campaignId, marketId] = key.split(":");
+        if (!campaignId || !marketId) return null;
+        return campaignSectionById.get(campaignId) === "kuehler" ? marketId : null;
+      })
+      .filter((entry): entry is string => Boolean(entry)),
+  );
+  const kuehlerUnitsByMarketId = new Map<string, Array<typeof marketKuehlerUnits.$inferSelect>>();
+  if (kuehlerMarketIds.length > 0) {
+    const kuehlerUnitRows = await db
+      .select()
+      .from(marketKuehlerUnits)
+      .where(and(inArray(marketKuehlerUnits.marketId, kuehlerMarketIds), eq(marketKuehlerUnits.isDeleted, false)))
+      .orderBy(asc(marketKuehlerUnits.kuehlerInternalId), asc(marketKuehlerUnits.createdAt));
+    for (const unit of kuehlerUnitRows) {
+      const bucket = kuehlerUnitsByMarketId.get(unit.marketId) ?? [];
+      bucket.push(unit);
+      kuehlerUnitsByMarketId.set(unit.marketId, bucket);
     }
   }
 
@@ -431,15 +498,50 @@ async function buildCampaignMarketVisitStatusBatch(campaignIds: string[]) {
 
   return uniqueCampaignIds.map((campaignId) => {
     const marketIds = Array.from(marketsByCampaign.get(campaignId) ?? []);
+    const isKuehlerCampaign = campaignSectionById.get(campaignId) === "kuehler";
     return {
       campaignId,
-      markets: marketIds.map((marketId) => {
+      markets: marketIds.flatMap<CampaignMarketVisitStatusRow>((marketId) => {
         const key = `${campaignId}:${marketId}`;
         const targetVisitCount = targetByCampaignMarket.get(key) ?? 0;
+        if (isKuehlerCampaign) {
+          const units = kuehlerUnitsByMarketId.get(marketId) ?? [];
+          const rowCount = Math.max(targetVisitCount, units.length, 1);
+          return Array.from({ length: rowCount }, (_, index) => {
+            const unit = units[index] ?? null;
+            const unitKey = unit ? `${key}:${unit.id}` : null;
+            const legacyAvailable = !unit ? Math.max(0, (submittedCountByLegacyKuehlerMarket.get(key) ?? 0) - index) : 0;
+            const submittedVisitCount = unitKey
+              ? Math.min(1, submittedCountByKuehlerUnit.get(unitKey) ?? 0)
+              : legacyAvailable > 0 ? 1 : 0;
+            const latest = unitKey
+              ? latestByKuehlerUnit.get(unitKey) ?? null
+              : index === 0 ? latestByLegacyKuehlerMarket.get(key) ?? null : null;
+            return {
+              rowId: `kuehler:${marketId}:${unit?.id ?? `slot-${index + 1}`}`,
+              marketId,
+              kuehlerUnitId: unit?.id ?? null,
+              kuehlerNumber: unit?.kuehlerInternalId ?? (rowCount > 1 ? `Kühler ${index + 1}` : null),
+              targetVisitCount: 1,
+              submittedVisitCount,
+              isComplete: submittedVisitCount >= 1,
+              hasSubmittedVisit: submittedVisitCount > 0,
+              sessionId: latest?.sessionId ?? null,
+              startedAt: latest?.startedAt?.toISOString() ?? null,
+              submittedAt: latest?.submittedAt?.toISOString() ?? null,
+              durationMinutes: latest ? calculateDurationMinutes(latest.startedAt, latest.submittedAt) : null,
+              gmUserId: latest?.gmUserId ?? null,
+              gmName: latest?.gmUserId ? gmNameById.get(latest.gmUserId) ?? null : null,
+            };
+          });
+        }
         const submittedVisitCount = submittedCountByCampaignMarket.get(key) ?? 0;
         const latest = latestByCampaignMarket.get(key) ?? null;
         return {
+          rowId: marketId,
           marketId,
+          kuehlerUnitId: null,
+          kuehlerNumber: null,
           targetVisitCount,
           submittedVisitCount,
           isComplete: targetVisitCount > 0 && submittedVisitCount >= targetVisitCount,

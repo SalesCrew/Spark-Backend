@@ -762,6 +762,8 @@ type ProgressMarketRow = {
   marketId: string;
   campaignId: string;
   campaignName: string;
+  kuehlerUnitId: string | null;
+  kuehlerNumber: string | null;
   chain: string;
   address: string;
   stammnr: string | null;
@@ -1535,6 +1537,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
         marketCity: markets.city,
         marketKuehlerStammnr: markets.kuehlerStammnr,
         marketCokeMasterNumber: markets.cokeMasterNumber,
+        visitTargetCount: campaignMarketAssignments.visitTargetCount,
       })
       .from(campaignMarketAssignments)
       .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
@@ -1561,6 +1564,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
         chain: string;
         address: string;
         stammnr: string | null;
+        visitTargetCount: number;
       }
     >();
     const dateRangeBySection = new Map<ProgressSectionKey, { startDate: string; endDate: string }>([
@@ -1571,19 +1575,25 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
     for (const row of assignmentRows) {
       const section = row.section as ProgressSectionKey;
       const key = `${row.marketId}__${row.campaignId}`;
-      if (assignmentKeys.has(key)) continue;
-      assignmentKeys.set(key, {
-        section,
-        marketId: row.marketId,
-        campaignId: row.campaignId,
-        campaignName: row.campaignName,
-        chain: deriveChainLabel({
-          name: row.marketName,
-          dbName: row.marketDbName ?? "",
-        }),
-        address: `${row.marketAddress}, ${row.marketPostalCode} ${row.marketCity}`.trim(),
-        stammnr: row.marketKuehlerStammnr ?? row.marketCokeMasterNumber ?? null,
-      });
+      const visitTargetCount = Math.max(1, Number(row.visitTargetCount ?? 1));
+      const existing = assignmentKeys.get(key);
+      if (existing) {
+        existing.visitTargetCount += visitTargetCount;
+      } else {
+        assignmentKeys.set(key, {
+          section,
+          marketId: row.marketId,
+          campaignId: row.campaignId,
+          campaignName: row.campaignName,
+          chain: deriveChainLabel({
+            name: row.marketName,
+            dbName: row.marketDbName ?? "",
+          }),
+          address: `${row.marketAddress}, ${row.marketPostalCode} ${row.marketCity}`.trim(),
+          stammnr: row.marketKuehlerStammnr ?? row.marketCokeMasterNumber ?? null,
+          visitTargetCount,
+        });
+      }
       const currentRange = dateRangeBySection.get(section);
       if (!currentRange) continue;
       const effectiveStart = row.scheduleType === "scheduled" && row.startDate ? String(row.startDate) : redStartYmd;
@@ -1593,6 +1603,35 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
       dateRangeBySection.set(section, currentRange);
     }
 
+    const kuehlerMarketIds = Array.from(
+      new Set(
+        Array.from(assignmentKeys.values())
+          .filter((row) => row.section === "kuehler")
+          .map((row) => row.marketId),
+      ),
+    );
+    const kuehlerUnitRows =
+      kuehlerMarketIds.length === 0
+        ? []
+        : await db
+            .select({
+              id: marketKuehlerUnits.id,
+              marketId: marketKuehlerUnits.marketId,
+              kuehlerInternalId: marketKuehlerUnits.kuehlerInternalId,
+              kuehlerSerialNumber: marketKuehlerUnits.kuehlerSerialNumber,
+              kuehlerModel: marketKuehlerUnits.kuehlerModel,
+              createdAt: marketKuehlerUnits.createdAt,
+            })
+            .from(marketKuehlerUnits)
+            .where(and(inArray(marketKuehlerUnits.marketId, kuehlerMarketIds), eq(marketKuehlerUnits.isDeleted, false)))
+            .orderBy(asc(marketKuehlerUnits.kuehlerInternalId), asc(marketKuehlerUnits.createdAt));
+    const kuehlerUnitsByMarketId = new Map<string, typeof kuehlerUnitRows>();
+    for (const unit of kuehlerUnitRows) {
+      const current = kuehlerUnitsByMarketId.get(unit.marketId) ?? [];
+      current.push(unit);
+      kuehlerUnitsByMarketId.set(unit.marketId, current);
+    }
+
     const assignedCampaignIds = Array.from(new Set(Array.from(assignmentKeys.values()).map((row) => row.campaignId)));
     const completionRows =
       assignedCampaignIds.length === 0
@@ -1600,6 +1639,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
         : await db
             .select({
               marketId: visitSessions.marketId,
+              kuehlerUnitId: visitSessions.kuehlerUnitId,
               campaignId: visitSessionSections.campaignId,
               submittedAt: visitSessions.submittedAt,
             })
@@ -1619,30 +1659,69 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
             .orderBy(desc(visitSessions.submittedAt));
 
     const completedByKey = new Map<string, string>();
+    const completedByUnitKey = new Map<string, string>();
+    const legacyCompletedDatesByKey = new Map<string, string[]>();
     for (const row of completionRows) {
       if (!row.submittedAt) continue;
       const key = `${row.marketId}__${row.campaignId}`;
       if (!assignmentKeys.has(key)) continue;
+      const submittedAtIso = row.submittedAt.toISOString();
+      if (row.kuehlerUnitId) {
+        const unitKey = `${key}__${row.kuehlerUnitId}`;
+        if (!completedByUnitKey.has(unitKey)) {
+          completedByUnitKey.set(unitKey, submittedAtIso);
+        }
+      } else {
+        const current = legacyCompletedDatesByKey.get(key) ?? [];
+        current.push(submittedAtIso);
+        legacyCompletedDatesByKey.set(key, current);
+      }
       if (!completedByKey.has(key)) {
-        completedByKey.set(key, row.submittedAt.toISOString());
+        completedByKey.set(key, submittedAtIso);
       }
     }
 
     const buildSectionPayload = (section: ProgressSectionKey): ProgressSectionPayload => {
       const rows = Array.from(assignmentKeys.values()).filter((entry) => entry.section === section);
-      const markets = rows.map((row) => {
+      const markets = rows.flatMap<ProgressMarketRow>((row) => {
         const key = `${row.marketId}__${row.campaignId}`;
+        if (section === "kuehler") {
+          const units = kuehlerUnitsByMarketId.get(row.marketId) ?? [];
+          const desiredCount = Math.max(row.visitTargetCount, units.length, 1);
+          const legacyDates = legacyCompletedDatesByKey.get(key) ?? [];
+          let legacyCursor = 0;
+          return Array.from({ length: desiredCount }, (_, index) => {
+            const unit = units[index] ?? null;
+            const unitDoneAt = unit ? completedByUnitKey.get(`${key}__${unit.id}`) ?? null : null;
+            const legacyDoneAt = unitDoneAt ? null : legacyDates[legacyCursor++] ?? null;
+            const doneAt = unitDoneAt ?? legacyDoneAt;
+            return {
+              marketId: row.marketId,
+              campaignId: row.campaignId,
+              campaignName: row.campaignName,
+              kuehlerUnitId: unit?.id ?? null,
+              kuehlerNumber: unit?.kuehlerInternalId ?? (desiredCount > 1 ? `Kühler ${index + 1}` : null),
+              chain: row.chain,
+              address: row.address,
+              stammnr: row.stammnr,
+              done: Boolean(doneAt),
+              doneAt,
+            };
+          });
+        }
         const doneAt = completedByKey.get(key) ?? null;
-        return {
+        return [{
           marketId: row.marketId,
           campaignId: row.campaignId,
           campaignName: row.campaignName,
+          kuehlerUnitId: null,
+          kuehlerNumber: null,
           chain: row.chain,
           address: row.address,
           stammnr: row.stammnr,
           done: Boolean(doneAt),
           doneAt,
-        };
+        }];
       });
       const total = markets.length;
       const current = markets.filter((row) => row.done).length;
