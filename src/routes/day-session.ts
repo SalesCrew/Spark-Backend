@@ -120,6 +120,7 @@ const reviewEditsSchema = z
 const submitSchema = z
   .object({
     comment: z.string().trim().max(2_000).optional(),
+    reviewEdits: reviewEditsSchema.shape.edits.optional(),
   })
   .strict();
 
@@ -385,6 +386,191 @@ async function loadReviewIntervals(input: {
     intervals.push({ kind: "zusatzzeit", id: row.id, startAt: row.startAt, endAt: row.endAt });
   }
   return intervals;
+}
+
+class ReviewEditHttpError extends Error {
+  statusCode: number;
+  code: string;
+
+  constructor(statusCode: number, message: string, code: string) {
+    super(message);
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+type ReviewEditInput = z.infer<typeof reviewEditsSchema>["edits"][number];
+type ReviewEditableSession = {
+  id: string;
+  gmUserId: string;
+  workDate: string;
+  timezone: string | null;
+  dayStartedAt: Date | null;
+  dayEndedAt: Date | null;
+};
+type ReviewIntervalUpdate = {
+  kind: "marktbesuch" | "pause" | "zusatzzeit";
+  id: string;
+  startAt: Date;
+  endAt: Date;
+};
+
+async function buildReviewEditUpdates(input: {
+  session: ReviewEditableSession;
+  gmUserId: string;
+  edits: ReviewEditInput[];
+}): Promise<{
+  daySessionUpdates: { dayStartedAt?: Date; dayEndedAt?: Date };
+  intervalUpdates: ReviewIntervalUpdate[];
+}> {
+  const { session, gmUserId, edits } = input;
+  if (edits.length === 0) {
+    return { daySessionUpdates: {}, intervalUpdates: [] };
+  }
+  if (!session.dayStartedAt || !session.dayEndedAt) {
+    throw new ReviewEditHttpError(409, "Arbeitstag ist unvollstÃ¤ndig.", "day_incomplete");
+  }
+
+  const timezone = session.timezone || DEFAULT_TIMEZONE;
+  const currentIntervals = await loadReviewIntervals({
+    daySessionId: session.id,
+    gmUserId,
+    workDate: session.workDate,
+    timezone,
+  });
+  const intervalByKey = new Map(currentIntervals.map((interval) => [`${interval.kind}:${interval.id}`, interval]));
+  const nextIntervals = currentIntervals.map((interval) => ({ ...interval }));
+  const updates = new Map<string, ReviewIntervalUpdate>();
+  let nextDayStartAt = session.dayStartedAt;
+  let nextDayEndAt = session.dayEndedAt;
+  const daySessionUpdates: { dayStartedAt?: Date; dayEndedAt?: Date } = {};
+
+  for (const edit of edits) {
+    if (edit.kind === "day_start" || edit.kind === "day_end") {
+      if (edit.segmentId !== session.id) {
+        throw new ReviewEditHttpError(404, "Arbeitstag nicht gefunden.", "day_segment_not_found");
+      }
+      const editedAt = parseWorkDateHmToUtc(
+        session.workDate,
+        edit.kind === "day_start" ? edit.startTime : edit.endTime,
+        timezone,
+      );
+      if (!editedAt) {
+        throw new ReviewEditHttpError(400, "Bitte gÃ¼ltige Uhrzeiten im Format HH:MM eingeben.", "invalid_time");
+      }
+      if (edit.kind === "day_start") {
+        nextDayStartAt = editedAt;
+        daySessionUpdates.dayStartedAt = editedAt;
+      } else {
+        nextDayEndAt = editedAt;
+        daySessionUpdates.dayEndedAt = editedAt;
+      }
+      continue;
+    }
+
+    const key = `${edit.kind}:${edit.segmentId}`;
+    const current = intervalByKey.get(key);
+    if (!current) {
+      throw new ReviewEditHttpError(404, "Zeiteintrag nicht gefunden.", "segment_not_found");
+    }
+    const startAt = parseWorkDateHmToUtc(session.workDate, edit.startTime, timezone);
+    const endAt = parseWorkDateHmToUtc(session.workDate, edit.endTime, timezone);
+    if (!startAt || !endAt) {
+      throw new ReviewEditHttpError(400, "Bitte gÃ¼ltige Uhrzeiten im Format HH:MM eingeben.", "invalid_time");
+    }
+    const index = nextIntervals.findIndex((interval) => interval.kind === edit.kind && interval.id === edit.segmentId);
+    if (index < 0) {
+      throw new ReviewEditHttpError(404, "Zeiteintrag nicht gefunden.", "segment_not_found");
+    }
+    const existingInterval = nextIntervals[index];
+    if (!existingInterval) {
+      throw new ReviewEditHttpError(404, "Zeiteintrag nicht gefunden.", "segment_not_found");
+    }
+    nextIntervals[index] = { ...existingInterval, startAt, endAt };
+    updates.set(key, { kind: edit.kind, id: edit.segmentId, startAt, endAt });
+  }
+
+  if (nextDayEndAt.getTime() <= nextDayStartAt.getTime()) {
+    throw new ReviewEditHttpError(400, "Tagesende muss nach Tagesstart liegen.", "invalid_day_interval");
+  }
+
+  for (const interval of nextIntervals) {
+    const validation = validateTimelineInterval({
+      kind: interval.kind,
+      id: interval.id,
+      startAt: interval.startAt,
+      endAt: interval.endAt,
+      dayStartAt: nextDayStartAt,
+      dayEndAt: nextDayEndAt,
+      intervals: nextIntervals,
+    });
+    if (!validation.ok) {
+      const message =
+        validation.code === "overlap"
+          ? "Dieser Zeitraum ist nicht mÃ¶glich, weil er sich mit einem bestehenden Eintrag ?berschneidet."
+          : validation.code === "outside_day"
+            ? "Tagesstart und Tagesende mÃ¼ssen alle EintrÃ¤ge vollstÃ¤ndig umfassen."
+            : validation.message;
+      throw new ReviewEditHttpError(validation.code === "overlap" ? 409 : 400, message, validation.code);
+    }
+  }
+
+  return { daySessionUpdates, intervalUpdates: [...updates.values()] };
+}
+
+async function applyReviewEditUpdates(input: {
+  tx: Pick<typeof db, "update">;
+  sessionId: string;
+  gmUserId: string;
+  updates: Awaited<ReturnType<typeof buildReviewEditUpdates>>;
+  now: Date;
+}) {
+  const { tx, sessionId, gmUserId, updates, now } = input;
+  if (updates.daySessionUpdates.dayStartedAt || updates.daySessionUpdates.dayEndedAt) {
+    await tx
+      .update(gmDaySessions)
+      .set({
+        ...updates.daySessionUpdates,
+        updatedAt: now,
+      })
+      .where(and(eq(gmDaySessions.id, sessionId), eq(gmDaySessions.gmUserId, gmUserId)));
+  }
+  for (const update of updates.intervalUpdates) {
+    if (update.kind === "marktbesuch") {
+      await tx
+        .update(visitSessions)
+        .set({
+          startedAt: update.startAt,
+          submittedAt: update.endAt,
+          updatedAt: now,
+        })
+        .where(and(eq(visitSessions.id, update.id), eq(visitSessions.gmUserId, gmUserId)));
+    } else if (update.kind === "pause") {
+      await tx
+        .update(gmDaySessionPauses)
+        .set({
+          pauseStartedAt: update.startAt,
+          pauseEndedAt: update.endAt,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(gmDaySessionPauses.id, update.id),
+            eq(gmDaySessionPauses.daySessionId, sessionId),
+            eq(gmDaySessionPauses.gmUserId, gmUserId),
+          ),
+        );
+    } else {
+      await tx
+        .update(timeTrackingEntries)
+        .set({
+          startAt: update.startAt,
+          endAt: update.endAt,
+          updatedAt: now,
+        })
+        .where(and(eq(timeTrackingEntries.id, update.id), eq(timeTrackingEntries.gmUserId, gmUserId)));
+    }
+  }
 }
 
 daySessionRouter.get("/current", async (req: AuthedRequest, res, next) => {
@@ -1303,19 +1489,32 @@ daySessionRouter.post("/submit", async (req: AuthedRequest, res, next) => {
       res.status(400).json({ error: "Start-KM und End-KM müssen gesetzt sein.", code: "km_required" });
       return;
     }
-    const [updated] = await db
-      .update(gmDaySessions)
-      .set({
-        status: "submitted",
-        submittedAt: now,
-        comment: parsed.data.comment?.trim() || null,
-        updatedAt: now,
-      })
-      .where(eq(gmDaySessions.id, session.id))
-      .returning();
+    const reviewEdits = parsed.data.reviewEdits ?? [];
+    const reviewUpdates = reviewEdits.length > 0
+      ? await buildReviewEditUpdates({ session, gmUserId, edits: reviewEdits })
+      : null;
+    const [updated] = await db.transaction(async (tx) => {
+      if (reviewUpdates) {
+        await applyReviewEditUpdates({ tx, sessionId: session.id, gmUserId, updates: reviewUpdates, now });
+      }
+      return tx
+        .update(gmDaySessions)
+        .set({
+          status: "submitted",
+          submittedAt: now,
+          comment: parsed.data.comment?.trim() || null,
+          updatedAt: now,
+        })
+        .where(eq(gmDaySessions.id, session.id))
+        .returning();
+    });
     if (!updated) throw new Error("Arbeitstag konnte nicht gespeichert werden.");
     res.status(200).json({ session: serializeDaySession(updated) });
   } catch (error) {
+    if (error instanceof ReviewEditHttpError) {
+      res.status(error.statusCode).json({ error: error.message, code: error.code });
+      return;
+    }
     next(error);
   }
 });
