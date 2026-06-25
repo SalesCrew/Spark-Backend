@@ -2458,6 +2458,118 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/change-requests", asyn
   }
 });
 
+gmVisitSessionsRouter.get("/gm/visit-sessions/change-requests", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId || req.authUser?.role !== "gm") {
+      res.status(403).json({ error: "Nur Gebietsmanager koennen eigene Aenderungsanfragen laden.", code: "gm_required" });
+      return;
+    }
+
+    const rows = await db
+      .select({
+        id: visitAnswerChangeRequests.id,
+        visitSessionId: visitAnswerChangeRequests.visitSessionId,
+        visitSessionQuestionId: visitAnswerChangeRequests.visitSessionQuestionId,
+        visitAnswerId: visitAnswerChangeRequests.visitAnswerId,
+        questionType: visitAnswerChangeRequests.questionType,
+        questionTextSnapshot: visitAnswerChangeRequests.questionTextSnapshot,
+        currentAnswerSnapshot: visitAnswerChangeRequests.currentAnswerSnapshot,
+        requestedAnswerPayload: visitAnswerChangeRequests.requestedAnswerPayload,
+        requestedAnswerSummary: visitAnswerChangeRequests.requestedAnswerSummary,
+        requestNote: visitAnswerChangeRequests.requestNote,
+        status: visitAnswerChangeRequests.status,
+        reviewedByUserId: visitAnswerChangeRequests.reviewedByUserId,
+        reviewedAt: visitAnswerChangeRequests.reviewedAt,
+        adminNote: visitAnswerChangeRequests.adminNote,
+        createdAt: visitAnswerChangeRequests.createdAt,
+        updatedAt: visitAnswerChangeRequests.updatedAt,
+        gmUserId: users.id,
+        gmFirstName: users.firstName,
+        gmLastName: users.lastName,
+        gmEmail: users.email,
+        gmRegion: users.region,
+        marketId: markets.id,
+        marketName: markets.name,
+        marketAddress: markets.address,
+        marketPostalCode: markets.postalCode,
+        marketCity: markets.city,
+        marketRegion: markets.region,
+        sessionStartedAt: visitSessions.startedAt,
+        sessionSubmittedAt: visitSessions.submittedAt,
+        section: visitSessionSections.section,
+        campaignId: visitSessionSections.campaignId,
+        campaignName: campaigns.name,
+        fragebogenName: visitSessionSections.fragebogenNameSnapshot,
+      })
+      .from(visitAnswerChangeRequests)
+      .innerJoin(users, eq(users.id, visitAnswerChangeRequests.gmUserId))
+      .innerJoin(markets, eq(markets.id, visitAnswerChangeRequests.marketId))
+      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswerChangeRequests.visitSessionId))
+      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswerChangeRequests.visitSessionSectionId))
+      .leftJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+      .where(and(eq(visitAnswerChangeRequests.gmUserId, gmUserId), eq(visitAnswerChangeRequests.isDeleted, false)))
+      .orderBy(
+        sql`case when ${visitAnswerChangeRequests.status} = 'pending' then 0 else 1 end`,
+        desc(visitAnswerChangeRequests.updatedAt),
+        desc(visitAnswerChangeRequests.createdAt),
+      )
+      .limit(120);
+
+    const requests = rows.map((row) => {
+      return {
+        id: row.id,
+        status: row.status,
+        createdAt: row.createdAt.toISOString(),
+        updatedAt: row.updatedAt.toISOString(),
+        reviewedByUserId: row.reviewedByUserId,
+        reviewedAt: row.reviewedAt?.toISOString() ?? null,
+        adminNote: row.adminNote,
+        visitSessionId: row.visitSessionId,
+        visitSessionQuestionId: row.visitSessionQuestionId,
+        visitAnswerId: row.visitAnswerId,
+        questionType: row.questionType,
+        questionText: row.questionTextSnapshot,
+        currentAnswerSnapshot: row.currentAnswerSnapshot ?? {},
+        requestedAnswerPayload: row.requestedAnswerPayload ?? {},
+        requestedAnswerSummary: row.requestedAnswerSummary,
+        requestNote: row.requestNote,
+        autoApplicable: true,
+        autoApplicabilityError: null,
+        gm: {
+          id: row.gmUserId,
+          name: [row.gmFirstName, row.gmLastName].filter(Boolean).join(" ").trim() || row.gmEmail,
+          email: row.gmEmail,
+          region: row.gmRegion,
+        },
+        market: {
+          id: row.marketId,
+          name: row.marketName,
+          address: row.marketAddress,
+          postalCode: row.marketPostalCode,
+          city: row.marketCity,
+          region: row.marketRegion,
+        },
+        session: {
+          id: row.visitSessionId,
+          startedAt: row.sessionStartedAt?.toISOString() ?? null,
+          submittedAt: row.sessionSubmittedAt?.toISOString() ?? null,
+        },
+        section: {
+          section: row.section,
+          campaignId: row.campaignId,
+          campaignName: row.campaignName ?? "",
+          fragebogenName: row.fragebogenName,
+        },
+      };
+    });
+
+    res.status(200).json({ requests });
+  } catch (error) {
+    next(error);
+  }
+});
+
 gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;
