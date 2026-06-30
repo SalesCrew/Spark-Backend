@@ -42,6 +42,8 @@ export const visitAnswerStatusEnum = pgEnum("visit_answer_status", ["unanswered"
 export const visitAnswerOptionRoleEnum = pgEnum("visit_answer_option_role", ["top", "sub"]);
 export const visitAnswerEventTypeEnum = pgEnum("visit_answer_event_type", ["set", "clear", "status_change"]);
 export const visitAnswerChangeRequestStatusEnum = pgEnum("visit_answer_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
+export const timeEntryChangeRequestStatusEnum = pgEnum("time_entry_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
+export const timeEntryChangeRequestSourceKindEnum = pgEnum("time_entry_change_request_source_kind", ["marktbesuch", "pause", "zusatzzeit"]);
 export const marketTypeEnum = pgEnum("market_type", ["universum", "kuehler", "both"]);
 export const timeTrackingActivityTypeEnum = pgEnum("time_tracking_activity_type", [
   "sonderaufgabe",
@@ -95,6 +97,8 @@ export const users = pgTable(
 
     isActive: boolean("is_active").notNull().default(true),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    anonymizedAt: timestamp("anonymized_at", { withTimezone: true }),
+    anonymizedByUserId: uuid("anonymized_by_user_id"),
 
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
@@ -105,6 +109,7 @@ export const users = pgTable(
     index("users_role_idx").on(table.role),
     index("users_active_idx").on(table.isActive),
     index("users_billa_gm_idx").on(table.isBillaGm),
+    index("users_anonymized_at_idx").on(table.anonymizedAt),
   ],
 );
 
@@ -127,6 +132,34 @@ export const kundeUsers = pgTable(
   (table) => [
     index("kunde_users_created_by_idx").on(table.createdByUserId),
     index("kunde_users_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const employeeAgreementAcceptances = pgTable(
+  "employee_agreement_acceptances",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    agreementKey: text("agreement_key").notNull().default("spark_employee_agreement"),
+    agreementVersion: text("agreement_version").notNull(),
+    agreementTitle: text("agreement_title").notNull(),
+    agreementHash: text("agreement_hash").notNull(),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }).defaultNow().notNull(),
+    acceptedIp: text("accepted_ip"),
+    acceptedUserAgent: text("accepted_user_agent"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("employee_agreement_acceptances_user_version_unique").on(
+      table.userId,
+      table.agreementKey,
+      table.agreementVersion,
+    ),
+    index("employee_agreement_acceptances_user_idx").on(table.userId),
+    index("employee_agreement_acceptances_key_version_idx").on(table.agreementKey, table.agreementVersion),
+    index("employee_agreement_acceptances_accepted_at_idx").on(table.acceptedAt),
   ],
 );
 
@@ -1816,6 +1849,49 @@ export const visitAnswerChangeRequests = pgTable(
   ],
 );
 
+export const timeEntryChangeRequests = pgTable(
+  "time_entry_change_requests",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    daySessionId: uuid("day_session_id")
+      .notNull()
+      .references(() => gmDaySessions.id, { onDelete: "cascade" }),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    sourceKind: timeEntryChangeRequestSourceKindEnum("source_kind").notNull(),
+    sourceId: uuid("source_id").notNull(),
+    workDate: date("work_date").notNull(),
+    timezone: text("timezone").notNull().default("Europe/Vienna"),
+    titleSnapshot: text("title_snapshot").notNull().default(""),
+    subtitleSnapshot: text("subtitle_snapshot"),
+    originalStartAt: timestamp("original_start_at", { withTimezone: true }).notNull(),
+    originalEndAt: timestamp("original_end_at", { withTimezone: true }).notNull(),
+    requestedStartAt: timestamp("requested_start_at", { withTimezone: true }).notNull(),
+    requestedEndAt: timestamp("requested_end_at", { withTimezone: true }).notNull(),
+    requestNote: text("request_note"),
+    status: timeEntryChangeRequestStatusEnum("status").notNull().default("pending"),
+    reviewedByUserId: uuid("reviewed_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    appliedAt: timestamp("applied_at", { withTimezone: true }),
+    adminNote: text("admin_note"),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("time_entry_change_requests_pending_source_unique")
+      .on(table.gmUserId, table.sourceKind, table.sourceId)
+      .where(sql`${table.isDeleted} = false AND ${table.status} = 'pending'`),
+    index("time_entry_change_requests_gm_status_idx").on(table.gmUserId, table.status, table.createdAt),
+    index("time_entry_change_requests_day_session_idx").on(table.daySessionId, table.createdAt),
+    index("time_entry_change_requests_source_idx").on(table.sourceKind, table.sourceId),
+    index("time_entry_change_requests_work_date_idx").on(table.workDate),
+    index("time_entry_change_requests_deleted_idx").on(table.isDeleted),
+  ],
+);
+
 export const visitAnswerEvents = pgTable(
   "visit_answer_events",
   {
@@ -1840,6 +1916,8 @@ export type KundeUserRow = typeof kundeUsers.$inferSelect;
 export type NewKundeUserRow = typeof kundeUsers.$inferInsert;
 export type MarketRow = typeof markets.$inferSelect;
 export type NewMarketRow = typeof markets.$inferInsert;
+export type TimeEntryChangeRequestRow = typeof timeEntryChangeRequests.$inferSelect;
+export type NewTimeEntryChangeRequestRow = typeof timeEntryChangeRequests.$inferInsert;
 export type MarketKuehlerUnitRow = typeof marketKuehlerUnits.$inferSelect;
 export type NewMarketKuehlerUnitRow = typeof marketKuehlerUnits.$inferInsert;
 export type LagerRow = typeof lager.$inferSelect;

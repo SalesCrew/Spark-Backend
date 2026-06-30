@@ -18,6 +18,7 @@ import { adminLagerRouter } from "./routes/admin-lager.js";
 import { authRouter } from "./routes/auth.js";
 import { clientTelemetryRouter } from "./routes/client-telemetry.js";
 import { daySessionRouter } from "./routes/day-session.js";
+import { employeeAgreementRouter } from "./routes/employee-agreement.js";
 import { adminFragebogenRouter } from "./routes/fragebogen.js";
 import { gmVisitSessionsRouter } from "./routes/gm-visit-sessions.js";
 import { gmProfileRouter } from "./routes/gm-profile.js";
@@ -28,6 +29,7 @@ import { adminPhotosRouter } from "./routes/admin-photos.js";
 import { adminPraemienRouter } from "./routes/praemien.js";
 import { adminRedMonthRouter, redMonthRouter } from "./routes/red-month.js";
 import { timeTrackingRouter } from "./routes/time-tracking.js";
+import { adminTimeEntryChangeRequestsRouter, gmTimeEntryChangeRequestsRouter } from "./routes/time-entry-change-requests.js";
 
 function resolveErrorStatusCode(error: unknown): number {
   const withStatus = error as { status?: unknown; statusCode?: unknown };
@@ -150,6 +152,8 @@ function createApp() {
 
   // Keep route registration order explicit for predictable middleware flow.
   app.use("/auth", authRouter);
+  app.use("/employee-agreement", employeeAgreementRouter);
+  app.use("/day-session/time-change-requests", gmTimeEntryChangeRequestsRouter);
   app.use("/day-session", daySessionRouter);
   app.use("/markets", marketsRouter);
   app.use("/markets", gmVisitSessionsRouter);
@@ -168,6 +172,7 @@ function createApp() {
   app.use("/admin/praemien", adminPraemienRouter);
   app.use("/admin", adminRedMonthRouter);
   app.use("/admin/zeiterfassung", adminZeiterfassungRouter);
+  app.use("/admin/time-change-requests", adminTimeEntryChangeRequestsRouter);
 
   app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const statusCode = resolveErrorStatusCode(err);

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, lte } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lt, lte, ne } from "drizzle-orm";
 import { db, sql as pgSql } from "./db.js";
 import { getCachedRedMonthCalendarConfig, refreshRedMonthCalendarConfig } from "./red-month-calendar.js";
 import {
@@ -262,7 +262,30 @@ async function ensureFreshCache(): Promise<void> {
 
 function findCachedPeriod(date: Date): ResolvedRedMonthPeriod | null {
   const target = toYmd(startOfDay(date));
-  return cachedPeriods.find((period) => target >= toYmd(period.start) && target <= toYmd(period.lookupEnd)) ?? null;
+  return (
+    cachedPeriods.find(
+      (period) => period.status !== "draft" && target >= toYmd(period.start) && target <= toYmd(period.lookupEnd),
+    ) ?? null
+  );
+}
+
+async function lockOlderActiveYearsForResolvedPeriod(period: ResolvedRedMonthPeriod): Promise<void> {
+  if (period.status !== "active" || !period.redMonthYearId) return;
+  const lockedRows = await db
+    .update(redMonthYears)
+    .set({ status: "locked", updatedAt: new Date() })
+    .where(
+      and(
+        eq(redMonthYears.status, "active"),
+        eq(redMonthYears.isDeleted, false),
+        ne(redMonthYears.id, period.redMonthYearId),
+        lt(redMonthYears.anchorStart, toYmd(period.anchorStart)),
+      ),
+    )
+    .returning({ id: redMonthYears.id });
+  if (lockedRows.length > 0) {
+    await refreshRedMonthPeriodCache();
+  }
 }
 
 export async function resolveRedPeriodForDate(date = new Date()): Promise<ResolvedRedMonthPeriod> {
@@ -273,7 +296,10 @@ export async function resolveRedPeriodForDate(date = new Date()): Promise<Resolv
 
   await ensureFreshCache();
   const fromCache = findCachedPeriod(date);
-  if (fromCache) return fromCache;
+  if (fromCache) {
+    await lockOlderActiveYearsForResolvedPeriod(fromCache);
+    return fromCache;
+  }
 
   const targetYmd = toYmd(startOfDay(date));
   const [row] = await db
@@ -287,6 +313,7 @@ export async function resolveRedPeriodForDate(date = new Date()): Promise<Resolv
       and(
         eq(redMonthPeriods.isDeleted, false),
         eq(redMonthYears.isDeleted, false),
+        inArray(redMonthYears.status, ["active", "locked"]),
         lte(redMonthPeriods.startDate, targetYmd),
         gte(redMonthPeriods.lookupEndDate, targetYmd),
       ),
@@ -294,7 +321,11 @@ export async function resolveRedPeriodForDate(date = new Date()): Promise<Resolv
     .orderBy(desc(redMonthPeriods.startDate))
     .limit(1);
 
-  if (row) return mapPeriodRow(row);
+  if (row) {
+    const period = mapPeriodRow(row);
+    await lockOlderActiveYearsForResolvedPeriod(period);
+    return period;
+  }
   throw makeRedMonthError(
     "Für dieses Datum ist kein RED-Monat gespeichert. Bitte zuerst ein RED-Jahr im Kalender anlegen.",
     "red_month_period_missing",
@@ -331,7 +362,10 @@ export async function listRedMonthPeriods(input: {
   const current = await resolveCurrentRedPeriod(now);
   const fromYmd = input.from ?? toYmd(addDays(current.start, -200));
   const toYmdValue = input.to ?? toYmd(addDays(current.end, 400));
-  return cachedPeriods.filter((period) => toYmd(period.lookupEnd) >= fromYmd && toYmd(period.start) <= toYmdValue);
+  return cachedPeriods.filter(
+    (period) =>
+      period.status !== "draft" && toYmd(period.lookupEnd) >= fromYmd && toYmd(period.start) <= toYmdValue,
+  );
 }
 
 export async function listRedMonthYears(): Promise<RedMonthYearRecord[]> {
@@ -393,18 +427,6 @@ export async function createRedMonthYear(input: {
     if (!yearRow) {
       throw makeRedMonthError("RED-Jahr konnte nicht erstellt werden.", "red_month_year_create_failed", 500);
     }
-    if (status === "active") {
-      await tx
-        .update(redMonthYears)
-        .set({ status: "locked", updatedAt: now })
-        .where(and(eq(redMonthYears.status, "active"), eq(redMonthYears.isDeleted, false)));
-      await tx
-        .update(redMonthYears)
-        .set({ status: "active", updatedAt: now })
-        .where(eq(redMonthYears.id, yearRow.id));
-      yearRow.status = "active";
-    }
-
     const insertedPeriods = await tx
       .insert(redMonthPeriods)
       .values(
@@ -528,10 +550,6 @@ export async function activateRedMonthYear(id: string): Promise<RedMonthYearReco
       .where(and(eq(redMonthYears.id, id), eq(redMonthYears.isDeleted, false)))
       .limit(1);
     if (!target) return null;
-    await tx
-      .update(redMonthYears)
-      .set({ status: "locked", updatedAt: now })
-      .where(and(eq(redMonthYears.status, "active"), eq(redMonthYears.isDeleted, false)));
     const [activated] = await tx
       .update(redMonthYears)
       .set({ status: "active", updatedAt: now })
@@ -541,6 +559,12 @@ export async function activateRedMonthYear(id: string): Promise<RedMonthYearReco
   });
   if (!row) throw makeRedMonthError("RED-Jahr nicht gefunden.", "red_month_year_not_found", 404);
   await refreshRedMonthPeriodCache();
+  try {
+    await resolveCurrentRedPeriod(new Date());
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code !== "red_month_period_missing") throw error;
+  }
   return mapYearRow(row);
 }
 

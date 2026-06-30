@@ -44,6 +44,19 @@ const updateOwnPasswordSchema = z.object({
 
 const adminUsersRouter = Router();
 
+function buildAnonymizedEmail(userId: string): string {
+  return `mitarbeiter-${userId.replace(/-/g, "").slice(0, 12)}@anonymisiert.coke-spark.local`;
+}
+
+function mapUserResponse(row: typeof users.$inferSelect, gmKpi?: { ipp: number; ippSampleCount: number } | null) {
+  return {
+    ...row,
+    isBillaGm: row.role === "gm" ? row.isBillaGm : false,
+    ipp: row.role === "gm" ? gmKpi?.ipp ?? 0 : row.ipp == null ? null : Number(row.ipp),
+    ippSampleCount: row.role === "gm" ? gmKpi?.ippSampleCount ?? 0 : null,
+  };
+}
+
 async function requireAdminUsersAccess(req: AuthedRequest, res: Response, next: NextFunction) {
   if (!req.authUser) {
     res.status(401).json({ error: "Authentication required.", code: "auth_required" });
@@ -169,6 +182,7 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
         ...(row.role !== "gm" ? { ipp: row.ipp == null ? null : Number(row.ipp), ippSampleCount: null } : {}),
         isActive: row.isActive,
         deletedAt: row.deletedAt,
+        anonymizedAt: row.anonymizedAt,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
       })),
@@ -432,12 +446,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         : null;
 
     res.status(200).json({
-      user: {
-        ...updated,
-        isBillaGm: updated.role === "gm" ? updated.isBillaGm : false,
-        ipp: updated.role === "gm" ? gmKpi?.ipp ?? 0 : updated.ipp == null ? null : Number(updated.ipp),
-        ippSampleCount: updated.role === "gm" ? gmKpi?.ippSampleCount ?? 0 : null,
-      },
+      user: mapUserResponse(updated, gmKpi),
     });
     logAction("info", "admin_user_update_success", {
       req,
@@ -596,6 +605,113 @@ adminUsersRouter.patch("/:id/password", async (req: AuthedRequest, res, next) =>
     logAction("error", "admin_user_password_failed", {
       req,
       action: "admin_user_password_update",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
+    next(err);
+  }
+});
+
+adminUsersRouter.patch("/:id/anonymize", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    if (!req.authUser || req.authUser.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins koennen Mitarbeiter anonymisieren.", code: "role_not_allowed" });
+      return;
+    }
+
+    const id = String(req.params.id ?? "");
+    if (!id) {
+      res.status(400).json({ error: "User id is required.", code: "invalid_user_id" });
+      return;
+    }
+    if (id === req.authUser.appUserId) {
+      res.status(409).json({ error: "Du kannst deinen eigenen Account nicht anonymisieren.", code: "cannot_anonymize_self" });
+      return;
+    }
+
+    const [target] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    if (!target) {
+      res.status(404).json({ error: "User not found.", code: "user_not_found" });
+      return;
+    }
+    if (target.role !== "gm" && target.role !== "sm") {
+      res.status(403).json({ error: "Nur GM- und SM-Mitarbeiter koennen ueber diesen Prozess anonymisiert werden.", code: "role_not_allowed" });
+      return;
+    }
+    if (target.anonymizedAt) {
+      res.status(200).json({ ok: true, alreadyAnonymized: true, user: mapUserResponse(target, null) });
+      return;
+    }
+
+    const now = new Date();
+    const anonymizedEmail = buildAnonymizedEmail(target.id);
+    const [updated] = await db
+      .update(users)
+      .set({
+        email: anonymizedEmail,
+        firstName: "Mitarbeiter",
+        lastName: "1",
+        phone: "1",
+        address: "Adresse 1",
+        city: "Ort 1",
+        postalCode: "1",
+        region: "1",
+        isBillaGm: false,
+        profilePhotoBucket: null,
+        profilePhotoPath: null,
+        profilePhotoUpdatedAt: null,
+        isActive: false,
+        deletedAt: now,
+        anonymizedAt: now,
+        anonymizedByUserId: req.authUser.appUserId,
+        updatedAt: now,
+      })
+      .where(eq(users.id, target.id))
+      .returning();
+
+    if (!updated) {
+      res.status(404).json({ error: "User not found after update.", code: "user_not_found" });
+      return;
+    }
+
+    const { error: authDeleteError } = await supabaseAdmin.auth.admin.deleteUser(target.supabaseAuthId);
+
+    await db.insert(authAuditLogs).values({
+      actorUserId: req.authUser.appUserId,
+      targetUserId: target.id,
+      eventType: "user_anonymized",
+      details: authDeleteError ? `auth_delete_failed=${authDeleteError.message}` : "auth_deleted=true",
+    });
+
+    logAction(authDeleteError ? "warn" : "info", "admin_user_anonymize_success", {
+      req,
+      action: "admin_user_anonymize",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: {
+        targetUserId: target.id,
+        targetRole: target.role,
+        authDeleted: !authDeleteError,
+      },
+    });
+
+    res.status(200).json({
+      ok: true,
+      authDeleted: !authDeleteError,
+      authDeleteError: authDeleteError?.message ?? null,
+      user: mapUserResponse(updated, null),
+    });
+  } catch (err) {
+    logAction("error", "admin_user_anonymize_failed", {
+      req,
+      action: "admin_user_anonymize",
       result: "failure",
       statusCode: 500,
       requestClass: "server_error",
