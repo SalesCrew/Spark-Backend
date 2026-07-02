@@ -2723,7 +2723,7 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
       throw new CampaignOverlapConflictError(conflicts);
     }
 
-    const campaignId = await db.transaction(async (tx) => {
+    const createResult = await db.transaction(async (tx) => {
       const [created] = await tx
         .insert(campaigns)
         .values({
@@ -2761,32 +2761,64 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
         );
       }
 
+      let historyRow: typeof campaignFragebogenHistory.$inferSelect | null = null;
       if (parsed.data.currentFragebogenId) {
-        await tx.insert(campaignFragebogenHistory).values({
-          campaignId: created.id,
-          fromFragebogenId: null,
-          toFragebogenId: parsed.data.currentFragebogenId,
-          changedAt: now,
-          changedByUserId: auditUserId,
-          isDeleted: false,
-          deletedAt: null,
-          createdAt: now,
-          updatedAt: now,
-        });
+        const [createdHistory] = await tx
+          .insert(campaignFragebogenHistory)
+          .values({
+            campaignId: created.id,
+            fromFragebogenId: null,
+            toFragebogenId: parsed.data.currentFragebogenId,
+            changedAt: now,
+            changedByUserId: auditUserId,
+            isDeleted: false,
+            deletedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning();
+        historyRow = createdHistory ?? null;
       }
-      return created.id;
+      return { campaign: created, historyRow };
     });
 
-    const [row] = await db
-      .select()
-      .from(campaigns)
-      .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
-      .limit(1);
-    if (!row) {
-      res.status(404).json({ error: "Kampagne nicht gefunden.", code: "campaign_not_found" });
-      return;
-    }
-    const [campaign] = await mapCampaignRows([row]);
+    const campaign = {
+      id: createResult.campaign.id,
+      name: createResult.campaign.name,
+      section: createResult.campaign.section,
+      currentFragebogenId: createResult.campaign.currentFragebogenId,
+      currentFragebogenName: null,
+      status: deriveEffectiveCampaignStatus({
+        status: createResult.campaign.status,
+        scheduleType: createResult.campaign.scheduleType,
+        startDate: createResult.campaign.startDate,
+        endDate: createResult.campaign.endDate,
+      }),
+      scheduleType: createResult.campaign.scheduleType,
+      startDate: createResult.campaign.startDate ? String(createResult.campaign.startDate) : null,
+      endDate: createResult.campaign.endDate ? String(createResult.campaign.endDate) : null,
+      marketIds: normalizeUnique(assignments.map((assignment) => assignment.marketId)),
+      assignments: assignments.map((assignment) => ({
+        marketId: assignment.marketId,
+        gmUserId: assignment.gmUserId,
+        gmName: null,
+        assignmentSlot: assignment.assignmentSlot,
+        visitTargetCount: assignment.visitTargetCount,
+        currentVisitsCount: 0,
+      })),
+      history: createResult.historyRow
+        ? [
+            {
+              id: createResult.historyRow.id,
+              fromFragebogenId: createResult.historyRow.fromFragebogenId,
+              toFragebogenId: createResult.historyRow.toFragebogenId,
+              changedAt: createResult.historyRow.changedAt.toISOString(),
+            },
+          ]
+        : [],
+      createdAt: createResult.campaign.createdAt.toISOString(),
+      updatedAt: createResult.campaign.updatedAt.toISOString(),
+    };
     res.status(201).json({ campaign });
     logAction("info", "campaign_create_success", {
       req,
@@ -2796,7 +2828,7 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
       requestClass: "success",
       startedAtNs,
       details: {
-        campaignId,
+        campaignId: createResult.campaign.id,
         section: parsed.data.section,
         assignmentsCount: assignments.length,
       },
