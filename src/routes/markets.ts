@@ -155,7 +155,8 @@ const universumImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; req
 ];
 
 const kuehlerImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; required: boolean; isIdentity: boolean }> = [
-  { key: "kuehlerStammnr", label: "Stammnr", required: true, isIdentity: true },
+  { key: "kuehlerStammnr", label: "Stammnr", required: false, isIdentity: true },
+  { key: "flexNumber", label: "Flex-Nummer", required: false, isIdentity: true },
   { key: "kuehlerInternalId", label: "internal_id", required: false, isIdentity: false },
   { key: "kuehlerBd", label: "BD", required: false, isIdentity: false },
   { key: "kuehlerAnzahlKsAmStandort", label: "Anzahl KS am Standort", required: false, isIdentity: false },
@@ -2054,8 +2055,8 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
     const payload = parsed.data;
     const importType: ImportDatasetType = payload.importType ?? "universum";
-    if (importType === "kuehler" && !isValidColLetter(payload.mapping.kuehlerStammnr ?? "")) {
-      res.status(400).json({ error: "Für Kühlermärkte muss 'Stammnr' gemappt sein." });
+    if (importType === "kuehler" && !isValidColLetter(payload.mapping.kuehlerStammnr ?? "") && !isValidColLetter(payload.mapping.flexNumber ?? "")) {
+      res.status(400).json({ error: "Für Kühlermärkte muss 'Stammnr' oder 'Flex-Nummer' gemappt sein." });
       return;
     }
     if (importType === "update") {
@@ -2373,6 +2374,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           .where(and(eq(marketKuehlerUnits.isDeleted, false), isNotNull(marketKuehlerUnits.kuehlerInternalId)));
 
         const marketByCanonicalStammnr = new Map<string, typeof markets.$inferSelect>();
+        const marketsByCanonicalFlex = new Map<string, Array<typeof markets.$inferSelect>>();
         const registerMarket = (market: typeof markets.$inferSelect) => {
           const keyCandidates = [
             normalizeStammnrForMatch(market.kuehlerStammnr),
@@ -2383,6 +2385,14 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             if (!canonical) continue;
             const current = marketByCanonicalStammnr.get(canonical);
             marketByCanonicalStammnr.set(canonical, choosePreferredMarketByStammnr(current, market));
+          }
+          const flexKey = normStr(normalizeIdentity(market.flexNumber) ?? "");
+          if (flexKey) {
+            const bucket = marketsByCanonicalFlex.get(flexKey) ?? [];
+            if (!bucket.some((entry) => entry.id === market.id)) {
+              bucket.push(market);
+              marketsByCanonicalFlex.set(flexKey, bucket);
+            }
           }
         };
         for (const market of existingMarkets) {
@@ -2438,13 +2448,15 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           const sampleText = String(draft.name ?? draft.city ?? row.find((cell) => cell?.trim()) ?? "");
           const stammnr = normalizeStammnrForMatch(draft.kuehlerStammnr);
           const canonicalStammnr = normStr(stammnr ?? "");
-          if (!canonicalStammnr) {
+          const flexIdentity = normalizeIdentity(draft.flexNumber);
+          const canonicalFlex = normStr(flexIdentity ?? "");
+          if (!canonicalStammnr && !canonicalFlex) {
             summary.skipped += 1;
             summary.kuehlerUnitsSkipped += 1;
             if (summary.skippedReasons.length < 50) {
               summary.skippedReasons.push({
                 row: rowNum,
-                reason: "Stammnr fehlt oder ist nach Normalisierung leer",
+                reason: "Stammnr und Flex-Nummer fehlen oder sind nach Normalisierung leer",
                 sample: sampleText,
                 draft,
               });
@@ -2468,8 +2480,42 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             continue;
           }
 
-          let resolvedMarket = marketByCanonicalStammnr.get(canonicalStammnr);
+          let resolvedMarket = canonicalStammnr ? marketByCanonicalStammnr.get(canonicalStammnr) : undefined;
+          let resolvedByFlexFallback = false;
+          if (!resolvedMarket && canonicalFlex) {
+            const flexMatches = marketsByCanonicalFlex.get(canonicalFlex) ?? [];
+            if (flexMatches.length === 1) {
+              resolvedMarket = flexMatches[0];
+              resolvedByFlexFallback = true;
+              summary.matchedBy.flexNumber += 1;
+            } else if (flexMatches.length > 1) {
+              summary.skipped += 1;
+              summary.kuehlerUnitsSkipped += 1;
+              if (summary.skippedReasons.length < 50) {
+                summary.skippedReasons.push({
+                  row: rowNum,
+                  reason: `Flex-Nummer ${String(draft.flexNumber ?? flexIdentity)} ist nicht eindeutig`,
+                  sample: sampleText,
+                  draft,
+                });
+              }
+              continue;
+            }
+          }
           if (!resolvedMarket) {
+            if (!canonicalStammnr) {
+              summary.skipped += 1;
+              summary.kuehlerUnitsSkipped += 1;
+              if (summary.skippedReasons.length < 50) {
+                summary.skippedReasons.push({
+                  row: rowNum,
+                  reason: `Kein bestehender Markt mit Flex-Nummer ${String(draft.flexNumber ?? flexIdentity)} gefunden`,
+                  sample: sampleText,
+                  draft,
+                });
+              }
+              continue;
+            }
             const seed = seedByCanonicalStammnr.get(canonicalStammnr);
             const seedDraft = seed?.draft ?? draft;
             const seedSampleText = seed?.sampleText ?? sampleText;
@@ -2556,8 +2602,13 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             const shouldUpdateMarket =
               nextMarketType !== resolvedMarket.marketType ||
               nextUniverseMarket !== resolvedMarket.universeMarket ||
-              normalizeStammnrForMatch(resolvedMarket.kuehlerStammnr) !== stammnr ||
-              normalizeStammnrForMatch(resolvedMarket.cokeMasterNumber) !== stammnr;
+              Boolean(
+                canonicalStammnr &&
+                (
+                  normalizeStammnrForMatch(resolvedMarket.kuehlerStammnr) !== stammnr ||
+                  normalizeStammnrForMatch(resolvedMarket.cokeMasterNumber) !== stammnr
+                ),
+              );
 
             if (shouldUpdateMarket) {
               const [updatedMarket] = await tx
@@ -2565,8 +2616,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
                 .set({
                   marketType: nextMarketType,
                   universeMarket: nextUniverseMarket,
-                  kuehlerStammnr: stammnr,
-                  cokeMasterNumber: stammnr,
+                  ...(canonicalStammnr ? { kuehlerStammnr: stammnr, cokeMasterNumber: stammnr } : {}),
                   importSourceFileName: payload.fileName,
                   importedAt,
                   updatedAt: new Date(),
@@ -2576,9 +2626,19 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
               if (updatedMarket) {
                 summary.updated += 1;
                 resolvedMarket = updatedMarket;
-                marketByCanonicalStammnr.set(canonicalStammnr, updatedMarket);
+                if (canonicalStammnr) marketByCanonicalStammnr.set(canonicalStammnr, updatedMarket);
                 registerMarket(updatedMarket);
               }
+            }
+            if (resolvedByFlexFallback) {
+              logger.debug("market_kuehler_import_flex_fallback_match", {
+                action: "market_import",
+                result: "matched",
+                row: rowNum,
+                flexNumber: flexIdentity,
+                marketId: resolvedMarket.id,
+                requestId: (req as { requestId?: string }).requestId ?? null,
+              });
             }
           }
 
