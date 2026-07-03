@@ -135,6 +135,29 @@ export const kundeUsers = pgTable(
   ],
 );
 
+export const specialArthurFilter = pgTable(
+  "special_arthur_filter",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    matchValue: text("match_value").notNull(),
+    createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("special_arthur_filter_gm_value_active_unique")
+      .on(table.gmUserId, table.matchValue)
+      .where(sql`${table.isDeleted} = false`),
+    index("special_arthur_filter_gm_active_idx").on(table.gmUserId, table.isDeleted),
+    index("special_arthur_filter_value_idx").on(table.matchValue),
+  ],
+);
+
 export const employeeAgreementAcceptances = pgTable(
   "employee_agreement_acceptances",
   {

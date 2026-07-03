@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq } from "drizzle-orm";
 import type { NextFunction, Response } from "express";
 import { Router } from "express";
 import { z } from "zod";
@@ -7,7 +7,7 @@ import { getKundePermissionsForUser, hasKundePermission } from "../lib/kunde-acc
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
-import { authAuditLogs, type UserRole, users } from "../lib/schema.js";
+import { authAuditLogs, specialArthurFilter, type UserRole, users } from "../lib/schema.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { generatePassword } from "../services/password.js";
 
@@ -42,10 +42,22 @@ const updateOwnPasswordSchema = z.object({
   newPassword: z.string().min(8).max(128),
 });
 
+const replaceSpecialArthurFilterSchema = z.object({
+  matchValues: z.array(z.string()).max(20000),
+});
+
 const adminUsersRouter = Router();
 
 function buildAnonymizedEmail(userId: string): string {
   return `mitarbeiter-${userId.replace(/-/g, "").slice(0, 12)}@anonymisiert.coke-spark.local`;
+}
+
+function normalizeSpecialArthurMatchValue(input: unknown): string | null {
+  const normalized = String(input ?? "")
+    .trim()
+    .replace(/\s+/g, "")
+    .toUpperCase();
+  return normalized.length > 0 ? normalized : null;
 }
 
 function mapUserResponse(row: typeof users.$inferSelect, gmKpi?: { ipp: number; ippSampleCount: number } | null) {
@@ -188,6 +200,139 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
       })),
     });
   } catch (err) {
+    next(err);
+  }
+});
+
+adminUsersRouter.get("/:id/special-arthur-filter", async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins duerfen GM-Maerktefilter verwalten.", code: "role_not_allowed" });
+      return;
+    }
+    const id = String(req.params.id ?? "");
+    const [gm] = await db
+      .select({ id: users.id, role: users.role })
+      .from(users)
+      .where(eq(users.id, id))
+      .limit(1);
+    if (!gm || gm.role !== "gm") {
+      res.status(404).json({ error: "GM nicht gefunden." });
+      return;
+    }
+
+    const entries = await db
+      .select({
+        id: specialArthurFilter.id,
+        matchValue: specialArthurFilter.matchValue,
+        createdAt: specialArthurFilter.createdAt,
+      })
+      .from(specialArthurFilter)
+      .where(and(eq(specialArthurFilter.gmUserId, id), eq(specialArthurFilter.isDeleted, false)))
+      .orderBy(asc(specialArthurFilter.matchValue));
+
+    res.status(200).json({
+      entries: entries.map((entry) => ({
+        id: entry.id,
+        matchValue: entry.matchValue,
+        createdAt: entry.createdAt.toISOString(),
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminUsersRouter.put("/:id/special-arthur-filter", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins duerfen GM-Maerktefilter verwalten.", code: "role_not_allowed" });
+      return;
+    }
+    const parsed = replaceSpecialArthurFilterSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid special Arthur filter payload." });
+      return;
+    }
+    const id = String(req.params.id ?? "");
+    const [gm] = await db
+      .select({ id: users.id, role: users.role })
+      .from(users)
+      .where(eq(users.id, id))
+      .limit(1);
+    if (!gm || gm.role !== "gm") {
+      res.status(404).json({ error: "GM nicht gefunden." });
+      return;
+    }
+
+    const matchValues = Array.from(
+      new Set(
+        parsed.data.matchValues
+          .map((value) => normalizeSpecialArthurMatchValue(value))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    ).sort((left, right) => left.localeCompare(right, "de"));
+
+    const now = new Date();
+    const entries = await db.transaction(async (tx) => {
+      await tx
+        .update(specialArthurFilter)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(eq(specialArthurFilter.gmUserId, id), eq(specialArthurFilter.isDeleted, false)));
+
+      if (matchValues.length === 0) return [];
+
+      return tx
+        .insert(specialArthurFilter)
+        .values(
+          matchValues.map((matchValue) => ({
+            gmUserId: id,
+            matchValue,
+            createdByUserId: req.authUser?.appUserId ?? null,
+          })),
+        )
+        .returning({
+          id: specialArthurFilter.id,
+          matchValue: specialArthurFilter.matchValue,
+          createdAt: specialArthurFilter.createdAt,
+        });
+    });
+
+    await db.insert(authAuditLogs).values({
+      actorUserId: req.authUser?.appUserId,
+      targetUserId: id,
+      eventType: "special_arthur_filter_replaced",
+      details: JSON.stringify({ count: entries.length }),
+    });
+
+    res.status(200).json({
+      entries: entries.map((entry) => ({
+        id: entry.id,
+        matchValue: entry.matchValue,
+        createdAt: entry.createdAt.toISOString(),
+      })),
+    });
+    logAction("info", "special_arthur_filter_replace_success", {
+      req,
+      action: "special_arthur_filter_replace",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { targetUserId: id, count: entries.length },
+    });
+  } catch (err) {
+    logAction("error", "special_arthur_filter_replace_failed", {
+      req,
+      action: "special_arthur_filter_replace",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error: err,
+    });
+    markErrorAsLogged(err);
     next(err);
   }
 });

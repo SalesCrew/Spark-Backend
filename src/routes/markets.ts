@@ -13,6 +13,7 @@ import {
   marketKuehlerUnits,
   markets,
   photoTags,
+  specialArthurFilter,
   visitAnswerPhotos,
   visitAnswers,
   visitQuestionComments,
@@ -93,6 +94,51 @@ function isBillaMarketRow(input: { name: string | null | undefined; dbName: stri
 
 function billaMarketSqlCondition() {
   return or(ilike(markets.name, "%billa%"), ilike(markets.dbName, "%billa%"));
+}
+
+function normalizeSpecialArthurMatchValue(input: unknown): string | null {
+  const normalized = String(input ?? "")
+    .trim()
+    .replace(/\s+/g, "")
+    .toUpperCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function normalizedMarketIdentifierSql(column: unknown) {
+  return sql<string>`upper(regexp_replace(coalesce(${column}, ''), '\s+', '', 'g'))`;
+}
+
+function specialArthurMarketSqlCondition(matchValues: string[]) {
+  if (matchValues.length === 0) return undefined;
+  return or(
+    inArray(normalizedMarketIdentifierSql(markets.kuehlerStammnr), matchValues),
+    inArray(normalizedMarketIdentifierSql(markets.cokeMasterNumber), matchValues),
+    inArray(normalizedMarketIdentifierSql(markets.flexNumber), matchValues),
+  );
+}
+
+async function loadSpecialArthurFilterValues(gmUserId: string): Promise<string[]> {
+  const rows = await db
+    .select({ matchValue: specialArthurFilter.matchValue })
+    .from(specialArthurFilter)
+    .where(and(eq(specialArthurFilter.gmUserId, gmUserId), eq(specialArthurFilter.isDeleted, false)));
+  return rows.map((row) => row.matchValue).filter((value) => value.length > 0);
+}
+
+function marketMatchesSpecialArthurFilter(
+  market: {
+    kuehlerStammnr: string | null;
+    cokeMasterNumber: string | null;
+    flexNumber: string | null;
+  },
+  matchValues: string[],
+): boolean {
+  if (matchValues.length === 0) return true;
+  const allowed = new Set(matchValues);
+  return [market.kuehlerStammnr, market.cokeMasterNumber, market.flexNumber].some((value) => {
+    const normalized = normalizeSpecialArthurMatchValue(value);
+    return normalized ? allowed.has(normalized) : false;
+  });
 }
 
 function isQuestionApplicableToMarketChain(questionChains: string[] | null | undefined, marketChain: string): boolean {
@@ -1098,6 +1144,7 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
       .where(eq(users.id, gmUserId))
       .limit(1);
     const isBillaGm = Boolean(gmUser?.isBillaGm);
+    const specialFilterValues = isBillaGm ? await loadSpecialArthurFilterValues(gmUserId) : [];
     const [rows, activeFlexCampaignRows] = await Promise.all([
       db
         .select()
@@ -1108,6 +1155,7 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
             eq(markets.isActive, true),
             inArray(markets.marketType, ["universum", "both"]),
             isBillaGm ? billaMarketSqlCondition() : undefined,
+            isBillaGm ? specialArthurMarketSqlCondition(specialFilterValues) : undefined,
           ),
         )
         .orderBy(desc(markets.createdAt)),
@@ -1185,6 +1233,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
       .where(eq(users.id, gmUserId))
       .limit(1);
     const isBillaGm = Boolean(gmUser?.isBillaGm);
+    const specialFilterValues = isBillaGm ? await loadSpecialArthurFilterValues(gmUserId) : [];
 
     const assignedCampaignRows = await db
       .select({
@@ -1236,7 +1285,8 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
     if (
       marketRow.isActive &&
       (marketRow.marketType === "universum" || marketRow.marketType === "both") &&
-      (!isBillaGm || isBillaMarketRow(marketRow))
+      (!isBillaGm || isBillaMarketRow(marketRow)) &&
+      (!isBillaGm || marketMatchesSpecialArthurFilter(marketRow, specialFilterValues))
     ) {
       const activeFlexRows = await db
         .select({
