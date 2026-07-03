@@ -37,6 +37,7 @@ import {
 const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd"]);
 const campaignStatusSchema = z.enum(["active", "scheduled", "inactive"]);
 const scheduleTypeSchema = z.enum(["always", "scheduled"]);
+const CAMPAIGN_ASSIGNMENT_INSERT_BATCH_SIZE = 500;
 const campaignAssignmentSchema = z
   .object({
     marketId: z.string().uuid(),
@@ -2743,22 +2744,25 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
       if (!created) throw new CampaignDomainError("invalid_payload", 400, "Kampagne konnte nicht erstellt werden.");
 
       if (assignments.length > 0) {
-        await tx.insert(campaignMarketAssignments).values(
-          assignments.map((assignment) => ({
-            campaignId: created.id,
-            marketId: assignment.marketId,
-            gmUserId: assignment.gmUserId,
-            assignmentSlot: assignment.assignmentSlot,
-            visitTargetCount: assignment.visitTargetCount,
-            currentVisitsCount: 0,
-            assignedAt: now,
-            assignedByUserId: auditUserId,
-            isDeleted: false,
-            deletedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          })),
-        );
+        for (let index = 0; index < assignments.length; index += CAMPAIGN_ASSIGNMENT_INSERT_BATCH_SIZE) {
+          const batch = assignments.slice(index, index + CAMPAIGN_ASSIGNMENT_INSERT_BATCH_SIZE);
+          await tx.insert(campaignMarketAssignments).values(
+            batch.map((assignment) => ({
+              campaignId: created.id,
+              marketId: assignment.marketId,
+              gmUserId: assignment.gmUserId,
+              assignmentSlot: assignment.assignmentSlot,
+              visitTargetCount: assignment.visitTargetCount,
+              currentVisitsCount: 0,
+              assignedAt: now,
+              assignedByUserId: auditUserId,
+              isDeleted: false,
+              deletedAt: null,
+              createdAt: now,
+              updatedAt: now,
+            })),
+          );
+        }
       }
 
       let historyRow: typeof campaignFragebogenHistory.$inferSelect | null = null;
