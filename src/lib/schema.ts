@@ -1952,6 +1952,48 @@ export const visitAnswerChangeRequests = pgTable(
   ],
 );
 
+export const visitSessionDeleteRequests = pgTable(
+  "visit_session_delete_requests",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    visitSessionId: uuid("visit_session_id")
+      .notNull()
+      .references(() => visitSessions.id, { onDelete: "cascade" }),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    marketId: uuid("market_id")
+      .notNull()
+      .references(() => markets.id, { onDelete: "cascade" }),
+    marketNameSnapshot: text("market_name_snapshot").notNull().default(""),
+    marketAddressSnapshot: text("market_address_snapshot").notNull().default(""),
+    marketPostalCodeSnapshot: text("market_postal_code_snapshot").notNull().default(""),
+    marketCitySnapshot: text("market_city_snapshot").notNull().default(""),
+    campaignSummarySnapshot: text("campaign_summary_snapshot").notNull().default(""),
+    sectionSummarySnapshot: text("section_summary_snapshot").notNull().default(""),
+    sessionStartedAtSnapshot: timestamp("session_started_at_snapshot", { withTimezone: true }),
+    sessionSubmittedAtSnapshot: timestamp("session_submitted_at_snapshot", { withTimezone: true }),
+    requestNote: text("request_note"),
+    status: visitAnswerChangeRequestStatusEnum("status").notNull().default("pending"),
+    reviewedByUserId: uuid("reviewed_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    adminNote: text("admin_note"),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("visit_session_delete_requests_pending_session_unique")
+      .on(table.visitSessionId)
+      .where(sql`${table.isDeleted} = false AND ${table.status} = 'pending'`),
+    index("visit_session_delete_requests_gm_status_idx").on(table.gmUserId, table.status, table.createdAt),
+    index("visit_session_delete_requests_session_idx").on(table.visitSessionId, table.createdAt),
+    index("visit_session_delete_requests_market_idx").on(table.marketId, table.createdAt),
+    index("visit_session_delete_requests_deleted_idx").on(table.isDeleted),
+  ],
+);
+
 export const timeEntryChangeRequests = pgTable(
   "time_entry_change_requests",
   {
@@ -2021,6 +2063,8 @@ export type MarketRow = typeof markets.$inferSelect;
 export type NewMarketRow = typeof markets.$inferInsert;
 export type TimeEntryChangeRequestRow = typeof timeEntryChangeRequests.$inferSelect;
 export type NewTimeEntryChangeRequestRow = typeof timeEntryChangeRequests.$inferInsert;
+export type VisitSessionDeleteRequestRow = typeof visitSessionDeleteRequests.$inferSelect;
+export type NewVisitSessionDeleteRequestRow = typeof visitSessionDeleteRequests.$inferInsert;
 export type MarketKuehlerUnitRow = typeof marketKuehlerUnits.$inferSelect;
 export type NewMarketKuehlerUnitRow = typeof marketKuehlerUnits.$inferInsert;
 export type LagerRow = typeof lager.$inferSelect;

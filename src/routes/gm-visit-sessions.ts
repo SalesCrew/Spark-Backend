@@ -40,6 +40,7 @@ import {
   visitQuestionComments,
   visitSessionQuestions,
   visitSessionSections,
+  visitSessionDeleteRequests,
   visitSessions,
 } from "../lib/schema.js";
 
@@ -82,6 +83,9 @@ const changeRequestBodySchema = z.object({
   visitQuestionId: z.string().regex(uuidRegex),
   requestedAnswerPayload: z.record(z.string(), z.unknown()).default({}),
   requestedAnswerSummary: z.string().trim().min(1).max(700),
+  requestNote: z.string().trim().max(700).optional(),
+});
+const deleteRequestBodySchema = z.object({
   requestNote: z.string().trim().max(700).optional(),
 });
 const SINGLE_CHOICE_AVAILABILITY_TYPES = ["Cooler", "SingleServe", "MultiServe", "Promos", "Warehouse"] as const;
@@ -2563,6 +2567,237 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/change-requests", async (req: Auth
         },
       };
     });
+
+    res.status(200).json({ requests });
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/delete-request", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    if (!gmUserId || req.authUser?.role !== "gm") {
+      res.status(403).json({ error: "Nur Gebietsmanager koennen eigene Loeschanfragen erstellen.", code: "gm_required" });
+      return;
+    }
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungueltige Session-ID.", code: "invalid_session_id" });
+      return;
+    }
+
+    const parsed = deleteRequestBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Loeschanfrage ist ungueltig.", code: "invalid_delete_request" });
+      return;
+    }
+
+    const [session] = await db
+      .select({
+        id: visitSessions.id,
+        gmUserId: visitSessions.gmUserId,
+        marketId: visitSessions.marketId,
+        status: visitSessions.status,
+        startedAt: visitSessions.startedAt,
+        submittedAt: visitSessions.submittedAt,
+        marketName: markets.name,
+        marketAddress: markets.address,
+        marketPostalCode: markets.postalCode,
+        marketCity: markets.city,
+      })
+      .from(visitSessions)
+      .innerJoin(markets, eq(markets.id, visitSessions.marketId))
+      .where(
+        and(
+          eq(visitSessions.id, sessionId),
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.status, "submitted"),
+          isNotNull(visitSessions.submittedAt),
+          eq(visitSessions.isDeleted, false),
+          eq(markets.isDeleted, false),
+        ),
+      )
+      .limit(1);
+
+    if (!session) {
+      res.status(404).json({ error: "Abgeschlossener Fragebogen wurde nicht gefunden.", code: "session_not_found" });
+      return;
+    }
+
+    const sections = await db
+      .select({
+        section: visitSessionSections.section,
+        campaignName: campaigns.name,
+        fragebogenName: visitSessionSections.fragebogenNameSnapshot,
+      })
+      .from(visitSessionSections)
+      .leftJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+      .where(and(eq(visitSessionSections.visitSessionId, session.id), eq(visitSessionSections.isDeleted, false)))
+      .orderBy(asc(visitSessionSections.orderIndex));
+
+    const campaignSummary = normalizeUnique(
+      sections.map((section) => section.campaignName || section.fragebogenName || section.section),
+    ).join(", ");
+    const sectionSummary = normalizeUnique(sections.map((section) => section.section)).join(", ");
+    const now = new Date();
+
+    const [saved] = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(visitSessionDeleteRequests)
+        .where(
+          and(
+            eq(visitSessionDeleteRequests.visitSessionId, session.id),
+            eq(visitSessionDeleteRequests.status, "pending"),
+            eq(visitSessionDeleteRequests.isDeleted, false),
+          ),
+        )
+        .limit(1);
+
+      if (existing) {
+        return tx
+          .update(visitSessionDeleteRequests)
+          .set({
+            requestNote: parsed.data.requestNote || null,
+            marketNameSnapshot: session.marketName ?? "",
+            marketAddressSnapshot: session.marketAddress ?? "",
+            marketPostalCodeSnapshot: session.marketPostalCode ?? "",
+            marketCitySnapshot: session.marketCity ?? "",
+            campaignSummarySnapshot: campaignSummary,
+            sectionSummarySnapshot: sectionSummary,
+            sessionStartedAtSnapshot: session.startedAt,
+            sessionSubmittedAtSnapshot: session.submittedAt,
+            updatedAt: now,
+          })
+          .where(eq(visitSessionDeleteRequests.id, existing.id))
+          .returning({
+            id: visitSessionDeleteRequests.id,
+            status: visitSessionDeleteRequests.status,
+            createdAt: visitSessionDeleteRequests.createdAt,
+            updatedAt: visitSessionDeleteRequests.updatedAt,
+          });
+      }
+
+      return tx
+        .insert(visitSessionDeleteRequests)
+        .values({
+          visitSessionId: session.id,
+          gmUserId,
+          marketId: session.marketId,
+          marketNameSnapshot: session.marketName ?? "",
+          marketAddressSnapshot: session.marketAddress ?? "",
+          marketPostalCodeSnapshot: session.marketPostalCode ?? "",
+          marketCitySnapshot: session.marketCity ?? "",
+          campaignSummarySnapshot: campaignSummary,
+          sectionSummarySnapshot: sectionSummary,
+          sessionStartedAtSnapshot: session.startedAt,
+          sessionSubmittedAtSnapshot: session.submittedAt,
+          requestNote: parsed.data.requestNote || null,
+          status: "pending",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning({
+          id: visitSessionDeleteRequests.id,
+          status: visitSessionDeleteRequests.status,
+          createdAt: visitSessionDeleteRequests.createdAt,
+          updatedAt: visitSessionDeleteRequests.updatedAt,
+        });
+    });
+
+    res.status(201).json({
+      ok: true,
+      request: saved
+        ? {
+            id: saved.id,
+            status: saved.status,
+            createdAt: saved.createdAt.toISOString(),
+            updatedAt: saved.updatedAt.toISOString(),
+          }
+        : null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.get("/gm/visit-sessions/delete-requests", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId || req.authUser?.role !== "gm") {
+      res.status(403).json({ error: "Nur Gebietsmanager koennen eigene Loeschanfragen laden.", code: "gm_required" });
+      return;
+    }
+
+    const rows = await db
+      .select({
+        id: visitSessionDeleteRequests.id,
+        visitSessionId: visitSessionDeleteRequests.visitSessionId,
+        requestNote: visitSessionDeleteRequests.requestNote,
+        status: visitSessionDeleteRequests.status,
+        reviewedByUserId: visitSessionDeleteRequests.reviewedByUserId,
+        reviewedAt: visitSessionDeleteRequests.reviewedAt,
+        adminNote: visitSessionDeleteRequests.adminNote,
+        createdAt: visitSessionDeleteRequests.createdAt,
+        updatedAt: visitSessionDeleteRequests.updatedAt,
+        gmUserId: users.id,
+        gmFirstName: users.firstName,
+        gmLastName: users.lastName,
+        gmEmail: users.email,
+        gmRegion: users.region,
+        marketId: visitSessionDeleteRequests.marketId,
+        marketName: visitSessionDeleteRequests.marketNameSnapshot,
+        marketAddress: visitSessionDeleteRequests.marketAddressSnapshot,
+        marketPostalCode: visitSessionDeleteRequests.marketPostalCodeSnapshot,
+        marketCity: visitSessionDeleteRequests.marketCitySnapshot,
+        campaignSummary: visitSessionDeleteRequests.campaignSummarySnapshot,
+        sectionSummary: visitSessionDeleteRequests.sectionSummarySnapshot,
+        sessionStartedAt: visitSessionDeleteRequests.sessionStartedAtSnapshot,
+        sessionSubmittedAt: visitSessionDeleteRequests.sessionSubmittedAtSnapshot,
+      })
+      .from(visitSessionDeleteRequests)
+      .innerJoin(users, eq(users.id, visitSessionDeleteRequests.gmUserId))
+      .where(and(eq(visitSessionDeleteRequests.gmUserId, gmUserId), eq(visitSessionDeleteRequests.isDeleted, false)))
+      .orderBy(
+        sql`case when ${visitSessionDeleteRequests.status} = 'pending' then 0 else 1 end`,
+        desc(visitSessionDeleteRequests.updatedAt),
+        desc(visitSessionDeleteRequests.createdAt),
+      )
+      .limit(120);
+
+    const requests = rows.map((row) => ({
+      id: row.id,
+      status: row.status,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+      reviewedByUserId: row.reviewedByUserId,
+      reviewedAt: row.reviewedAt?.toISOString() ?? null,
+      adminNote: row.adminNote,
+      visitSessionId: row.visitSessionId,
+      requestNote: row.requestNote,
+      campaignSummary: row.campaignSummary,
+      sectionSummary: row.sectionSummary,
+      gm: {
+        id: row.gmUserId,
+        name: [row.gmFirstName, row.gmLastName].filter(Boolean).join(" ").trim() || row.gmEmail,
+        email: row.gmEmail,
+        region: row.gmRegion,
+      },
+      market: {
+        id: row.marketId,
+        name: row.marketName,
+        address: row.marketAddress,
+        postalCode: row.marketPostalCode,
+        city: row.marketCity,
+        region: null,
+      },
+      session: {
+        id: row.visitSessionId,
+        startedAt: row.sessionStartedAt?.toISOString() ?? null,
+        submittedAt: row.sessionSubmittedAt?.toISOString() ?? null,
+      },
+    }));
 
     res.status(200).json({ requests });
   } catch (error) {

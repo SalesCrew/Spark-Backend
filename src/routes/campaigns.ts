@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { type Response, Router } from "express";
 import { z } from "zod";
-import { finalizeBonusForSubmittedVisitSessionTx } from "../lib/bonus-finalizer.js";
+import { finalizeBonusForSubmittedVisitSessionTx, recomputeBonusWaveTx } from "../lib/bonus-finalizer.js";
 import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
@@ -20,6 +20,7 @@ import {
   fragebogenMhd,
   markets,
   marketKuehlerUnits,
+  praemienGmWaveContributions,
   visitAnswerMatrixCells,
   visitAnswerOptions,
   visitAnswerPhotoTags,
@@ -30,6 +31,7 @@ import {
   visitQuestionComments,
   visitSessionQuestions,
   visitSessionSections,
+  visitSessionDeleteRequests,
   visitSessions,
   users,
 } from "../lib/schema.js";
@@ -2211,6 +2213,354 @@ adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve
     }
 
     res.status(200).json({ ok: true, request: { id: result.requestId, status: "approved" }, answerId: result.answerId });
+  } catch (error) {
+    const err = error as Error & { status?: number; code?: string };
+    if (err.status) {
+      res.status(err.status).json({ error: err.message, code: err.code });
+      return;
+    }
+    next(error);
+  }
+});
+
+adminCampaignsRouter.get("/campaigns/visit-session-delete-requests", async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins koennen Loeschanfragen pruefen.", code: "admin_required" });
+      return;
+    }
+
+    const rows = await db
+      .select({
+        id: visitSessionDeleteRequests.id,
+        visitSessionId: visitSessionDeleteRequests.visitSessionId,
+        requestNote: visitSessionDeleteRequests.requestNote,
+        status: visitSessionDeleteRequests.status,
+        reviewedByUserId: visitSessionDeleteRequests.reviewedByUserId,
+        reviewedAt: visitSessionDeleteRequests.reviewedAt,
+        adminNote: visitSessionDeleteRequests.adminNote,
+        createdAt: visitSessionDeleteRequests.createdAt,
+        updatedAt: visitSessionDeleteRequests.updatedAt,
+        gmUserId: users.id,
+        gmFirstName: users.firstName,
+        gmLastName: users.lastName,
+        gmEmail: users.email,
+        gmRegion: users.region,
+        marketId: visitSessionDeleteRequests.marketId,
+        marketName: visitSessionDeleteRequests.marketNameSnapshot,
+        marketAddress: visitSessionDeleteRequests.marketAddressSnapshot,
+        marketPostalCode: visitSessionDeleteRequests.marketPostalCodeSnapshot,
+        marketCity: visitSessionDeleteRequests.marketCitySnapshot,
+        campaignSummary: visitSessionDeleteRequests.campaignSummarySnapshot,
+        sectionSummary: visitSessionDeleteRequests.sectionSummarySnapshot,
+        sessionStartedAt: visitSessionDeleteRequests.sessionStartedAtSnapshot,
+        sessionSubmittedAt: visitSessionDeleteRequests.sessionSubmittedAtSnapshot,
+      })
+      .from(visitSessionDeleteRequests)
+      .innerJoin(users, eq(users.id, visitSessionDeleteRequests.gmUserId))
+      .where(eq(visitSessionDeleteRequests.isDeleted, false))
+      .orderBy(
+        sql`case when ${visitSessionDeleteRequests.status} = 'pending' then 0 else 1 end`,
+        desc(visitSessionDeleteRequests.createdAt),
+      )
+      .limit(250);
+
+    const requests = rows.map((row) => ({
+      id: row.id,
+      status: row.status,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+      reviewedByUserId: row.reviewedByUserId,
+      reviewedAt: row.reviewedAt?.toISOString() ?? null,
+      adminNote: row.adminNote,
+      visitSessionId: row.visitSessionId,
+      requestNote: row.requestNote,
+      campaignSummary: row.campaignSummary,
+      sectionSummary: row.sectionSummary,
+      gm: {
+        id: row.gmUserId,
+        name: [row.gmFirstName, row.gmLastName].filter(Boolean).join(" ").trim() || row.gmEmail,
+        email: row.gmEmail,
+        region: row.gmRegion,
+      },
+      market: {
+        id: row.marketId,
+        name: row.marketName,
+        address: row.marketAddress,
+        postalCode: row.marketPostalCode,
+        city: row.marketCity,
+        region: null,
+      },
+      session: {
+        id: row.visitSessionId,
+        startedAt: row.sessionStartedAt?.toISOString() ?? null,
+        submittedAt: row.sessionSubmittedAt?.toISOString() ?? null,
+      },
+    }));
+
+    res.status(200).json({ requests });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminCampaignsRouter.patch("/campaigns/visit-session-delete-requests/:requestId/reject", async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins koennen Loeschanfragen pruefen.", code: "admin_required" });
+      return;
+    }
+
+    const requestId = String(req.params.requestId ?? "");
+    if (!isUuid(requestId)) {
+      res.status(400).json({ error: "Ungueltige Anfrage-ID.", code: "invalid_request_id" });
+      return;
+    }
+    const parsed = adminChangeRequestDecisionSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltiges Entscheidungs-Payload.", code: "invalid_payload" });
+      return;
+    }
+    const now = new Date();
+    const [updated] = await db
+      .update(visitSessionDeleteRequests)
+      .set({
+        status: "rejected",
+        reviewedByUserId: req.authUser?.appUserId ?? null,
+        reviewedAt: now,
+        adminNote: parsed.data.adminNote || null,
+        updatedAt: now,
+      })
+      .where(and(eq(visitSessionDeleteRequests.id, requestId), eq(visitSessionDeleteRequests.status, "pending"), eq(visitSessionDeleteRequests.isDeleted, false)))
+      .returning({
+        id: visitSessionDeleteRequests.id,
+        status: visitSessionDeleteRequests.status,
+        updatedAt: visitSessionDeleteRequests.updatedAt,
+      });
+    if (!updated) {
+      res.status(404).json({ error: "Offene Loeschanfrage wurde nicht gefunden.", code: "request_not_found" });
+      return;
+    }
+    res.status(200).json({ ok: true, request: { id: updated.id, status: updated.status, updatedAt: updated.updatedAt.toISOString() } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminCampaignsRouter.patch("/campaigns/visit-session-delete-requests/:requestId/approve", async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins koennen Loeschanfragen pruefen.", code: "admin_required" });
+      return;
+    }
+
+    const requestId = String(req.params.requestId ?? "");
+    if (!isUuid(requestId)) {
+      res.status(400).json({ error: "Ungueltige Anfrage-ID.", code: "invalid_request_id" });
+      return;
+    }
+    const parsed = adminChangeRequestDecisionSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltiges Entscheidungs-Payload.", code: "invalid_payload" });
+      return;
+    }
+    const actorUserId = req.authUser?.appUserId ?? null;
+    const now = new Date();
+
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from ${visitSessionDeleteRequests} where ${visitSessionDeleteRequests.id} = ${requestId} for update`);
+      const [requestRow] = await tx
+        .select()
+        .from(visitSessionDeleteRequests)
+        .where(and(eq(visitSessionDeleteRequests.id, requestId), eq(visitSessionDeleteRequests.isDeleted, false)))
+        .limit(1);
+      if (!requestRow || requestRow.status !== "pending") {
+        const error = new Error("Offene Loeschanfrage wurde nicht gefunden.") as Error & { status?: number; code?: string };
+        error.status = 404;
+        error.code = "request_not_found";
+        throw error;
+      }
+
+      const [session] = await tx
+        .select({
+          id: visitSessions.id,
+          gmUserId: visitSessions.gmUserId,
+          marketId: visitSessions.marketId,
+          status: visitSessions.status,
+          submittedAt: visitSessions.submittedAt,
+        })
+        .from(visitSessions)
+        .where(and(eq(visitSessions.id, requestRow.visitSessionId), eq(visitSessions.isDeleted, false)))
+        .limit(1);
+      if (!session) {
+        const error = new Error("Session wurde nicht gefunden.") as Error & { status?: number; code?: string };
+        error.status = 404;
+        error.code = "session_not_found";
+        throw error;
+      }
+      if (session.status !== "submitted" || !session.submittedAt) {
+        const error = new Error("Nur abgeschlossene Sessions koennen geloescht werden.") as Error & { status?: number; code?: string };
+        error.status = 409;
+        error.code = "session_not_submitted";
+        throw error;
+      }
+
+      const waveRows = await tx
+        .select({ waveId: praemienGmWaveContributions.waveId })
+        .from(praemienGmWaveContributions)
+        .where(eq(praemienGmWaveContributions.visitSessionId, session.id));
+      const affectedWaveIds = normalizeUnique(waveRows.map((row) => row.waveId));
+
+      const sectionRows = await tx
+        .select({ id: visitSessionSections.id })
+        .from(visitSessionSections)
+        .where(and(eq(visitSessionSections.visitSessionId, session.id), eq(visitSessionSections.isDeleted, false)));
+      const sectionIds = sectionRows.map((row) => row.id);
+
+      const questionRows = sectionIds.length === 0
+        ? []
+        : await tx
+            .select({ id: visitSessionQuestions.id })
+            .from(visitSessionQuestions)
+            .where(and(inArray(visitSessionQuestions.visitSessionSectionId, sectionIds), eq(visitSessionQuestions.isDeleted, false)));
+      const questionIds = questionRows.map((row) => row.id);
+
+      const answerRows = await tx
+        .select({ id: visitAnswers.id })
+        .from(visitAnswers)
+        .where(and(eq(visitAnswers.visitSessionId, session.id), eq(visitAnswers.isDeleted, false)));
+      const answerIds = answerRows.map((row) => row.id);
+
+      const photoRows = answerIds.length === 0
+        ? []
+        : await tx
+            .select({ id: visitAnswerPhotos.id })
+            .from(visitAnswerPhotos)
+            .where(and(inArray(visitAnswerPhotos.visitAnswerId, answerIds), eq(visitAnswerPhotos.isDeleted, false)));
+      const photoIds = photoRows.map((row) => row.id);
+
+      if (photoIds.length > 0) {
+        await tx
+          .update(visitAnswerPhotoTags)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, photoIds), eq(visitAnswerPhotoTags.isDeleted, false)));
+      }
+      if (answerIds.length > 0) {
+        await tx
+          .update(visitAnswerPhotos)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitAnswerPhotos.visitAnswerId, answerIds), eq(visitAnswerPhotos.isDeleted, false)));
+        await tx
+          .update(visitAnswerOptions)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitAnswerOptions.visitAnswerId, answerIds), eq(visitAnswerOptions.isDeleted, false)));
+        await tx
+          .update(visitAnswerMatrixCells)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitAnswerMatrixCells.visitAnswerId, answerIds), eq(visitAnswerMatrixCells.isDeleted, false)));
+      }
+      if (questionIds.length > 0) {
+        await tx
+          .update(visitQuestionComments)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitQuestionComments.visitSessionQuestionId, questionIds), eq(visitQuestionComments.isDeleted, false)));
+        await tx
+          .update(visitSessionQuestions)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitSessionQuestions.id, questionIds), eq(visitSessionQuestions.isDeleted, false)));
+      }
+      if (sectionIds.length > 0) {
+        await tx
+          .update(visitSessionSections)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitSessionSections.id, sectionIds), eq(visitSessionSections.isDeleted, false)));
+      }
+      await tx
+        .update(visitAnswers)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(eq(visitAnswers.visitSessionId, session.id), eq(visitAnswers.isDeleted, false)));
+      await tx
+        .update(visitAnswerChangeRequests)
+        .set({ status: "cancelled", isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(eq(visitAnswerChangeRequests.visitSessionId, session.id), eq(visitAnswerChangeRequests.isDeleted, false)));
+      await tx
+        .update(visitSessions)
+        .set({
+          status: "cancelled",
+          cancelledAt: now,
+          lastSavedAt: now,
+          isDeleted: true,
+          deletedAt: now,
+          updatedAt: now,
+        })
+        .where(and(eq(visitSessions.id, session.id), eq(visitSessions.isDeleted, false)));
+      await tx
+        .update(visitSessionDeleteRequests)
+        .set({
+          status: "approved",
+          reviewedByUserId: actorUserId,
+          reviewedAt: now,
+          adminNote: parsed.data.adminNote || null,
+          updatedAt: now,
+        })
+        .where(eq(visitSessionDeleteRequests.id, requestRow.id));
+
+      return {
+        requestId: requestRow.id,
+        sessionId: session.id,
+        gmUserId: session.gmUserId,
+        marketId: session.marketId,
+        submittedAt: session.submittedAt,
+        affectedWaveIds,
+      };
+    });
+
+    const affectedGmUserIds = new Set<string>([result.gmUserId]);
+    for (const waveId of result.affectedWaveIds) {
+      try {
+        const recomputeResult = await db.transaction((tx) => recomputeBonusWaveTx(tx, waveId));
+        for (const gmUserId of recomputeResult.affectedGmUserIds) affectedGmUserIds.add(gmUserId);
+      } catch (bonusError) {
+        logger.error("visit_session_delete_request_bonus_recompute_failed", {
+          action: "visit_session_delete_request_approved",
+          result: "failure",
+          requestId: result.requestId,
+          sessionId: result.sessionId,
+          waveId,
+          error: bonusError instanceof Error ? bonusError.message : String(bonusError),
+        });
+      }
+    }
+
+    try {
+      await enqueueIppRecalcForDate(result.marketId, result.submittedAt, "visit_session_delete_request_approved");
+    } catch (enqueueError) {
+      logger.error("visit_session_delete_request_ipp_enqueue_failed", {
+        action: "visit_session_delete_request_approved",
+        result: "failure",
+        requestId: result.requestId,
+        sessionId: result.sessionId,
+        marketId: result.marketId,
+        error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
+      });
+    }
+
+    for (const gmUserId of affectedGmUserIds) {
+      try {
+        await recomputeGmKpiCache(gmUserId);
+      } catch (kpiError) {
+        logger.error("visit_session_delete_request_kpi_recompute_failed", {
+          action: "visit_session_delete_request_approved",
+          result: "failure",
+          requestId: result.requestId,
+          sessionId: result.sessionId,
+          gmUserId,
+          error: kpiError instanceof Error ? kpiError.message : String(kpiError),
+        });
+      }
+    }
+
+    res.status(200).json({ ok: true, request: { id: result.requestId, status: "approved" }, sessionId: result.sessionId });
   } catch (error) {
     const err = error as Error & { status?: number; code?: string };
     if (err.status) {
