@@ -18,6 +18,7 @@ import { adminLagerRouter } from "./routes/admin-lager.js";
 import { authRouter } from "./routes/auth.js";
 import { clientTelemetryRouter } from "./routes/client-telemetry.js";
 import { daySessionRouter } from "./routes/day-session.js";
+import { adminDsarRouter } from "./routes/dsar.js";
 import { employeeAgreementRouter } from "./routes/employee-agreement.js";
 import { adminFragebogenRouter } from "./routes/fragebogen.js";
 import { gmVisitSessionsRouter } from "./routes/gm-visit-sessions.js";
@@ -163,6 +164,7 @@ function createApp() {
   app.use("/red-month", redMonthRouter);
   app.use("/admin/kunden-users", kundenUsersRouter);
   app.use("/admin/users", adminUsersRouter);
+  app.use("/admin/dsar", adminDsarRouter);
   app.use("/admin/markets", adminMarketsRouter);
   app.use("/admin", adminLagerRouter);
   app.use("/admin", adminFragebogenRouter);

@@ -2449,7 +2449,7 @@ test("standalone question save allows self-trigger but rejects self-target", asy
     ],
   });
   assert.equal(rejectSelfTargetRes.status, 400);
-  assert.equal(rejectSelfTargetRes.body.error, "Regeln duerfen nicht auf dieselbe Frage verweisen.");
+  assert.equal(rejectSelfTargetRes.body.error, "Regeln dürfen nicht auf dieselbe Frage verweisen.");
 });
 
 test("fragebogen update soft-deletes old module links and spezial rows", async (t) => {

@@ -16,7 +16,7 @@ type TimelineKind = "anfahrt" | "fahrtzeit" | "marktbesuch" | "pause" | "zusatzz
 const DEFAULT_FINISHED_DAY_PAUSE_MIN = 30;
 const DEFAULT_PAUSE_MINIMUM_WORKDAY_MIN = 6 * 60;
 const TIMELINE_OVERLAP_ERROR_MESSAGE =
-  "Dieser Zeitraum ist nicht möglich, weil er sich mit einem bestehenden Eintrag ?berschneidet.";
+  "Dieser Zeitraum ist nicht möglich, weil er sich mit einem bestehenden Eintrag überschneidet.";
 
 type BaseAction = {
   id: string;

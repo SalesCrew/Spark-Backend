@@ -356,7 +356,7 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
 
     const payload = parsed.data;
     if (req.authUser?.role === "kunde" && payload.role !== "gm") {
-      res.status(403).json({ error: "Kundenzugaenge duerfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
+      res.status(403).json({ error: "Kundenzugänge dürfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
       return;
     }
     const password = generatePassword();
@@ -532,7 +532,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       return;
     }
     if (req.authUser?.role === "kunde" && existing.role !== "gm") {
-      res.status(403).json({ error: "Kundenzugaenge duerfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
+      res.status(403).json({ error: "Kundenzugänge dürfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
       return;
     }
 
@@ -900,7 +900,7 @@ adminUsersRouter.patch("/:id/deactivate", async (req: AuthedRequest, res, next) 
       return;
     }
     if (req.authUser?.role === "kunde" && target.role !== "gm") {
-      res.status(403).json({ error: "Kundenzugaenge duerfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
+      res.status(403).json({ error: "Kundenzugänge dürfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
       return;
     }
 

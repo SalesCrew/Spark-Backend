@@ -184,6 +184,21 @@ timeTrackingRouter.post("/entries/draft/start", async (req: AuthedRequest, res, 
         )
         .limit(1);
     }
+    if (!entry) {
+      [entry] = await db
+        .select()
+        .from(timeTrackingEntries)
+        .where(
+          and(
+            eq(timeTrackingEntries.gmUserId, authUserId),
+            eq(timeTrackingEntries.activityType, activityType),
+            eq(timeTrackingEntries.status, "draft"),
+            eq(timeTrackingEntries.isDeleted, false),
+          ),
+        )
+        .orderBy(desc(timeTrackingEntries.updatedAt))
+        .limit(1);
+    }
 
     const validationId = entry?.id ?? parsed.data.clientEntryToken ?? "new-time-tracking-draft";
     if (parsed.data.endAt) {
@@ -211,6 +226,7 @@ timeTrackingRouter.post("/entries/draft/start", async (req: AuthedRequest, res, 
         .update(timeTrackingEntries)
         .set({
           startAt,
+          endAt: parsed.data.endAt ? parseIso(parsed.data.endAt) : null,
           marketId: parsed.data.marketId ?? null,
           updatedAt: now,
         })

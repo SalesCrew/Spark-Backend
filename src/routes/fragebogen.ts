@@ -359,7 +359,7 @@ function validateQuestionDomain(question: UiQuestion) {
     throw new DomainValidationError("Verfügbarkeits-Typ darf nur für Single Choice Fragen gesetzt werden.");
   }
   if ((question.type === "numeric" || question.type === "slider") && scoringKeys.some((key) => key !== "__value__")) {
-    throw new DomainValidationError("Numerische Fragen duerfen nur den Scoring-Key '__value__' verwenden.");
+    throw new DomainValidationError("Numerische Fragen dürfen nur den Scoring-Key '__value__' verwenden.");
   }
 
   if (question.type === "single" || question.type === "multiple") {
@@ -685,7 +685,7 @@ function remapAndValidateQuestionRules(
       ),
     );
     if (sourceQuestionId && targetQuestionIds.includes(sourceQuestionId)) {
-      throw new DomainValidationError("Regeln duerfen nicht auf dieselbe Frage verweisen.");
+      throw new DomainValidationError("Regeln dürfen nicht auf dieselbe Frage verweisen.");
     }
     if (sourceQuestionId && sourceOrderIndex != null) {
       for (const targetQuestionId of targetQuestionIds) {
@@ -908,10 +908,10 @@ async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen
       }
       if (parsed.id && isUuid(parsed.id)) {
         if (rule.triggerQuestionId === parsed.id) {
-          throw new DomainValidationError("Spezialfrage-Regeln duerfen nicht auf sich selbst triggern.");
+          throw new DomainValidationError("Spezialfrage-Regeln dürfen nicht auf sich selbst triggern.");
         }
         if (rule.targetQuestionIds.some((id) => id === parsed.id)) {
-          throw new DomainValidationError("Spezialfrage-Regeln duerfen sich nicht selbst als Ziel haben.");
+          throw new DomainValidationError("Spezialfrage-Regeln dürfen sich nicht selbst als Ziel haben.");
         }
       }
     }
@@ -1211,7 +1211,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
     ...rule.targetQuestionIds,
   ]);
   if (questionId && rules.some((rule) => rule.targetQuestionIds.includes(questionId!))) {
-    throw new DomainValidationError("Regeln duerfen nicht auf dieselbe Frage verweisen.");
+    throw new DomainValidationError("Regeln dürfen nicht auf dieselbe Frage verweisen.");
   }
   await ensureQuestionRefsExist(tx, referencedIds);
   await ensurePhotoTagsActive(tx, tagIds);

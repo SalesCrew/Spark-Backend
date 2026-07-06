@@ -77,6 +77,9 @@ function normalizeQuestionChains(chains: string[] | null | undefined): string[] 
 }
 
 function deriveChainLabel(input: { name: string; dbName: string }): string {
+  const dbName = input.dbName?.trim();
+  if (dbName) return dbName.toUpperCase();
+
   const source = `${input.name} ${input.dbName}`.toUpperCase();
   if (source.includes("BILLA+")) return "BILLA+";
   if (source.includes("BILLA")) return "BILLA";

@@ -7,7 +7,7 @@ import { employeeAgreementAcceptances } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const AGREEMENT_KEY = "spark_employee_agreement";
-const AGREEMENT_VERSION = "2026-06-29-v3";
+const AGREEMENT_VERSION = "2026-06-30-v4";
 const AGREEMENT_TITLE = "Nutzungs- und Kontrollmaßnahmenvereinbarung für Coke Spark";
 
 const agreementSections = [
@@ -52,17 +52,18 @@ const agreementSections = [
   {
     title: "6. Speicherfristen und Sicherheit",
     body: [
-      "Daten werden nur so lange gespeichert, wie sie für Arbeitszeitnachweise, Abrechnung, Kundenreporting, Qualitätssicherung, Kampagnenhistorie, Reklamationen, Sicherheit oder rechtliche Nachweise erforderlich sind.",
-      "Arbeitszeit- und Korrekturdaten werden mindestens so lange aufbewahrt, wie gesetzliche Nachweis-, Abrechnungs- und arbeitsrechtliche Aufbewahrungspflichten bestehen oder Ansprüche daraus geprüft werden können.",
+      "Coke Spark speichert Daten nach einem internen Aufbewahrungskonzept. Marktbesuche, Fragebogenantworten, Kommentare, Tags, Status und Besuchsfotos werden grundsätzlich 3 Jahre nach Ende des betreffenden Kampagnen- oder RED-Jahres aufbewahrt und danach gelöscht oder anonymisiert, sofern keine Reklamation, Nachweispflicht oder Legal Hold besteht.",
+      "Arbeitszeit-, Pausen-, Zusatzzeit-, Tagesstart/-ende- und Kilometerdaten werden 7 Jahre nach Ende des Kalenderjahres aufbewahrt, wenn sie für Abrechnung, Diäten, Payroll, Aufwandsersatz oder buchhalterische Nachweise verwendet werden. Zeitkorrekturanfragen werden für denselben Zeitraum aufbewahrt.",
+      "Login-, Auth-, Audit- und Sicherheitslogs werden grundsätzlich 24 Monate gespeichert. Technische Telemetrie und Fehlerdetails werden grundsätzlich 90 Tage gespeichert; aggregierte technische Statistiken höchstens 12 Monate. Exportdateien sind Arbeitskopien und grundsätzlich innerhalb von 30 Tagen nach Zweckerfüllung zu löschen.",
       "Coke Spark nutzt rollenbasierte Berechtigungen, serverseitige Zugriffskontrollen, private Speicherbereiche, signierte Datei-URLs, Protokollierung und Backend-only Datenbankzugriffe.",
     ],
   },
   {
     title: "7. Löschung und Anonymisierung",
     body: [
-      "Eingereichte Marktbesuche, Antworten, Fotos, Zeit- und Kilometerdaten werden im System grundsätzlich als historische Arbeits-, Reporting- und Statistikdaten erhalten, weil sie für Nachweise, Auswertungen, Kundenreporting und Abrechnung erforderlich sein können.",
-      "Wenn ein Mitarbeiter aus dem aktiven Einsatz ausscheidet und die operative Spark-Identität nicht mehr benötigt wird, kann der personenbezogene Nutzerstammdatensatz anonymisiert werden. Dabei werden Name, E-Mail-Adresse, Telefon, Adresse, PLZ/Ort, Region, Profilfoto und Loginbezug entfernt oder durch neutrale Platzhalter ersetzt.",
-      "Die historischen Einträge bleiben dadurch für Statistiken und Nachweise erhalten, sind aber in Spark nicht mehr mit dem ursprünglichen Namen oder privaten Kontaktdaten sichtbar. Separate HR-/Payroll-Unterlagen außerhalb von Spark können aufgrund gesetzlicher Pflichten länger personenbezogen aufbewahrt werden.",
+      "Wenn ein Mitarbeiter aus dem aktiven Einsatz ausscheidet und die operative Spark-Identität nicht mehr benötigt wird, wird der Spark-Login deaktiviert und der personenbezogene Nutzerstammdatensatz grundsätzlich innerhalb von 30 Tagen nach Abschluss der Übergabe anonymisiert, sofern keine offene Prüfung, Abrechnung, Reklamation oder gesetzliche Pflicht entgegensteht.",
+      "Dabei werden Name, E-Mail-Adresse, Telefon, Adresse, PLZ/Ort, Region, Profilfoto und Loginbezug entfernt oder durch neutrale Platzhalter ersetzt. Historische Einträge bleiben nur im zulässigen Umfang für Statistiken, Nachweise, Kundenreporting und Abrechnung erhalten.",
+      "Offensichtlich private oder sensible Fehlfotos sollen gemeldet werden und werden nach Prüfung früher gelöscht oder eingeschränkt. Gesetzliche Aufbewahrungspflichten, offene Ansprüche, Sicherheitsvorfälle oder ein dokumentierter Legal Hold können einzelne Löschfristen verlängern.",
     ],
   },
   {
@@ -88,7 +89,7 @@ function agreementPayload() {
     version: AGREEMENT_VERSION,
     title: AGREEMENT_TITLE,
     hash: agreementHash,
-    effectiveDate: "2026-06-29",
+    effectiveDate: "2026-06-30",
     sections: agreementSections,
   };
 }

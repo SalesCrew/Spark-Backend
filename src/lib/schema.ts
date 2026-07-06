@@ -44,6 +44,24 @@ export const visitAnswerEventTypeEnum = pgEnum("visit_answer_event_type", ["set"
 export const visitAnswerChangeRequestStatusEnum = pgEnum("visit_answer_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
 export const timeEntryChangeRequestStatusEnum = pgEnum("time_entry_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
 export const timeEntryChangeRequestSourceKindEnum = pgEnum("time_entry_change_request_source_kind", ["marktbesuch", "pause", "zusatzzeit"]);
+export const dsarRequestTypeEnum = pgEnum("dsar_request_type", [
+  "access",
+  "rectification",
+  "erasure",
+  "restriction",
+  "portability",
+  "objection",
+  "mixed",
+]);
+export const dsarRequestStatusEnum = pgEnum("dsar_request_status", [
+  "open",
+  "identity_check",
+  "collecting",
+  "decision",
+  "responded",
+  "closed",
+  "cancelled",
+]);
 export const marketTypeEnum = pgEnum("market_type", ["universum", "kuehler", "both"]);
 export const timeTrackingActivityTypeEnum = pgEnum("time_tracking_activity_type", [
   "sonderaufgabe",
@@ -183,6 +201,68 @@ export const employeeAgreementAcceptances = pgTable(
     index("employee_agreement_acceptances_user_idx").on(table.userId),
     index("employee_agreement_acceptances_key_version_idx").on(table.agreementKey, table.agreementVersion),
     index("employee_agreement_acceptances_accepted_at_idx").on(table.acceptedAt),
+  ],
+);
+
+export const dsarRequests = pgTable(
+  "dsar_requests",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    requestType: dsarRequestTypeEnum("request_type").notNull(),
+    status: dsarRequestStatusEnum("status").notNull().default("open"),
+    intakeChannel: text("intake_channel").notNull().default("email"),
+    requesterName: text("requester_name").notNull(),
+    requesterEmail: text("requester_email").notNull(),
+    requesterUserId: uuid("requester_user_id").references(() => users.id, { onDelete: "set null" }),
+    subjectUserId: uuid("subject_user_id").references(() => users.id, { onDelete: "set null" }),
+    subjectNameSnapshot: text("subject_name_snapshot").notNull(),
+    subjectEmailSnapshot: text("subject_email_snapshot").notNull(),
+    subjectRoleSnapshot: text("subject_role_snapshot"),
+    requestSummary: text("request_summary").notNull().default(""),
+    assignedToUserId: uuid("assigned_to_user_id").references(() => users.id, { onDelete: "set null" }),
+    receivedAt: timestamp("received_at", { withTimezone: true }).defaultNow().notNull(),
+    dueAt: timestamp("due_at", { withTimezone: true }).notNull(),
+    extendedUntil: timestamp("extended_until", { withTimezone: true }),
+    extensionReason: text("extension_reason"),
+    identityVerifiedAt: timestamp("identity_verified_at", { withTimezone: true }),
+    identityVerifiedByUserId: uuid("identity_verified_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    decisionSummary: text("decision_summary"),
+    legalBlockers: text("legal_blockers"),
+    responseChannel: text("response_channel"),
+    responseSentAt: timestamp("response_sent_at", { withTimezone: true }),
+    responseSentByUserId: uuid("response_sent_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    exportPackageSummary: jsonb("export_package_summary").$type<Record<string, unknown>>(),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("dsar_requests_status_due_idx").on(table.status, table.dueAt),
+    index("dsar_requests_subject_user_idx").on(table.subjectUserId),
+    index("dsar_requests_requester_user_idx").on(table.requesterUserId),
+    index("dsar_requests_received_at_idx").on(table.receivedAt),
+    index("dsar_requests_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const dsarRequestEvents = pgTable(
+  "dsar_request_events",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    requestId: uuid("request_id")
+      .notNull()
+      .references(() => dsarRequests.id, { onDelete: "cascade" }),
+    actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+    eventType: text("event_type").notNull(),
+    message: text("message").notNull().default(""),
+    metadata: jsonb("metadata").$type<Record<string, unknown>>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("dsar_request_events_request_idx").on(table.requestId, table.createdAt),
+    index("dsar_request_events_actor_idx").on(table.actorUserId),
   ],
 );
 

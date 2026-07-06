@@ -428,7 +428,7 @@ async function buildReviewEditUpdates(input: {
     return { daySessionUpdates: {}, intervalUpdates: [] };
   }
   if (!session.dayStartedAt || !session.dayEndedAt) {
-    throw new ReviewEditHttpError(409, "Arbeitstag ist unvollstÃ¤ndig.", "day_incomplete");
+    throw new ReviewEditHttpError(409, "Arbeitstag ist unvollständig.", "day_incomplete");
   }
 
   const timezone = session.timezone || DEFAULT_TIMEZONE;
@@ -456,7 +456,7 @@ async function buildReviewEditUpdates(input: {
         timezone,
       );
       if (!editedAt) {
-        throw new ReviewEditHttpError(400, "Bitte gÃ¼ltige Uhrzeiten im Format HH:MM eingeben.", "invalid_time");
+        throw new ReviewEditHttpError(400, "Bitte gültige Uhrzeiten im Format HH:MM eingeben.", "invalid_time");
       }
       if (edit.kind === "day_start") {
         nextDayStartAt = editedAt;
@@ -476,7 +476,7 @@ async function buildReviewEditUpdates(input: {
     const startAt = parseWorkDateHmToUtc(session.workDate, edit.startTime, timezone);
     const endAt = parseWorkDateHmToUtc(session.workDate, edit.endTime, timezone);
     if (!startAt || !endAt) {
-      throw new ReviewEditHttpError(400, "Bitte gÃ¼ltige Uhrzeiten im Format HH:MM eingeben.", "invalid_time");
+      throw new ReviewEditHttpError(400, "Bitte gültige Uhrzeiten im Format HH:MM eingeben.", "invalid_time");
     }
     const index = nextIntervals.findIndex((interval) => interval.kind === edit.kind && interval.id === edit.segmentId);
     if (index < 0) {
@@ -507,9 +507,9 @@ async function buildReviewEditUpdates(input: {
     if (!validation.ok) {
       const message =
         validation.code === "overlap"
-          ? "Dieser Zeitraum ist nicht mÃ¶glich, weil er sich mit einem bestehenden Eintrag ?berschneidet."
+          ? "Dieser Zeitraum ist nicht möglich, weil er sich mit einem bestehenden Eintrag überschneidet."
           : validation.code === "outside_day"
-            ? "Tagesstart und Tagesende mÃ¼ssen alle EintrÃ¤ge vollstÃ¤ndig umfassen."
+            ? "Tagesstart und Tagesende müssen alle Einträge vollständig umfassen."
             : validation.message;
       throw new ReviewEditHttpError(validation.code === "overlap" ? 409 : 400, message, validation.code);
     }
@@ -725,7 +725,7 @@ daySessionRouter.post("/pause/manual", async (req: AuthedRequest, res, next) => 
     if (error instanceof TimelineValidationError && error.code === "overlap") {
       res.status(409).json({
         error:
-          "Diese Pause ist nicht möglich, weil sie sich mit einem Marktbesuch oder einer anderen Pause ?berschneidet. Pausen duerfen nur Zusatzzeiterfassung schneiden.",
+          "Diese Pause ist nicht möglich, weil sie sich mit einem Marktbesuch oder einer anderen Pause überschneidet. Pausen dürfen nur Zusatzzeiterfassung schneiden.",
         code: "overlap",
       });
       return;
@@ -881,7 +881,7 @@ daySessionRouter.patch("/review-edits", async (req: AuthedRequest, res, next) =>
       if (!validation.ok) {
         const message =
           validation.code === "overlap"
-            ? "Dieser Zeitraum ist nicht möglich, weil er sich mit einem bestehenden Eintrag ?berschneidet."
+            ? "Dieser Zeitraum ist nicht möglich, weil er sich mit einem bestehenden Eintrag überschneidet."
             : validation.code === "outside_day"
               ? "Tagesstart und Tagesende müssen alle Einträge vollständig umfassen."
             : validation.message;
