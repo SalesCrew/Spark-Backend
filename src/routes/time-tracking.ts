@@ -8,6 +8,7 @@ import { ensureStartedDaySession } from "../lib/day-session.js";
 import {
   respondTimelineValidationError,
   validateGmTimelineInterval,
+  validateGmTimelineStartPoint,
 } from "../lib/zeiterfassung-validation.js";
 import {
   timeTrackingEntries,
@@ -56,6 +57,7 @@ const startDraftSchema = z
   .object({
     activityType: activityTypeSchema,
     startAt: isoDateTimeSchema,
+    endAt: isoDateTimeSchema.optional(),
     marketId: uuidSchema.optional().nullable(),
     clientEntryToken: z.string().trim().min(8).max(120).optional(),
   })
@@ -183,6 +185,27 @@ timeTrackingRouter.post("/entries/draft/start", async (req: AuthedRequest, res, 
         .limit(1);
     }
 
+    const validationId = entry?.id ?? parsed.data.clientEntryToken ?? "new-time-tracking-draft";
+    if (parsed.data.endAt) {
+      const endAt = parseIso(parsed.data.endAt);
+      await validateGmTimelineInterval({
+        gmUserId: authUserId,
+        kind: "zusatzzeit",
+        id: validationId,
+        startAt,
+        endAt,
+        now,
+      });
+    } else {
+      await validateGmTimelineStartPoint({
+        gmUserId: authUserId,
+        kind: "zusatzzeit",
+        id: validationId,
+        startAt,
+        now,
+      });
+    }
+
     if (entry) {
       const [updated] = await db
         .update(timeTrackingEntries)
@@ -231,6 +254,7 @@ timeTrackingRouter.post("/entries/draft/start", async (req: AuthedRequest, res, 
       },
     });
   } catch (error) {
+    if (respondTimelineValidationError(res, error)) return;
     next(error);
   }
 });

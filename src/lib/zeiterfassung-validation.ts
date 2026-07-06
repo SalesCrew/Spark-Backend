@@ -153,7 +153,7 @@ async function loadValidationIntervalsForSession(input: {
       .where(
         and(
           eq(timeTrackingEntries.gmUserId, input.gmUserId),
-          inArray(timeTrackingEntries.status, ["draft", "submitted"]),
+          sql`(${timeTrackingEntries.status}::text = 'submitted' or (${timeTrackingEntries.status}::text = 'draft' and ${timeTrackingEntries.endAt} is null))`,
           eq(timeTrackingEntries.isDeleted, false),
           isNotNull(timeTrackingEntries.startAt),
           sql`${timeTrackingEntries.startAt} < ${dayEndAt}::timestamptz`,
