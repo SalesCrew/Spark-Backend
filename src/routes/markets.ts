@@ -276,6 +276,7 @@ const mappingSchema = z
 const importMarketsSchema = z
   .object({
     importType: z.enum(["universum", "kuehler", "update"]).optional().default("universum"),
+    allowMissingCokeMasterNumber: z.boolean().optional().default(false),
     fileName: z.string().min(1),
     sheetName: z.string().min(1),
     rows: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))).min(1),
@@ -2108,6 +2109,8 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
     const payload = parsed.data;
     const importType: ImportDatasetType = payload.importType ?? "universum";
+    const allowMissingCokeMasterNumber =
+      importType === "universum" && Boolean(payload.allowMissingCokeMasterNumber);
     if (importType === "kuehler" && !isValidColLetter(payload.mapping.kuehlerStammnr ?? "") && !isValidColLetter(payload.mapping.flexNumber ?? "")) {
       res.status(400).json({ error: "Für Kühlermärkte muss 'Stammnr' oder 'Flex-Nummer' gemappt sein." });
       return;
@@ -2970,7 +2973,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         }
         const hasRequiredUniversumFields = Boolean(
           flexIdentity &&
-          cokeIdentity &&
+          (allowMissingCokeMasterNumber || cokeIdentity) &&
           draft.address &&
           draft.postalCode &&
           draft.city &&
@@ -2979,19 +2982,27 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         if (!hasRequiredUniversumFields) {
           summary.skipped += 1;
           if (summary.skippedReasons.length < 50) {
-            const { missingFields, missingFieldKeys, fetchedFields } = buildSkipMeta(
+            const skipMeta = buildSkipMeta(
               draft,
               payload.mapping,
               importType,
             );
+            const filteredMissingFieldKeys = allowMissingCokeMasterNumber
+              ? skipMeta.missingFieldKeys.filter((key) => key !== "cokeMasterNumber")
+              : skipMeta.missingFieldKeys;
+            const filteredMissingFields = allowMissingCokeMasterNumber
+              ? skipMeta.missingFields.filter((_, index) => skipMeta.missingFieldKeys[index] !== "cokeMasterNumber")
+              : skipMeta.missingFields;
             summary.skippedReasons.push({
               row: rowNum,
-              reason: "Universum-Markt ohne Pflichtfelder (Flex-Nummer, Stammnr. von Coke, Adresse, PLZ, Ort, Region)",
+              reason: allowMissingCokeMasterNumber
+                ? "Universum-Markt ohne Pflichtfelder (Flex-Nummer, Adresse, PLZ, Ort, Region)"
+                : "Universum-Markt ohne Pflichtfelder (Flex-Nummer, Stammnr. von Coke, Adresse, PLZ, Ort, Region)",
               sample: sampleText,
               draft,
-              missingFields,
-              missingFieldKeys,
-              fetchedFields,
+              missingFields: filteredMissingFields,
+              missingFieldKeys: filteredMissingFieldKeys,
+              fetchedFields: skipMeta.fetchedFields,
             });
           }
           continue;
