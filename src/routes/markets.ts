@@ -805,6 +805,9 @@ type ActiveNowCampaignSummary = {
   campaignId: string;
   campaignName: string;
   section: "standard" | "flex" | "kuehler" | "mhd" | "billa";
+  targetVisitCount?: number;
+  submittedVisitCount?: number;
+  isComplete?: boolean;
 };
 
 type ProgressSectionKey = "kuehler" | "mhd";
@@ -1092,6 +1095,7 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
         campaignId: campaigns.id,
         campaignName: campaigns.name,
         section: campaigns.section,
+        visitTargetCount: campaignMarketAssignments.visitTargetCount,
       })
       .from(campaignMarketAssignments)
       .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
@@ -1105,16 +1109,71 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
       );
 
     const activeNowByMarketId = new Map<string, ActiveNowCampaignSummary[]>();
+    const activeNowByKey = new Map<string, ActiveNowCampaignSummary>();
     for (const row of activeNowCampaignRows) {
       const bucket = activeNowByMarketId.get(row.marketId) ?? [];
-      if (!bucket.some((entry) => entry.campaignId === row.campaignId)) {
-        bucket.push({
+      const key = `${row.marketId}::${row.campaignId}`;
+      const targetCount = Math.max(1, Number(row.visitTargetCount ?? 1));
+      const existing = activeNowByKey.get(key);
+      if (existing) {
+        existing.targetVisitCount = (existing.targetVisitCount ?? 0) + targetCount;
+      } else {
+        const summary: ActiveNowCampaignSummary = {
           campaignId: row.campaignId,
           campaignName: row.campaignName,
           section: row.section,
-        });
+          targetVisitCount: targetCount,
+          submittedVisitCount: 0,
+          isComplete: false,
+        };
+        activeNowByKey.set(key, summary);
+        bucket.push(summary);
       }
       activeNowByMarketId.set(row.marketId, bucket);
+    }
+
+    const activeCampaignIds = Array.from(new Set(activeNowCampaignRows.map((row) => row.campaignId)));
+    const activeMarketIds = Array.from(new Set(activeNowCampaignRows.map((row) => row.marketId)));
+    if (activeCampaignIds.length > 0 && activeMarketIds.length > 0) {
+      const redPeriod = await resolveCurrentRedPeriod();
+      const redEndExclusive = redPeriodEndExclusive(redPeriod.end);
+      const submittedRows = await db
+        .select({
+          marketId: visitSessions.marketId,
+          campaignId: visitSessionSections.campaignId,
+          visitSessionId: visitSessionSections.visitSessionId,
+        })
+        .from(visitSessionSections)
+        .innerJoin(visitSessions, eq(visitSessions.id, visitSessionSections.visitSessionId))
+        .where(
+          and(
+            inArray(visitSessionSections.campaignId, activeCampaignIds),
+            inArray(visitSessions.marketId, activeMarketIds),
+            eq(visitSessionSections.isDeleted, false),
+            eq(visitSessions.gmUserId, gmUserId),
+            eq(visitSessions.status, "submitted"),
+            eq(visitSessions.isDeleted, false),
+            isNotNull(visitSessions.submittedAt),
+            gte(visitSessions.submittedAt, redPeriod.start),
+            lt(visitSessions.submittedAt, redEndExclusive),
+          ),
+        );
+
+      const submittedByKey = new Map<string, Set<string>>();
+      for (const row of submittedRows) {
+        if (!row.marketId) continue;
+        const key = `${row.marketId}::${row.campaignId}`;
+        const bucket = submittedByKey.get(key) ?? new Set<string>();
+        bucket.add(row.visitSessionId);
+        submittedByKey.set(key, bucket);
+      }
+
+      for (const [key, summary] of activeNowByKey) {
+        const submittedVisitCount = submittedByKey.get(key)?.size ?? 0;
+        const targetVisitCount = Math.max(1, Number(summary.targetVisitCount ?? 1));
+        summary.submittedVisitCount = submittedVisitCount;
+        summary.isComplete = submittedVisitCount >= targetVisitCount;
+      }
     }
 
     const gmNamesByMarketId = await resolveActiveStandardGmNamesByMarketIds(rows.map((row) => row.id));
