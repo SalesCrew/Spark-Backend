@@ -76,6 +76,12 @@ const segmentPatchSchema = z
     comment: z.string().trim().max(2_000).nullable().optional(),
   })
   .strict();
+const daySessionPatchSchema = z
+  .object({
+    startTime: z.string().regex(hhmmRegex).optional(),
+    endTime: z.string().regex(hhmmRegex).optional(),
+  })
+  .strict();
 
 type QueryInput = {
   from: string;
@@ -1253,6 +1259,101 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
         })
         .where(eq(timeTrackingEntries.id, segmentId));
     }
+
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminZeiterfassungRouter.patch("/day-sessions/:sessionId", async (req: AuthedRequest, res, next) => {
+  try {
+    const sessionId = String(req.params.sessionId ?? "").trim();
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungueltige Arbeitstag-ID." });
+      return;
+    }
+    const parsed = daySessionPatchSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungueltige Bearbeitungsdaten." });
+      return;
+    }
+    const body = parsed.data;
+    if (body.startTime === undefined && body.endTime === undefined) {
+      res.status(400).json({ error: "Keine Aenderung uebermittelt." });
+      return;
+    }
+
+    const [session] = await db
+      .select({
+        id: gmDaySessions.id,
+        gmUserId: gmDaySessions.gmUserId,
+        workDate: gmDaySessions.workDate,
+        timezone: gmDaySessions.timezone,
+        status: gmDaySessions.status,
+        dayStartedAt: gmDaySessions.dayStartedAt,
+        dayEndedAt: gmDaySessions.dayEndedAt,
+      })
+      .from(gmDaySessions)
+      .where(and(eq(gmDaySessions.id, sessionId), eq(gmDaySessions.isDeleted, false)))
+      .limit(1);
+
+    if (!session) {
+      res.status(404).json({ error: "Arbeitstag nicht gefunden." });
+      return;
+    }
+    if (session.status !== "submitted" && session.status !== "ended") {
+      res.status(409).json({ error: "Nur beendete/gespeicherte Arbeitstage koennen bearbeitet werden." });
+      return;
+    }
+    if (!session.dayStartedAt || !session.dayEndedAt) {
+      res.status(409).json({ error: "Arbeitstag ist unvollstaendig und kann nicht bearbeitet werden." });
+      return;
+    }
+
+    const timezone = session.timezone || "Europe/Vienna";
+    const nextDayStartAt = body.startTime
+      ? parseWorkDateHmToUtc(session.workDate, body.startTime, timezone)
+      : session.dayStartedAt;
+    const nextDayEndAt = body.endTime
+      ? parseWorkDateHmToUtc(session.workDate, body.endTime, timezone)
+      : session.dayEndedAt;
+    if (!nextDayStartAt || !nextDayEndAt) {
+      res.status(400).json({ error: "Bitte gueltige Uhrzeiten im Format HH:MM eingeben." });
+      return;
+    }
+    if (nextDayEndAt.getTime() <= nextDayStartAt.getTime()) {
+      res.status(400).json({ error: "Tagesende muss nach Tagesstart liegen." });
+      return;
+    }
+
+    const intervals = await loadSessionIntervals({
+      daySessionId: session.id,
+      gmUserId: session.gmUserId,
+      workDate: session.workDate,
+      timezone,
+    });
+    const outsideInterval = intervals.find(
+      (interval) =>
+        interval.startAt.getTime() < nextDayStartAt.getTime() ||
+        interval.endAt.getTime() > nextDayEndAt.getTime(),
+    );
+    if (outsideInterval) {
+      res.status(400).json({
+        error: "Tagesstart und Tagesende muessen alle Eintraege vollstaendig umfassen.",
+        code: "outside_day",
+      });
+      return;
+    }
+
+    await db
+      .update(gmDaySessions)
+      .set({
+        ...(body.startTime !== undefined ? { dayStartedAt: nextDayStartAt } : {}),
+        ...(body.endTime !== undefined ? { dayEndedAt: nextDayEndAt } : {}),
+        updatedAt: new Date(),
+      })
+      .where(eq(gmDaySessions.id, session.id));
 
     res.status(200).json({ ok: true });
   } catch (error) {
