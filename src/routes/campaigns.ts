@@ -165,6 +165,7 @@ class CampaignDomainError extends Error {
     | "schedule_invalid"
     | "market_missing"
     | "gm_missing"
+    | "gm_required"
     | "campaign_market_overlap"
     | "fragebogen_mismatch"
     | "campaign_not_found";
@@ -177,6 +178,7 @@ class CampaignDomainError extends Error {
       | "schedule_invalid"
       | "market_missing"
       | "gm_missing"
+      | "gm_required"
       | "campaign_market_overlap"
       | "fragebogen_mismatch"
       | "campaign_not_found",
@@ -749,6 +751,17 @@ function normalizeAssignments(input: {
     });
   }
   return Array.from(normalized.values());
+}
+
+function ensureManualAssignmentsHaveGm(section: CampaignSection, assignments: CampaignAssignmentInput[]) {
+  if (section === "flex") return;
+  const hasUnassignedTarget = assignments.some((assignment) => !assignment.gmUserId);
+  if (!hasUnassignedTarget) return;
+  throw new CampaignDomainError(
+    "gm_required",
+    400,
+    "Bitte einen GM auswaehlen. Maerkte ohne GM sind fuer GMs nicht sichtbar.",
+  );
 }
 
 async function ensureGmUsersExist(gmUserIds: Array<string | null>) {
@@ -3619,6 +3632,7 @@ adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, r
       marketIds: parsed.data.marketIds,
       ...(parsed.data.assignments ? { assignments: parsed.data.assignments } : {}),
     });
+    ensureManualAssignmentsHaveGm(campaignForValidation.section, assignments);
     const marketIds = assignments.map((assignment) => assignment.marketId);
     await ensureMarketsExist(marketIds);
     await ensureGmUsersExist(assignments.map((assignment) => assignment.gmUserId));
