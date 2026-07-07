@@ -584,13 +584,21 @@ daySessionRouter.get("/current", async (req: AuthedRequest, res, next) => {
     const todaySession = await loadTodaySession(gmUserId, now, DEFAULT_TIMEZONE);
     const session = todaySession ?? (await loadAnyOpenSessionForUser(gmUserId));
     const openPause = session ? await loadOpenPause(gmUserId, session.id) : null;
+    const sessionTimezone = session?.timezone || DEFAULT_TIMEZONE;
+    const currentWorkDate = toYmdInTimezone(now, sessionTimezone);
+    const staleDayOpen = Boolean(
+      session &&
+        (session.status === "started" || session.status === "ended") &&
+        session.workDate < currentWorkDate,
+    );
     res.status(200).json({
       session: serializeDaySession(session ?? null),
       gate: {
-        dayStarted: Boolean(session && session.status === "started" && session.dayStartedAt),
+        dayStarted: Boolean(session && session.status === "started" && session.dayStartedAt && !staleDayOpen),
         startKmPending: Boolean(session && !session.isStartKmCompleted),
         endKmPending: Boolean(session && Boolean(session.dayEndedAt) && !session.isEndKmCompleted),
         pauseOpen: Boolean(openPause),
+        staleDayOpen,
       },
     });
   } catch (error) {

@@ -159,7 +159,10 @@ timeTrackingRouter.post("/entries/draft/start", async (req: AuthedRequest, res, 
     const dayGuard = await ensureStartedDaySession({ gmUserId: authUserId });
     if (!dayGuard.ok) {
       res.status(409).json({
-        error: "Bitte zuerst den Arbeitstag starten.",
+        error:
+          dayGuard.reason === "stale_day_open"
+            ? "Bitte zuerst den offenen Arbeitstag vom Vortag abschließen."
+            : "Bitte zuerst den Arbeitstag starten.",
         code: dayGuard.reason,
       });
       return;

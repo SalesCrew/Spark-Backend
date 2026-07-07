@@ -79,15 +79,20 @@ async function ensureStartedDaySession(input: {
   timezone?: string;
 }): Promise<
   | { ok: true; session: typeof gmDaySessions.$inferSelect | null; skipped: boolean }
-  | { ok: false; reason: "day_not_started" }
+  | { ok: false; reason: "day_not_started" | "stale_day_open" }
 > {
   if (!(await ensureDaySessionTableReady())) {
     return { ok: true, session: null, skipped: true };
   }
-  const session = await getCurrentWritableDaySessionForUser(input);
+  const now = input.now ?? new Date();
+  const timezone = input.timezone ?? DEFAULT_TIMEZONE;
+  const session = await getCurrentWritableDaySessionForUser({ ...input, now, timezone });
   if (!session) return { ok: false, reason: "day_not_started" };
   if (!inArrayValue(session.status, ["started", "ended"])) return { ok: false, reason: "day_not_started" };
   if (!session.dayStartedAt) return { ok: false, reason: "day_not_started" };
+  if (session.workDate < toYmdInTimezone(now, session.timezone || timezone)) {
+    return { ok: false, reason: "stale_day_open" };
+  }
   return { ok: true, session, skipped: false };
 }
 
