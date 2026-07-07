@@ -354,6 +354,41 @@ function calculateDurationMinutes(startedAt: Date | null, submittedAt: Date | nu
   return Math.round(deltaMs / 60000);
 }
 
+function mapCampaignMarketRow(row: typeof markets.$inferSelect) {
+  const createdAtIso = row.createdAt instanceof Date ? row.createdAt.toISOString() : new Date().toISOString();
+  const updatedAtIso = row.updatedAt instanceof Date ? row.updatedAt.toISOString() : createdAtIso;
+  const importedAtIso = row.importedAt instanceof Date ? row.importedAt.toISOString() : createdAtIso;
+  return {
+    id: row.id,
+    standardMarketNumber: row.standardMarketNumber,
+    cokeMasterNumber: row.cokeMasterNumber,
+    flexNumber: row.flexNumber,
+    name: row.name,
+    dbName: row.dbName,
+    address: row.address,
+    postalCode: row.postalCode,
+    city: row.city,
+    region: row.region,
+    emEh: row.emEh,
+    employee: row.employee,
+    currentGmName: row.currentGmName,
+    visitFrequencyPerYear: row.visitFrequencyPerYear,
+    infoFlag: row.infoFlag,
+    infoNote: row.infoNote,
+    universeMarket: row.universeMarket,
+    marketType: row.marketType,
+    kuehlerStammnr: row.kuehlerStammnr,
+    isActive: row.isActive,
+    importSourceFileName: row.importSourceFileName,
+    importedAt: importedAtIso,
+    plannedToId: row.plannedToId,
+    plannedByActiveStandardGmName: null as string | null,
+    isDeleted: row.isDeleted,
+    createdAt: createdAtIso,
+    updatedAt: updatedAtIso,
+  };
+}
+
 type CampaignMarketVisitStatusRow = {
   rowId: string;
   marketId: string;
@@ -1706,6 +1741,51 @@ adminCampaignsRouter.get("/campaigns/market-visit-status", async (req, res, next
 
     const statusRows = await buildCampaignMarketVisitStatusBatch(campaignIds);
     res.status(200).json({ campaigns: statusRows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminCampaignsRouter.get("/campaigns/assigned-markets", async (req, res, next) => {
+  try {
+    const rawCampaignIds = String(req.query.campaignIds ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const campaignIds = normalizeUnique(rawCampaignIds);
+    if (campaignIds.length === 0 || campaignIds.some((campaignId) => !isUuid(campaignId))) {
+      res.status(400).json({ error: "Ungültige Kampagnen-IDs.", code: "invalid_campaign_ids" });
+      return;
+    }
+    if (campaignIds.length > 50) {
+      res.status(400).json({ error: "Maximal 50 Kampagnen pro Markt-Anfrage erlaubt.", code: "campaign_market_batch_too_large" });
+      return;
+    }
+
+    const assignmentRows = await db
+      .select({ marketId: campaignMarketAssignments.marketId })
+      .from(campaignMarketAssignments)
+      .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
+      .where(
+        and(
+          inArray(campaignMarketAssignments.campaignId, campaignIds),
+          eq(campaignMarketAssignments.isDeleted, false),
+          eq(campaigns.isDeleted, false),
+        ),
+      );
+    const marketIds = normalizeUnique(assignmentRows.map((row) => row.marketId));
+    if (marketIds.length === 0) {
+      res.status(200).json({ markets: [] });
+      return;
+    }
+
+    const marketRows = await db
+      .select()
+      .from(markets)
+      .where(and(inArray(markets.id, marketIds), eq(markets.isDeleted, false)))
+      .orderBy(asc(markets.name), asc(markets.address));
+
+    res.status(200).json({ markets: marketRows.map(mapCampaignMarketRow) });
   } catch (error) {
     next(error);
   }
