@@ -3929,6 +3929,228 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
   }
 });
 
+gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/delete", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungültige Session-ID." });
+      return;
+    }
+
+    const parsed = z
+      .object({
+        visitAnswerId: z.string().uuid(),
+        storagePath: z.string().min(1),
+      })
+      .strict()
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültiges Foto-Lösch-Payload." });
+      return;
+    }
+    const requestedStoragePath = cleanStoragePath(parsed.data.storagePath);
+    if (!requestedStoragePath) {
+      res.status(400).json({ error: "Ungültiger Storage-Pfad für Foto-Löschung." });
+      return;
+    }
+
+    const [answerRow] = await db
+      .select({
+        answerId: visitAnswers.id,
+        sharedQuestionId: visitAnswers.questionId,
+        questionType: visitAnswers.questionType,
+        sessionStatus: visitSessions.status,
+        submittedAt: visitSessions.submittedAt,
+      })
+      .from(visitAnswers)
+      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
+      .where(
+        and(
+          eq(visitAnswers.id, parsed.data.visitAnswerId),
+          eq(visitAnswers.isDeleted, false),
+          eq(visitSessions.id, sessionId),
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.isDeleted, false),
+        ),
+      )
+      .limit(1);
+    if (!answerRow) {
+      res.status(404).json({ error: "Foto-Antwort nicht gefunden." });
+      return;
+    }
+    if (answerRow.questionType !== "photo") {
+      res.status(400).json({ error: "Fotos können nur bei Foto-Fragen gelöscht werden." });
+      return;
+    }
+    if (answerRow.sessionStatus !== "draft" || answerRow.submittedAt != null) {
+      res.status(409).json({
+        error: "Fotos können nur gelöscht werden, solange der Fragebogen noch nicht abgeschlossen ist.",
+        code: "photo_delete_not_draft",
+      });
+      return;
+    }
+
+    const [requestedPhoto] = await db
+      .select({ id: visitAnswerPhotos.id })
+      .from(visitAnswerPhotos)
+      .where(
+        and(
+          eq(visitAnswerPhotos.visitAnswerId, parsed.data.visitAnswerId),
+          eq(visitAnswerPhotos.storagePath, requestedStoragePath),
+          eq(visitAnswerPhotos.isDeleted, false),
+        ),
+      )
+      .limit(1);
+    if (!requestedPhoto) {
+      res.status(404).json({ error: "Dieses Foto wurde nicht gefunden oder bereits gelöscht." });
+      return;
+    }
+
+    const now = new Date();
+    const deletedStorageRows: Array<{ bucket: string; path: string }> = [];
+    await db.transaction(async (tx) => {
+      const siblingQuestions = await loadSiblingSessionQuestions(tx, {
+        sessionId,
+        questionId: answerRow.sharedQuestionId,
+      });
+      const siblingQuestionIds = siblingQuestions.map((row) => row.visitQuestionId);
+      if (siblingQuestionIds.length === 0) {
+        throw new Error("Keine zugehörigen Fragen für Foto-Löschung gefunden.");
+      }
+
+      await tx.execute(
+        sql`SELECT id FROM ${visitSessionQuestions} WHERE ${inArray(visitSessionQuestions.id, siblingQuestionIds)} FOR UPDATE`,
+      );
+
+      const siblingAnswers = await tx
+        .select()
+        .from(visitAnswers)
+        .where(and(inArray(visitAnswers.visitSessionQuestionId, siblingQuestionIds), eq(visitAnswers.isDeleted, false)));
+      const siblingAnswerByVisitQuestionId = new Map(
+        siblingAnswers.map((row) => [row.visitSessionQuestionId, row]),
+      );
+
+      for (const sibling of siblingQuestions) {
+        const targetAnswer = siblingAnswerByVisitQuestionId.get(sibling.visitQuestionId);
+        if (!targetAnswer) continue;
+        const targetStoragePath = rewritePhotoStoragePathForAnswer(requestedStoragePath, sessionId, targetAnswer.id);
+        const [photoRow] = await tx
+          .select({
+            id: visitAnswerPhotos.id,
+            storageBucket: visitAnswerPhotos.storageBucket,
+            storagePath: visitAnswerPhotos.storagePath,
+          })
+          .from(visitAnswerPhotos)
+          .where(
+            and(
+              eq(visitAnswerPhotos.visitAnswerId, targetAnswer.id),
+              eq(visitAnswerPhotos.storagePath, targetStoragePath),
+              eq(visitAnswerPhotos.isDeleted, false),
+            ),
+          )
+          .limit(1);
+        if (!photoRow) continue;
+
+        await tx
+          .update(visitAnswerPhotoTags)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(eq(visitAnswerPhotoTags.visitAnswerPhotoId, photoRow.id), eq(visitAnswerPhotoTags.isDeleted, false)));
+        await tx
+          .update(visitAnswerPhotos)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(eq(visitAnswerPhotos.id, photoRow.id));
+        deletedStorageRows.push({ bucket: photoRow.storageBucket, path: photoRow.storagePath });
+
+        const remainingPhotos = await tx
+          .select()
+          .from(visitAnswerPhotos)
+          .where(and(eq(visitAnswerPhotos.visitAnswerId, targetAnswer.id), eq(visitAnswerPhotos.isDeleted, false)))
+          .orderBy(asc(visitAnswerPhotos.createdAt));
+        const remainingPhotoIds = remainingPhotos.map((row) => row.id);
+        const remainingTags = remainingPhotoIds.length === 0
+          ? []
+          : await tx
+              .select()
+              .from(visitAnswerPhotoTags)
+              .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, remainingPhotoIds), eq(visitAnswerPhotoTags.isDeleted, false)));
+
+        const config = sibling.questionConfigSnapshot ?? {};
+        const tagsEnabled = Boolean(config.tagsEnabled) && Array.isArray(config.tagIds) && (config.tagIds as unknown[]).length > 0;
+        const requiredPhotoQuestion = Boolean(sibling.requiredSnapshot);
+        const requiresTagSelection = requiredPhotoQuestion && tagsEnabled;
+        const taggedPhotoIds = new Set(remainingTags.map((row) => row.visitAnswerPhotoId));
+        const everyPhotoHasTag = !tagsEnabled || remainingPhotos.every((row) => taggedPhotoIds.has(row.id));
+        const isAnswered = remainingPhotos.length > 0;
+        const isValid = requiredPhotoQuestion ? isAnswered && everyPhotoHasTag : true;
+
+        await tx
+          .update(visitAnswers)
+          .set({
+            answerStatus: isAnswered ? (isValid ? "answered" : "invalid") : "unanswered",
+            isValid,
+            validationError: isValid ? null : (requiresTagSelection ? "Foto-Frage benötigt mindestens einen Tag." : null),
+            valueJson: {
+              storage: remainingPhotos.map((row) => ({
+                id: row.id,
+                bucket: row.storageBucket,
+                path: row.storagePath,
+              })),
+            },
+            answeredAt: isAnswered ? now : null,
+            changedAt: now,
+            version: sql`${visitAnswers.version} + 1`,
+            updatedAt: now,
+          })
+          .where(eq(visitAnswers.id, targetAnswer.id));
+      }
+
+      await tx
+        .update(visitSessions)
+        .set({ lastSavedAt: now, updatedAt: now })
+        .where(eq(visitSessions.id, sessionId));
+    });
+
+    const pathsByBucket = new Map<string, string[]>();
+    for (const row of deletedStorageRows) {
+      const bucket = row.bucket.trim();
+      const path = row.path.trim();
+      if (!bucket || !path) continue;
+      pathsByBucket.set(bucket, [...(pathsByBucket.get(bucket) ?? []), path]);
+    }
+    for (const [bucket, paths] of pathsByBucket.entries()) {
+      try {
+        const { error } = await supabaseAdmin.storage.from(bucket).remove(Array.from(new Set(paths)));
+        if (error) {
+          logger.warn("gm_visit_photo_delete_storage_cleanup_failed", {
+            action: "gm_visit_photo_delete",
+            result: "failure",
+            sessionId,
+            bucket,
+            error: error.message,
+          });
+        }
+      } catch (cleanupError) {
+        logger.warn("gm_visit_photo_delete_storage_cleanup_failed", {
+          action: "gm_visit_photo_delete",
+          result: "failure",
+          sessionId,
+          bucket,
+          error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        });
+      }
+    }
+
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
 gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;
