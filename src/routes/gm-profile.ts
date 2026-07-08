@@ -1,12 +1,21 @@
 import crypto from "node:crypto";
-import { and, desc, eq, gte, isNotNull, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gte, isNotNull, isNull, lt, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { ensureAndGetGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { redMonthPeriodToYmd, resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
 import { loadZeiterfassungDaySessions } from "../lib/zeiterfassung-days.js";
 import { db } from "../lib/db.js";
-import { markets, users, visitSessions } from "../lib/schema.js";
+import {
+  campaigns,
+  gmDaySessionPauses,
+  gmDaySessions,
+  markets,
+  timeTrackingEntries,
+  users,
+  visitSessionSections,
+  visitSessions,
+} from "../lib/schema.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
@@ -52,6 +61,216 @@ function addOneDay(date: Date): Date {
 }
 
 gmProfileRouter.use(requireAuth(["gm"]));
+
+function serializeDashboardDaySession(row: typeof gmDaySessions.$inferSelect | null) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    gmUserId: row.gmUserId,
+    workDate: row.workDate,
+    timezone: row.timezone,
+    status: row.status,
+    dayStartedAt: row.dayStartedAt?.toISOString() ?? null,
+    dayEndedAt: row.dayEndedAt?.toISOString() ?? null,
+    startKm: row.startKm,
+    endKm: row.endKm,
+    startKmDeferred: row.startKmDeferred,
+    endKmDeferred: row.endKmDeferred,
+    isStartKmCompleted: row.isStartKmCompleted,
+    isEndKmCompleted: row.isEndKmCompleted,
+    comment: row.comment,
+    submittedAt: row.submittedAt?.toISOString() ?? null,
+    cancelledAt: row.cancelledAt?.toISOString() ?? null,
+  };
+}
+
+function serializeDashboardDraft(row: typeof timeTrackingEntries.$inferSelect) {
+  return {
+    id: row.id,
+    gmUserId: row.gmUserId,
+    marketId: row.marketId,
+    activityType: row.activityType,
+    clientEntryToken: row.clientEntryToken,
+    startAt: row.startAt?.toISOString() ?? null,
+    endAt: row.endAt?.toISOString() ?? null,
+    comment: row.comment,
+    status: row.status,
+    submittedAt: row.submittedAt?.toISOString() ?? null,
+    cancelledAt: row.cancelledAt?.toISOString() ?? null,
+    durationMin: row.startAt && row.endAt ? Math.max(0, Math.floor((row.endAt.getTime() - row.startAt.getTime()) / 60_000)) : null,
+  };
+}
+
+async function loadDashboardDayGate(gmUserId: string, now: Date) {
+  const todayYmd = ymdInTimezone(now);
+  const [todaySession] = await db
+    .select()
+    .from(gmDaySessions)
+    .where(
+      and(
+        eq(gmDaySessions.gmUserId, gmUserId),
+        eq(gmDaySessions.workDate, todayYmd),
+        eq(gmDaySessions.isDeleted, false),
+      ),
+    )
+    .limit(1);
+
+  const [openSession] = todaySession
+    ? [todaySession]
+    : await db
+        .select()
+        .from(gmDaySessions)
+        .where(
+          and(
+            eq(gmDaySessions.gmUserId, gmUserId),
+            eq(gmDaySessions.isDeleted, false),
+            sql`${gmDaySessions.status}::text in ('started', 'ended')`,
+          ),
+        )
+        .orderBy(desc(gmDaySessions.dayStartedAt), desc(gmDaySessions.updatedAt))
+        .limit(1);
+
+  const session = openSession ?? null;
+  const [openPause] = session
+    ? await db
+        .select({ id: gmDaySessionPauses.id })
+        .from(gmDaySessionPauses)
+        .where(
+          and(
+            eq(gmDaySessionPauses.gmUserId, gmUserId),
+            eq(gmDaySessionPauses.daySessionId, session.id),
+            eq(gmDaySessionPauses.isDeleted, false),
+            isNull(gmDaySessionPauses.pauseEndedAt),
+          ),
+        )
+        .limit(1)
+    : [];
+  const sessionTimezone = session?.timezone || VIENNA_TIMEZONE;
+  const currentWorkDate = ymdInTimezone(now, sessionTimezone);
+  const staleDayOpen = Boolean(
+    session &&
+      (session.status === "started" || session.status === "ended") &&
+      session.workDate < currentWorkDate,
+  );
+
+  return {
+    session: serializeDashboardDaySession(session),
+    gate: {
+      dayStarted: Boolean(session && session.status === "started" && session.dayStartedAt && !staleDayOpen),
+      startKmPending: Boolean(session && !session.isStartKmCompleted),
+      endKmPending: Boolean(session && Boolean(session.dayEndedAt) && !session.isEndKmCompleted),
+      pauseOpen: Boolean(openPause),
+      staleDayOpen,
+    },
+  };
+}
+
+gmProfileRouter.get("/dashboard/critical", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+
+    const now = new Date();
+    const [daySession, draftRows, activeVisitRows, redPeriodResult] = await Promise.all([
+      loadDashboardDayGate(gmUserId, now),
+      db
+        .select()
+        .from(timeTrackingEntries)
+        .where(
+          and(
+            eq(timeTrackingEntries.gmUserId, gmUserId),
+            eq(timeTrackingEntries.status, "draft"),
+            eq(timeTrackingEntries.isDeleted, false),
+          ),
+        )
+        .orderBy(desc(timeTrackingEntries.updatedAt)),
+      db
+        .select({
+          sessionId: visitSessions.id,
+          startedAt: visitSessions.startedAt,
+          marketId: visitSessions.marketId,
+          marketName: markets.name,
+          marketAddress: markets.address,
+          marketPostalCode: markets.postalCode,
+          marketCity: markets.city,
+        })
+        .from(visitSessions)
+        .innerJoin(markets, eq(markets.id, visitSessions.marketId))
+        .where(
+          and(
+            eq(visitSessions.gmUserId, gmUserId),
+            eq(visitSessions.status, "draft"),
+            isNull(visitSessions.submittedAt),
+            eq(visitSessions.isDeleted, false),
+          ),
+        )
+        .orderBy(desc(visitSessions.startedAt), desc(visitSessions.updatedAt))
+        .limit(1),
+      resolveCurrentRedPeriod(now)
+        .then((period) => ({ ok: true as const, period }))
+        .catch(() => ({ ok: false as const, period: null })),
+    ]);
+
+    const activeVisit = activeVisitRows[0] ?? null;
+    const sectionRows = activeVisit
+      ? await db
+          .select({
+            campaignId: visitSessionSections.campaignId,
+            campaignName: campaigns.name,
+          })
+          .from(visitSessionSections)
+          .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+          .where(
+            and(
+              eq(visitSessionSections.visitSessionId, activeVisit.sessionId),
+              eq(visitSessionSections.isDeleted, false),
+              eq(campaigns.isDeleted, false),
+            ),
+          )
+          .orderBy(visitSessionSections.orderIndex)
+      : [];
+
+    const campaignIds = Array.from(new Set(sectionRows.map((row) => row.campaignId).filter(Boolean)));
+    const campaignNames = Array.from(new Set(sectionRows.map((row) => row.campaignName).filter(Boolean)));
+    const redPeriod = redPeriodResult.ok ? redPeriodResult.period : null;
+    const redDates = redPeriod ? redMonthPeriodToYmd(redPeriod) : null;
+    const todayStart = new Date(now);
+    todayStart.setHours(0, 0, 0, 0);
+
+    res.status(200).json({
+      serverTime: now.toISOString(),
+      daySession,
+      activeVisit: activeVisit
+        ? {
+            sessionId: activeVisit.sessionId,
+            startedAt: activeVisit.startedAt.toISOString(),
+            marketId: activeVisit.marketId,
+            marketName: activeVisit.marketName,
+            marketAddress: activeVisit.marketAddress,
+            marketPostalCode: activeVisit.marketPostalCode,
+            marketCity: activeVisit.marketCity,
+            campaignIds,
+            campaignNames,
+          }
+        : null,
+      activeTimeTrackingDrafts: draftRows.map(serializeDashboardDraft),
+      redPeriod: redPeriod && redDates
+        ? {
+            redPeriodId: redPeriod.redPeriodId,
+            label: redPeriod.label,
+            startDate: redDates.startYmd,
+            endDate: redDates.endYmd,
+            daysUntilEnd: Math.max(0, Math.floor((redPeriod.end.getTime() - todayStart.getTime()) / (24 * 60 * 60 * 1000))),
+          }
+        : null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 
 function cleanStoragePath(path: string): string {
   return path.replace(/^\/+/, "").replace(/\\/g, "/");
