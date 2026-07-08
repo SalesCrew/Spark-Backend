@@ -17,7 +17,7 @@ import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const hhmmRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const ymdRegex = /^\d{4}-\d{2}-\d{2}$/;
-const sourceKindSchema = z.enum(["marktbesuch", "pause", "zusatzzeit"]);
+const sourceKindSchema = z.enum(["day_start", "marktbesuch", "pause", "zusatzzeit"]);
 
 const gmCreateTimeChangeRequestSchema = z
   .object({
@@ -129,6 +129,17 @@ function toIso(value: Date | null | undefined): string | null {
   return value ? value.toISOString() : null;
 }
 
+function buildHttpError(message: string, status: number, code: string) {
+  const error = new Error(message) as Error & { status?: number; code?: string };
+  error.status = status;
+  error.code = code;
+  return error;
+}
+
+function sameMinute(left: Date, right: Date): boolean {
+  return Math.floor(left.getTime() / 60_000) === Math.floor(right.getTime() / 60_000);
+}
+
 function mapRequestRow(row: {
   id: string;
   daySessionId: string;
@@ -211,7 +222,114 @@ async function loadDaySession(sessionId: string, gmUserId?: string): Promise<Day
   return session ?? null;
 }
 
+async function loadFirstRealActionStart(session: DaySessionContext, now = new Date()): Promise<Date | null> {
+  if (!session.dayStartedAt) return null;
+  const lower = session.dayStartedAt;
+  const upper = session.dayEndedAt ?? now;
+
+  const [visitRows, extraRows, pauseRows] = await Promise.all([
+    db
+      .select({ startAt: visitSessions.startedAt })
+      .from(visitSessions)
+      .where(
+        and(
+          eq(visitSessions.gmUserId, session.gmUserId),
+          eq(visitSessions.status, "submitted"),
+          eq(visitSessions.isDeleted, false),
+          sql`${visitSessions.startedAt} is not null`,
+          sql`${visitSessions.submittedAt} is not null`,
+          gte(visitSessions.startedAt, lower),
+          lte(visitSessions.startedAt, upper),
+        ),
+      )
+      .orderBy(sql`${visitSessions.startedAt} asc`)
+      .limit(1),
+    db
+      .select({ startAt: timeTrackingEntries.startAt })
+      .from(timeTrackingEntries)
+      .where(
+        and(
+          eq(timeTrackingEntries.gmUserId, session.gmUserId),
+          eq(timeTrackingEntries.status, "submitted"),
+          eq(timeTrackingEntries.isDeleted, false),
+          sql`${timeTrackingEntries.startAt} is not null`,
+          sql`${timeTrackingEntries.endAt} is not null`,
+          gte(timeTrackingEntries.startAt, lower),
+          lte(timeTrackingEntries.startAt, upper),
+        ),
+      )
+      .orderBy(sql`${timeTrackingEntries.startAt} asc`)
+      .limit(1),
+    db
+      .select({ startAt: gmDaySessionPauses.pauseStartedAt })
+      .from(gmDaySessionPauses)
+      .where(
+        and(
+          eq(gmDaySessionPauses.daySessionId, session.id),
+          eq(gmDaySessionPauses.gmUserId, session.gmUserId),
+          eq(gmDaySessionPauses.isDeleted, false),
+          sql`${gmDaySessionPauses.pauseStartedAt} is not null`,
+          sql`${gmDaySessionPauses.pauseEndedAt} is not null`,
+          gte(gmDaySessionPauses.pauseStartedAt, lower),
+          lte(gmDaySessionPauses.pauseStartedAt, upper),
+        ),
+      )
+      .orderBy(sql`${gmDaySessionPauses.pauseStartedAt} asc`)
+      .limit(1),
+  ]);
+
+  const starts = [visitRows[0]?.startAt, extraRows[0]?.startAt, pauseRows[0]?.startAt].filter((value): value is Date => value instanceof Date);
+  const [firstStart, ...remainingStarts] = starts;
+  if (!firstStart) return null;
+  return remainingStarts.reduce((earliest, value) => (value.getTime() < earliest.getTime() ? value : earliest), firstStart);
+}
+
+async function validateDayStartChange(input: {
+  session: DaySessionContext;
+  sourceId: string;
+  requestedStartAt: Date;
+  requestedEndAt: Date;
+  now?: Date;
+}) {
+  if (!input.session.dayStartedAt) {
+    throw buildHttpError("Arbeitstag ist unvollständig und kann nicht korrigiert werden.", 409, "day_incomplete");
+  }
+  if (input.sourceId !== input.session.id && input.sourceId !== `anfahrt-${input.session.id}`) {
+    throw buildHttpError("Anfahrt konnte nicht eindeutig zugeordnet werden.", 404, "time_source_not_found");
+  }
+  const timezone = input.session.timezone || "Europe/Vienna";
+  if (toYmdInTimezone(input.requestedStartAt, timezone) !== input.session.workDate || toYmdInTimezone(input.requestedEndAt, timezone) !== input.session.workDate) {
+    throw buildHttpError("Startzeit muss am Arbeitstag liegen.", 409, "outside_day");
+  }
+
+  const boundary = await loadFirstRealActionStart(input.session, input.now ?? new Date()) ?? input.session.dayEndedAt ?? input.now ?? new Date();
+  if (!sameMinute(input.requestedEndAt, boundary)) {
+    throw buildHttpError("Das Ende der Anfahrt wird durch den nächsten Eintrag bestimmt. Bitte nur die Startzeit ändern.", 409, "day_start_end_locked");
+  }
+  if (input.requestedStartAt.getTime() >= boundary.getTime()) {
+    throw buildHttpError("Die Startzeit darf den nächsten Eintrag nicht überschneiden.", 409, "overlap");
+  }
+  if (input.requestedStartAt.getTime() >= input.requestedEndAt.getTime()) {
+    throw buildHttpError("Startzeit muss vor der nächsten Zeitbuchung liegen.", 409, "invalid_interval");
+  }
+}
+
 async function loadSourceSnapshot(kind: SourceKind, sourceId: string, session: DaySessionContext): Promise<SourceSnapshot | null> {
+  if (kind === "day_start") {
+    if (!session.dayStartedAt) return null;
+    if (sourceId !== session.id && sourceId !== `anfahrt-${session.id}`) return null;
+    const endAt = await loadFirstRealActionStart(session) ?? session.dayEndedAt ?? new Date();
+    if (session.dayStartedAt.getTime() >= endAt.getTime()) return null;
+    return {
+      id: session.id,
+      kind,
+      startAt: session.dayStartedAt,
+      endAt,
+      title: "Anfahrt",
+      subtitle: null,
+    };
+  }
+
   if (kind === "marktbesuch") {
     const [visit] = await db
       .select({
@@ -345,6 +463,22 @@ async function applyApprovedTimeChange(input: {
   requestedEndAt: Date;
   now: Date;
 }) {
+  if (input.kind === "day_start") {
+    await validateDayStartChange({
+      session: input.session,
+      sourceId: input.sourceId,
+      requestedStartAt: input.requestedStartAt,
+      requestedEndAt: input.requestedEndAt,
+      now: input.now,
+    });
+    const [updated] = await db
+      .update(gmDaySessions)
+      .set({ dayStartedAt: input.requestedStartAt, updatedAt: input.now })
+      .where(and(eq(gmDaySessions.id, input.session.id), eq(gmDaySessions.gmUserId, input.session.gmUserId), eq(gmDaySessions.isDeleted, false)))
+      .returning({ id: gmDaySessions.id });
+    return Boolean(updated);
+  }
+
   await validateGmTimelineInterval({
     gmUserId: input.session.gmUserId,
     kind: input.kind,
@@ -475,13 +609,22 @@ gmTimeEntryChangeRequestsRouter.post("/", async (req: AuthedRequest, res, next) 
       return;
     }
 
-    await validateGmTimelineInterval({
-      gmUserId,
-      kind: parsed.data.kind,
-      id: parsed.data.segmentId,
-      startAt: requestedStartAt,
-      endAt: requestedEndAt,
-    });
+    if (parsed.data.kind === "day_start") {
+      await validateDayStartChange({
+        session,
+        sourceId: parsed.data.segmentId,
+        requestedStartAt,
+        requestedEndAt,
+      });
+    } else {
+      await validateGmTimelineInterval({
+        gmUserId,
+        kind: parsed.data.kind,
+        id: parsed.data.segmentId,
+        startAt: requestedStartAt,
+        endAt: requestedEndAt,
+      });
+    }
 
     const now = new Date();
     const [saved] = await db.transaction(async (tx) => {

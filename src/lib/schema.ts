@@ -43,7 +43,7 @@ export const visitAnswerOptionRoleEnum = pgEnum("visit_answer_option_role", ["to
 export const visitAnswerEventTypeEnum = pgEnum("visit_answer_event_type", ["set", "clear", "status_change"]);
 export const visitAnswerChangeRequestStatusEnum = pgEnum("visit_answer_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
 export const timeEntryChangeRequestStatusEnum = pgEnum("time_entry_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
-export const timeEntryChangeRequestSourceKindEnum = pgEnum("time_entry_change_request_source_kind", ["marktbesuch", "pause", "zusatzzeit"]);
+export const timeEntryChangeRequestSourceKindEnum = pgEnum("time_entry_change_request_source_kind", ["day_start", "marktbesuch", "pause", "zusatzzeit"]);
 export const dsarRequestTypeEnum = pgEnum("dsar_request_type", [
   "access",
   "rectification",

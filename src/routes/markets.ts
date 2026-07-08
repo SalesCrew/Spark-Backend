@@ -120,6 +120,10 @@ function specialArthurMarketSqlCondition(matchValues: string[]) {
   );
 }
 
+function billaGmMarketSqlCondition(matchValues: string[]) {
+  return specialArthurMarketSqlCondition(matchValues) ?? billaMarketSqlCondition();
+}
+
 async function loadSpecialArthurFilterValues(gmUserId: string): Promise<string[]> {
   const rows = await db
     .select({ matchValue: specialArthurFilter.matchValue })
@@ -142,6 +146,19 @@ function marketMatchesSpecialArthurFilter(
     const normalized = normalizeSpecialArthurMatchValue(value);
     return normalized ? allowed.has(normalized) : false;
   });
+}
+
+function isMarketVisibleForBillaGm(
+  market: {
+    name: string | null;
+    dbName: string | null;
+    kuehlerStammnr: string | null;
+    cokeMasterNumber: string | null;
+    flexNumber: string | null;
+  },
+  matchValues: string[],
+): boolean {
+  return matchValues.length > 0 ? marketMatchesSpecialArthurFilter(market, matchValues) : isBillaMarketRow(market);
 }
 
 function isQuestionApplicableToMarketChain(questionChains: string[] | null | undefined, marketChain: string): boolean {
@@ -1217,8 +1234,7 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
             eq(markets.isDeleted, false),
             eq(markets.isActive, true),
             inArray(markets.marketType, ["universum", "both"]),
-            isBillaGm ? billaMarketSqlCondition() : undefined,
-            isBillaGm ? specialArthurMarketSqlCondition(specialFilterValues) : undefined,
+            isBillaGm ? billaGmMarketSqlCondition(specialFilterValues) : undefined,
           ),
         )
         .orderBy(desc(markets.createdAt)),
@@ -1348,8 +1364,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
     if (
       marketRow.isActive &&
       (marketRow.marketType === "universum" || marketRow.marketType === "both") &&
-      (!isBillaGm || isBillaMarketRow(marketRow)) &&
-      (!isBillaGm || marketMatchesSpecialArthurFilter(marketRow, specialFilterValues))
+      (!isBillaGm || isMarketVisibleForBillaGm(marketRow, specialFilterValues))
     ) {
       const activeFlexRows = await db
         .select({
