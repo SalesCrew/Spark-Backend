@@ -322,6 +322,21 @@ function assertFinishedDay(session: DaySessionContext) {
   }
 }
 
+function assertStartedDay(session: DaySessionContext) {
+  if (session.status !== "started" && session.status !== "ended" && session.status !== "submitted") {
+    const error = new Error("Arbeitstag wurde noch nicht gestartet.") as Error & { status?: number; code?: string };
+    error.status = 409;
+    error.code = "day_not_started";
+    throw error;
+  }
+  if (!session.dayStartedAt) {
+    const error = new Error("Arbeitstag ist unvollstaendig und kann nicht korrigiert werden.") as Error & { status?: number; code?: string };
+    error.status = 409;
+    error.code = "day_incomplete";
+    throw error;
+  }
+}
+
 async function applyApprovedTimeChange(input: {
   kind: SourceKind;
   sourceId: string;
@@ -445,7 +460,7 @@ gmTimeEntryChangeRequestsRouter.post("/", async (req: AuthedRequest, res, next) 
       res.status(404).json({ error: "Arbeitstag nicht gefunden.", code: "day_session_not_found" });
       return;
     }
-    assertFinishedDay(session);
+    assertStartedDay(session);
 
     const source = await loadSourceSnapshot(parsed.data.kind, parsed.data.segmentId, session);
     if (!source) {
@@ -650,7 +665,7 @@ adminTimeEntryChangeRequestsRouter.patch("/:requestId/approve", async (req: Auth
         error.code = "day_session_not_found";
         throw error;
       }
-      assertFinishedDay(session);
+      assertStartedDay(session);
 
       const applied = await applyApprovedTimeChange({
         kind: requestRow.sourceKind,
