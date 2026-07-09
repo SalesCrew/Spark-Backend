@@ -570,6 +570,9 @@ async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayloa
       comment: timeTrackingEntries.comment,
       startAt: timeTrackingEntries.startAt,
       endAt: timeTrackingEntries.endAt,
+      doctorConfirmationPath: timeTrackingEntries.doctorConfirmationPath,
+      doctorConfirmationFileName: timeTrackingEntries.doctorConfirmationFileName,
+      doctorConfirmationUploadedAt: timeTrackingEntries.doctorConfirmationUploadedAt,
       marketName: markets.name,
       marketAddress: markets.address,
     })
@@ -601,6 +604,16 @@ async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayloa
       endAt,
       subtype: row.activityType,
       ...(row.comment ? { comment: row.comment } : {}),
+      ...(row.activityType === "arztbesuch"
+        ? {
+            doctorConfirmation: {
+              isRequired: true,
+              isUploaded: Boolean(row.doctorConfirmationPath),
+              uploadedAt: row.doctorConfirmationUploadedAt?.toISOString() ?? null,
+              fileName: row.doctorConfirmationFileName ?? null,
+            },
+          }
+        : {}),
       ...(row.marketName ? { marketName: row.marketName } : {}),
       ...(row.marketAddress ? { marketAddress: row.marketAddress } : {}),
     });

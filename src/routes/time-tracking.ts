@@ -1,10 +1,12 @@
-import { and, desc, eq, isNull } from "drizzle-orm";
+import crypto from "node:crypto";
+import { and, desc, eq } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { logAction, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { ensureStartedDaySession } from "../lib/day-session.js";
+import { supabaseAdmin } from "../lib/supabase.js";
 import {
   respondTimelineValidationError,
   validateGmTimelineInterval,
@@ -41,6 +43,17 @@ timeTrackingRouter.use((req, res, next) => {
 
 const uuidSchema = z.string().uuid();
 const isoDateTimeSchema = z.string().datetime();
+const DOCTOR_CONFIRMATION_BUCKET = "visit-photos";
+const DOCTOR_CONFIRMATION_READ_TTL_SECONDS = 30 * 60;
+const DOCTOR_CONFIRMATION_MAX_BYTES = 10 * 1024 * 1024;
+const DOCTOR_CONFIRMATION_MIME_BY_EXT: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  heic: "image/heic",
+  heif: "image/heif",
+};
 
 const activityTypeSchema = z.enum([
   "sonderaufgabe",
@@ -78,6 +91,24 @@ const commentDraftSchema = z
 const activeDraftQuerySchema = z
   .object({
     gmUserId: uuidSchema.optional(),
+  })
+  .strict();
+
+const doctorConfirmationPresignSchema = z
+  .object({
+    extension: z.string().max(12).optional(),
+    mimeType: z.string().max(80).optional(),
+    fileName: z.string().trim().max(240).optional(),
+  })
+  .strict();
+
+const doctorConfirmationCommitSchema = z
+  .object({
+    storageBucket: z.literal(DOCTOR_CONFIRMATION_BUCKET),
+    storagePath: z.string().min(1),
+    fileName: z.string().trim().max(240).optional(),
+    mimeType: z.string().max(80).optional(),
+    byteSize: z.number().int().min(1).max(DOCTOR_CONFIRMATION_MAX_BYTES).optional(),
   })
   .strict();
 
@@ -122,6 +153,14 @@ function serializeEntry(row: typeof timeTrackingEntries.$inferSelect) {
     submittedAt: row.submittedAt?.toISOString() ?? null,
     cancelledAt: row.cancelledAt?.toISOString() ?? null,
     durationMin: toDurationMinutes(row.startAt ?? null, row.endAt ?? null),
+    doctorConfirmation: row.activityType === "arztbesuch"
+      ? {
+          isRequired: true,
+          isUploaded: Boolean(row.doctorConfirmationPath),
+          uploadedAt: row.doctorConfirmationUploadedAt?.toISOString() ?? null,
+          fileName: row.doctorConfirmationFileName ?? null,
+        }
+      : null,
   };
 }
 
@@ -142,6 +181,40 @@ async function appendEntryEvent(input: {
     eventType: input.eventType,
     payload: input.payload,
   });
+}
+
+function cleanStoragePath(path: string): string {
+  return path.replace(/^\/+/, "").replace(/\\/g, "/").trim();
+}
+
+function normalizeDoctorConfirmationExt(input?: { extension?: string | undefined; mimeType?: string | undefined }): string {
+  const rawExt = (input?.extension ?? "").trim().toLowerCase().replace(/^\./, "");
+  if (rawExt && DOCTOR_CONFIRMATION_MIME_BY_EXT[rawExt]) return rawExt === "jpeg" ? "jpg" : rawExt;
+  const mime = (input?.mimeType ?? "").trim().toLowerCase();
+  const match = Object.entries(DOCTOR_CONFIRMATION_MIME_BY_EXT).find(([, value]) => value === mime);
+  if (match) return match[0] === "jpeg" ? "jpg" : match[0];
+  return "jpg";
+}
+
+function isAllowedDoctorConfirmationMime(mimeType: string | null | undefined): boolean {
+  if (!mimeType) return true;
+  return Object.values(DOCTOR_CONFIRMATION_MIME_BY_EXT).includes(mimeType.toLowerCase());
+}
+
+function safeDoctorConfirmationFileName(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").slice(0, 180);
+}
+
+async function verifyStorageObjectExists(bucket: string, storagePath: string): Promise<boolean> {
+  const normalized = cleanStoragePath(storagePath);
+  const lastSlash = normalized.lastIndexOf("/");
+  const folder = lastSlash >= 0 ? normalized.slice(0, lastSlash) : "";
+  const fileName = lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
+  const { data, error } = await supabaseAdmin.storage.from(bucket).list(folder, { search: fileName, limit: 10 });
+  if (error) return false;
+  return (data ?? []).some((entry) => entry.name === fileName);
 }
 
 timeTrackingRouter.post("/entries/draft/start", async (req: AuthedRequest, res, next) => {
@@ -374,6 +447,194 @@ timeTrackingRouter.patch("/entries/:id/draft/comment", async (req: AuthedRequest
       payload: { comment: parsed.data.comment ?? null },
     });
     res.status(200).json({ entry: serializeEntry(updated) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+timeTrackingRouter.post("/entries/:id/doctor-confirmation/presign", async (req: AuthedRequest, res, next) => {
+  try {
+    const idParse = uuidSchema.safeParse(req.params.id);
+    const parsed = doctorConfirmationPresignSchema.safeParse(req.body ?? {});
+    if (!idParse.success || !parsed.success) {
+      res.status(400).json({ error: "Ungültiges Arztbestätigung-Payload." });
+      return;
+    }
+    const authUserId = req.authUser?.appUserId;
+    if (!authUserId || req.authUser?.role !== "gm") {
+      res.status(403).json({ error: "Nur der zuständige GM kann eine Arztbestätigung hochladen." });
+      return;
+    }
+    if (!isAllowedDoctorConfirmationMime(parsed.data.mimeType)) {
+      res.status(400).json({ error: "Arztbestätigung muss ein Foto im Format JPG, PNG, WebP oder HEIC sein." });
+      return;
+    }
+
+    const [entry] = await db
+      .select()
+      .from(timeTrackingEntries)
+      .where(and(eq(timeTrackingEntries.id, idParse.data), eq(timeTrackingEntries.isDeleted, false)))
+      .limit(1);
+    if (!entry) {
+      res.status(404).json({ error: "Eintrag nicht gefunden." });
+      return;
+    }
+    if (entry.gmUserId !== authUserId) {
+      res.status(403).json({ error: "Diese Arztbestätigung gehört nicht zu deinem Account." });
+      return;
+    }
+    if (entry.activityType !== "arztbesuch") {
+      res.status(400).json({ error: "Arztbestätigung ist nur für Arztbesuch-Einträge möglich." });
+      return;
+    }
+    if (entry.doctorConfirmationPath) {
+      res.status(409).json({ error: "Für diesen Arztbesuch wurde bereits eine Arztbestätigung hochgeladen." });
+      return;
+    }
+
+    const ext = normalizeDoctorConfirmationExt(parsed.data);
+    const path = `doctor-confirmations/${authUserId}/${entry.id}/${crypto.randomUUID()}.${ext}`;
+    const { data, error } = await supabaseAdmin.storage.from(DOCTOR_CONFIRMATION_BUCKET).createSignedUploadUrl(path);
+    if (error || !data) {
+      res.status(500).json({ error: "Upload-Link konnte nicht erstellt werden." });
+      return;
+    }
+
+    res.status(200).json({
+      upload: {
+        bucket: DOCTOR_CONFIRMATION_BUCKET,
+        path: data.path,
+        signedUrl: data.signedUrl,
+        token: data.token,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+timeTrackingRouter.post("/entries/:id/doctor-confirmation/commit", async (req: AuthedRequest, res, next) => {
+  try {
+    const idParse = uuidSchema.safeParse(req.params.id);
+    const parsed = doctorConfirmationCommitSchema.safeParse(req.body ?? {});
+    if (!idParse.success || !parsed.success) {
+      res.status(400).json({ error: "Arztbestätigung konnte nicht gespeichert werden." });
+      return;
+    }
+    const authUserId = req.authUser?.appUserId;
+    if (!authUserId || req.authUser?.role !== "gm") {
+      res.status(403).json({ error: "Nur der zuständige GM kann eine Arztbestätigung hochladen." });
+      return;
+    }
+    if (!isAllowedDoctorConfirmationMime(parsed.data.mimeType)) {
+      res.status(400).json({ error: "Arztbestätigung muss ein Foto im Format JPG, PNG, WebP oder HEIC sein." });
+      return;
+    }
+
+    const [entry] = await db
+      .select()
+      .from(timeTrackingEntries)
+      .where(and(eq(timeTrackingEntries.id, idParse.data), eq(timeTrackingEntries.isDeleted, false)))
+      .limit(1);
+    if (!entry) {
+      res.status(404).json({ error: "Eintrag nicht gefunden." });
+      return;
+    }
+    if (entry.gmUserId !== authUserId) {
+      res.status(403).json({ error: "Diese Arztbestätigung gehört nicht zu deinem Account." });
+      return;
+    }
+    if (entry.activityType !== "arztbesuch") {
+      res.status(400).json({ error: "Arztbestätigung ist nur für Arztbesuch-Einträge möglich." });
+      return;
+    }
+    if (entry.doctorConfirmationPath) {
+      res.status(409).json({ error: "Für diesen Arztbesuch wurde bereits eine Arztbestätigung hochgeladen." });
+      return;
+    }
+
+    const normalizedPath = cleanStoragePath(parsed.data.storagePath);
+    const expectedPrefix = `doctor-confirmations/${authUserId}/${entry.id}/`;
+    if (!normalizedPath.startsWith(expectedPrefix)) {
+      res.status(403).json({ error: "Diese Arztbestätigung gehört nicht zu diesem Eintrag." });
+      return;
+    }
+    const exists = await verifyStorageObjectExists(DOCTOR_CONFIRMATION_BUCKET, normalizedPath);
+    if (!exists) {
+      res.status(400).json({ error: "Arztbestätigung wurde noch nicht vollständig hochgeladen." });
+      return;
+    }
+
+    const now = new Date();
+    const [updated] = await db
+      .update(timeTrackingEntries)
+      .set({
+        doctorConfirmationBucket: DOCTOR_CONFIRMATION_BUCKET,
+        doctorConfirmationPath: normalizedPath,
+        doctorConfirmationFileName: safeDoctorConfirmationFileName(parsed.data.fileName),
+        doctorConfirmationMimeType: parsed.data.mimeType ?? null,
+        doctorConfirmationByteSize: parsed.data.byteSize ?? null,
+        doctorConfirmationUploadedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(timeTrackingEntries.id, entry.id))
+      .returning();
+    if (!updated) {
+      throw new Error("Arztbestätigung konnte nicht gespeichert werden.");
+    }
+
+    res.status(200).json({ entry: serializeEntry(updated) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+timeTrackingRouter.get("/entries/:id/doctor-confirmation", async (req: AuthedRequest, res, next) => {
+  try {
+    const idParse = uuidSchema.safeParse(req.params.id);
+    if (!idParse.success) {
+      res.status(400).json({ error: "Ungültige Eintrags-ID." });
+      return;
+    }
+    const [entry] = await db
+      .select()
+      .from(timeTrackingEntries)
+      .where(and(eq(timeTrackingEntries.id, idParse.data), eq(timeTrackingEntries.isDeleted, false)))
+      .limit(1);
+    if (!entry) {
+      res.status(404).json({ error: "Eintrag nicht gefunden." });
+      return;
+    }
+    if (!canAccessEntry(req, entry.gmUserId)) {
+      res.status(403).json({ error: "Keine Berechtigung für diesen Eintrag." });
+      return;
+    }
+    if (entry.activityType !== "arztbesuch" || !entry.doctorConfirmationPath) {
+      res.status(404).json({ error: "Keine Arztbestätigung vorhanden." });
+      return;
+    }
+    if (entry.doctorConfirmationBucket !== DOCTOR_CONFIRMATION_BUCKET) {
+      res.status(404).json({ error: "Keine Arztbestätigung vorhanden." });
+      return;
+    }
+
+    const normalizedPath = cleanStoragePath(entry.doctorConfirmationPath);
+    const { data, error } = await supabaseAdmin.storage
+      .from(DOCTOR_CONFIRMATION_BUCKET)
+      .createSignedUrl(normalizedPath, DOCTOR_CONFIRMATION_READ_TTL_SECONDS);
+    if (error || !data?.signedUrl) {
+      res.status(500).json({ error: "Arztbestätigung konnte nicht geöffnet werden." });
+      return;
+    }
+
+    res.status(200).json({
+      doctorConfirmation: {
+        signedUrl: data.signedUrl,
+        expiresAt: new Date(Date.now() + DOCTOR_CONFIRMATION_READ_TTL_SECONDS * 1000).toISOString(),
+        fileName: entry.doctorConfirmationFileName,
+        mimeType: entry.doctorConfirmationMimeType,
+      },
+    });
   } catch (error) {
     next(error);
   }

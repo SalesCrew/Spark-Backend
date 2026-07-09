@@ -1016,6 +1016,9 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
           status: timeTrackingEntries.status,
           activityType: timeTrackingEntries.activityType,
           comment: timeTrackingEntries.comment,
+          doctorConfirmationPath: timeTrackingEntries.doctorConfirmationPath,
+          doctorConfirmationFileName: timeTrackingEntries.doctorConfirmationFileName,
+          doctorConfirmationUploadedAt: timeTrackingEntries.doctorConfirmationUploadedAt,
           marketName: markets.name,
           marketAddress: markets.address,
         })
@@ -1108,6 +1111,16 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
         endAt: row.endAt,
         subtype: row.activityType,
         ...(row.comment ? { comment: row.comment } : {}),
+        ...(row.activityType === "arztbesuch"
+          ? {
+              doctorConfirmation: {
+                isRequired: true,
+                isUploaded: Boolean(row.doctorConfirmationPath),
+                uploadedAt: row.doctorConfirmationUploadedAt?.toISOString() ?? null,
+                fileName: row.doctorConfirmationFileName ?? null,
+              },
+            }
+          : {}),
         ...(row.marketName ? { marketName: row.marketName } : {}),
         ...(row.marketAddress ? { marketAddress: row.marketAddress } : {}),
       });

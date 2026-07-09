@@ -27,6 +27,12 @@ type BaseAction = {
   marketAddress?: string;
   subtype?: string;
   comment?: string;
+  doctorConfirmation?: {
+    isRequired: boolean;
+    isUploaded: boolean;
+    uploadedAt: string | null;
+    fileName: string | null;
+  };
   questionnaireType?: string;
   questionnaireTypes?: string[];
 };
@@ -74,6 +80,12 @@ type SessionEntry = {
   marketAddress?: string;
   subtype?: string;
   comment?: string;
+  doctorConfirmation?: {
+    isRequired: boolean;
+    isUploaded: boolean;
+    uploadedAt: string | null;
+    fileName: string | null;
+  };
   questionnaireType?: string;
   questionnaireTypes?: string[];
 };
@@ -88,6 +100,12 @@ type TimelineSegment = {
   subtitle?: string;
   subtype?: string;
   comment?: string;
+  doctorConfirmation?: {
+    isRequired: boolean;
+    isUploaded: boolean;
+    uploadedAt: string | null;
+    fileName: string | null;
+  };
   questionnaireType?: string;
 };
 
@@ -342,6 +360,7 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
     ...(action.marketAddress ? { marketAddress: action.marketAddress } : {}),
     ...(action.subtype ? { subtype: action.subtype } : {}),
     ...(action.comment ? { comment: action.comment } : {}),
+    ...(action.doctorConfirmation ? { doctorConfirmation: action.doctorConfirmation } : {}),
     ...(action.questionnaireType ? { questionnaireType: action.questionnaireType } : {}),
     ...(action.questionnaireTypes && action.questionnaireTypes.length > 0
       ? { questionnaireTypes: action.questionnaireTypes }
@@ -402,6 +421,9 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
         : {}),
       ...(current.kind === "zusatzzeit" && current.comment
         ? { comment: current.comment }
+        : {}),
+      ...(current.kind === "zusatzzeit" && current.doctorConfirmation
+        ? { doctorConfirmation: current.doctorConfirmation }
         : {}),
       ...(current.kind === "marktbesuch" && current.questionnaireType
         ? { questionnaireType: current.questionnaireType }
