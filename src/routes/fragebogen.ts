@@ -1709,16 +1709,18 @@ adminFragebogenRouter.get("/markets/chains", async (_req, res, next) => {
 });
 
 adminFragebogenRouter.post("/photo-tags", async (req, res, next) => {
+  let parsedLabel: string | null = null;
   try {
     const parsed = z.object({ label: z.string().trim().min(1) }).safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: "Ungültiger Tag." });
       return;
     }
+    parsedLabel = parsed.data.label;
     const now = new Date();
     const [created] = await db
       .insert(photoTags)
-      .values({ label: parsed.data.label, isDeleted: false, deletedAt: null, createdAt: now, updatedAt: now })
+      .values({ label: parsedLabel, isDeleted: false, deletedAt: null, createdAt: now, updatedAt: now })
       .returning();
     if (!created) {
       throw new Error("Tag konnte nicht erstellt werden.");
@@ -1733,8 +1735,24 @@ adminFragebogenRouter.post("/photo-tags", async (req, res, next) => {
     });
   } catch (error) {
     if (isPhotoTagLabelConflict(error)) {
-      res.status(409).json({ error: "Dieses Foto-Tag existiert bereits." });
-      return;
+      const [existing] = parsedLabel
+        ? await db
+            .select()
+            .from(photoTags)
+            .where(and(eq(photoTags.label, parsedLabel), eq(photoTags.isDeleted, false)))
+            .limit(1)
+        : [];
+      if (existing) {
+        res.status(200).json({
+          tag: {
+            id: existing.id,
+            label: existing.label,
+            deletedAt: existing.deletedAt?.toISOString() ?? null,
+            createdAt: existing.createdAt.toISOString(),
+          },
+        });
+        return;
+      }
     }
     next(error);
   }
