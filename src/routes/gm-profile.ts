@@ -10,6 +10,7 @@ import {
   campaigns,
   gmDaySessionPauses,
   gmDaySessions,
+  gmTextSettings,
   markets,
   timeTrackingEntries,
   users,
@@ -33,6 +34,10 @@ const PROFILE_PHOTO_MIME_BY_EXT: Record<string, string> = {
   heic: "image/heic",
   heif: "image/heif",
 };
+
+const gmTextSettingsPayloadSchema = z.object({
+  textScalePercent: z.number().int().min(0).max(50),
+});
 
 function ymdInTimezone(date: Date, timezone = VIENNA_TIMEZONE): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -100,6 +105,72 @@ function serializeDashboardDraft(row: typeof timeTrackingEntries.$inferSelect) {
     durationMin: row.startAt && row.endAt ? Math.max(0, Math.floor((row.endAt.getTime() - row.startAt.getTime()) / 60_000)) : null,
   };
 }
+
+gmProfileRouter.get("/settings/text-scale", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) return res.status(401).json({ error: "auth_required" });
+
+    const [settings] = await db
+      .select({
+        textScalePercent: gmTextSettings.textScalePercent,
+        updatedAt: gmTextSettings.updatedAt,
+      })
+      .from(gmTextSettings)
+      .where(and(eq(gmTextSettings.userId, gmUserId), eq(gmTextSettings.isDeleted, false)))
+      .limit(1);
+
+    return res.json({
+      textScalePercent: settings?.textScalePercent ?? 0,
+      updatedAt: settings?.updatedAt?.toISOString() ?? null,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+gmProfileRouter.patch("/settings/text-scale", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) return res.status(401).json({ error: "auth_required" });
+
+    const parsed = gmTextSettingsPayloadSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: "invalid_payload", issues: parsed.error.issues });
+    }
+
+    const now = new Date();
+    const [settings] = await db
+      .insert(gmTextSettings)
+      .values({
+        userId: gmUserId,
+        textScalePercent: parsed.data.textScalePercent,
+        isDeleted: false,
+        deletedAt: null,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: gmTextSettings.userId,
+        set: {
+          textScalePercent: parsed.data.textScalePercent,
+          isDeleted: false,
+          deletedAt: null,
+          updatedAt: now,
+        },
+      })
+      .returning({
+        textScalePercent: gmTextSettings.textScalePercent,
+        updatedAt: gmTextSettings.updatedAt,
+      });
+
+    return res.json({
+      textScalePercent: settings?.textScalePercent ?? parsed.data.textScalePercent,
+      updatedAt: settings?.updatedAt?.toISOString() ?? now.toISOString(),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 async function loadDashboardDayGate(gmUserId: string, now: Date) {
   const todayYmd = ymdInTimezone(now);

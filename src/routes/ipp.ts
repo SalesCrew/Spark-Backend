@@ -12,7 +12,7 @@ import { requireAuth } from "../middleware/auth.js";
 const adminIppRouter = Router();
 adminIppRouter.use(requireAuth(["admin", "kunde"]));
 adminIppRouter.use(requireKundeAdminPermission);
-adminIppRouter.use((req, res, next) => {
+adminIppRouter.use("/ipp", (req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {
     const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";

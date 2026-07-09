@@ -159,7 +159,7 @@ redMonthRouter.use((req, res, next) => {
   next();
 });
 
-adminRedMonthRouter.use((req, res, next) => {
+adminRedMonthRouter.use("/red-month", (req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {
     const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";

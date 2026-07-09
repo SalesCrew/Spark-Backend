@@ -1748,7 +1748,7 @@ function respondDomainError(res: Response, error: CampaignDomainError) {
 const adminCampaignsRouter = Router();
 adminCampaignsRouter.use(requireAuth(["admin", "kunde"]));
 adminCampaignsRouter.use(requireKundeAdminPermission);
-adminCampaignsRouter.use((req, res, next) => {
+adminCampaignsRouter.use("/campaigns", (req, res, next) => {
   if (req.method.toUpperCase() === "GET") {
     next();
     return;

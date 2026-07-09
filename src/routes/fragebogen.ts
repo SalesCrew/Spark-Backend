@@ -44,7 +44,20 @@ import {
 const adminFragebogenRouter = Router();
 adminFragebogenRouter.use(requireAuth(["admin", "kunde"]));
 adminFragebogenRouter.use(requireKundeAdminPermission);
+const fragebogenLogPrefixes = [
+  "/photo-tags",
+  "/markets/chains",
+  "/questions",
+  "/modules",
+  "/fragebogen",
+  "/question-map",
+];
+
 adminFragebogenRouter.use((req, res, next) => {
+  if (!fragebogenLogPrefixes.some((prefix) => req.path === prefix || req.path.startsWith(`${prefix}/`))) {
+    next();
+    return;
+  }
   if (req.method.toUpperCase() === "GET") {
     next();
     return;

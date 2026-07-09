@@ -22,7 +22,7 @@ const adminLagerRouter = Router();
 
 adminLagerRouter.use(requireAuth(["admin", "kunde"]));
 adminLagerRouter.use(requireKundeAdminPermission);
-adminLagerRouter.use((req, res, next) => {
+adminLagerRouter.use("/lager", (req, res, next) => {
   if (req.method.toUpperCase() === "GET") {
     next();
     return;

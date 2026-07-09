@@ -43,7 +43,7 @@ export const visitAnswerOptionRoleEnum = pgEnum("visit_answer_option_role", ["to
 export const visitAnswerEventTypeEnum = pgEnum("visit_answer_event_type", ["set", "clear", "status_change"]);
 export const visitAnswerChangeRequestStatusEnum = pgEnum("visit_answer_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
 export const timeEntryChangeRequestStatusEnum = pgEnum("time_entry_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
-export const timeEntryChangeRequestSourceKindEnum = pgEnum("time_entry_change_request_source_kind", ["day_start", "marktbesuch", "pause", "zusatzzeit"]);
+export const timeEntryChangeRequestSourceKindEnum = pgEnum("time_entry_change_request_source_kind", ["day_start", "day_end", "marktbesuch", "pause", "zusatzzeit"]);
 export const dsarRequestTypeEnum = pgEnum("dsar_request_type", [
   "access",
   "rectification",
@@ -150,6 +150,24 @@ export const kundeUsers = pgTable(
   (table) => [
     index("kunde_users_created_by_idx").on(table.createdByUserId),
     index("kunde_users_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const gmTextSettings = pgTable(
+  "gm_text_settings",
+  {
+    userId: uuid("user_id")
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    textScalePercent: integer("text_scale_percent").notNull().default(0),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("gm_text_settings_percent_range_ck", sql`${table.textScalePercent} >= 0 and ${table.textScalePercent} <= 50`),
+    index("gm_text_settings_deleted_idx").on(table.isDeleted),
   ],
 );
 
