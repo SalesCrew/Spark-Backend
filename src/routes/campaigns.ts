@@ -8,6 +8,7 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { aggregateHighVolumeLoad, logAction, logger, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { type AuthedRequest, requireAuth } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
+import { supabaseAdmin } from "../lib/supabase.js";
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { buildVisitAnswerValidationResult, computeMissingRequiredQuestions } from "../lib/visit-session-answer-validation.js";
 import {
@@ -40,6 +41,9 @@ const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "m
 const campaignStatusSchema = z.enum(["active", "scheduled", "inactive"]);
 const scheduleTypeSchema = z.enum(["always", "scheduled"]);
 const CAMPAIGN_ASSIGNMENT_INSERT_BATCH_SIZE = 500;
+const VISIT_PHOTOS_BUCKET = "visit-photos";
+const VISIT_PHOTO_READ_URL_TTL_SECONDS = 30 * 60;
+const VISIT_PHOTO_READ_URL_TIMEOUT_MS = 1800;
 const campaignAssignmentSchema = z
   .object({
     marketId: z.string().uuid(),
@@ -218,6 +222,55 @@ class CampaignOverlapConflictError extends Error {
 
 function isUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function cleanStoragePath(path: string): string {
+  return path.replace(/^\/+/, "").trim();
+}
+
+async function createVisitPhotoReadUrl(input: {
+  photoId: string;
+  storageBucket: string;
+  storagePath: string;
+}): Promise<{ signedUrl: string | null; expiresAt: string | null }> {
+  const expiresAt = new Date(Date.now() + VISIT_PHOTO_READ_URL_TTL_SECONDS * 1000).toISOString();
+  if (input.storageBucket !== VISIT_PHOTOS_BUCKET) return { signedUrl: null, expiresAt: null };
+  const normalizedPath = cleanStoragePath(input.storagePath);
+  if (!normalizedPath) return { signedUrl: null, expiresAt: null };
+
+  const signed = await Promise.race([
+    supabaseAdmin.storage
+      .from(input.storageBucket)
+      .createSignedUrl(normalizedPath, VISIT_PHOTO_READ_URL_TTL_SECONDS)
+      .then(({ data, error }) => ({
+        signedUrl: error || !data?.signedUrl ? null : data.signedUrl,
+        errorMessage: error?.message ?? null,
+        timedOut: false,
+      }))
+      .catch((error: unknown) => ({
+        signedUrl: null,
+        errorMessage: error instanceof Error ? error.message : "unknown_error",
+        timedOut: false,
+      })),
+    new Promise<{ signedUrl: null; errorMessage: string; timedOut: true }>((resolve) => {
+      setTimeout(() => resolve({ signedUrl: null, errorMessage: "signed_url_timeout", timedOut: true }), VISIT_PHOTO_READ_URL_TIMEOUT_MS);
+    }),
+  ]);
+
+  if (!signed.signedUrl) {
+    logger.warn("admin_campaign_visit_photo_signed_url_failed", {
+      action: "admin_campaign_visit_detail",
+      result: "failure",
+      photoId: input.photoId,
+      storageBucket: input.storageBucket,
+      storagePath: input.storagePath,
+      error: signed.errorMessage,
+      timedOut: signed.timedOut,
+    });
+    return { signedUrl: null, expiresAt: null };
+  }
+
+  return { signedUrl: signed.signedUrl, expiresAt };
 }
 
 function normalizeUnique(values: string[]): string[] {
@@ -1225,7 +1278,7 @@ async function mergeCampaignAssignment(
 
 async function buildCampaignMarketVisitSummaries(
   campaignId: string,
-  options?: { marketIds?: string[]; sessionId?: string | null },
+  options?: { marketIds?: string[]; sessionId?: string | null; includePhotoSignedUrls?: boolean },
 ) {
   const scopedMarketIds = normalizeUnique(options?.marketIds ?? []).filter(isUuid);
   const assignedConditions = [
@@ -1449,6 +1502,19 @@ async function buildCampaignMarketVisitSummaries(
     bucket.push(row);
     photosByAnswerId.set(row.visitAnswerId, bucket);
   }
+  const photoReadUrlById = new Map<string, { signedUrl: string | null; expiresAt: string | null }>();
+  if (options?.includePhotoSignedUrls && answerPhotos.length > 0) {
+    await Promise.all(
+      answerPhotos.map(async (photo) => {
+        const signed = await createVisitPhotoReadUrl({
+          photoId: photo.id,
+          storageBucket: photo.storageBucket,
+          storagePath: photo.storagePath,
+        });
+        photoReadUrlById.set(photo.id, signed);
+      }),
+    );
+  }
   const tagsByPhotoId = new Map<string, typeof answerPhotoTags>();
   for (const row of answerPhotoTags) {
     const bucket = tagsByPhotoId.get(row.visitAnswerPhotoId) ?? [];
@@ -1624,6 +1690,8 @@ async function buildCampaignMarketVisitSummaries(
                     id: photo.id,
                     storageBucket: photo.storageBucket,
                     storagePath: photo.storagePath,
+                    signedUrl: photoReadUrlById.get(photo.id)?.signedUrl ?? null,
+                    signedUrlExpiresAt: photoReadUrlById.get(photo.id)?.expiresAt ?? null,
                     mimeType: photo.mimeType ?? null,
                     byteSize: photo.byteSize ?? null,
                     widthPx: photo.widthPx ?? null,
@@ -1841,12 +1909,169 @@ adminCampaignsRouter.get("/campaigns/:campaignId/markets/:marketId/visit-detail"
       return;
     }
 
-    const [detail] = await buildCampaignMarketVisitSummaries(campaignId, { marketIds: [marketId], sessionId });
+    const [detail] = await buildCampaignMarketVisitSummaries(campaignId, {
+      marketIds: [marketId],
+      sessionId,
+      includePhotoSignedUrls: true,
+    });
     if (!detail) {
       res.status(404).json({ error: "Markt ist dieser Kampagne nicht zugewiesen.", code: "campaign_market_not_found" });
       return;
     }
     res.status(200).json({ market: detail });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminCampaignsRouter.delete("/campaigns/visit-sessions/:sessionId/photos/:photoId", async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins koennen Besuchsfotos loeschen.", code: "admin_required" });
+      return;
+    }
+
+    const sessionId = String(req.params.sessionId ?? "");
+    const photoId = String(req.params.photoId ?? "");
+    if (!isUuid(sessionId) || !isUuid(photoId)) {
+      res.status(400).json({ error: "Ungueltige Foto-Loeschanfrage.", code: "invalid_id" });
+      return;
+    }
+
+    const [photoRow] = await db
+      .select({
+        photoId: visitAnswerPhotos.id,
+        answerId: visitAnswers.id,
+        storageBucket: visitAnswerPhotos.storageBucket,
+        storagePath: visitAnswerPhotos.storagePath,
+        questionType: visitAnswers.questionType,
+        questionRequired: visitSessionQuestions.requiredSnapshot,
+        questionConfig: visitSessionQuestions.questionConfigSnapshot,
+      })
+      .from(visitAnswerPhotos)
+      .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
+      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
+      .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
+      .where(
+        and(
+          eq(visitAnswerPhotos.id, photoId),
+          eq(visitAnswerPhotos.isDeleted, false),
+          eq(visitAnswers.visitSessionId, sessionId),
+          eq(visitAnswers.isDeleted, false),
+          eq(visitSessions.isDeleted, false),
+          eq(visitSessionQuestions.isDeleted, false),
+        ),
+      )
+      .limit(1);
+
+    if (!photoRow) {
+      res.status(404).json({ error: "Foto wurde nicht gefunden oder bereits geloescht.", code: "photo_not_found" });
+      return;
+    }
+    if (photoRow.questionType !== "photo") {
+      res.status(400).json({ error: "Nur Fotos aus Foto-Fragen koennen hier geloescht werden.", code: "not_photo_answer" });
+      return;
+    }
+
+    const now = new Date();
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT id FROM ${visitAnswers} WHERE ${visitAnswers.id} = ${photoRow.answerId} FOR UPDATE`);
+
+      await tx
+        .update(visitAnswerPhotoTags)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(eq(visitAnswerPhotoTags.visitAnswerPhotoId, photoRow.photoId), eq(visitAnswerPhotoTags.isDeleted, false)));
+
+      await tx
+        .update(visitAnswerPhotos)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(eq(visitAnswerPhotos.id, photoRow.photoId));
+
+      const remainingPhotos = await tx
+        .select({
+          id: visitAnswerPhotos.id,
+          storageBucket: visitAnswerPhotos.storageBucket,
+          storagePath: visitAnswerPhotos.storagePath,
+        })
+        .from(visitAnswerPhotos)
+        .where(and(eq(visitAnswerPhotos.visitAnswerId, photoRow.answerId), eq(visitAnswerPhotos.isDeleted, false)))
+        .orderBy(asc(visitAnswerPhotos.createdAt));
+
+      const remainingPhotoIds = remainingPhotos.map((row) => row.id);
+      const remainingTags = remainingPhotoIds.length === 0
+        ? []
+        : await tx
+            .select({ visitAnswerPhotoId: visitAnswerPhotoTags.visitAnswerPhotoId })
+            .from(visitAnswerPhotoTags)
+            .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, remainingPhotoIds), eq(visitAnswerPhotoTags.isDeleted, false)));
+
+      const config = asPlainRecord(photoRow.questionConfig);
+      const configuredTagIds = Array.isArray(config.tagIds) ? config.tagIds : [];
+      const tagsEnabled = Boolean(config.tagsEnabled) && configuredTagIds.length > 0;
+      const requiredPhotoQuestion = Boolean(photoRow.questionRequired);
+      const requiresTagSelection = requiredPhotoQuestion && tagsEnabled;
+      const taggedPhotoIds = new Set(remainingTags.map((row) => row.visitAnswerPhotoId));
+      const everyPhotoHasTag = !tagsEnabled || remainingPhotos.every((row) => taggedPhotoIds.has(row.id));
+      const isAnswered = remainingPhotos.length > 0;
+      const isValid = requiredPhotoQuestion ? isAnswered && everyPhotoHasTag : true;
+
+      await tx
+        .update(visitAnswers)
+        .set({
+          answerStatus: isAnswered ? (isValid ? "answered" : "invalid") : "unanswered",
+          isValid,
+          validationError: isValid
+            ? null
+            : requiresTagSelection
+              ? "Foto-Frage benoetigt mindestens einen Tag."
+              : "Foto-Frage benoetigt mindestens ein Foto.",
+          valueJson: {
+            storage: remainingPhotos.map((row) => ({
+              id: row.id,
+              bucket: row.storageBucket,
+              path: row.storagePath,
+            })),
+          },
+          answeredAt: isAnswered ? now : null,
+          changedAt: now,
+          version: sql`${visitAnswers.version} + 1`,
+          updatedAt: now,
+        })
+        .where(eq(visitAnswers.id, photoRow.answerId));
+
+      await tx
+        .update(visitSessions)
+        .set({ lastSavedAt: now, updatedAt: now })
+        .where(eq(visitSessions.id, sessionId));
+    });
+
+    const storagePath = cleanStoragePath(photoRow.storagePath);
+    if (photoRow.storageBucket && storagePath) {
+      try {
+        const { error } = await supabaseAdmin.storage.from(photoRow.storageBucket).remove([storagePath]);
+        if (error) {
+          logger.warn("admin_campaign_visit_photo_delete_storage_cleanup_failed", {
+            action: "admin_campaign_visit_photo_delete",
+            result: "failure",
+            photoId,
+            storageBucket: photoRow.storageBucket,
+            storagePath,
+            error: error.message,
+          });
+        }
+      } catch (cleanupError) {
+        logger.warn("admin_campaign_visit_photo_delete_storage_cleanup_failed", {
+          action: "admin_campaign_visit_photo_delete",
+          result: "failure",
+          photoId,
+          storageBucket: photoRow.storageBucket,
+          storagePath,
+          error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        });
+      }
+    }
+
+    res.status(200).json({ ok: true });
   } catch (error) {
     next(error);
   }
