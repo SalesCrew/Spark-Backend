@@ -582,6 +582,10 @@ function normalizeRulesForComparison(rules: UiQuestion["rules"] = []) {
   }));
 }
 
+function normalizePhotoTagIdsForComparison(config: Record<string, unknown> | undefined): string[] {
+  return Array.from(new Set(parseArrayField(config?.tagIds).filter(isUuid))).sort((left, right) => left.localeCompare(right));
+}
+
 function questionGraphSnapshotForComparison(question: UiQuestion) {
   return {
     type: question.type,
@@ -593,6 +597,9 @@ function questionGraphSnapshotForComparison(question: UiQuestion) {
     config: sortJsonValue(
       sanitizeQuestionConfig((question.config ?? {}) as Record<string, unknown>),
     ) as Record<string, unknown>,
+    photoTagIds: question.type === "photo"
+      ? normalizePhotoTagIdsForComparison((question.config ?? {}) as Record<string, unknown>)
+      : [],
     scoring: sortJsonValue(question.scoring ?? {}) as UiQuestion["scoring"],
     rules: sortJsonValue(normalizeRulesForComparison(question.rules ?? [])),
   };
