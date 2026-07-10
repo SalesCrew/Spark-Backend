@@ -4,10 +4,11 @@ import { z } from "zod";
 import { db } from "../lib/db.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { supabaseAdmin } from "../lib/supabase.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import {
   campaigns,
   markets,
+  photoTags,
   users,
   visitAnswerPhotoTags,
   visitAnswerPhotos,
@@ -60,6 +61,10 @@ type PhotoSignVariant = z.infer<typeof photoSignVariantSchema>;
 const photoSignedUrlsBodySchema = z.object({
   photoIds: z.array(z.string().regex(uuidRegex)).min(1).max(40),
   variant: photoSignVariantSchema,
+});
+
+const photoTagsUpdateBodySchema = z.object({
+  photoTagIds: z.array(z.string().regex(uuidRegex)).max(80),
 });
 
 type PhotoRow = {
@@ -623,6 +628,89 @@ adminPhotosRouter.post("/photos/signed-urls", async (req, res, next) => {
     );
 
     res.status(200).json({ urls });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminPhotosRouter.patch("/photos/:photoId/tags", async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins dürfen Foto-Tags bearbeiten.", code: "admin_required" });
+      return;
+    }
+    const photoId = String(req.params.photoId ?? "");
+    if (!uuidRegex.test(photoId)) {
+      res.status(400).json({ error: "Ungültige Foto-ID.", code: "invalid_photo_id" });
+      return;
+    }
+    const parsed = photoTagsUpdateBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige Foto-Tag-Auswahl.", code: "invalid_photo_tags" });
+      return;
+    }
+
+    const where = buildPhotoWhere({ page: 1, pageSize: 1 }, photoId);
+    const photoRows = (await basePhotoSelect(where).limit(1)) as PhotoRow[];
+    if (!photoRows[0]) {
+      res.status(404).json({ error: "Foto nicht gefunden.", code: "photo_not_found" });
+      return;
+    }
+
+    const requestedTagIds = Array.from(new Set(parsed.data.photoTagIds));
+    const requestedTags = requestedTagIds.length === 0
+      ? []
+      : await db
+          .select({ id: photoTags.id, label: photoTags.label })
+          .from(photoTags)
+          .where(and(inArray(photoTags.id, requestedTagIds), eq(photoTags.isDeleted, false)));
+    if (requestedTags.length !== requestedTagIds.length) {
+      res.status(400).json({ error: "Mindestens ein ausgewählter Foto-Tag ist nicht mehr verfügbar.", code: "photo_tag_not_available" });
+      return;
+    }
+
+    const now = new Date();
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from ${visitAnswerPhotos} where ${visitAnswerPhotos.id} = ${photoId} for update`);
+      const existingRows = await tx
+        .select({
+          id: visitAnswerPhotoTags.id,
+          photoTagId: visitAnswerPhotoTags.photoTagId,
+        })
+        .from(visitAnswerPhotoTags)
+        .where(and(eq(visitAnswerPhotoTags.visitAnswerPhotoId, photoId), eq(visitAnswerPhotoTags.isDeleted, false)));
+
+      const requestedSet = new Set(requestedTagIds);
+      const existingTagIds = new Set(existingRows.map((row) => row.photoTagId).filter((value): value is string => Boolean(value)));
+      const removeRowIds = existingRows
+        .filter((row) => !row.photoTagId || !requestedSet.has(row.photoTagId))
+        .map((row) => row.id);
+      if (removeRowIds.length > 0) {
+        await tx
+          .update(visitAnswerPhotoTags)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(inArray(visitAnswerPhotoTags.id, removeRowIds));
+      }
+
+      const addRows = requestedTags.filter((tag) => !existingTagIds.has(tag.id));
+      if (addRows.length > 0) {
+        await tx.insert(visitAnswerPhotoTags).values(
+          addRows.map((tag) => ({
+            visitAnswerPhotoId: photoId,
+            photoTagId: tag.id,
+            photoTagLabelSnapshot: tag.label,
+            createdAt: now,
+            updatedAt: now,
+          })),
+        );
+      }
+    });
+
+    const tags = (await loadTagsByPhotoId([photoId])).get(photoId) ?? [];
+    res.status(200).json({
+      ok: true,
+      tags: tags.map((tag) => ({ id: tag.id, photoTagId: tag.photoTagId, label: tag.label })),
+    });
   } catch (error) {
     next(error);
   }
