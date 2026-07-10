@@ -80,6 +80,8 @@ const daySessionPatchSchema = z
   .object({
     startTime: z.string().regex(hhmmRegex).optional(),
     endTime: z.string().regex(hhmmRegex).optional(),
+    startKm: z.number().int().min(0).max(10_000_000).optional(),
+    endKm: z.number().int().min(0).max(10_000_000).optional(),
   })
   .strict();
 
@@ -1292,7 +1294,7 @@ adminZeiterfassungRouter.patch("/day-sessions/:sessionId", async (req: AuthedReq
       return;
     }
     const body = parsed.data;
-    if (body.startTime === undefined && body.endTime === undefined) {
+    if (body.startTime === undefined && body.endTime === undefined && body.startKm === undefined && body.endKm === undefined) {
       res.status(400).json({ error: "Keine Aenderung uebermittelt." });
       return;
     }
@@ -1306,6 +1308,8 @@ adminZeiterfassungRouter.patch("/day-sessions/:sessionId", async (req: AuthedReq
         status: gmDaySessions.status,
         dayStartedAt: gmDaySessions.dayStartedAt,
         dayEndedAt: gmDaySessions.dayEndedAt,
+        startKm: gmDaySessions.startKm,
+        endKm: gmDaySessions.endKm,
       })
       .from(gmDaySessions)
       .where(and(eq(gmDaySessions.id, sessionId), eq(gmDaySessions.isDeleted, false)))
@@ -1333,6 +1337,13 @@ adminZeiterfassungRouter.patch("/day-sessions/:sessionId", async (req: AuthedReq
       : session.dayEndedAt;
     if (!nextDayStartAt || !nextDayEndAt) {
       res.status(400).json({ error: "Bitte gueltige Uhrzeiten im Format HH:MM eingeben." });
+      return;
+    }
+
+    const nextStartKm = body.startKm ?? session.startKm;
+    const nextEndKm = body.endKm ?? session.endKm;
+    if (nextStartKm !== null && nextEndKm !== null && nextEndKm < nextStartKm) {
+      res.status(400).json({ error: "End-KM darf nicht kleiner als Start-KM sein.", code: "invalid_km_range" });
       return;
     }
     if (nextDayEndAt.getTime() <= nextDayStartAt.getTime()) {
@@ -1364,6 +1375,12 @@ adminZeiterfassungRouter.patch("/day-sessions/:sessionId", async (req: AuthedReq
       .set({
         ...(body.startTime !== undefined ? { dayStartedAt: nextDayStartAt } : {}),
         ...(body.endTime !== undefined ? { dayEndedAt: nextDayEndAt } : {}),
+        ...(body.startKm !== undefined
+          ? { startKm: body.startKm, startKmDeferred: false, isStartKmCompleted: true }
+          : {}),
+        ...(body.endKm !== undefined
+          ? { endKm: body.endKm, endKmDeferred: false, isEndKmCompleted: true }
+          : {}),
         updatedAt: new Date(),
       })
       .where(eq(gmDaySessions.id, session.id));

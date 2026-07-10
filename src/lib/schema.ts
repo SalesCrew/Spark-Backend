@@ -43,7 +43,7 @@ export const visitAnswerOptionRoleEnum = pgEnum("visit_answer_option_role", ["to
 export const visitAnswerEventTypeEnum = pgEnum("visit_answer_event_type", ["set", "clear", "status_change"]);
 export const visitAnswerChangeRequestStatusEnum = pgEnum("visit_answer_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
 export const timeEntryChangeRequestStatusEnum = pgEnum("time_entry_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
-export const timeEntryChangeRequestSourceKindEnum = pgEnum("time_entry_change_request_source_kind", ["day_start", "day_end", "marktbesuch", "pause", "zusatzzeit"]);
+export const timeEntryChangeRequestSourceKindEnum = pgEnum("time_entry_change_request_source_kind", ["day_start", "day_end", "day_km", "marktbesuch", "pause", "zusatzzeit"]);
 export const dsarRequestTypeEnum = pgEnum("dsar_request_type", [
   "access",
   "rectification",
@@ -2038,6 +2038,10 @@ export const timeEntryChangeRequests = pgTable(
     originalEndAt: timestamp("original_end_at", { withTimezone: true }).notNull(),
     requestedStartAt: timestamp("requested_start_at", { withTimezone: true }).notNull(),
     requestedEndAt: timestamp("requested_end_at", { withTimezone: true }).notNull(),
+    originalStartKm: integer("original_start_km"),
+    originalEndKm: integer("original_end_km"),
+    requestedStartKm: integer("requested_start_km"),
+    requestedEndKm: integer("requested_end_km"),
     requestNote: text("request_note"),
     status: timeEntryChangeRequestStatusEnum("status").notNull().default("pending"),
     reviewedByUserId: uuid("reviewed_by_user_id").references(() => users.id, { onDelete: "set null" }),

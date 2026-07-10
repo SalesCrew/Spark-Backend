@@ -17,18 +17,31 @@ import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const hhmmRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const ymdRegex = /^\d{4}-\d{2}-\d{2}$/;
-const sourceKindSchema = z.enum(["day_start", "day_end", "marktbesuch", "pause", "zusatzzeit"]);
+const sourceKindSchema = z.enum(["day_start", "day_end", "day_km", "marktbesuch", "pause", "zusatzzeit"]);
 
 const gmCreateTimeChangeRequestSchema = z
   .object({
     sessionId: z.string().uuid(),
     kind: sourceKindSchema,
     segmentId: z.string().uuid(),
-    requestedStartTime: z.string().regex(hhmmRegex),
-    requestedEndTime: z.string().regex(hhmmRegex),
+    requestedStartTime: z.string().regex(hhmmRegex).optional(),
+    requestedEndTime: z.string().regex(hhmmRegex).optional(),
+    requestedStartKm: z.number().int().min(0).max(10_000_000).optional(),
+    requestedEndKm: z.number().int().min(0).max(10_000_000).optional(),
     requestNote: z.string().trim().max(2_000).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.kind === "day_km") {
+      if (value.requestedStartKm === undefined && value.requestedEndKm === undefined) {
+        context.addIssue({ code: z.ZodIssueCode.custom, message: "Mindestens ein KM-Wert ist erforderlich." });
+      }
+      return;
+    }
+    if (!value.requestedStartTime || !value.requestedEndTime) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Start- und Endzeit sind erforderlich." });
+    }
+  });
 
 const gmListTimeChangeRequestsSchema = z
   .object({
@@ -53,6 +66,8 @@ type DaySessionContext = {
   status: string;
   dayStartedAt: Date | null;
   dayEndedAt: Date | null;
+  startKm: number | null;
+  endKm: number | null;
 };
 
 type SourceSnapshot = {
@@ -154,6 +169,10 @@ function mapRequestRow(row: {
   originalEndAt: Date;
   requestedStartAt: Date;
   requestedEndAt: Date;
+  originalStartKm: number | null;
+  originalEndKm: number | null;
+  requestedStartKm: number | null;
+  requestedEndKm: number | null;
   requestNote: string | null;
   status: "pending" | "approved" | "rejected" | "cancelled";
   reviewedByUserId: string | null;
@@ -181,6 +200,10 @@ function mapRequestRow(row: {
     originalEndAt: row.originalEndAt.toISOString(),
     requestedStartAt: row.requestedStartAt.toISOString(),
     requestedEndAt: row.requestedEndAt.toISOString(),
+    originalStartKm: row.originalStartKm,
+    originalEndKm: row.originalEndKm,
+    requestedStartKm: row.requestedStartKm,
+    requestedEndKm: row.requestedEndKm,
     requestNote: row.requestNote,
     status: row.status,
     reviewedByUserId: row.reviewedByUserId,
@@ -215,6 +238,8 @@ async function loadDaySession(sessionId: string, gmUserId?: string): Promise<Day
       status: gmDaySessions.status,
       dayStartedAt: gmDaySessions.dayStartedAt,
       dayEndedAt: gmDaySessions.dayEndedAt,
+      startKm: gmDaySessions.startKm,
+      endKm: gmDaySessions.endKm,
     })
     .from(gmDaySessions)
     .where(and(...clauses))
@@ -559,14 +584,61 @@ function assertStartedDay(session: DaySessionContext) {
   }
 }
 
+function validateKmChange(input: {
+  session: DaySessionContext;
+  sourceId: string;
+  requestedStartKm: number | null;
+  requestedEndKm: number | null;
+}) {
+  if (input.sourceId !== input.session.id) {
+    throw buildHttpError("Kilometerstand konnte nicht eindeutig zugeordnet werden.", 404, "km_source_not_found");
+  }
+  if (input.requestedStartKm === null && input.requestedEndKm === null) {
+    throw buildHttpError("Mindestens ein Kilometerstand muss angegeben werden.", 400, "invalid_km");
+  }
+  const nextStartKm = input.requestedStartKm ?? input.session.startKm;
+  const nextEndKm = input.requestedEndKm ?? input.session.endKm;
+  if (nextStartKm !== null && nextEndKm !== null && nextEndKm < nextStartKm) {
+    throw buildHttpError("End-KM darf nicht kleiner als Start-KM sein.", 409, "invalid_km_range");
+  }
+  if (nextStartKm === input.session.startKm && nextEndKm === input.session.endKm) {
+    throw buildHttpError("Die Kilometerstände wurden nicht geändert.", 409, "km_unchanged");
+  }
+}
+
 async function applyApprovedTimeChange(input: {
   kind: SourceKind;
   sourceId: string;
   session: DaySessionContext;
   requestedStartAt: Date;
   requestedEndAt: Date;
+  requestedStartKm: number | null;
+  requestedEndKm: number | null;
   now: Date;
 }) {
+  if (input.kind === "day_km") {
+    validateKmChange({
+      session: input.session,
+      sourceId: input.sourceId,
+      requestedStartKm: input.requestedStartKm,
+      requestedEndKm: input.requestedEndKm,
+    });
+    const [updated] = await db
+      .update(gmDaySessions)
+      .set({
+        ...(input.requestedStartKm !== null
+          ? { startKm: input.requestedStartKm, startKmDeferred: false, isStartKmCompleted: true }
+          : {}),
+        ...(input.requestedEndKm !== null
+          ? { endKm: input.requestedEndKm, endKmDeferred: false, isEndKmCompleted: true }
+          : {}),
+        updatedAt: input.now,
+      })
+      .where(and(eq(gmDaySessions.id, input.session.id), eq(gmDaySessions.gmUserId, input.session.gmUserId), eq(gmDaySessions.isDeleted, false)))
+      .returning({ id: gmDaySessions.id });
+    return Boolean(updated);
+  }
+
   if (input.kind === "day_start") {
     await validateDayStartChange({
       session: input.session,
@@ -716,41 +788,65 @@ gmTimeEntryChangeRequestsRouter.post("/", async (req: AuthedRequest, res, next) 
     }
     assertStartedDay(session);
 
-    const source = await loadSourceSnapshot(parsed.data.kind, parsed.data.segmentId, session);
-    if (!source) {
-      res.status(404).json({ error: "Zeiteintrag nicht gefunden.", code: "time_source_not_found" });
-      return;
-    }
+    let title = "Kilometerstand";
+    let subtitle: string | null = null;
+    let originalStartAt = session.dayStartedAt ?? new Date();
+    let originalEndAt = session.dayEndedAt ?? originalStartAt;
+    let requestedStartAt = originalStartAt;
+    let requestedEndAt = originalEndAt;
+    let originalStartKm: number | null = null;
+    let originalEndKm: number | null = null;
+    let requestedStartKm: number | null = null;
+    let requestedEndKm: number | null = null;
 
-    const requestedStartAt = parseWorkDateHmToUtc(session.workDate, parsed.data.requestedStartTime, session.timezone || "Europe/Vienna");
-    const requestedEndAt = parseWorkDateHmToUtc(session.workDate, parsed.data.requestedEndTime, session.timezone || "Europe/Vienna");
-    if (!requestedStartAt || !requestedEndAt) {
-      res.status(400).json({ error: "Ungültige Uhrzeit.", code: "invalid_time" });
-      return;
-    }
-
-    if (parsed.data.kind === "day_start") {
-      await validateDayStartChange({
+    if (parsed.data.kind === "day_km") {
+      requestedStartKm = parsed.data.requestedStartKm ?? null;
+      requestedEndKm = parsed.data.requestedEndKm ?? null;
+      validateKmChange({
         session,
         sourceId: parsed.data.segmentId,
-        requestedStartAt,
-        requestedEndAt,
+        requestedStartKm,
+        requestedEndKm,
       });
-    } else if (parsed.data.kind === "day_end") {
-      await validateDayEndChange({
-        session,
-        sourceId: parsed.data.segmentId,
-        requestedStartAt,
-        requestedEndAt,
-      });
+      originalStartKm = session.startKm;
+      originalEndKm = session.endKm;
+      subtitle = session.workDate;
     } else {
-      await validateGmTimelineInterval({
-        gmUserId,
-        kind: parsed.data.kind,
-        id: parsed.data.segmentId,
-        startAt: requestedStartAt,
-        endAt: requestedEndAt,
-      });
+      const source = await loadSourceSnapshot(parsed.data.kind, parsed.data.segmentId, session);
+      if (!source) {
+        res.status(404).json({ error: "Zeiteintrag nicht gefunden.", code: "time_source_not_found" });
+        return;
+      }
+      if (!parsed.data.requestedStartTime || !parsed.data.requestedEndTime) {
+        res.status(400).json({ error: "Ungültige Uhrzeit.", code: "invalid_time" });
+        return;
+      }
+      const parsedStartAt = parseWorkDateHmToUtc(session.workDate, parsed.data.requestedStartTime, session.timezone || "Europe/Vienna");
+      const parsedEndAt = parseWorkDateHmToUtc(session.workDate, parsed.data.requestedEndTime, session.timezone || "Europe/Vienna");
+      if (!parsedStartAt || !parsedEndAt) {
+        res.status(400).json({ error: "Ungültige Uhrzeit.", code: "invalid_time" });
+        return;
+      }
+      title = source.title;
+      subtitle = source.subtitle;
+      originalStartAt = source.startAt;
+      originalEndAt = source.endAt;
+      requestedStartAt = parsedStartAt;
+      requestedEndAt = parsedEndAt;
+
+      if (parsed.data.kind === "day_start") {
+        await validateDayStartChange({ session, sourceId: parsed.data.segmentId, requestedStartAt, requestedEndAt });
+      } else if (parsed.data.kind === "day_end") {
+        await validateDayEndChange({ session, sourceId: parsed.data.segmentId, requestedStartAt, requestedEndAt });
+      } else {
+        await validateGmTimelineInterval({
+          gmUserId,
+          kind: parsed.data.kind,
+          id: parsed.data.segmentId,
+          startAt: requestedStartAt,
+          endAt: requestedEndAt,
+        });
+      }
     }
 
     const now = new Date();
@@ -773,10 +869,12 @@ gmTimeEntryChangeRequestsRouter.post("/", async (req: AuthedRequest, res, next) 
         return tx
           .update(timeEntryChangeRequests)
           .set({
-            titleSnapshot: source.title,
-            subtitleSnapshot: source.subtitle,
+            titleSnapshot: title,
+            subtitleSnapshot: subtitle,
             requestedStartAt,
             requestedEndAt,
+            requestedStartKm,
+            requestedEndKm,
             requestNote: parsed.data.requestNote?.trim() || null,
             updatedAt: now,
           })
@@ -793,12 +891,16 @@ gmTimeEntryChangeRequestsRouter.post("/", async (req: AuthedRequest, res, next) 
           sourceId: parsed.data.segmentId,
           workDate: session.workDate,
           timezone: session.timezone || "Europe/Vienna",
-          titleSnapshot: source.title,
-          subtitleSnapshot: source.subtitle,
-          originalStartAt: source.startAt,
-          originalEndAt: source.endAt,
+          titleSnapshot: title,
+          subtitleSnapshot: subtitle,
+          originalStartAt,
+          originalEndAt,
           requestedStartAt,
           requestedEndAt,
+          originalStartKm,
+          originalEndKm,
+          requestedStartKm,
+          requestedEndKm,
           requestNote: parsed.data.requestNote?.trim() || null,
           status: "pending",
           createdAt: now,
@@ -838,6 +940,10 @@ adminTimeEntryChangeRequestsRouter.get("/", async (_req: AuthedRequest, res, nex
         originalEndAt: timeEntryChangeRequests.originalEndAt,
         requestedStartAt: timeEntryChangeRequests.requestedStartAt,
         requestedEndAt: timeEntryChangeRequests.requestedEndAt,
+        originalStartKm: timeEntryChangeRequests.originalStartKm,
+        originalEndKm: timeEntryChangeRequests.originalEndKm,
+        requestedStartKm: timeEntryChangeRequests.requestedStartKm,
+        requestedEndKm: timeEntryChangeRequests.requestedEndKm,
         requestNote: timeEntryChangeRequests.requestNote,
         status: timeEntryChangeRequests.status,
         reviewedByUserId: timeEntryChangeRequests.reviewedByUserId,
@@ -943,6 +1049,8 @@ adminTimeEntryChangeRequestsRouter.patch("/:requestId/approve", async (req: Auth
         session,
         requestedStartAt: requestRow.requestedStartAt,
         requestedEndAt: requestRow.requestedEndAt,
+        requestedStartKm: requestRow.requestedStartKm,
+        requestedEndKm: requestRow.requestedEndKm,
         now,
       });
       if (!applied) {
