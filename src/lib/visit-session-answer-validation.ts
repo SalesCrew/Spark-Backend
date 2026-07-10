@@ -46,6 +46,7 @@ export type RequiredCheckPhoto = {
   id: string;
   visitAnswerId: string;
   storagePath: string;
+  inherited?: boolean;
 };
 
 export type RequiredCheckPhotoTag = {
@@ -441,8 +442,8 @@ export function computeMissingRequiredQuestions(input: {
     .filter((q) => q.requiredSnapshot && !hiddenQuestionIds.has(q.id))
     .filter((q) => {
       const answer = answersByQuestionId.get(q.id);
-      if (!answer || answer.answerStatus !== "answered" || !answer.isValid) return true;
-      if (q.questionType !== "photo") return false;
+      if (!answer) return true;
+      if (q.questionType !== "photo") return answer.answerStatus !== "answered" || !answer.isValid;
       const photos = photosByAnswerId.get(answer.id) ?? [];
       if (photos.length === 0) return true;
       const cfg = (q.questionConfigSnapshot ?? {}) as Record<string, unknown>;
@@ -452,10 +453,10 @@ export function computeMissingRequiredQuestions(input: {
             .map((entry) => (typeof entry.path === "string" ? entry.path : ""))
             .filter((entry) => entry.length > 0)
         : [];
-      const photoPaths = photos.map((photo) => photo.storagePath);
-      if (persistedStorage.length !== photoPaths.length) return true;
+      const currentPhotoPaths = photos.filter((photo) => !photo.inherited).map((photo) => photo.storagePath);
+      if (persistedStorage.length !== currentPhotoPaths.length) return true;
       const persistedSet = new Set(persistedStorage);
-      if (photoPaths.some((path) => !persistedSet.has(path))) return true;
+      if (currentPhotoPaths.some((path) => !persistedSet.has(path))) return true;
       if (!tagsEnabled) return false;
       const missingPerPhotoTag = photos.some((photo) => (tagsByPhotoId.get(photo.id) ?? []).length === 0);
       if (missingPerPhotoTag) return true;

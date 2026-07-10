@@ -12,7 +12,7 @@ import { ensureStartedDaySession } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import { addDays, startOfDay } from "../lib/red-monat.js";
-import { resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
+import { resolveCurrentRedPeriod, resolveRedPeriodForDate } from "../lib/red-month-periods.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import {
@@ -523,29 +523,6 @@ function rewritePhotoStoragePathForAnswer(inputPath: string, sessionId: string, 
   return `visit-photos/${sessionId}/${answerId}/${fileName}`;
 }
 
-function rewritePhotoStoragePayloadForAnswer(
-  valueJson: Record<string, unknown> | null | undefined,
-  sessionId: string,
-  answerId: string,
-): Record<string, unknown> | null {
-  if (!valueJson || typeof valueJson !== "object") return valueJson ?? null;
-  const storageRaw = (valueJson as { storage?: unknown }).storage;
-  if (!Array.isArray(storageRaw)) return valueJson;
-  const nextStorage = storageRaw.map((entry) => {
-    if (!entry || typeof entry !== "object") return entry;
-    const row = entry as { path?: unknown };
-    if (typeof row.path !== "string" || row.path.trim().length === 0) return entry;
-    return {
-      ...(entry as Record<string, unknown>),
-      path: rewritePhotoStoragePathForAnswer(row.path, sessionId, answerId),
-    };
-  });
-  return {
-    ...valueJson,
-    storage: nextStorage,
-  };
-}
-
 type SessionQuestionRow = {
   visitQuestionId: string;
   visitSessionSectionId: string;
@@ -720,6 +697,217 @@ async function loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(input: {
     });
   }
   return output;
+}
+
+type RedMonthHistoryPhoto = {
+  photo: typeof visitAnswerPhotos.$inferSelect;
+  sourceSessionId: string;
+  sourceAnswerId: string;
+  questionId: string;
+  submittedAt: Date;
+  tags: Array<typeof visitAnswerPhotoTags.$inferSelect>;
+};
+
+async function loadSubmittedPhotoHistoryByQuestionId(input: {
+  gmUserId: string;
+  marketId: string;
+  questionIds: string[];
+  periodDate: Date;
+  before: Date;
+  excludeSessionId?: string;
+}): Promise<Map<string, RedMonthHistoryPhoto[]>> {
+  const questionIds = normalizeUnique(input.questionIds.filter((id) => isUuid(id)));
+  if (questionIds.length === 0) return new Map();
+
+  const period = await resolveRedPeriodForDate(input.periodDate);
+  const periodStart = startOfDay(period.start);
+  const periodEndExclusive = addDays(startOfDay(period.end), 1);
+  const rows = await db
+    .select({
+      photo: visitAnswerPhotos,
+      sourceSessionId: visitSessions.id,
+      sourceAnswerId: visitAnswers.id,
+      questionId: visitAnswers.questionId,
+      submittedAt: visitSessions.submittedAt,
+    })
+    .from(visitAnswerPhotos)
+    .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
+    .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
+    .where(
+      and(
+        inArray(visitAnswers.questionId, questionIds),
+        eq(visitAnswerPhotos.isDeleted, false),
+        eq(visitAnswers.isDeleted, false),
+        eq(visitSessions.isDeleted, false),
+        eq(visitSessions.status, "submitted"),
+        eq(visitSessions.gmUserId, input.gmUserId),
+        eq(visitSessions.marketId, input.marketId),
+        isNotNull(visitSessions.submittedAt),
+        gte(visitSessions.submittedAt, periodStart),
+        lt(visitSessions.submittedAt, periodEndExclusive),
+        lt(visitSessions.submittedAt, input.before),
+        input.excludeSessionId ? sql`${visitSessions.id} <> ${input.excludeSessionId}` : undefined,
+      ),
+    )
+    .orderBy(asc(visitSessions.submittedAt), asc(visitAnswerPhotos.createdAt));
+
+  const photoIds = rows.map((row) => row.photo.id);
+  const tagRows = photoIds.length === 0
+    ? []
+    : await db
+        .select()
+        .from(visitAnswerPhotoTags)
+        .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, photoIds), eq(visitAnswerPhotoTags.isDeleted, false)))
+        .orderBy(asc(visitAnswerPhotoTags.createdAt));
+  const tagsByPhotoId = new Map<string, Array<typeof visitAnswerPhotoTags.$inferSelect>>();
+  for (const tag of tagRows) {
+    const bucket = tagsByPhotoId.get(tag.visitAnswerPhotoId) ?? [];
+    bucket.push(tag);
+    tagsByPhotoId.set(tag.visitAnswerPhotoId, bucket);
+  }
+
+  const result = new Map<string, RedMonthHistoryPhoto[]>();
+  for (const row of rows) {
+    if (!row.submittedAt) continue;
+    const bucket = result.get(row.questionId) ?? [];
+    bucket.push({
+      photo: row.photo,
+      sourceSessionId: row.sourceSessionId,
+      sourceAnswerId: row.sourceAnswerId,
+      questionId: row.questionId,
+      submittedAt: row.submittedAt,
+      tags: tagsByPhotoId.get(row.photo.id) ?? [],
+    });
+    result.set(row.questionId, bucket);
+  }
+  return result;
+}
+
+async function resolveInheritedPhotoForDraftSession(input: {
+  gmUserId: string;
+  currentSessionId: string;
+  photoId: string;
+}) {
+  const [currentSession] = await db
+    .select()
+    .from(visitSessions)
+    .where(
+      and(
+        eq(visitSessions.id, input.currentSessionId),
+        eq(visitSessions.gmUserId, input.gmUserId),
+        eq(visitSessions.status, "draft"),
+        isNull(visitSessions.submittedAt),
+        eq(visitSessions.isDeleted, false),
+      ),
+    )
+    .limit(1);
+  if (!currentSession) return null;
+
+  const period = await resolveRedPeriodForDate(currentSession.startedAt);
+  const periodStart = startOfDay(period.start);
+  const periodEndExclusive = addDays(startOfDay(period.end), 1);
+  const [source] = await db
+    .select({
+      photo: visitAnswerPhotos,
+      sourceAnswerId: visitAnswers.id,
+      sourceSessionId: visitSessions.id,
+      questionId: visitAnswers.questionId,
+      sourceQuestionConfig: visitSessionQuestions.questionConfigSnapshot,
+      sourceQuestionRequired: visitSessionQuestions.requiredSnapshot,
+    })
+    .from(visitAnswerPhotos)
+    .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
+    .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
+    .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
+    .where(
+      and(
+        eq(visitAnswerPhotos.id, input.photoId),
+        eq(visitAnswerPhotos.isDeleted, false),
+        eq(visitAnswers.isDeleted, false),
+        eq(visitAnswers.questionType, "photo"),
+        eq(visitSessions.gmUserId, input.gmUserId),
+        eq(visitSessions.marketId, currentSession.marketId),
+        eq(visitSessions.status, "submitted"),
+        eq(visitSessions.isDeleted, false),
+        isNotNull(visitSessions.submittedAt),
+        gte(visitSessions.submittedAt, periodStart),
+        lt(visitSessions.submittedAt, periodEndExclusive),
+        lt(visitSessions.submittedAt, currentSession.createdAt),
+      ),
+    )
+    .limit(1);
+  if (!source) return null;
+
+  const [currentQuestion] = await db
+    .select({ id: visitSessionQuestions.id })
+    .from(visitSessionQuestions)
+    .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+    .where(
+      and(
+        eq(visitSessionSections.visitSessionId, currentSession.id),
+        eq(visitSessionSections.isDeleted, false),
+        eq(visitSessionQuestions.questionId, source.questionId),
+        eq(visitSessionQuestions.questionType, "photo"),
+        eq(visitSessionQuestions.isDeleted, false),
+      ),
+    )
+    .limit(1);
+  if (!currentQuestion) return null;
+  return { currentSession, ...source };
+}
+
+async function refreshPersistedPhotoAnswerState(
+  tx: any,
+  input: {
+    answerId: string;
+    required: boolean;
+    config: Record<string, unknown>;
+    now: Date;
+  },
+): Promise<void> {
+  const photos = await tx
+    .select()
+    .from(visitAnswerPhotos)
+    .where(and(eq(visitAnswerPhotos.visitAnswerId, input.answerId), eq(visitAnswerPhotos.isDeleted, false)))
+    .orderBy(asc(visitAnswerPhotos.createdAt));
+  const photoIds = photos.map((row: typeof visitAnswerPhotos.$inferSelect) => row.id);
+  const tags = photoIds.length === 0
+    ? []
+    : await tx
+        .select()
+        .from(visitAnswerPhotoTags)
+        .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, photoIds), eq(visitAnswerPhotoTags.isDeleted, false)));
+  const tagsEnabled = Boolean(input.config.tagsEnabled)
+    && Array.isArray(input.config.tagIds)
+    && input.config.tagIds.length > 0;
+  const taggedPhotoIds = new Set(tags.map((row: typeof visitAnswerPhotoTags.$inferSelect) => row.visitAnswerPhotoId));
+  const everyPhotoHasTag = !tagsEnabled
+    || photos.every((row: typeof visitAnswerPhotos.$inferSelect) => taggedPhotoIds.has(row.id));
+  const isAnswered = photos.length > 0;
+  const isValid = input.required ? isAnswered && everyPhotoHasTag : true;
+  await tx
+    .update(visitAnswers)
+    .set({
+      answerStatus: isAnswered ? (isValid ? "answered" : "invalid") : "unanswered",
+      isValid,
+      validationError: isValid
+        ? null
+        : input.required && tagsEnabled
+          ? "Foto-Frage benötigt mindestens einen Tag."
+          : null,
+      valueJson: {
+        storage: photos.map((row: typeof visitAnswerPhotos.$inferSelect) => ({
+          id: row.id,
+          bucket: row.storageBucket,
+          path: row.storagePath,
+        })),
+      },
+      answeredAt: isAnswered ? input.now : null,
+      changedAt: input.now,
+      version: sql`${visitAnswers.version} + 1`,
+      updatedAt: input.now,
+    })
+    .where(eq(visitAnswers.id, input.answerId));
 }
 
 async function resolveVisitSectionsForSelection(input: {
@@ -1935,29 +2123,25 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
           const redMonthSource = latestRedMonthAnswersByQuestionId.get(question.questionId);
           if (redMonthSource) {
             const sourceAnswer = redMonthSource.answer;
-            const rewrittenValueJson =
-              sourceAnswer.questionType === "photo"
-                ? rewritePhotoStoragePayloadForAnswer(
-                    sourceAnswer.valueJson as Record<string, unknown> | null | undefined,
-                    sessionRow.id,
-                    qRow.id,
-                  )
-                : (sourceAnswer.valueJson as Record<string, unknown> | null);
+            const isPhotoAnswer = sourceAnswer.questionType === "photo";
+            const prefilledValueJson = isPhotoAnswer
+              ? { storage: [] }
+              : (sourceAnswer.valueJson as Record<string, unknown> | null);
             const [insertedAnswer] = await tx
               .insert(visitAnswers)
-              .values({
-                visitSessionId: sessionRow.id,
-                visitSessionSectionId: sectionRow.id,
-                visitSessionQuestionId: qRow.id,
-                questionId: question.questionId,
-                questionType: sourceAnswer.questionType,
-                answerStatus: sourceAnswer.answerStatus,
-                valueText: sourceAnswer.valueText,
-                valueNumber: sourceAnswer.valueNumber == null ? null : String(sourceAnswer.valueNumber),
-                valueJson: rewrittenValueJson,
-                isValid: sourceAnswer.isValid,
-                validationError: sourceAnswer.validationError,
-                answeredAt: sourceAnswer.answeredAt ? now : null,
+                .values({
+                  visitSessionId: sessionRow.id,
+                  visitSessionSectionId: sectionRow.id,
+                  visitSessionQuestionId: qRow.id,
+                  questionId: question.questionId,
+                  questionType: sourceAnswer.questionType,
+                  answerStatus: isPhotoAnswer ? "unanswered" : sourceAnswer.answerStatus,
+                  valueText: isPhotoAnswer ? null : sourceAnswer.valueText,
+                  valueNumber: isPhotoAnswer || sourceAnswer.valueNumber == null ? null : String(sourceAnswer.valueNumber),
+                  valueJson: prefilledValueJson,
+                  isValid: isPhotoAnswer ? true : sourceAnswer.isValid,
+                  validationError: isPhotoAnswer ? null : sourceAnswer.validationError,
+                  answeredAt: isPhotoAnswer ? null : (sourceAnswer.answeredAt ? now : null),
                 changedAt: now,
                 version: 1,
                 isDeleted: false,
@@ -1999,43 +2183,6 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
                   updatedAt: now,
                 })),
               );
-            }
-
-            for (const sourcePhoto of redMonthSource.photos) {
-              const rewrittenPath = rewritePhotoStoragePathForAnswer(sourcePhoto.storagePath, sessionRow.id, insertedAnswer.id);
-              const [insertedPhoto] = await tx
-                .insert(visitAnswerPhotos)
-                .values({
-                  visitAnswerId: insertedAnswer.id,
-                  storageBucket: sourcePhoto.storageBucket,
-                  storagePath: rewrittenPath,
-                  mimeType: sourcePhoto.mimeType,
-                  byteSize: sourcePhoto.byteSize,
-                  widthPx: sourcePhoto.widthPx,
-                  heightPx: sourcePhoto.heightPx,
-                  sha256: sourcePhoto.sha256,
-                  uploadedAt: sourcePhoto.uploadedAt ?? now,
-                  isDeleted: false,
-                  deletedAt: null,
-                  createdAt: now,
-                  updatedAt: now,
-                })
-                .returning();
-              if (!insertedPhoto) continue;
-              const sourceTags = redMonthSource.tagsByPhotoId.get(sourcePhoto.id) ?? [];
-              if (sourceTags.length > 0) {
-                await tx.insert(visitAnswerPhotoTags).values(
-                  sourceTags.map((tag) => ({
-                    visitAnswerPhotoId: insertedPhoto.id,
-                    photoTagId: tag.photoTagId,
-                    photoTagLabelSnapshot: tag.photoTagLabelSnapshot,
-                    isDeleted: false,
-                    deletedAt: null,
-                    createdAt: now,
-                    updatedAt: now,
-                  })),
-                );
-              }
             }
 
             const sourceComment = redMonthSource.commentText?.trim() ?? "";
@@ -2918,6 +3065,21 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
           .from(visitAnswerPhotos)
           .where(and(inArray(visitAnswerPhotos.visitAnswerId, answerIds), eq(visitAnswerPhotos.isDeleted, false)))
           .orderBy(asc(visitAnswerPhotos.createdAt));
+    const sharedPhotoQuestionIds = normalizeUnique(
+      questions
+        .filter((question) => question.questionType === "photo")
+        .map((question) => question.questionId),
+    );
+    const inheritedPhotosByQuestionId = session.status === "draft"
+      ? await loadSubmittedPhotoHistoryByQuestionId({
+          gmUserId: session.gmUserId,
+          marketId: session.marketId,
+          questionIds: sharedPhotoQuestionIds,
+          periodDate: session.startedAt,
+          before: session.createdAt,
+          excludeSessionId: session.id,
+        })
+      : new Map<string, RedMonthHistoryPhoto[]>();
     const answerPhotoIds = answerPhotos.map((row) => row.id);
     const answerPhotoTags = answerPhotoIds.length === 0
       ? []
@@ -2967,8 +3129,9 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
       questionsBySectionId.set(q.visitSessionSectionId, bucket);
     }
     const signedPhotoUrlById = new Map<string, { signedUrl: string | null; expiresAt: string | null }>();
+    const inheritedPhotos = Array.from(inheritedPhotosByQuestionId.values()).flat();
     await Promise.all(
-      answerPhotos.map(async (photo) => {
+      [...answerPhotos, ...inheritedPhotos.map((entry) => entry.photo)].map(async (photo) => {
         signedPhotoUrlById.set(
           photo.id,
           await createVisitPhotoReadUrl({
@@ -3013,6 +3176,7 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
             tagMetaById,
           );
           const photos = answer ? (photosByAnswerId.get(answer.id) ?? []) : [];
+          const inheritedPhotos = inheritedPhotosByQuestionId.get(question.questionId) ?? [];
           return {
             id: question.id,
             questionId: question.questionId,
@@ -3048,23 +3212,48 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedReq
                     cellSelected: row.cellSelected,
                     orderIndex: row.orderIndex,
                   })),
-                  photos: photos.map((photo) => ({
-                    id: photo.id,
-                    storageBucket: photo.storageBucket,
-                    storagePath: photo.storagePath,
-                    signedUrl: signedPhotoUrlById.get(photo.id)?.signedUrl ?? null,
-                    signedUrlExpiresAt: signedPhotoUrlById.get(photo.id)?.expiresAt ?? null,
-                    mimeType: photo.mimeType ?? null,
-                    byteSize: photo.byteSize ?? null,
-                    widthPx: photo.widthPx ?? null,
-                    heightPx: photo.heightPx ?? null,
-                    sha256: photo.sha256 ?? null,
-                    tags: (tagsByPhotoId.get(photo.id) ?? []).map((tag) => ({
-                      id: tag.id,
-                      photoTagId: tag.photoTagId ?? null,
-                      photoTagLabelSnapshot: tag.photoTagLabelSnapshot,
+                  photos: [
+                    ...inheritedPhotos.map((entry) => ({
+                      id: entry.photo.id,
+                      storageBucket: entry.photo.storageBucket,
+                      storagePath: entry.photo.storagePath,
+                      signedUrl: signedPhotoUrlById.get(entry.photo.id)?.signedUrl ?? null,
+                      signedUrlExpiresAt: signedPhotoUrlById.get(entry.photo.id)?.expiresAt ?? null,
+                      mimeType: entry.photo.mimeType ?? null,
+                      byteSize: entry.photo.byteSize ?? null,
+                      widthPx: entry.photo.widthPx ?? null,
+                      heightPx: entry.photo.heightPx ?? null,
+                      sha256: entry.photo.sha256 ?? null,
+                      inherited: true,
+                      sourceSessionId: entry.sourceSessionId,
+                      sourceAnswerId: entry.sourceAnswerId,
+                      tags: entry.tags.map((tag) => ({
+                        id: tag.id,
+                        photoTagId: tag.photoTagId ?? null,
+                        photoTagLabelSnapshot: tag.photoTagLabelSnapshot,
+                      })),
                     })),
-                  })),
+                    ...photos.map((photo) => ({
+                      id: photo.id,
+                      storageBucket: photo.storageBucket,
+                      storagePath: photo.storagePath,
+                      signedUrl: signedPhotoUrlById.get(photo.id)?.signedUrl ?? null,
+                      signedUrlExpiresAt: signedPhotoUrlById.get(photo.id)?.expiresAt ?? null,
+                      mimeType: photo.mimeType ?? null,
+                      byteSize: photo.byteSize ?? null,
+                      widthPx: photo.widthPx ?? null,
+                      heightPx: photo.heightPx ?? null,
+                      sha256: photo.sha256 ?? null,
+                      inherited: false,
+                      sourceSessionId: session.id,
+                      sourceAnswerId: answer.id,
+                      tags: (tagsByPhotoId.get(photo.id) ?? []).map((tag) => ({
+                        id: tag.id,
+                        photoTagId: tag.photoTagId ?? null,
+                        photoTagLabelSnapshot: tag.photoTagLabelSnapshot,
+                      })),
+                    })),
+                  ],
                 }
               : null,
             comment: comment?.commentText ?? "",
@@ -4154,6 +4343,245 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/delete", async 
   }
 });
 
+gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/inherited-photos/tags", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungültige Session-ID." });
+      return;
+    }
+    const parsed = z
+      .object({
+        photos: z.array(z.object({
+          photoId: z.string().uuid(),
+          photoTagIds: z.array(z.string().uuid()).max(80),
+        }).strict()).max(80),
+      })
+      .strict()
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige Tag-Auswahl für übernommene Fotos." });
+      return;
+    }
+    const requestedByPhotoId = new Map(
+      parsed.data.photos.map((entry) => [entry.photoId, normalizeUnique(entry.photoTagIds)]),
+    );
+    if (requestedByPhotoId.size === 0) {
+      res.status(200).json({ ok: true });
+      return;
+    }
+
+    const [currentSession] = await db
+      .select()
+      .from(visitSessions)
+      .where(
+        and(
+          eq(visitSessions.id, sessionId),
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.status, "draft"),
+          isNull(visitSessions.submittedAt),
+          eq(visitSessions.isDeleted, false),
+        ),
+      )
+      .limit(1);
+    if (!currentSession) {
+      res.status(409).json({ error: "Übernommene Fotos können nur in einem laufenden Fragebogen bearbeitet werden." });
+      return;
+    }
+    const period = await resolveRedPeriodForDate(currentSession.startedAt);
+    const periodStart = startOfDay(period.start);
+    const periodEndExclusive = addDays(startOfDay(period.end), 1);
+    const photoIds = Array.from(requestedByPhotoId.keys());
+    const sourceRows = await db
+      .select({
+        photoId: visitAnswerPhotos.id,
+        sourceAnswerId: visitAnswers.id,
+        questionId: visitAnswers.questionId,
+        sourceQuestionConfig: visitSessionQuestions.questionConfigSnapshot,
+        sourceQuestionRequired: visitSessionQuestions.requiredSnapshot,
+      })
+      .from(visitAnswerPhotos)
+      .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
+      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
+      .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
+      .where(
+        and(
+          inArray(visitAnswerPhotos.id, photoIds),
+          eq(visitAnswerPhotos.isDeleted, false),
+          eq(visitAnswers.isDeleted, false),
+          eq(visitAnswers.questionType, "photo"),
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.marketId, currentSession.marketId),
+          eq(visitSessions.status, "submitted"),
+          eq(visitSessions.isDeleted, false),
+          isNotNull(visitSessions.submittedAt),
+          gte(visitSessions.submittedAt, periodStart),
+          lt(visitSessions.submittedAt, periodEndExclusive),
+          lt(visitSessions.submittedAt, currentSession.createdAt),
+        ),
+      );
+    if (sourceRows.length !== photoIds.length) {
+      res.status(404).json({ error: "Mindestens ein übernommenes Foto ist nicht mehr verfügbar." });
+      return;
+    }
+
+    const currentQuestions = await db
+      .select({
+        questionId: visitSessionQuestions.questionId,
+        config: visitSessionQuestions.questionConfigSnapshot,
+      })
+      .from(visitSessionQuestions)
+      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+      .where(
+        and(
+          eq(visitSessionSections.visitSessionId, currentSession.id),
+          eq(visitSessionSections.isDeleted, false),
+          eq(visitSessionQuestions.questionType, "photo"),
+          eq(visitSessionQuestions.isDeleted, false),
+        ),
+      );
+    const currentConfigByQuestionId = new Map(
+      currentQuestions.map((row) => [row.questionId, (row.config ?? {}) as Record<string, unknown>]),
+    );
+    const allRequestedTagIds = normalizeUnique(Array.from(requestedByPhotoId.values()).flat());
+    const availableTags = allRequestedTagIds.length === 0
+      ? []
+      : await db
+          .select({ id: photoTags.id, label: photoTags.label })
+          .from(photoTags)
+          .where(and(inArray(photoTags.id, allRequestedTagIds), eq(photoTags.isDeleted, false)));
+    if (availableTags.length !== allRequestedTagIds.length) {
+      res.status(400).json({ error: "Mindestens ein Foto-Tag ist nicht mehr verfügbar." });
+      return;
+    }
+    const tagById = new Map(availableTags.map((tag) => [tag.id, tag.label]));
+    for (const source of sourceRows) {
+      const currentConfig = currentConfigByQuestionId.get(source.questionId);
+      if (!currentConfig) {
+        res.status(400).json({ error: "Das übernommene Foto gehört nicht zu diesem Fragebogen." });
+        return;
+      }
+      const allowedTagIds = new Set(extractConfiguredPhotoTagIds(currentConfig));
+      const requestedTagIds = requestedByPhotoId.get(source.photoId) ?? [];
+      if (allowedTagIds.size > 0 && requestedTagIds.some((tagId) => !allowedTagIds.has(tagId))) {
+        res.status(400).json({ error: "Die Tag-Auswahl passt nicht zur aktuellen Foto-Frage." });
+        return;
+      }
+    }
+
+    const now = new Date();
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from ${visitAnswerPhotos} where ${inArray(visitAnswerPhotos.id, photoIds)} for update`);
+      await tx
+        .update(visitAnswerPhotoTags)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, photoIds), eq(visitAnswerPhotoTags.isDeleted, false)));
+      const insertRows = sourceRows.flatMap((source) =>
+        (requestedByPhotoId.get(source.photoId) ?? []).flatMap((tagId) => {
+          const label = tagById.get(tagId);
+          return label
+            ? [{
+                visitAnswerPhotoId: source.photoId,
+                photoTagId: tagId,
+                photoTagLabelSnapshot: label,
+                isDeleted: false,
+                deletedAt: null,
+                createdAt: now,
+                updatedAt: now,
+              }]
+            : [];
+        }),
+      );
+      if (insertRows.length > 0) await tx.insert(visitAnswerPhotoTags).values(insertRows);
+
+      const sourceAnswerById = new Map(sourceRows.map((source) => [source.sourceAnswerId, source]));
+      for (const source of sourceAnswerById.values()) {
+        await refreshPersistedPhotoAnswerState(tx, {
+          answerId: source.sourceAnswerId,
+          required: source.sourceQuestionRequired,
+          config: (source.sourceQuestionConfig ?? {}) as Record<string, unknown>,
+          now,
+        });
+      }
+    });
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/inherited-photos/delete", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungültige Session-ID." });
+      return;
+    }
+    const parsed = z.object({ photoId: z.string().uuid() }).strict().safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige Foto-ID." });
+      return;
+    }
+    const source = await resolveInheritedPhotoForDraftSession({
+      gmUserId,
+      currentSessionId: sessionId,
+      photoId: parsed.data.photoId,
+    });
+    if (!source) {
+      res.status(404).json({ error: "Das übernommene Foto wurde nicht gefunden oder darf hier nicht gelöscht werden." });
+      return;
+    }
+
+    const now = new Date();
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from ${visitAnswerPhotos} where ${visitAnswerPhotos.id} = ${source.photo.id} for update`);
+      await tx
+        .update(visitAnswerPhotoTags)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(eq(visitAnswerPhotoTags.visitAnswerPhotoId, source.photo.id), eq(visitAnswerPhotoTags.isDeleted, false)));
+      await tx
+        .update(visitAnswerPhotos)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(eq(visitAnswerPhotos.id, source.photo.id), eq(visitAnswerPhotos.isDeleted, false)));
+      await refreshPersistedPhotoAnswerState(tx, {
+        answerId: source.sourceAnswerId,
+        required: source.sourceQuestionRequired,
+        config: (source.sourceQuestionConfig ?? {}) as Record<string, unknown>,
+        now,
+      });
+    });
+
+    try {
+      const storagePath = cleanStoragePath(source.photo.storagePath);
+      if (storagePath) {
+        const { error } = await supabaseAdmin.storage.from(source.photo.storageBucket).remove([storagePath]);
+        if (error) throw error;
+      }
+    } catch (cleanupError) {
+      logger.warn("gm_inherited_visit_photo_delete_storage_cleanup_failed", {
+        action: "gm_inherited_visit_photo_delete",
+        result: "failure",
+        sessionId,
+        photoId: source.photo.id,
+        error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+      });
+    }
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
 gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;
@@ -4282,6 +4710,39 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
       tagsByPhotoId.set(row.visitAnswerPhotoId, bucket);
     }
 
+    const inheritedPhotosByQuestionId = await loadSubmittedPhotoHistoryByQuestionId({
+      gmUserId: session.gmUserId,
+      marketId: session.marketId,
+      questionIds: normalizeUnique(
+        questions.filter((question) => question.questionType === "photo").map((question) => question.questionId),
+      ),
+      periodDate: session.startedAt,
+      before: session.createdAt,
+      excludeSessionId: session.id,
+    });
+    const inheritedValidationPhotos: Array<{
+      id: string;
+      visitAnswerId: string;
+      storagePath: string;
+      inherited: true;
+    }> = [];
+    const inheritedValidationTags: Array<{ visitAnswerPhotoId: string }> = [];
+    for (const question of questions) {
+      if (question.questionType !== "photo") continue;
+      const answer = answersByQuestionId.get(question.id);
+      if (!answer) continue;
+      for (const entry of inheritedPhotosByQuestionId.get(question.questionId) ?? []) {
+        const virtualPhotoId = `inherited:${answer.id}:${entry.photo.id}`;
+        inheritedValidationPhotos.push({
+          id: virtualPhotoId,
+          visitAnswerId: answer.id,
+          storagePath: entry.photo.storagePath,
+          inherited: true,
+        });
+        entry.tags.forEach(() => inheritedValidationTags.push({ visitAnswerPhotoId: virtualPhotoId }));
+      }
+    }
+
     const { missingRequired } = computeMissingRequiredQuestions({
       questions: questions.map((question) => ({
         id: question.id,
@@ -4302,14 +4763,21 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/submit", async (req: A
         valueJson: (answer.valueJson as Record<string, unknown> | null) ?? null,
         isValid: answer.isValid,
       })),
-      photos: committedPhotos.map((photo) => ({
-        id: photo.id,
-        visitAnswerId: photo.visitAnswerId,
-        storagePath: photo.storagePath,
-      })),
-      photoTags: committedPhotoTags.map((tag) => ({
-        visitAnswerPhotoId: tag.visitAnswerPhotoId,
-      })),
+      photos: [
+        ...committedPhotos.map((photo) => ({
+          id: photo.id,
+          visitAnswerId: photo.visitAnswerId,
+          storagePath: photo.storagePath,
+          inherited: false,
+        })),
+        ...inheritedValidationPhotos,
+      ],
+      photoTags: [
+        ...committedPhotoTags.map((tag) => ({
+          visitAnswerPhotoId: tag.visitAnswerPhotoId,
+        })),
+        ...inheritedValidationTags,
+      ],
     });
 
     if (missingRequired.length > 0) {
