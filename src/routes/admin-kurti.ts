@@ -9,7 +9,7 @@ import { ADMIN_KURTI_SYSTEM_PROMPT } from "../lib/admin-kurti-system-prompt.js";
 import { ADMIN_KURTI_TOOLS, executeAdminKurtiTool } from "../lib/admin-kurti-tools.js";
 import { db } from "../lib/db.js";
 import { getRequestLogMeta, logger, serializeError } from "../lib/logger.js";
-import { users } from "../lib/schema.js";
+import { adminKurtiWindowPreferences, users } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const adminKurtiRouter = Router();
@@ -21,6 +21,40 @@ const messageSchema = z.object({
   message: z.string().trim().min(1).max(4000),
 }).strict();
 
+const layoutCoordinateSchema = z.number().int().min(0).max(100000);
+const windowLayoutSchema = z.object({
+  panel: z.object({
+    x: layoutCoordinateSchema,
+    y: layoutCoordinateSchema,
+    width: z.number().int().min(280).max(10000),
+    height: z.number().int().min(300).max(10000),
+  }).strict(),
+  bubble: z.object({
+    x: layoutCoordinateSchema,
+    y: layoutCoordinateSchema,
+  }).strict(),
+  bubbleDismissed: z.boolean(),
+  isCollapsed: z.boolean().default(false),
+}).strict();
+
+function serializeWindowLayout(row: typeof adminKurtiWindowPreferences.$inferSelect) {
+  return {
+    panel: {
+      x: row.panelX,
+      y: row.panelY,
+      width: row.panelWidth,
+      height: row.panelHeight,
+    },
+    bubble: {
+      x: row.bubbleX,
+      y: row.bubbleY,
+    },
+    bubbleDismissed: row.bubbleDismissed,
+    isCollapsed: row.isCollapsed,
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
 const openai = env.OPENAI_API_KEY
   ? new OpenAI({
       apiKey: env.OPENAI_API_KEY,
@@ -30,6 +64,80 @@ const openai = env.OPENAI_API_KEY
   : null;
 
 adminKurtiRouter.use(requireAuth(["admin"]));
+
+adminKurtiRouter.get("/layout", async (req: AuthedRequest, res, next) => {
+  try {
+    const adminUserId = req.authUser?.appUserId;
+    if (!adminUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt.", code: "auth_required" });
+      return;
+    }
+    const rows = await db
+      .select()
+      .from(adminKurtiWindowPreferences)
+      .where(eq(adminKurtiWindowPreferences.adminUserId, adminUserId))
+      .limit(1);
+    res.json({ layout: rows[0] ? serializeWindowLayout(rows[0]) : null });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminKurtiRouter.put("/layout", async (req: AuthedRequest, res, next) => {
+  try {
+    const adminUserId = req.authUser?.appUserId;
+    if (!adminUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt.", code: "auth_required" });
+      return;
+    }
+    const parsed = windowLayoutSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "Ungültige Admin-Kurti-Fensterposition.",
+        code: "invalid_admin_kurti_layout",
+      });
+      return;
+    }
+    const now = new Date();
+    const values = {
+      adminUserId,
+      panelX: parsed.data.panel.x,
+      panelY: parsed.data.panel.y,
+      panelWidth: parsed.data.panel.width,
+      panelHeight: parsed.data.panel.height,
+      bubbleX: parsed.data.bubble.x,
+      bubbleY: parsed.data.bubble.y,
+      bubbleDismissed: parsed.data.bubbleDismissed,
+      isCollapsed: parsed.data.isCollapsed,
+      updatedAt: now,
+    };
+    const rows = await db
+      .insert(adminKurtiWindowPreferences)
+      .values(values)
+      .onConflictDoUpdate({
+        target: adminKurtiWindowPreferences.adminUserId,
+        set: {
+          panelX: values.panelX,
+          panelY: values.panelY,
+          panelWidth: values.panelWidth,
+          panelHeight: values.panelHeight,
+          bubbleX: values.bubbleX,
+          bubbleY: values.bubbleY,
+          bubbleDismissed: values.bubbleDismissed,
+          isCollapsed: values.isCollapsed,
+          updatedAt: now,
+        },
+      })
+      .returning();
+    const savedLayout = rows[0];
+    if (!savedLayout) {
+      throw new Error("Admin-Kurti-Fensterposition konnte nicht gespeichert werden.");
+    }
+    res.json({ layout: serializeWindowLayout(savedLayout) });
+  } catch (error) {
+    next(error);
+  }
+});
 
 adminKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
   try {
@@ -47,7 +155,7 @@ adminKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
         readOnly: true,
         crossGm: true,
         toolCount: ADMIN_KURTI_TOOLS.length,
-        memoryMinutes: 15,
+        memoryMinutes: 480,
       },
     });
   } catch (error) {

@@ -3,7 +3,7 @@ import { db } from "./db.js";
 import { logger, serializeError } from "./logger.js";
 import { adminKurtiMessages, type AdminKurtiMessageRole } from "./schema.js";
 
-const ADMIN_KURTI_MEMORY_TTL_MS = 15 * 60 * 1000;
+const ADMIN_KURTI_MEMORY_TTL_MS = 8 * 60 * 60 * 1000;
 const ADMIN_KURTI_CLEANUP_INTERVAL_MS = 60 * 1000;
 
 export type AdminKurtiMemoryMessage = {

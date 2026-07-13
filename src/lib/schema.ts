@@ -215,6 +215,30 @@ export const adminKurtiMessages = pgTable(
   ],
 );
 
+export const adminKurtiWindowPreferences = pgTable(
+  "admin_kurti_window_preferences",
+  {
+    adminUserId: uuid("admin_user_id")
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    panelX: integer("panel_x").notNull(),
+    panelY: integer("panel_y").notNull(),
+    panelWidth: integer("panel_width").notNull(),
+    panelHeight: integer("panel_height").notNull(),
+    bubbleX: integer("bubble_x").notNull(),
+    bubbleY: integer("bubble_y").notNull(),
+    bubbleDismissed: boolean("bubble_dismissed").notNull().default(false),
+    isCollapsed: boolean("is_collapsed").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("admin_kurti_window_preferences_panel_position_ck", sql`${table.panelX} between 0 and 100000 and ${table.panelY} between 0 and 100000`),
+    check("admin_kurti_window_preferences_panel_size_ck", sql`${table.panelWidth} between 280 and 10000 and ${table.panelHeight} between 300 and 10000`),
+    check("admin_kurti_window_preferences_bubble_position_ck", sql`${table.bubbleX} between 0 and 100000 and ${table.bubbleY} between 0 and 100000`),
+  ],
+);
+
 export const specialArthurFilter = pgTable(
   "special_arthur_filter",
   {

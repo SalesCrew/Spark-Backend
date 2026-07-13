@@ -13,6 +13,7 @@ const NULLABLE_UUID_SCHEMA = { type: ["string", "null"], format: "uuid" } as con
 const NULLABLE_STRING_SCHEMA = { type: ["string", "null"] } as const;
 const NULLABLE_BOOLEAN_SCHEMA = { type: ["boolean", "null"] } as const;
 const LIMIT_SCHEMA = { type: "integer", minimum: 1, maximum: 150 } as const;
+const CHAT_LIMIT_SCHEMA = { type: "integer", minimum: 1, maximum: 40 } as const;
 const YMD_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const VIENNA_TIMEZONE = "Europe/Vienna";
 
@@ -41,9 +42,21 @@ function functionTool(
 export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
   functionTool(
     "get_admin_overview",
-    "Returns the current Coke Spark admin overview across users, markets, campaigns, visits, photos, time tracking, review queues, and the current RED period. Use this first for broad status questions.",
+    "Returns the current Coke Spark admin overview across user roles, active GM Kurti conversations, markets, campaigns, visits, photos, time tracking, review queues, and the current RED period. Use this first for broad status questions.",
     {},
     [],
+  ),
+  functionTool(
+    "get_user_access_context",
+    "Searches every Coke Spark user role and returns account status, contact/region data, customer page permissions, GM display settings, special filters, latest employee-agreement acceptance, and operational counts. It never returns auth IDs, tokens, passwords, agreement hashes, IP addresses, or user agents.",
+    {
+      userId: NULLABLE_UUID_SCHEMA,
+      query: NULLABLE_STRING_SCHEMA,
+      role: { type: ["string", "null"], enum: ["admin", "gm", "sm", "kunde", null] },
+      activeOnly: { type: "boolean" },
+      limit: LIMIT_SCHEMA,
+    },
+    ["userId", "query", "role", "activeOnly", "limit"],
   ),
   functionTool(
     "search_gms",
@@ -61,6 +74,18 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
     "Returns a deep current context for one GM: profile, current workday, active and recent visits, week time/KM calculations, RED period, campaign assignments/progress, IPP/bonus KPI, and pending requests.",
     { gmUserId: UUID_SCHEMA },
     ["gmUserId"],
+  ),
+  functionTool(
+    "get_gm_kurti_chat_history",
+    "Reads GM Kurti messages that are still inside their active 15-minute Coke Spark retention window. Filter by resolved GM ID/name, message role, or content. Use only for a concrete admin support, quality, or troubleshooting question; expired messages are unavailable and must never be reconstructed.",
+    {
+      gmUserId: NULLABLE_UUID_SCHEMA,
+      gmQuery: NULLABLE_STRING_SCHEMA,
+      contentQuery: NULLABLE_STRING_SCHEMA,
+      role: { type: ["string", "null"], enum: ["user", "assistant", null] },
+      limit: CHAT_LIMIT_SCHEMA,
+    },
+    ["gmUserId", "gmQuery", "contentQuery", "role", "limit"],
   ),
   functionTool(
     "search_markets",
@@ -147,6 +172,70 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
     ["waveId", "gmUserId", "limit"],
   ),
   functionTool(
+    "get_admin_module_catalog",
+    "Returns the complete read-only Admin-Kurti coverage catalog for every Coke Spark admin page and its authoritative datasets, plus live record counts. Use it when deciding which tool or module contains requested data.",
+    {},
+    [],
+  ),
+  functionTool(
+    "get_module_context",
+    "Lists every Standard, Flex, Billa, Kühlerinventur, and MHD module. For a resolved module it returns all linked questions in order, complete question configuration, normalized rules and targets, scoring, matrices, attachments, photo tags, chain filters, questionnaire usage, and visit usage.",
+    {
+      scope: { type: ["string", "null"], enum: ["main", "kuehler", "mhd", null] },
+      moduleId: NULLABLE_UUID_SCHEMA,
+      query: NULLABLE_STRING_SCHEMA,
+      includeQuestions: { type: "boolean" },
+      limit: LIMIT_SCHEMA,
+    },
+    ["scope", "moduleId", "query", "includeQuestions", "limit"],
+  ),
+  functionTool(
+    "get_question_context",
+    "Searches the complete shared question bank and questionnaire-specific special items. Returns legacy and normalized configuration, conditional rules and targets, scoring/Bewertung rows, matrices, attachment metadata, photo tags, module/questionnaire memberships, chain filters, campaigns, and real visit/answer usage.",
+    {
+      questionId: NULLABLE_UUID_SCHEMA,
+      moduleId: NULLABLE_UUID_SCHEMA,
+      questionnaireId: NULLABLE_UUID_SCHEMA,
+      scope: { type: ["string", "null"], enum: ["main", "kuehler", "mhd", null] },
+      query: NULLABLE_STRING_SCHEMA,
+      questionType: NULLABLE_STRING_SCHEMA,
+      includeUsage: { type: "boolean" },
+      limit: LIMIT_SCHEMA,
+    },
+    ["questionId", "moduleId", "questionnaireId", "scope", "query", "questionType", "includeUsage", "limit"],
+  ),
+  functionTool(
+    "get_evaluation_context",
+    "Reads real questionnaire evaluation data across visits: question/answer snapshots, answer values, selected options, matrix cells, validation, comments, photos/tags, answer-change requests, answer audit events, configured scoring rows, GM, market, campaign, questionnaire, and date/status filters. It is read-only; authoritative period IPP remains in get_ipp_context and bonus totals in get_bonus_context.",
+    {
+      questionId: NULLABLE_UUID_SCHEMA,
+      moduleId: NULLABLE_UUID_SCHEMA,
+      questionnaireId: NULLABLE_UUID_SCHEMA,
+      campaignId: NULLABLE_UUID_SCHEMA,
+      gmUserId: NULLABLE_UUID_SCHEMA,
+      marketId: NULLABLE_UUID_SCHEMA,
+      section: { type: ["string", "null"], enum: ["standard", "flex", "billa", "kuehler", "mhd", null] },
+      visitStatus: { type: "string", enum: ["all", "draft", "submitted", "cancelled"] },
+      from: NULLABLE_STRING_SCHEMA,
+      to: NULLABLE_STRING_SCHEMA,
+      includeInvalid: { type: "boolean" },
+      includeDetails: { type: "boolean" },
+      limit: LIMIT_SCHEMA,
+    },
+    ["questionId", "moduleId", "questionnaireId", "campaignId", "gmUserId", "marketId", "section", "visitStatus", "from", "to", "includeInvalid", "includeDetails", "limit"],
+  ),
+  functionTool(
+    "get_filter_context",
+    "Returns every relevant filter/rule configuration: normalized and legacy question visibility rules, rule targets, question and module chain filters, single-choice availability filters, GM special filters, market filter facets, campaign status/section filters, and questionnaire scope/schedule filters.",
+    {
+      kind: { type: "string", enum: ["all", "question_rules", "chain_filters", "gm_filters", "market_filters", "campaign_filters", "questionnaire_filters"] },
+      entityId: NULLABLE_UUID_SCHEMA,
+      query: NULLABLE_STRING_SCHEMA,
+      limit: LIMIT_SCHEMA,
+    },
+    ["kind", "entityId", "query", "limit"],
+  ),
+  functionTool(
     "get_questionnaire_context",
     "Lists questionnaire/module/question configuration for Standard, Flex, Billa, Kühlerinventur, and MHD. With a questionnaire ID it returns the linked modules and questions, rules, configuration, photo tags, and scoring metadata.",
     {
@@ -196,6 +285,19 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
     ["kind", "status", "gmUserId", "limit"],
   ),
   functionTool(
+    "get_audit_history_context",
+    "Returns sanitized read-only history for auth/account events, campaign questionnaire/assignment changes, questionnaire answer-configuration changes, time-entry events, visit-answer events, or DSGVO request events. Sensitive credential, storage, medical-document, IP, and raw-auth fields are removed.",
+    {
+      kind: { type: "string", enum: ["auth", "campaign", "questionnaire", "time", "visit_answer", "dsar"] },
+      entityId: NULLABLE_UUID_SCHEMA,
+      gmUserId: NULLABLE_UUID_SCHEMA,
+      from: NULLABLE_STRING_SCHEMA,
+      to: NULLABLE_STRING_SCHEMA,
+      limit: LIMIT_SCHEMA,
+    },
+    ["kind", "entityId", "gmUserId", "from", "to", "limit"],
+  ),
+  functionTool(
     "get_red_month_context",
     "Returns the active RED year, current RED month, configured period boundaries, cycle, labels, and visit counts by period. Use it before period-based comparisons.",
     { year: { type: ["integer", "null"], minimum: 2020, maximum: 2100 } },
@@ -208,6 +310,22 @@ const searchGmsSchema = z.object({
   region: z.string().nullable(),
   activeOnly: z.boolean(),
   limit: z.number().int().min(1).max(150),
+});
+
+const userAccessSchema = z.object({
+  userId: z.string().uuid().nullable(),
+  query: z.string().nullable(),
+  role: z.enum(["admin", "gm", "sm", "kunde"]).nullable(),
+  activeOnly: z.boolean(),
+  limit: z.number().int().min(1).max(150),
+});
+
+const gmKurtiChatHistorySchema = z.object({
+  gmUserId: z.string().uuid().nullable(),
+  gmQuery: z.string().nullable(),
+  contentQuery: z.string().nullable(),
+  role: z.enum(["user", "assistant"]).nullable(),
+  limit: z.number().int().min(1).max(40),
 });
 
 const searchMarketsSchema = z.object({
@@ -230,6 +348,57 @@ const searchVisitsSchema = z.object({
   limit: z.number().int().min(1).max(150),
 });
 
+const auditHistorySchema = z.object({
+  kind: z.enum(["auth", "campaign", "questionnaire", "time", "visit_answer", "dsar"]),
+  entityId: z.string().uuid().nullable(),
+  gmUserId: z.string().uuid().nullable(),
+  from: z.string().nullable(),
+  to: z.string().nullable(),
+  limit: z.number().int().min(1).max(150),
+});
+
+const moduleContextSchema = z.object({
+  scope: z.enum(["main", "kuehler", "mhd"]).nullable(),
+  moduleId: z.string().uuid().nullable(),
+  query: z.string().nullable(),
+  includeQuestions: z.boolean(),
+  limit: z.number().int().min(1).max(150),
+});
+
+const questionContextSchema = z.object({
+  questionId: z.string().uuid().nullable(),
+  moduleId: z.string().uuid().nullable(),
+  questionnaireId: z.string().uuid().nullable(),
+  scope: z.enum(["main", "kuehler", "mhd"]).nullable(),
+  query: z.string().nullable(),
+  questionType: z.string().nullable(),
+  includeUsage: z.boolean(),
+  limit: z.number().int().min(1).max(150),
+});
+
+const evaluationContextSchema = z.object({
+  questionId: z.string().uuid().nullable(),
+  moduleId: z.string().uuid().nullable(),
+  questionnaireId: z.string().uuid().nullable(),
+  campaignId: z.string().uuid().nullable(),
+  gmUserId: z.string().uuid().nullable(),
+  marketId: z.string().uuid().nullable(),
+  section: z.enum(["standard", "flex", "billa", "kuehler", "mhd"]).nullable(),
+  visitStatus: z.enum(["all", "draft", "submitted", "cancelled"]),
+  from: z.string().nullable(),
+  to: z.string().nullable(),
+  includeInvalid: z.boolean(),
+  includeDetails: z.boolean(),
+  limit: z.number().int().min(1).max(150),
+});
+
+const filterContextSchema = z.object({
+  kind: z.enum(["all", "question_rules", "chain_filters", "gm_filters", "market_filters", "campaign_filters", "questionnaire_filters"]),
+  entityId: z.string().uuid().nullable(),
+  query: z.string().nullable(),
+  limit: z.number().int().min(1).max(150),
+});
+
 function parseYmd(value: string | null, fallback: Date): string {
   return value && YMD_REGEX.test(value) ? value : fallback.toISOString().slice(0, 10);
 }
@@ -238,6 +407,30 @@ function daysAgo(days: number): Date {
   const value = new Date();
   value.setUTCDate(value.getUTCDate() - days);
   return value;
+}
+
+function redactSensitiveText(value: string): string {
+  return value
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_API_KEY]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED_TOKEN]")
+    .replace(/\b(password|passwort|api[ _-]?key|token|secret)\s*[:=]\s*\S+/gi, "$1: [REDACTED]");
+}
+
+function sanitizeSensitiveValue(value: unknown, depth = 0): unknown {
+  if (depth > 8) return "[TRUNCATED_NESTING]";
+  if (typeof value === "string") return redactSensitiveText(value);
+  if (Array.isArray(value)) return value.map((entry) => sanitizeSensitiveValue(entry, depth + 1));
+  if (!value || typeof value !== "object") return value;
+
+  const sanitized: JsonRecord = {};
+  for (const [key, entry] of Object.entries(value as JsonRecord)) {
+    if (/(password|passwort|secret|token|auth|supabase|service.?role|api.?key|signed.?url|storage.?path|bucket|doctor|medical|user.?agent|ip.?address|accepted.?ip)/i.test(key)) {
+      sanitized[key] = "[REDACTED]";
+      continue;
+    }
+    sanitized[key] = sanitizeSensitiveValue(entry, depth + 1);
+  }
+  return sanitized;
 }
 
 function envelope(tool: string, data: unknown, meta?: JsonRecord): JsonRecord {
@@ -255,8 +448,13 @@ async function getAdminOverview(): Promise<JsonRecord> {
   const [counts, campaigns, pending, redPeriod] = await Promise.all([
     pgSql<JsonRecord[]>`
       select
+        (select count(*)::int from users where role = 'admin' and is_active = true and deleted_at is null) as active_admins,
         (select count(*)::int from users where role = 'gm' and is_active = true and deleted_at is null) as active_gms,
         (select count(*)::int from users where role = 'gm' and (is_active = false or deleted_at is not null)) as inactive_gms,
+        (select count(*)::int from users where role = 'sm' and is_active = true and deleted_at is null) as active_sms,
+        (select count(*)::int from users where role = 'kunde' and is_active = true and deleted_at is null) as active_customer_users,
+        (select count(distinct gm_user_id)::int from gm_kurti_messages where expires_at > now()) as active_gm_kurti_conversations,
+        (select count(*)::int from gm_kurti_messages where expires_at > now()) as active_gm_kurti_messages,
         (select count(*)::int from markets where is_deleted = false and is_active = true) as active_markets,
         (select count(*)::int from markets where is_deleted = false and universe_market = true) as universe_markets,
         (select count(*)::int from markets where is_deleted = false and market_type in ('kuehler', 'both')) as cooler_markets,
@@ -309,6 +507,74 @@ async function getAdminOverview(): Promise<JsonRecord> {
   });
 }
 
+async function getUserAccessContext(args: unknown): Promise<JsonRecord> {
+  const input = userAccessSchema.parse(args);
+  const query = input.query?.trim() || null;
+  const rows = await pgSql<JsonRecord[]>`
+    select
+      u.id,
+      concat_ws(' ', u.first_name, u.last_name) as full_name,
+      u.first_name,
+      u.last_name,
+      u.email,
+      u.role::text,
+      u.phone,
+      u.address,
+      u.city,
+      u.postal_code,
+      u.region,
+      u.is_billa_gm,
+      u.is_active,
+      u.deleted_at,
+      u.anonymized_at,
+      u.created_at,
+      u.updated_at,
+      ku.page_permissions as customer_page_permissions,
+      case when ku.user_id is null then null else not ku.is_deleted end as customer_access_active,
+      ku.created_at as customer_access_created_at,
+      ku.updated_at as customer_access_updated_at,
+      case when ts.is_deleted = false then ts.text_scale_percent else null end as text_scale_percent,
+      (select coalesce(jsonb_agg(jsonb_build_object(
+          'matchValue', sf.match_value,
+          'createdAt', sf.created_at
+        ) order by sf.created_at), '[]'::jsonb)
+       from special_arthur_filter sf
+       where sf.gm_user_id = u.id and sf.is_deleted = false) as special_filters,
+      (select jsonb_build_object(
+          'agreementKey', ea.agreement_key,
+          'agreementVersion', ea.agreement_version,
+          'agreementTitle', ea.agreement_title,
+          'acceptedAt', ea.accepted_at
+        )
+       from employee_agreement_acceptances ea
+       where ea.user_id = u.id
+       order by ea.accepted_at desc
+       limit 1) as latest_employee_agreement,
+      (select count(distinct cma.market_id)::int
+       from campaign_market_assignments cma
+       where cma.gm_user_id = u.id and cma.is_deleted = false) as assigned_markets,
+      (select count(*)::int
+       from visit_sessions vs
+       where vs.gm_user_id = u.id and vs.is_deleted = false and vs.status = 'submitted') as submitted_visits,
+      (select count(*)::int
+       from gm_kurti_messages km
+       where km.gm_user_id = u.id and km.expires_at > now()) as active_kurti_messages,
+      (select max(km.created_at)
+       from gm_kurti_messages km
+       where km.gm_user_id = u.id and km.expires_at > now()) as latest_active_kurti_message_at
+    from users u
+    left join kunde_users ku on ku.user_id = u.id
+    left join gm_text_settings ts on ts.user_id = u.id
+    where (${input.userId}::uuid is null or u.id = ${input.userId})
+      and (${input.role}::text is null or u.role::text = ${input.role})
+      and (${input.activeOnly}::boolean = false or (u.is_active = true and u.deleted_at is null))
+      and (${query}::text is null or concat_ws(' ', u.first_name, u.last_name, u.email, u.role::text, u.region, u.city, u.postal_code) ilike '%' || ${query} || '%')
+    order by u.is_active desc, u.role, u.last_name, u.first_name
+    limit ${input.limit}
+  `;
+  return envelope("get_user_access_context", rows, { resultCount: rows.length });
+}
+
 async function searchGms(args: unknown): Promise<JsonRecord> {
   const input = searchGmsSchema.parse(args);
   const query = input.query?.trim() || null;
@@ -333,7 +599,9 @@ async function searchGms(args: unknown): Promise<JsonRecord> {
       (select count(*)::int from visit_sessions vs where vs.gm_user_id = u.id and vs.is_deleted = false and vs.status = 'draft') as active_visit_drafts,
       (select count(*)::int from gm_day_sessions ds where ds.gm_user_id = u.id and ds.is_deleted = false and ds.status in ('started', 'ended')) as open_workdays,
       (select count(*)::int from visit_answer_change_requests r where r.gm_user_id = u.id and r.is_deleted = false and r.status = 'pending') as pending_answer_changes,
-      (select count(*)::int from time_entry_change_requests r where r.gm_user_id = u.id and r.is_deleted = false and r.status = 'pending') as pending_time_changes
+      (select count(*)::int from time_entry_change_requests r where r.gm_user_id = u.id and r.is_deleted = false and r.status = 'pending') as pending_time_changes,
+      (select count(*)::int from gm_kurti_messages km where km.gm_user_id = u.id and km.expires_at > now()) as active_kurti_messages,
+      (select max(km.created_at) from gm_kurti_messages km where km.gm_user_id = u.id and km.expires_at > now()) as latest_active_kurti_message_at
     from users u
     left join gm_kpi_cache k on k.gm_user_id = u.id and k.is_deleted = false
     where u.role = 'gm'
@@ -350,6 +618,47 @@ async function getGmContext(args: unknown): Promise<JsonRecord> {
   const { gmUserId } = z.object({ gmUserId: z.string().uuid() }).parse(args);
   const context = await buildKurtiGmContext(gmUserId, new Date());
   return envelope("get_gm_context", context, { gmUserId });
+}
+
+async function getGmKurtiChatHistory(args: unknown): Promise<JsonRecord> {
+  const input = gmKurtiChatHistorySchema.parse(args);
+  const gmQuery = input.gmQuery?.trim() || null;
+  const contentQuery = input.contentQuery?.trim() || null;
+  const rows = await pgSql<JsonRecord[]>`
+    with latest_messages as (
+      select
+        km.id,
+        km.gm_user_id,
+        concat_ws(' ', u.first_name, u.last_name) as gm_name,
+        u.email as gm_email,
+        u.region as gm_region,
+        u.is_active as gm_is_active,
+        km.role,
+        km.content,
+        km.created_at,
+        km.expires_at
+      from gm_kurti_messages km
+      join users u on u.id = km.gm_user_id and u.role = 'gm'
+      where km.expires_at > now()
+        and (${input.gmUserId}::uuid is null or km.gm_user_id = ${input.gmUserId})
+        and (${gmQuery}::text is null or concat_ws(' ', u.first_name, u.last_name, u.email, u.region) ilike '%' || ${gmQuery} || '%')
+        and (${contentQuery}::text is null or km.content ilike '%' || ${contentQuery} || '%')
+        and (${input.role}::text is null or km.role = ${input.role})
+      order by km.created_at desc
+      limit ${input.limit}
+    )
+    select * from latest_messages order by created_at asc
+  `;
+  const messages = rows.map((row) => ({
+    ...row,
+    content: redactSensitiveText(String(row.content ?? "")),
+  }));
+  return envelope("get_gm_kurti_chat_history", messages, {
+    resultCount: messages.length,
+    retentionWindowMinutes: 15,
+    onlyUnexpiredMessages: true,
+    sensitiveTextRedaction: true,
+  });
 }
 
 async function searchMarkets(args: unknown): Promise<JsonRecord> {
@@ -703,6 +1012,597 @@ async function getBonusContext(args: unknown): Promise<JsonRecord> {
   return envelope("get_bonus_context", { waves, thresholds, pillars, sources, gmTotals: totals, qualityScores: quality, flexScores: flex });
 }
 
+async function getAdminModuleCatalog(): Promise<JsonRecord> {
+  const [counts] = await pgSql<JsonRecord[]>`
+    select
+      (select count(*)::int from fragebogen_main where is_deleted = false) as main_questionnaires,
+      (select count(*)::int from fragebogen_kuehler where is_deleted = false) as cooler_questionnaires,
+      (select count(*)::int from fragebogen_mhd where is_deleted = false) as mhd_questionnaires,
+      (select count(*)::int from module_main where is_deleted = false) as main_modules,
+      (select count(*)::int from module_kuehler where is_deleted = false) as cooler_modules,
+      (select count(*)::int from module_mhd where is_deleted = false) as mhd_modules,
+      (select count(*)::int from question_bank_shared where is_deleted = false) as shared_questions,
+      (select count(*)::int from fragebogen_main_spezial_items where is_deleted = false) as special_questionnaire_items,
+      (select count(*)::int from question_rules where is_deleted = false) as normalized_question_rules,
+      (select count(*)::int from question_scoring where is_deleted = false) as scoring_rows,
+      (select count(*)::int from module_question_chains where is_deleted = false) as module_chain_filters,
+      (select count(*)::int from campaigns where is_deleted = false) as campaigns,
+      (select count(*)::int from campaign_market_assignments where is_deleted = false) as campaign_assignments,
+      (select count(*)::int from visit_sessions where is_deleted = false) as visit_sessions,
+      (select count(*)::int from visit_answers where is_deleted = false) as visit_answers,
+      (select count(*)::int from visit_answer_photos where is_deleted = false) as photo_records,
+      (select count(*)::int from gm_day_sessions where is_deleted = false) as day_sessions,
+      (select count(*)::int from markets where is_deleted = false) as markets,
+      (select count(*)::int from users where deleted_at is null) as users,
+      (select count(*)::int from lager where is_deleted = false) as warehouses,
+      (select count(*)::int from praemien_waves where is_deleted = false) as bonus_waves,
+      (select count(*)::int from ipp_market_redmonth_results where is_deleted = false) as finalized_ipp_results
+  `;
+  return envelope("get_admin_module_catalog", {
+    modules: [
+      { page: "/admin/gm-dashboard", label: "GM Dashboard", tools: ["get_admin_overview", "search_gms", "get_gm_context"] },
+      { page: "/admin/ipp-berechnung", label: "IPP Berechnung", tools: ["get_ipp_context", "get_evaluation_context", "get_question_context"] },
+      { page: "/admin/praemien", label: "Prämien", tools: ["get_bonus_context", "get_evaluation_context", "get_question_context"] },
+      { page: "/admin/fragebogen", label: "Standard-Fragebögen", tools: ["get_questionnaire_context", "get_module_context", "get_question_context", "get_filter_context"] },
+      { page: "/admin/flexbesuche", label: "Flex-Fragebögen", tools: ["get_questionnaire_context", "get_module_context", "get_question_context", "get_filter_context"] },
+      { page: "/admin/billa", label: "Billa-Fragebögen", tools: ["get_questionnaire_context", "get_module_context", "get_question_context", "get_filter_context"] },
+      { page: "/admin/kuehlerinventur", label: "Kühlerinventur", tools: ["get_questionnaire_context", "get_module_context", "get_question_context", "get_inventory_context"] },
+      { page: "/admin/mhd", label: "MHD", tools: ["get_questionnaire_context", "get_module_context", "get_question_context"] },
+      { page: "/admin/fbmanagement", label: "Kampagnenmanagement", tools: ["get_campaign_context", "get_filter_context", "search_visits", "get_evaluation_context"] },
+      { page: "/admin/fotoarchiv", label: "Fotoarchiv", tools: ["search_photo_archive", "get_visit_context"] },
+      { page: "/admin/zeiterfassung", label: "Zeiterfassung", tools: ["get_time_context", "get_pending_requests", "get_audit_history_context"] },
+      { page: "/admin/maerkte", label: "Märkte", tools: ["search_markets", "get_market_context", "get_filter_context"] },
+      { page: "/admin/lager", label: "Lager", tools: ["get_inventory_context"] },
+      { page: "/admin/gebietsmanager", label: "Gebietsmanager", tools: ["search_gms", "get_gm_context", "get_user_access_context", "get_filter_context", "get_gm_kurti_chat_history"] },
+      { page: "/admin/shelfmerchandiser", label: "Shelf Merchandiser", tools: ["get_user_access_context"] },
+      { page: "/admin/datenschutzanfragen", label: "Datenschutzanfragen", tools: ["get_pending_requests", "get_audit_history_context", "get_user_access_context"] },
+    ],
+    questionnaireDataCoverage: [
+      "questionnaires and questionnaire-module ordering",
+      "all main/cooler/MHD modules and module-question ordering",
+      "shared questions and main-questionnaire special items",
+      "legacy JSON configuration/rules/scoring and normalized rules/targets/scoring",
+      "matrices, attachment metadata, photo tags, question/module chain filters",
+      "campaign and assignment usage",
+      "visit question snapshots, answers, options, matrix cells, comments, photo metadata/tags",
+      "answer change requests and answer audit events",
+    ],
+    liveRecordCounts: counts ?? {},
+  });
+}
+
+async function loadQuestionDetails(input: z.infer<typeof questionContextSchema>): Promise<{ questions: JsonRecord[]; specialItems: JsonRecord[] }> {
+  const query = input.query?.trim() || null;
+  const questionType = input.questionType?.trim() || null;
+  const questions = await pgSql<JsonRecord[]>`
+    select
+      q.id,
+      q.question_type::text,
+      q.text,
+      q.required,
+      q.red_survey,
+      q.single_choice_availability,
+      q.single_choice_availability_type,
+      q.chains,
+      q.config,
+      q.rules as legacy_rules,
+      q.scoring as legacy_scoring,
+      q.created_at,
+      q.updated_at,
+      coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'id', r.id,
+          'operator', r.operator,
+          'triggerQuestionId', r.trigger_question_id,
+          'triggerQuestionText', tq.text,
+          'triggerValue', r.trigger_value,
+          'triggerValueMax', r.trigger_value_max,
+          'action', r.action::text,
+          'orderIndex', r.order_index,
+          'targets', coalesce((
+            select jsonb_agg(jsonb_build_object(
+              'questionId', rt.target_question_id,
+              'questionText', target_q.text,
+              'orderIndex', rt.order_index
+            ) order by rt.order_index)
+            from question_rule_targets rt
+            join question_bank_shared target_q on target_q.id = rt.target_question_id
+            where rt.rule_id = r.id and rt.is_deleted = false
+          ), '[]'::jsonb)
+        ) order by r.order_index)
+        from question_rules r
+        left join question_bank_shared tq on tq.id = r.trigger_question_id
+        where r.question_id = q.id and r.is_deleted = false
+      ), '[]'::jsonb) as normalized_rules,
+      coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'id', s.id,
+          'scoreKey', s.score_key,
+          'ipp', s.ipp,
+          'zweitplatzierung', s.zweitplatzierung,
+          'mitbewerberabfrage', s.mitbewerberabfrage,
+          'boni', s.boni
+        ) order by s.score_key)
+        from question_scoring s
+        where s.question_id = q.id and s.is_deleted = false
+      ), '[]'::jsonb) as scoring_rows,
+      (select jsonb_build_object('subtype', mx.matrix_subtype, 'rows', mx.rows, 'columns', mx.columns)
+         from question_matrix mx where mx.question_id = q.id and mx.is_deleted = false) as matrix,
+      coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'id', a.id,
+          'orderIndex', a.order_index,
+          'payload', case when length(a.payload) <= 4000 then a.payload else left(a.payload, 4000) || '…' end,
+          'payloadLength', length(a.payload),
+          'truncated', length(a.payload) > 4000
+        ) order by a.order_index)
+        from question_attachments a
+        where a.question_id = q.id and a.is_deleted = false
+      ), '[]'::jsonb) as attachments,
+      coalesce((
+        select jsonb_agg(jsonb_build_object('id', pt.id, 'label', pt.label) order by pt.label)
+        from question_photo_tags qpt
+        join photo_tags pt on pt.id = qpt.photo_tag_id and pt.is_deleted = false
+        where qpt.question_id = q.id and qpt.is_deleted = false
+      ), '[]'::jsonb) as photo_tags,
+      coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'scope', membership.scope,
+          'questionnaireId', membership.questionnaire_id,
+          'questionnaireName', membership.questionnaire_name,
+          'moduleId', membership.module_id,
+          'moduleName', membership.module_name,
+          'membershipKind', membership.membership_kind,
+          'orderIndex', membership.order_index
+        ) order by membership.scope, membership.questionnaire_name, membership.order_index)
+        from (
+          select 'main'::text as scope, fm.fragebogen_id as questionnaire_id, f.name as questionnaire_name,
+                 mmq.module_id, mm.name as module_name, 'module'::text as membership_kind, mmq.order_index
+          from module_main_question mmq
+          join module_main mm on mm.id = mmq.module_id and mm.is_deleted = false
+          join fragebogen_main_module fm on fm.module_id = mmq.module_id and fm.is_deleted = false
+          join fragebogen_main f on f.id = fm.fragebogen_id and f.is_deleted = false
+          where mmq.question_id = q.id and mmq.is_deleted = false
+          union all
+          select 'main'::text, fsq.fragebogen_id, f.name, null::uuid, null::text, 'special_question'::text, fsq.order_index
+          from fragebogen_main_spezial_question fsq
+          join fragebogen_main f on f.id = fsq.fragebogen_id and f.is_deleted = false
+          where fsq.question_id = q.id and fsq.is_deleted = false
+          union all
+          select 'kuehler'::text, fm.fragebogen_id, f.name, mq.module_id, mm.name, 'module'::text, mq.order_index
+          from module_kuehler_question mq
+          join module_kuehler mm on mm.id = mq.module_id and mm.is_deleted = false
+          join fragebogen_kuehler_module fm on fm.module_id = mq.module_id and fm.is_deleted = false
+          join fragebogen_kuehler f on f.id = fm.fragebogen_id and f.is_deleted = false
+          where mq.question_id = q.id and mq.is_deleted = false
+          union all
+          select 'mhd'::text, fm.fragebogen_id, f.name, mq.module_id, mm.name, 'module'::text, mq.order_index
+          from module_mhd_question mq
+          join module_mhd mm on mm.id = mq.module_id and mm.is_deleted = false
+          join fragebogen_mhd_module fm on fm.module_id = mq.module_id and fm.is_deleted = false
+          join fragebogen_mhd f on f.id = fm.fragebogen_id and f.is_deleted = false
+          where mq.question_id = q.id and mq.is_deleted = false
+        ) membership
+      ), '[]'::jsonb) as questionnaire_memberships,
+      coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'scope', c.scope::text,
+          'moduleId', c.module_id,
+          'chain', c.chain_db_name
+        ) order by c.scope, c.chain_db_name)
+        from module_question_chains c
+        where c.question_id = q.id and c.is_deleted = false
+      ), '[]'::jsonb) as module_chain_filters,
+      case when ${input.includeUsage}::boolean then jsonb_build_object(
+        'visitQuestionSnapshots', (select count(*)::int from visit_session_questions vq where vq.question_id = q.id and vq.is_deleted = false),
+        'answers', (select count(*)::int from visit_answers va where va.question_id = q.id and va.is_deleted = false),
+        'submittedVisits', (select count(distinct va.visit_session_id)::int from visit_answers va join visit_sessions vs on vs.id = va.visit_session_id where va.question_id = q.id and va.is_deleted = false and vs.is_deleted = false and vs.status = 'submitted'),
+        'answerChangeRequests', (select count(*)::int from visit_answer_change_requests cr where cr.question_id = q.id and cr.is_deleted = false),
+        'campaigns', coalesce((
+          select jsonb_agg(distinct jsonb_build_object('id', c.id, 'name', c.name, 'section', c.section::text, 'status', c.status::text))
+          from campaigns c
+          where c.is_deleted = false and c.current_fragebogen_id in (
+            select fm.fragebogen_id from module_main_question mq join fragebogen_main_module fm on fm.module_id = mq.module_id and fm.is_deleted = false where mq.question_id = q.id and mq.is_deleted = false
+            union select fsq.fragebogen_id from fragebogen_main_spezial_question fsq where fsq.question_id = q.id and fsq.is_deleted = false
+            union select fm.fragebogen_id from module_kuehler_question mq join fragebogen_kuehler_module fm on fm.module_id = mq.module_id and fm.is_deleted = false where mq.question_id = q.id and mq.is_deleted = false
+            union select fm.fragebogen_id from module_mhd_question mq join fragebogen_mhd_module fm on fm.module_id = mq.module_id and fm.is_deleted = false where mq.question_id = q.id and mq.is_deleted = false
+          )
+        ), '[]'::jsonb)
+      ) else null end as usage
+    from question_bank_shared q
+    where q.is_deleted = false
+      and (${input.questionId}::uuid is null or q.id = ${input.questionId})
+      and (${questionType}::text is null or q.question_type::text = ${questionType})
+      and (${query}::text is null or concat_ws(' ', q.text, q.question_type::text, q.config::text, q.rules::text, q.scoring::text, array_to_string(q.chains, ' ')) ilike '%' || ${query} || '%')
+      and (${input.moduleId}::uuid is null or exists (
+        select 1 from module_main_question x where x.question_id = q.id and x.module_id = ${input.moduleId} and x.is_deleted = false
+        union all select 1 from module_kuehler_question x where x.question_id = q.id and x.module_id = ${input.moduleId} and x.is_deleted = false
+        union all select 1 from module_mhd_question x where x.question_id = q.id and x.module_id = ${input.moduleId} and x.is_deleted = false
+      ))
+      and (${input.questionnaireId}::uuid is null or exists (
+        select 1 from module_main_question mq join fragebogen_main_module fm on fm.module_id = mq.module_id and fm.is_deleted = false where mq.question_id = q.id and mq.is_deleted = false and fm.fragebogen_id = ${input.questionnaireId}
+        union all select 1 from fragebogen_main_spezial_question x where x.question_id = q.id and x.fragebogen_id = ${input.questionnaireId} and x.is_deleted = false
+        union all select 1 from module_kuehler_question mq join fragebogen_kuehler_module fm on fm.module_id = mq.module_id and fm.is_deleted = false where mq.question_id = q.id and mq.is_deleted = false and fm.fragebogen_id = ${input.questionnaireId}
+        union all select 1 from module_mhd_question mq join fragebogen_mhd_module fm on fm.module_id = mq.module_id and fm.is_deleted = false where mq.question_id = q.id and mq.is_deleted = false and fm.fragebogen_id = ${input.questionnaireId}
+      ))
+      and (${input.scope}::text is null or
+        (${input.scope}::text = 'main' and (exists (select 1 from module_main_question x where x.question_id = q.id and x.is_deleted = false) or exists (select 1 from fragebogen_main_spezial_question x where x.question_id = q.id and x.is_deleted = false))) or
+        (${input.scope}::text = 'kuehler' and exists (select 1 from module_kuehler_question x where x.question_id = q.id and x.is_deleted = false)) or
+        (${input.scope}::text = 'mhd' and exists (select 1 from module_mhd_question x where x.question_id = q.id and x.is_deleted = false))
+      )
+    order by q.updated_at desc, q.text
+    limit ${input.limit}
+  `;
+
+  const specialItems = (input.scope && input.scope !== "main") || input.moduleId
+    ? []
+    : await pgSql<JsonRecord[]>`
+      select si.id, 'main'::text as scope, si.fragebogen_id, f.name as questionnaire_name,
+             si.question_type::text, si.text, si.required, si.chains, si.config,
+             si.rules, si.scoring, si.order_index, si.created_at, si.updated_at
+      from fragebogen_main_spezial_items si
+      join fragebogen_main f on f.id = si.fragebogen_id and f.is_deleted = false
+      where si.is_deleted = false
+        and (${input.questionId}::uuid is null or si.id = ${input.questionId})
+        and (${input.questionnaireId}::uuid is null or si.fragebogen_id = ${input.questionnaireId})
+        and (${questionType}::text is null or si.question_type::text = ${questionType})
+        and (${query}::text is null or concat_ws(' ', si.text, si.question_type::text, si.config::text, si.rules::text, si.scoring::text, array_to_string(si.chains, ' '), f.name) ilike '%' || ${query} || '%')
+      order by f.name, si.order_index
+      limit ${input.limit}
+    `;
+  return { questions, specialItems };
+}
+
+async function getModuleContext(args: unknown): Promise<JsonRecord> {
+  const input = moduleContextSchema.parse(args);
+  const query = input.query?.trim() || null;
+  const modules = await pgSql<JsonRecord[]>`
+    select * from (
+      select 'main'::text as scope, m.id, m.name, m.description, m.section_keywords::text as sections, m.created_at, m.updated_at,
+             (select count(*)::int from module_main_question mq where mq.module_id = m.id and mq.is_deleted = false) as question_count,
+             coalesce((select jsonb_agg(jsonb_build_object('id', f.id, 'name', f.name, 'sections', f.section_keywords::text, 'status', f.status::text, 'orderIndex', fm.order_index) order by f.name)
+                       from fragebogen_main_module fm join fragebogen_main f on f.id = fm.fragebogen_id and f.is_deleted = false where fm.module_id = m.id and fm.is_deleted = false), '[]'::jsonb) as questionnaires,
+             (select count(*)::int from visit_session_questions vq where vq.module_id = m.id and vq.is_deleted = false) as visit_question_snapshots
+      from module_main m where m.is_deleted = false
+      union all
+      select 'kuehler'::text, m.id, m.name, m.description, 'kuehler'::text, m.created_at, m.updated_at,
+             (select count(*)::int from module_kuehler_question mq where mq.module_id = m.id and mq.is_deleted = false),
+             coalesce((select jsonb_agg(jsonb_build_object('id', f.id, 'name', f.name, 'status', f.status::text, 'orderIndex', fm.order_index) order by f.name)
+                       from fragebogen_kuehler_module fm join fragebogen_kuehler f on f.id = fm.fragebogen_id and f.is_deleted = false where fm.module_id = m.id and fm.is_deleted = false), '[]'::jsonb),
+             (select count(*)::int from visit_session_questions vq where vq.module_id = m.id and vq.is_deleted = false)
+      from module_kuehler m where m.is_deleted = false
+      union all
+      select 'mhd'::text, m.id, m.name, m.description, 'mhd'::text, m.created_at, m.updated_at,
+             (select count(*)::int from module_mhd_question mq where mq.module_id = m.id and mq.is_deleted = false),
+             coalesce((select jsonb_agg(jsonb_build_object('id', f.id, 'name', f.name, 'status', f.status::text, 'orderIndex', fm.order_index) order by f.name)
+                       from fragebogen_mhd_module fm join fragebogen_mhd f on f.id = fm.fragebogen_id and f.is_deleted = false where fm.module_id = m.id and fm.is_deleted = false), '[]'::jsonb),
+             (select count(*)::int from visit_session_questions vq where vq.module_id = m.id and vq.is_deleted = false)
+      from module_mhd m where m.is_deleted = false
+    ) module
+    where (${input.scope}::text is null or module.scope = ${input.scope})
+      and (${input.moduleId}::uuid is null or module.id = ${input.moduleId})
+      and (${query}::text is null or concat_ws(' ', module.name, module.description, module.sections) ilike '%' || ${query} || '%')
+    order by module.scope, module.name
+    limit ${input.limit}
+  `;
+  const details = input.includeQuestions || input.moduleId
+    ? await loadQuestionDetails({
+        questionId: null,
+        moduleId: input.moduleId,
+        questionnaireId: null,
+        scope: input.scope,
+        query,
+        questionType: null,
+        includeUsage: true,
+        limit: input.limit,
+      })
+    : { questions: [], specialItems: [] };
+  return envelope("get_module_context", { modules, ...details }, { resultCount: modules.length });
+}
+
+async function getQuestionContext(args: unknown): Promise<JsonRecord> {
+  const input = questionContextSchema.parse(args);
+  const data = await loadQuestionDetails(input);
+  return envelope("get_question_context", data, {
+    questionCount: data.questions.length,
+    specialItemCount: data.specialItems.length,
+  });
+}
+
+async function getEvaluationContext(args: unknown): Promise<JsonRecord> {
+  const input = evaluationContextSchema.parse(args);
+  const from = input.from && YMD_REGEX.test(input.from) ? input.from : null;
+  const to = input.to && YMD_REGEX.test(input.to) ? input.to : null;
+  const summaries = await pgSql<JsonRecord[]>`
+    select
+      q.question_id,
+      max(q.question_text_snapshot) as question_text,
+      q.question_type::text,
+      count(*)::int as answer_rows,
+      count(distinct a.visit_session_id)::int as visit_count,
+      count(distinct vs.gm_user_id)::int as gm_count,
+      count(distinct vs.market_id)::int as market_count,
+      (count(*) filter (where a.answer_status = 'answered'))::int as answered_count,
+      (count(*) filter (where a.answer_status = 'unanswered'))::int as unanswered_count,
+      (count(*) filter (where a.answer_status = 'hidden_by_rule'))::int as hidden_by_rule_count,
+      (count(*) filter (where a.answer_status = 'skipped'))::int as skipped_count,
+      (count(*) filter (where a.is_valid = false))::int as invalid_count,
+      avg(a.value_number) filter (where a.value_number is not null) as average_numeric_value,
+      min(a.answered_at) as first_answered_at,
+      max(a.answered_at) as latest_answered_at,
+      coalesce(jsonb_agg(distinct s.section::text), '[]'::jsonb) as sections,
+      coalesce((select jsonb_agg(jsonb_build_object(
+        'scoreKey', scoring.score_key,
+        'ipp', scoring.ipp,
+        'zweitplatzierung', scoring.zweitplatzierung,
+        'mitbewerberabfrage', scoring.mitbewerberabfrage,
+        'boni', scoring.boni
+      ) order by scoring.score_key) from question_scoring scoring where scoring.question_id = q.question_id and scoring.is_deleted = false), '[]'::jsonb) as current_scoring_configuration
+    from visit_answers a
+    join visit_session_questions q on q.id = a.visit_session_question_id and q.is_deleted = false
+    join visit_session_sections s on s.id = a.visit_session_section_id and s.is_deleted = false
+    join visit_sessions vs on vs.id = a.visit_session_id and vs.is_deleted = false
+    where a.is_deleted = false
+      and (${input.questionId}::uuid is null or q.question_id = ${input.questionId})
+      and (${input.moduleId}::uuid is null or q.module_id = ${input.moduleId})
+      and (${input.questionnaireId}::uuid is null or s.fragebogen_id = ${input.questionnaireId})
+      and (${input.campaignId}::uuid is null or s.campaign_id = ${input.campaignId})
+      and (${input.gmUserId}::uuid is null or vs.gm_user_id = ${input.gmUserId})
+      and (${input.marketId}::uuid is null or vs.market_id = ${input.marketId})
+      and (${input.section}::text is null or s.section::text = ${input.section})
+      and (${input.visitStatus} = 'all' or vs.status::text = ${input.visitStatus})
+      and (${input.includeInvalid}::boolean = true or a.is_valid = true)
+      and (${from}::date is null or coalesce(vs.submitted_at, vs.started_at)::date >= ${from}::date)
+      and (${to}::date is null or coalesce(vs.submitted_at, vs.started_at)::date <= ${to}::date)
+    group by q.question_id, q.question_type
+    order by answer_rows desc, latest_answered_at desc nulls last
+    limit ${input.limit}
+  `;
+
+  const details = input.includeDetails ? await pgSql<JsonRecord[]>`
+    select
+      a.id as answer_id,
+      a.visit_session_id,
+      a.answer_status::text,
+      a.question_type::text,
+      a.value_text,
+      a.value_number,
+      a.value_json,
+      a.is_valid,
+      a.validation_error,
+      a.answered_at,
+      a.changed_at,
+      a.version,
+      q.id as visit_question_id,
+      q.question_id,
+      q.module_id,
+      q.module_name_snapshot,
+      q.question_text_snapshot,
+      q.question_config_snapshot,
+      q.question_rules_snapshot,
+      q.question_chains_snapshot,
+      q.applies_to_market_chain_snapshot,
+      q.required_snapshot,
+      q.red_survey_snapshot,
+      q.single_choice_availability_snapshot,
+      q.single_choice_availability_type_snapshot,
+      s.id as visit_section_id,
+      s.section::text,
+      s.status::text as section_status,
+      s.campaign_id,
+      c.name as campaign_name,
+      s.fragebogen_id,
+      s.fragebogen_name_snapshot,
+      vs.status::text as visit_status,
+      vs.started_at,
+      vs.submitted_at,
+      vs.gm_user_id,
+      concat_ws(' ', u.first_name, u.last_name) as gm_name,
+      u.region as gm_region,
+      vs.market_id,
+      m.name as market_name,
+      m.standard_market_number,
+      m.coke_master_number,
+      m.flex_number,
+      m.db_name as market_chain,
+      coalesce((select jsonb_agg(jsonb_build_object('role', o.option_role::text, 'value', o.option_value, 'orderIndex', o.order_index) order by o.order_index)
+                from visit_answer_options o where o.visit_answer_id = a.id and o.is_deleted = false), '[]'::jsonb) as selected_options,
+      coalesce((select jsonb_agg(jsonb_build_object('row', cell.row_key, 'column', cell.column_key, 'text', cell.cell_value_text, 'date', cell.cell_value_date, 'selected', cell.cell_selected, 'orderIndex', cell.order_index) order by cell.order_index)
+                from visit_answer_matrix_cells cell where cell.visit_answer_id = a.id and cell.is_deleted = false), '[]'::jsonb) as matrix_cells,
+      (select comment.comment_text from visit_question_comments comment where comment.visit_session_question_id = q.id and comment.is_deleted = false order by comment.updated_at desc limit 1) as comment,
+      jsonb_build_object(
+        'count', (select count(*)::int from visit_answer_photos p where p.visit_answer_id = a.id and p.is_deleted = false),
+        'tags', coalesce((select jsonb_agg(distinct tag.photo_tag_label_snapshot) filter (where tag.photo_tag_label_snapshot <> '')
+                          from visit_answer_photos p join visit_answer_photo_tags tag on tag.visit_answer_photo_id = p.id and tag.is_deleted = false
+                          where p.visit_answer_id = a.id and p.is_deleted = false), '[]'::jsonb)
+      ) as photo_metadata,
+      coalesce((select jsonb_agg(jsonb_build_object(
+        'status', request.status::text,
+        'currentAnswerSnapshot', request.current_answer_snapshot,
+        'requestedAnswerPayload', request.requested_answer_payload,
+        'requestedAnswerSummary', request.requested_answer_summary,
+        'requestNote', request.request_note,
+        'reviewedBy', concat_ws(' ', reviewer.first_name, reviewer.last_name),
+        'reviewedAt', request.reviewed_at,
+        'adminNote', request.admin_note,
+        'createdAt', request.created_at,
+        'updatedAt', request.updated_at
+      ) order by request.created_at desc)
+      from visit_answer_change_requests request
+      left join users reviewer on reviewer.id = request.reviewed_by_user_id
+      where request.visit_session_question_id = q.id and request.is_deleted = false), '[]'::jsonb) as answer_change_requests,
+      coalesce((select jsonb_agg(jsonb_build_object(
+        'eventType', event.event_type::text,
+        'payload', event.payload,
+        'actorName', concat_ws(' ', actor.first_name, actor.last_name),
+        'createdAt', event.created_at
+      ) order by event.created_at desc)
+      from visit_answer_events event
+      left join users actor on actor.id = event.actor_user_id
+      where event.visit_answer_id = a.id), '[]'::jsonb) as answer_events,
+      coalesce((select jsonb_agg(jsonb_build_object(
+        'scoreKey', scoring.score_key,
+        'ipp', scoring.ipp,
+        'zweitplatzierung', scoring.zweitplatzierung,
+        'mitbewerberabfrage', scoring.mitbewerberabfrage,
+        'boni', scoring.boni
+      ) order by scoring.score_key) from question_scoring scoring where scoring.question_id = q.question_id and scoring.is_deleted = false), '[]'::jsonb) as current_scoring_configuration
+    from visit_answers a
+    join visit_session_questions q on q.id = a.visit_session_question_id and q.is_deleted = false
+    join visit_session_sections s on s.id = a.visit_session_section_id and s.is_deleted = false
+    join visit_sessions vs on vs.id = a.visit_session_id and vs.is_deleted = false
+    join users u on u.id = vs.gm_user_id
+    join markets m on m.id = vs.market_id
+    left join campaigns c on c.id = s.campaign_id
+    where a.is_deleted = false
+      and (${input.questionId}::uuid is null or q.question_id = ${input.questionId})
+      and (${input.moduleId}::uuid is null or q.module_id = ${input.moduleId})
+      and (${input.questionnaireId}::uuid is null or s.fragebogen_id = ${input.questionnaireId})
+      and (${input.campaignId}::uuid is null or s.campaign_id = ${input.campaignId})
+      and (${input.gmUserId}::uuid is null or vs.gm_user_id = ${input.gmUserId})
+      and (${input.marketId}::uuid is null or vs.market_id = ${input.marketId})
+      and (${input.section}::text is null or s.section::text = ${input.section})
+      and (${input.visitStatus} = 'all' or vs.status::text = ${input.visitStatus})
+      and (${input.includeInvalid}::boolean = true or a.is_valid = true)
+      and (${from}::date is null or coalesce(vs.submitted_at, vs.started_at)::date >= ${from}::date)
+      and (${to}::date is null or coalesce(vs.submitted_at, vs.started_at)::date <= ${to}::date)
+    order by coalesce(vs.submitted_at, vs.started_at) desc, s.order_index, q.order_index
+    limit ${input.limit}
+  ` : [];
+
+  const safeDetails = sanitizeSensitiveValue(details) as JsonRecord[];
+  return envelope("get_evaluation_context", {
+    filters: { ...input, from, to },
+    questionSummaries: summaries,
+    answerDetails: safeDetails,
+  }, {
+    summaryCount: summaries.length,
+    detailCount: safeDetails.length,
+    scoringNote: "Rows expose current scoring configuration next to historical answer snapshots. Use get_ipp_context for authoritative RED-period IPP and get_bonus_context for finalized bonus totals.",
+  });
+}
+
+async function getFilterContext(args: unknown): Promise<JsonRecord> {
+  const input = filterContextSchema.parse(args);
+  const query = input.query?.trim() || null;
+  const include = (kind: typeof input.kind) => input.kind === "all" || input.kind === kind;
+
+  const questionRules = include("question_rules") ? await pgSql<JsonRecord[]>`
+    select
+      r.id,
+      r.question_id,
+      q.text as question_text,
+      q.question_type::text,
+      r.trigger_question_id,
+      trigger_q.text as trigger_question_text,
+      r.operator,
+      r.trigger_value,
+      r.trigger_value_max,
+      r.action::text,
+      r.order_index,
+      coalesce((select jsonb_agg(jsonb_build_object('questionId', rt.target_question_id, 'questionText', target_q.text, 'orderIndex', rt.order_index) order by rt.order_index)
+                from question_rule_targets rt join question_bank_shared target_q on target_q.id = rt.target_question_id
+                where rt.rule_id = r.id and rt.is_deleted = false), '[]'::jsonb) as targets,
+      q.rules as legacy_rules
+    from question_rules r
+    join question_bank_shared q on q.id = r.question_id and q.is_deleted = false
+    left join question_bank_shared trigger_q on trigger_q.id = r.trigger_question_id
+    where r.is_deleted = false
+      and (${input.entityId}::uuid is null or r.id = ${input.entityId} or r.question_id = ${input.entityId} or r.trigger_question_id = ${input.entityId} or exists (select 1 from question_rule_targets rt where rt.rule_id = r.id and rt.target_question_id = ${input.entityId} and rt.is_deleted = false))
+      and (${query}::text is null or concat_ws(' ', q.text, trigger_q.text, r.operator, r.trigger_value, r.trigger_value_max, r.action::text, q.rules::text) ilike '%' || ${query} || '%')
+    order by q.text, r.order_index
+    limit ${input.limit}
+  ` : [];
+
+  const chainFilters = include("chain_filters") ? await pgSql<JsonRecord[]>`
+    select c.id, c.scope::text, c.module_id,
+           coalesce(mm.name, mk.name, mh.name) as module_name,
+           c.question_id, q.text as question_text, q.question_type::text,
+           c.chain_db_name, q.chains as legacy_question_chains,
+           q.single_choice_availability, q.single_choice_availability_type
+    from module_question_chains c
+    join question_bank_shared q on q.id = c.question_id and q.is_deleted = false
+    left join module_main mm on c.scope = 'main' and mm.id = c.module_id
+    left join module_kuehler mk on c.scope = 'kuehler' and mk.id = c.module_id
+    left join module_mhd mh on c.scope = 'mhd' and mh.id = c.module_id
+    where c.is_deleted = false
+      and (${input.entityId}::uuid is null or c.id = ${input.entityId} or c.module_id = ${input.entityId} or c.question_id = ${input.entityId})
+      and (${query}::text is null or concat_ws(' ', c.scope::text, coalesce(mm.name, mk.name, mh.name), q.text, c.chain_db_name, array_to_string(q.chains, ' '), q.single_choice_availability_type) ilike '%' || ${query} || '%')
+    order by c.scope, module_name, q.text, c.chain_db_name
+    limit ${input.limit}
+  ` : [];
+
+  const gmFilters = include("gm_filters") ? await pgSql<JsonRecord[]>`
+    select sf.id, sf.gm_user_id, concat_ws(' ', u.first_name, u.last_name) as gm_name,
+           u.email as gm_email, u.region, u.is_active, sf.match_value, sf.created_at, sf.updated_at
+    from special_arthur_filter sf
+    join users u on u.id = sf.gm_user_id
+    where sf.is_deleted = false
+      and (${input.entityId}::uuid is null or sf.id = ${input.entityId} or sf.gm_user_id = ${input.entityId})
+      and (${query}::text is null or concat_ws(' ', u.first_name, u.last_name, u.email, u.region, sf.match_value) ilike '%' || ${query} || '%')
+    order by u.last_name, u.first_name, sf.match_value
+    limit ${input.limit}
+  ` : [];
+
+  const marketFilters = include("market_filters") ? await pgSql<JsonRecord[]>`
+    select id, name, db_name as chain, standard_market_number, coke_master_number, flex_number,
+           region, current_gm_name, universe_market, market_type::text, info_flag, is_active
+    from markets
+    where is_deleted = false
+      and (${input.entityId}::uuid is null or id = ${input.entityId})
+      and (${query}::text is null or concat_ws(' ', name, db_name, standard_market_number, coke_master_number, flex_number, region, current_gm_name, market_type::text, info_flag) ilike '%' || ${query} || '%')
+    order by is_active desc, name
+    limit ${input.limit}
+  ` : [];
+  const marketFacets = include("market_filters") ? await pgSql<JsonRecord[]>`
+    select 'region'::text as facet, coalesce(region, '(leer)') as value, count(*)::int as count from markets where is_deleted = false group by region
+    union all select 'chain', coalesce(db_name, '(leer)'), count(*)::int from markets where is_deleted = false group by db_name
+    union all select 'market_type', market_type::text, count(*)::int from markets where is_deleted = false group by market_type
+    union all select 'universe_market', universe_market::text, count(*)::int from markets where is_deleted = false group by universe_market
+    union all select 'active', is_active::text, count(*)::int from markets where is_deleted = false group by is_active
+    order by facet, value
+  ` : [];
+
+  const campaignFilters = include("campaign_filters") ? await pgSql<JsonRecord[]>`
+    select c.id, c.name, c.section::text, c.status::text, c.schedule_type::text,
+           c.start_date, c.end_date, c.current_fragebogen_id,
+           coalesce(fm.name, fk.name, fmd.name) as questionnaire_name,
+           (select count(*)::int from campaign_market_assignments a where a.campaign_id = c.id and a.is_deleted = false) as assignment_rows
+    from campaigns c
+    left join fragebogen_main fm on fm.id = c.current_fragebogen_id and fm.is_deleted = false
+    left join fragebogen_kuehler fk on fk.id = c.current_fragebogen_id and fk.is_deleted = false
+    left join fragebogen_mhd fmd on fmd.id = c.current_fragebogen_id and fmd.is_deleted = false
+    where c.is_deleted = false
+      and (${input.entityId}::uuid is null or c.id = ${input.entityId} or c.current_fragebogen_id = ${input.entityId})
+      and (${query}::text is null or concat_ws(' ', c.name, c.section::text, c.status::text, c.schedule_type::text, fm.name, fk.name, fmd.name) ilike '%' || ${query} || '%')
+    order by c.status = 'active' desc, c.section, c.name
+    limit ${input.limit}
+  ` : [];
+
+  const questionnaireFilters = include("questionnaire_filters") ? await pgSql<JsonRecord[]>`
+    select * from (
+      select 'main'::text as scope, id, name, description, section_keywords::text as sections, status::text, schedule_type::text, start_date, end_date, nur_einmal_ausfuellbar, updated_at from fragebogen_main where is_deleted = false
+      union all select 'kuehler', id, name, description, 'kuehler', status::text, schedule_type::text, start_date, end_date, nur_einmal_ausfuellbar, updated_at from fragebogen_kuehler where is_deleted = false
+      union all select 'mhd', id, name, description, 'mhd', status::text, schedule_type::text, start_date, end_date, nur_einmal_ausfuellbar, updated_at from fragebogen_mhd where is_deleted = false
+    ) questionnaire
+    where (${input.entityId}::uuid is null or questionnaire.id = ${input.entityId})
+      and (${query}::text is null or concat_ws(' ', questionnaire.scope, questionnaire.name, questionnaire.description, questionnaire.sections, questionnaire.status, questionnaire.schedule_type) ilike '%' || ${query} || '%')
+    order by questionnaire.scope, questionnaire.name
+    limit ${input.limit}
+  ` : [];
+
+  return envelope("get_filter_context", {
+    kind: input.kind,
+    questionRules,
+    chainFilters,
+    gmSpecialFilters: gmFilters,
+    marketFilters,
+    marketFacets,
+    campaignFilters,
+    questionnaireFilters,
+  });
+}
+
 async function getQuestionnaireContext(args: unknown): Promise<JsonRecord> {
   const input = z.object({
     scope: z.enum(["main", "kuehler", "mhd"]).nullable(),
@@ -889,6 +1789,166 @@ async function getPendingRequests(args: unknown): Promise<JsonRecord> {
   return envelope("get_pending_requests", { answerChanges, visitDeleteRequests: visitDeletes, timeChanges, dsarRequests: dsar });
 }
 
+async function getAuditHistoryContext(args: unknown): Promise<JsonRecord> {
+  const input = auditHistorySchema.parse(args);
+  const from = input.from && YMD_REGEX.test(input.from) ? input.from : null;
+  const to = input.to && YMD_REGEX.test(input.to) ? input.to : null;
+  let rows: JsonRecord[] = [];
+
+  if (input.kind === "auth") {
+    rows = await pgSql<JsonRecord[]>`
+      select l.id, l.event_type, l.created_at,
+             l.actor_user_id, concat_ws(' ', actor.first_name, actor.last_name) as actor_name, actor.role::text as actor_role,
+             l.target_user_id, concat_ws(' ', target.first_name, target.last_name) as target_name, target.role::text as target_role
+      from auth_audit_logs l
+      left join users actor on actor.id = l.actor_user_id
+      left join users target on target.id = l.target_user_id
+      where (${input.entityId}::uuid is null or l.actor_user_id = ${input.entityId} or l.target_user_id = ${input.entityId})
+        and (${input.gmUserId}::uuid is null or l.actor_user_id = ${input.gmUserId} or l.target_user_id = ${input.gmUserId})
+        and (${from}::date is null or l.created_at >= (${from}::date at time zone ${VIENNA_TIMEZONE}))
+        and (${to}::date is null or l.created_at < ((${to}::date + 1) at time zone ${VIENNA_TIMEZONE}))
+      order by l.created_at desc
+      limit ${input.limit}
+    `;
+  } else if (input.kind === "campaign") {
+    rows = await pgSql<JsonRecord[]>`
+      select * from (
+        select h.id, 'questionnaire_change'::text as event_type, h.changed_at as created_at,
+               h.changed_by_user_id as actor_user_id, concat_ws(' ', actor.first_name, actor.last_name) as actor_name,
+               null::uuid as gm_user_id, null::text as gm_name,
+               h.campaign_id as entity_id, c.name as entity_name,
+               null::uuid as market_id, null::text as market_name,
+               jsonb_build_object('fromQuestionnaireId', h.from_fragebogen_id, 'toQuestionnaireId', h.to_fragebogen_id) as payload
+        from campaign_fragebogen_history h
+        join campaigns c on c.id = h.campaign_id
+        left join users actor on actor.id = h.changed_by_user_id
+        where h.is_deleted = false
+          and (${input.entityId}::uuid is null or h.campaign_id = ${input.entityId})
+          and ${input.gmUserId}::uuid is null
+          and (${from}::date is null or h.changed_at >= (${from}::date at time zone ${VIENNA_TIMEZONE}))
+          and (${to}::date is null or h.changed_at < ((${to}::date + 1) at time zone ${VIENNA_TIMEZONE}))
+        union all
+        select h.id, 'assignment_migration'::text as event_type, h.migrated_at as created_at,
+               h.migrated_by_user_id as actor_user_id, concat_ws(' ', actor.first_name, actor.last_name) as actor_name,
+               h.to_gm_user_id as gm_user_id, concat_ws(' ', target_gm.first_name, target_gm.last_name) as gm_name,
+               h.to_campaign_id as entity_id, target_campaign.name as entity_name,
+               h.market_id, m.name as market_name,
+               jsonb_build_object(
+                 'section', h.section::text,
+                 'fromCampaignId', h.from_campaign_id,
+                 'fromCampaign', source_campaign.name,
+                 'toCampaignId', h.to_campaign_id,
+                 'toCampaign', target_campaign.name,
+                 'fromGmUserId', h.from_gm_user_id,
+                 'fromGm', concat_ws(' ', source_gm.first_name, source_gm.last_name),
+                 'toGmUserId', h.to_gm_user_id,
+                 'toGm', concat_ws(' ', target_gm.first_name, target_gm.last_name),
+                 'reason', h.reason
+               ) as payload
+        from campaign_market_assignment_history h
+        join campaigns source_campaign on source_campaign.id = h.from_campaign_id
+        join campaigns target_campaign on target_campaign.id = h.to_campaign_id
+        join markets m on m.id = h.market_id
+        left join users actor on actor.id = h.migrated_by_user_id
+        left join users source_gm on source_gm.id = h.from_gm_user_id
+        left join users target_gm on target_gm.id = h.to_gm_user_id
+        where (${input.entityId}::uuid is null or h.from_campaign_id = ${input.entityId} or h.to_campaign_id = ${input.entityId} or h.market_id = ${input.entityId})
+          and (${input.gmUserId}::uuid is null or h.from_gm_user_id = ${input.gmUserId} or h.to_gm_user_id = ${input.gmUserId})
+          and (${from}::date is null or h.migrated_at >= (${from}::date at time zone ${VIENNA_TIMEZONE}))
+          and (${to}::date is null or h.migrated_at < ((${to}::date + 1) at time zone ${VIENNA_TIMEZONE}))
+      ) history
+      order by created_at desc
+      limit ${input.limit}
+    `;
+  } else if (input.kind === "questionnaire") {
+    rows = input.gmUserId ? [] : await pgSql<JsonRecord[]>`
+      select h.id, h.change_kind as event_type, h.changed_at as created_at,
+             h.question_id, q.text as question_text, h.fragebogen_id, f.name as questionnaire_name,
+             h.spezial_item_id,
+             jsonb_build_object(
+               'previousQuestionType', h.previous_question_type::text,
+               'nextQuestionType', h.next_question_type::text,
+               'previousAnswerState', h.previous_answer_state,
+               'nextAnswerState', h.next_answer_state
+             ) as payload
+      from question_answer_history h
+      left join question_bank_shared q on q.id = h.question_id
+      left join fragebogen_main f on f.id = h.fragebogen_id
+      where h.is_deleted = false
+        and (${input.entityId}::uuid is null or h.question_id = ${input.entityId} or h.fragebogen_id = ${input.entityId} or h.spezial_item_id = ${input.entityId})
+        and (${from}::date is null or h.changed_at >= (${from}::date at time zone ${VIENNA_TIMEZONE}))
+        and (${to}::date is null or h.changed_at < ((${to}::date + 1) at time zone ${VIENNA_TIMEZONE}))
+      order by h.changed_at desc
+      limit ${input.limit}
+    `;
+  } else if (input.kind === "time") {
+    rows = await pgSql<JsonRecord[]>`
+      select e.id, e.event_type::text, e.created_at, e.entry_id, coalesce(e.gm_user_id, t.gm_user_id) as gm_user_id,
+             concat_ws(' ', u.first_name, u.last_name) as gm_name,
+             t.activity_type::text, t.status::text, t.start_at, t.end_at,
+             t.market_id, m.name as market_name, e.payload
+      from time_tracking_entry_events e
+      join time_tracking_entries t on t.id = e.entry_id
+      left join users u on u.id = coalesce(e.gm_user_id, t.gm_user_id)
+      left join markets m on m.id = t.market_id
+      where (${input.entityId}::uuid is null or e.entry_id = ${input.entityId})
+        and (${input.gmUserId}::uuid is null or coalesce(e.gm_user_id, t.gm_user_id) = ${input.gmUserId})
+        and (${from}::date is null or e.created_at >= (${from}::date at time zone ${VIENNA_TIMEZONE}))
+        and (${to}::date is null or e.created_at < ((${to}::date + 1) at time zone ${VIENNA_TIMEZONE}))
+      order by e.created_at desc
+      limit ${input.limit}
+    `;
+  } else if (input.kind === "visit_answer") {
+    rows = await pgSql<JsonRecord[]>`
+      select e.id, e.event_type::text, e.created_at, e.visit_answer_id,
+             va.visit_session_id, vs.gm_user_id, concat_ws(' ', u.first_name, u.last_name) as gm_name,
+             vs.market_id, m.name as market_name, m.standard_market_number,
+             q.question_text_snapshot as question_text, e.actor_user_id,
+             concat_ws(' ', actor.first_name, actor.last_name) as actor_name,
+             e.payload
+      from visit_answer_events e
+      join visit_answers va on va.id = e.visit_answer_id
+      join visit_sessions vs on vs.id = va.visit_session_id
+      join users u on u.id = vs.gm_user_id
+      join markets m on m.id = vs.market_id
+      left join visit_session_questions q on q.id = va.visit_session_question_id
+      left join users actor on actor.id = e.actor_user_id
+      where (${input.entityId}::uuid is null or e.visit_answer_id = ${input.entityId} or va.visit_session_id = ${input.entityId})
+        and (${input.gmUserId}::uuid is null or vs.gm_user_id = ${input.gmUserId})
+        and (${from}::date is null or e.created_at >= (${from}::date at time zone ${VIENNA_TIMEZONE}))
+        and (${to}::date is null or e.created_at < ((${to}::date + 1) at time zone ${VIENNA_TIMEZONE}))
+      order by e.created_at desc
+      limit ${input.limit}
+    `;
+  } else {
+    rows = await pgSql<JsonRecord[]>`
+      select e.id, e.event_type, e.message, e.created_at, e.request_id,
+             r.request_type::text, r.status::text, r.subject_user_id,
+             r.subject_name_snapshot, r.subject_role_snapshot,
+             e.actor_user_id, concat_ws(' ', actor.first_name, actor.last_name) as actor_name,
+             e.metadata as payload
+      from dsar_request_events e
+      join dsar_requests r on r.id = e.request_id
+      left join users actor on actor.id = e.actor_user_id
+      where r.is_deleted = false
+        and (${input.entityId}::uuid is null or e.request_id = ${input.entityId})
+        and (${input.gmUserId}::uuid is null or r.subject_user_id = ${input.gmUserId} or r.requester_user_id = ${input.gmUserId})
+        and (${from}::date is null or e.created_at >= (${from}::date at time zone ${VIENNA_TIMEZONE}))
+        and (${to}::date is null or e.created_at < ((${to}::date + 1) at time zone ${VIENNA_TIMEZONE}))
+      order by e.created_at desc
+      limit ${input.limit}
+    `;
+  }
+
+  const sanitizedRows = rows.map((row) => sanitizeSensitiveValue(row) as JsonRecord);
+  return envelope("get_audit_history_context", sanitizedRows, {
+    kind: input.kind,
+    resultCount: sanitizedRows.length,
+    sanitized: true,
+    note: input.kind === "auth" ? "Raw auth details are intentionally excluded." : undefined,
+  });
+}
+
 async function getRedMonthContext(args: unknown): Promise<JsonRecord> {
   const input = z.object({ year: z.number().int().min(2020).max(2100).nullable() }).parse(args);
   const current = await resolveCurrentRedPeriod(new Date());
@@ -912,8 +1972,10 @@ async function getRedMonthContext(args: unknown): Promise<JsonRecord> {
 
 const TOOL_HANDLERS: Record<string, (args: unknown) => Promise<JsonRecord>> = {
   get_admin_overview: getAdminOverview,
+  get_user_access_context: getUserAccessContext,
   search_gms: searchGms,
   get_gm_context: getGmContext,
+  get_gm_kurti_chat_history: getGmKurtiChatHistory,
   search_markets: searchMarkets,
   get_market_context: getMarketContext,
   search_visits: searchVisits,
@@ -922,10 +1984,16 @@ const TOOL_HANDLERS: Record<string, (args: unknown) => Promise<JsonRecord>> = {
   get_time_context: getTimeContext,
   get_ipp_context: getIppContext,
   get_bonus_context: getBonusContext,
+  get_admin_module_catalog: getAdminModuleCatalog,
+  get_module_context: getModuleContext,
+  get_question_context: getQuestionContext,
+  get_evaluation_context: getEvaluationContext,
+  get_filter_context: getFilterContext,
   get_questionnaire_context: getQuestionnaireContext,
   search_photo_archive: searchPhotoArchive,
   get_inventory_context: getInventoryContext,
   get_pending_requests: getPendingRequests,
+  get_audit_history_context: getAuditHistoryContext,
   get_red_month_context: getRedMonthContext,
 };
 
