@@ -19,7 +19,7 @@ const envSchema = z.object({
     z.string().min(1).optional(),
   ),
   OPENAI_KURTI_MODEL: z.string().min(1).default("gpt-5.6-luna"),
-  OPENAI_KURTI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(200).max(4000).default(900),
+  OPENAI_KURTI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(200).max(30_000).default(15_000),
   OPENAI_KURTI_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(120_000).default(45_000),
   IPP_FINALIZER_ENABLED: z.preprocess((value) => {
     if (typeof value === "string") {
