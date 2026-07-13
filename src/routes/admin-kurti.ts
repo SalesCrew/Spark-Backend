@@ -135,6 +135,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       tool_choice: "auto",
       parallel_tool_calls: true,
       reasoning: { effort: "low" },
+      include: ["reasoning.encrypted_content"],
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
       store: false,
     });
@@ -161,6 +162,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
         tool_choice: round === MAX_TOOL_ROUNDS - 1 ? "none" : "auto",
         parallel_tool_calls: true,
         reasoning: { effort: "low" },
+        include: ["reasoning.encrypted_content"],
         max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
         store: false,
       });
