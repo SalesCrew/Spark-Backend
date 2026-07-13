@@ -14,6 +14,13 @@ const envSchema = z.object({
   DB_POOL_MAX: z.coerce.number().int().min(1).max(20).default(4),
   JWT_SECRET: z.string().min(16),
   CORS_ORIGIN: z.string().default("http://localhost:3000"),
+  OPENAI_API_KEY: z.preprocess(
+    (value) => (typeof value === "string" && value.trim().length === 0 ? undefined : value),
+    z.string().min(1).optional(),
+  ),
+  OPENAI_KURTI_MODEL: z.string().min(1).default("gpt-5.6-luna"),
+  OPENAI_KURTI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(200).max(4000).default(900),
+  OPENAI_KURTI_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(120_000).default(45_000),
   IPP_FINALIZER_ENABLED: z.preprocess((value) => {
     if (typeof value === "string") {
       const normalized = value.trim().toLowerCase();

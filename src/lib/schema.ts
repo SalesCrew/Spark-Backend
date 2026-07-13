@@ -171,6 +171,28 @@ export const gmTextSettings = pgTable(
   ],
 );
 
+export type GmKurtiMessageRole = "user" | "assistant";
+
+export const gmKurtiMessages = pgTable(
+  "gm_kurti_messages",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    role: text("role").$type<GmKurtiMessageRole>().notNull(),
+    content: text("content").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("gm_kurti_messages_role_ck", sql`${table.role} in ('user', 'assistant')`),
+    check("gm_kurti_messages_content_length_ck", sql`char_length(${table.content}) between 1 and 12000`),
+    index("gm_kurti_messages_gm_created_idx").on(table.gmUserId, table.createdAt),
+    index("gm_kurti_messages_expires_idx").on(table.expiresAt),
+  ],
+);
+
 export const specialArthurFilter = pgTable(
   "special_arthur_filter",
   {

@@ -23,6 +23,7 @@ import { employeeAgreementRouter } from "./routes/employee-agreement.js";
 import { adminFragebogenRouter } from "./routes/fragebogen.js";
 import { gmVisitSessionsRouter } from "./routes/gm-visit-sessions.js";
 import { gmProfileRouter } from "./routes/gm-profile.js";
+import { gmKurtiRouter } from "./routes/gm-kurti.js";
 import { adminIppRouter } from "./routes/ipp.js";
 import { kundenUsersRouter } from "./routes/kunden-users.js";
 import { adminMarketsRouter, marketsRouter } from "./routes/markets.js";
@@ -158,6 +159,7 @@ function createApp() {
   app.use("/day-session", daySessionRouter);
   app.use("/markets", marketsRouter);
   app.use("/markets", gmVisitSessionsRouter);
+  app.use("/gm/kurti", gmKurtiRouter);
   app.use("/gm", gmProfileRouter);
   app.use("/time-tracking", timeTrackingRouter);
   app.use("/telemetry", clientTelemetryRouter);

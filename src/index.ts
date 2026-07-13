@@ -2,6 +2,7 @@ import { env } from "./config/env.js";
 import { createApp } from "./app.js";
 import { startIppFinalizerScheduler } from "./lib/ipp-finalizer.js";
 import { logger, serializeError } from "./lib/logger.js";
+import { startKurtiMemoryCleanupScheduler } from "./lib/kurti-memory.js";
 import { startRedMonthCalendarScheduler } from "./lib/red-month-calendar.js";
 
 const app = createApp();
@@ -14,6 +15,7 @@ const server = app.listen(env.PORT, () => {
   });
   startRedMonthCalendarScheduler();
   startIppFinalizerScheduler();
+  startKurtiMemoryCleanupScheduler();
 });
 
 server.on("error", (error) => {

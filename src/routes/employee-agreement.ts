@@ -3,12 +3,14 @@ import { and, desc, eq } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../lib/db.js";
+import {
+  EMPLOYEE_AGREEMENT_EFFECTIVE_DATE,
+  EMPLOYEE_AGREEMENT_KEY,
+  EMPLOYEE_AGREEMENT_TITLE,
+  EMPLOYEE_AGREEMENT_VERSION,
+} from "../lib/employee-agreement-meta.js";
 import { employeeAgreementAcceptances } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
-
-const AGREEMENT_KEY = "spark_employee_agreement";
-const AGREEMENT_VERSION = "2026-06-30-v4";
-const AGREEMENT_TITLE = "Nutzungs- und Kontrollmaßnahmenvereinbarung für Coke Spark";
 
 const agreementSections = [
   {
@@ -24,6 +26,7 @@ const agreementSections = [
       "Verarbeitet werden insbesondere Name, Rolle, E-Mail-Adresse, Region, Markt- und Kampagnenzuordnungen, Besuchszeiten, Start- und Endzeiten des Arbeitstags, Pausen, Zusatzzeiten, Kilometerstände, Fragebogenantworten, Fotos, Tags, Kommentare, Korrekturanfragen, Statusdaten, IPP-/Qualitätskennzahlen, Bonus-/Prämienwerte sowie technische Sicherheits- und Fehlerprotokolle.",
       "Arbeitszeitaufzeichnungen umfassen insbesondere Beginn und Ende des Arbeitstags, Pausen, Tages- und Wochenarbeitszeit, Zusatzzeiten, Marktbesuche, Anfahrt/Fahrtzeit/Heimfahrt, Kilometerstände und nachträglich freigegebene Korrekturen.",
       "Fotos sollen nur markt- und kampagnenrelevante Inhalte zeigen. Personen, private Unterlagen oder unnötige personenbezogene Details sollen nicht fotografiert werden.",
+      "Wenn du Frag Kurti nutzt, werden deine Chatnachricht und ein begrenzter, für die Assistenz vorgesehener Ausschnitt aus deinen eigenen Spark-Daten an den eingesetzten KI-Dienstleister übermittelt. Dazu können insbesondere eigene Profilangaben, Arbeitszeit-/KM-Zusammenfassungen, Besuche, Kampagnen, offene Fragebögen und eigene Anfragestatus gehören. Daten anderer Mitarbeitender, Admin-Inhalte, Passwörter, Authentifizierungsdaten und technische Rohdaten sind nicht Bestandteil dieses Assistenten-Kontexts.",
     ],
   },
   {
@@ -31,6 +34,7 @@ const agreementSections = [
     body: [
       "Die Daten werden genutzt für Arbeitsausführung, Einsatzsteuerung, gesetzliche Arbeitszeitaufzeichnungen, Nachweisführung, Qualitätssicherung, Kundenreporting, Bonus-/Prämienberechnung, Fehlerkorrekturen, Support, Betrugs- und Missbrauchsvermeidung sowie Systemsicherheit.",
       "Spark wird nicht für verdeckte Überwachung eingesetzt. Es findet keine dauerhafte Live-Ortung statt, sofern eine solche Funktion nicht ausdrücklich gesondert vereinbart und dokumentiert wird.",
+      "Frag Kurti dient ausschließlich als Lese-, Navigations- und Supporthilfe. Kurti kann keine Einträge ändern, nichts absenden und keine Personal-, Bonus- oder sonstige Entscheidung treffen. Maßgeblich bleiben immer die in Coke Spark angezeigten Daten und die Prüfung durch berechtigte interne Stellen.",
     ],
   },
   {
@@ -39,6 +43,7 @@ const agreementSections = [
       "Berechtigte interne Admins, verantwortliche Manager und zuständige Abrechnungs-/HR-nahe Stellen können Daten sehen, soweit sie diese für ihre Aufgabe benötigen.",
       "Coca-Cola erhält nur die für das vereinbarte Reporting erforderlichen Markt-, Kampagnen-, Antwort-, Foto- und Statusdaten. Eine namentliche GM-Zuordnung kann sichtbar sein, soweit sie für Rückfragen, Kampagnenkontrolle oder Nachweisführung erforderlich ist.",
       "Coca-Cola erhält keinen Zugriff auf interne Arbeitszeit-, Kilometer-, Bonus-/Prämien-, HR-, Payroll- oder interne Sicherheits-/Auditdetails, sofern dies nicht ausdrücklich separat dokumentiert und freigegeben wird.",
+      "Für Frag Kurti wird OpenAI als technischer KI-Dienstleister eingesetzt. Übermittelt werden nur die Nachricht des aktuell angemeldeten Nutzers, dessen eigener begrenzter Spark-Kontext und die Systemanweisungen für Navigation, Support, Datenschutz und Datengrenzen. Andere GM-Daten werden nicht bereitgestellt.",
     ],
   },
   {
@@ -56,6 +61,7 @@ const agreementSections = [
       "Arbeitszeit-, Pausen-, Zusatzzeit-, Tagesstart/-ende- und Kilometerdaten werden 7 Jahre nach Ende des Kalenderjahres aufbewahrt, wenn sie für Abrechnung, Diäten, Payroll, Aufwandsersatz oder buchhalterische Nachweise verwendet werden. Zeitkorrekturanfragen werden für denselben Zeitraum aufbewahrt.",
       "Login-, Auth-, Audit- und Sicherheitslogs werden grundsätzlich 24 Monate gespeichert. Technische Telemetrie und Fehlerdetails werden grundsätzlich 90 Tage gespeichert; aggregierte technische Statistiken höchstens 12 Monate. Exportdateien sind Arbeitskopien und grundsätzlich innerhalb von 30 Tagen nach Zweckerfüllung zu löschen.",
       "Coke Spark nutzt rollenbasierte Berechtigungen, serverseitige Zugriffskontrollen, private Speicherbereiche, signierte Datei-URLs, Protokollierung und Backend-only Datenbankzugriffe.",
+      "Kurti-Chatnachrichten werden in Coke Spark 15 Minuten nach der letzten erfolgreichen Unterhaltung gespeichert und danach gelöscht. Die Responses-API wird mit deaktivierter Anwendungsspeicherung verwendet. Davon getrennt können beim KI-Dienstleister Inhalte nach dessen vertraglichen Datenkontrollen standardmäßig bis zu 30 Tage in Missbrauchs-/Sicherheitsprotokollen und verschlüsselte Prompt-Cache-Zwischendaten bis zu 24 Stunden verarbeitet werden, sofern für das verwendete API-Projekt keine strengeren Aufbewahrungskontrollen aktiviert sind. API-Inhalte werden nicht zum Modelltraining verwendet, außer der Verantwortliche würde einer solchen Nutzung ausdrücklich zustimmen.",
     ],
   },
   {
@@ -76,7 +82,7 @@ const agreementSections = [
 ] as const;
 
 const agreementHash = createHash("sha256")
-  .update(JSON.stringify({ key: AGREEMENT_KEY, version: AGREEMENT_VERSION, title: AGREEMENT_TITLE, sections: agreementSections }))
+  .update(JSON.stringify({ key: EMPLOYEE_AGREEMENT_KEY, version: EMPLOYEE_AGREEMENT_VERSION, title: EMPLOYEE_AGREEMENT_TITLE, sections: agreementSections }))
   .digest("hex");
 
 const acceptSchema = z.object({
@@ -85,11 +91,11 @@ const acceptSchema = z.object({
 
 function agreementPayload() {
   return {
-    key: AGREEMENT_KEY,
-    version: AGREEMENT_VERSION,
-    title: AGREEMENT_TITLE,
+    key: EMPLOYEE_AGREEMENT_KEY,
+    version: EMPLOYEE_AGREEMENT_VERSION,
+    title: EMPLOYEE_AGREEMENT_TITLE,
     hash: agreementHash,
-    effectiveDate: "2026-06-30",
+    effectiveDate: EMPLOYEE_AGREEMENT_EFFECTIVE_DATE,
     sections: agreementSections,
   };
 }
@@ -109,8 +115,8 @@ employeeAgreementRouter.get("/current", requireAuth(["gm", "sm"]), async (req: A
       .where(
         and(
           eq(employeeAgreementAcceptances.userId, req.authUser.appUserId),
-          eq(employeeAgreementAcceptances.agreementKey, AGREEMENT_KEY),
-          eq(employeeAgreementAcceptances.agreementVersion, AGREEMENT_VERSION),
+          eq(employeeAgreementAcceptances.agreementKey, EMPLOYEE_AGREEMENT_KEY),
+          eq(employeeAgreementAcceptances.agreementVersion, EMPLOYEE_AGREEMENT_VERSION),
         ),
       )
       .orderBy(desc(employeeAgreementAcceptances.acceptedAt))
@@ -145,7 +151,7 @@ employeeAgreementRouter.post("/accept", requireAuth(["gm", "sm"]), async (req: A
       return;
     }
 
-    if (parsed.data.version !== AGREEMENT_VERSION) {
+    if (parsed.data.version !== EMPLOYEE_AGREEMENT_VERSION) {
       res.status(409).json({
         error: "Diese Vereinbarung ist nicht mehr aktuell. Bitte aktuelle Version laden.",
         code: "agreement_version_mismatch",
@@ -160,8 +166,8 @@ employeeAgreementRouter.post("/accept", requireAuth(["gm", "sm"]), async (req: A
       .where(
         and(
           eq(employeeAgreementAcceptances.userId, req.authUser.appUserId),
-          eq(employeeAgreementAcceptances.agreementKey, AGREEMENT_KEY),
-          eq(employeeAgreementAcceptances.agreementVersion, AGREEMENT_VERSION),
+          eq(employeeAgreementAcceptances.agreementKey, EMPLOYEE_AGREEMENT_KEY),
+          eq(employeeAgreementAcceptances.agreementVersion, EMPLOYEE_AGREEMENT_VERSION),
         ),
       )
       .limit(1);
@@ -173,9 +179,9 @@ employeeAgreementRouter.post("/accept", requireAuth(["gm", "sm"]), async (req: A
             .insert(employeeAgreementAcceptances)
             .values({
               userId: req.authUser.appUserId,
-              agreementKey: AGREEMENT_KEY,
-              agreementVersion: AGREEMENT_VERSION,
-              agreementTitle: AGREEMENT_TITLE,
+              agreementKey: EMPLOYEE_AGREEMENT_KEY,
+              agreementVersion: EMPLOYEE_AGREEMENT_VERSION,
+              agreementTitle: EMPLOYEE_AGREEMENT_TITLE,
               agreementHash,
               acceptedIp: req.ip ?? req.socket.remoteAddress ?? null,
               acceptedUserAgent: req.get("user-agent")?.slice(0, 512) ?? null,
