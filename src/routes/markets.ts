@@ -331,6 +331,12 @@ const updateMarketSchema = z
   })
   .strict();
 
+const updateUniverseMarketSchema = z
+  .object({
+    universeMarket: z.boolean(),
+  })
+  .strict();
+
 const createMarketSchema = z
   .object({
     standardMarketNumber: z.string().optional(),
@@ -3547,6 +3553,43 @@ adminMarketsRouter.patch("/:marketId/kuehler-units/:unitId", async (req: AuthedR
       res.status(409).json({ error: "Kühler konnte nicht aktualisiert werden: internal_id bereits vorhanden." });
       return;
     }
+    next(err);
+  }
+});
+
+adminMarketsRouter.patch("/:id/universe-market", async (req: AuthedRequest, res, next) => {
+  try {
+    const id = String(req.params.id ?? "");
+    if (!z.string().uuid().safeParse(id).success) {
+      res.status(400).json({ error: "Ungültige Markt-ID." });
+      return;
+    }
+    const parsed = updateUniverseMarketSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültiger Universumsmarkt-Wert." });
+      return;
+    }
+
+    const [updated] = await db
+      .update(markets)
+      .set({
+        universeMarket: parsed.data.universeMarket,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(markets.id, id), eq(markets.isDeleted, false)))
+      .returning();
+
+    if (!updated) {
+      res.status(404).json({ error: "Markt nicht gefunden." });
+      return;
+    }
+    res.status(200).json({
+      market: {
+        id: updated.id,
+        universeMarket: updated.universeMarket,
+      },
+    });
+  } catch (err) {
     next(err);
   }
 });
