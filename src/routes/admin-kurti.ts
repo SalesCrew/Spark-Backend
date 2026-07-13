@@ -4,6 +4,11 @@ import { eq } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { env } from "../config/env.js";
+import {
+  appendAdminKurtiCharts,
+  parseAdminKurtiChartArguments,
+  type AdminKurtiChartSpec,
+} from "../lib/admin-kurti-charts.js";
 import { loadActiveAdminKurtiMessages, saveAdminKurtiExchange } from "../lib/admin-kurti-memory.js";
 import { ADMIN_KURTI_SYSTEM_PROMPT } from "../lib/admin-kurti-system-prompt.js";
 import { ADMIN_KURTI_TOOLS, executeAdminKurtiTool } from "../lib/admin-kurti-tools.js";
@@ -234,6 +239,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
         content: parsed.data.message,
       },
     ];
+    const renderedCharts: AdminKurtiChartSpec[] = [];
 
     let response = await openai.responses.create({
       model: env.OPENAI_KURTI_MODEL,
@@ -254,11 +260,42 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
 
       input.push(...response.output as Responses.ResponseInputItem[]);
       const toolOutputs = await Promise.all(
-        toolCalls.map(async (toolCall) => ({
-          type: "function_call_output" as const,
-          call_id: toolCall.call_id,
-          output: await executeAdminKurtiTool(toolCall.name, toolCall.arguments),
-        })),
+        toolCalls.map(async (toolCall) => {
+          let output: string;
+          if (toolCall.name === "render_admin_chart") {
+            try {
+              if (renderedCharts.length >= 3) {
+                output = JSON.stringify({
+                  tool: toolCall.name,
+                  error: "chart_limit_reached",
+                  message: "At most three charts can be rendered in one answer.",
+                });
+              } else {
+                const chart = parseAdminKurtiChartArguments(toolCall.arguments);
+                renderedCharts.push(chart);
+                output = JSON.stringify({
+                  tool: toolCall.name,
+                  accepted: true,
+                  chartIndex: renderedCharts.length - 1,
+                  title: chart.title,
+                });
+              }
+            } catch (error) {
+              output = JSON.stringify({
+                tool: toolCall.name,
+                error: "invalid_chart_spec",
+                message: error instanceof Error ? error.message : "The chart specification is invalid.",
+              });
+            }
+          } else {
+            output = await executeAdminKurtiTool(toolCall.name, toolCall.arguments);
+          }
+          return {
+            type: "function_call_output" as const,
+            call_id: toolCall.call_id,
+            output,
+          };
+        }),
       );
       input.push(...toolOutputs);
 
@@ -276,8 +313,8 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       });
     }
 
-    const assistantContent = response.output_text.trim();
-    if (!assistantContent) {
+    const assistantText = response.output_text.trim();
+    if (!assistantText && renderedCharts.length === 0) {
       logger.warn("admin_kurti_empty_response", {
         ...getRequestLogMeta(req),
         action: "admin_kurti_chat",
@@ -290,6 +327,10 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       });
       return;
     }
+    const assistantContent = appendAdminKurtiCharts(
+      assistantText || "Hier ist die gewünschte Auswertung.",
+      renderedCharts,
+    );
 
     const messages = await saveAdminKurtiExchange({
       adminUserId,

@@ -1,5 +1,6 @@
 import type { Responses } from "openai/resources/responses/responses";
 import { z } from "zod";
+import { adminKurtiChartSpecSchema } from "./admin-kurti-charts.js";
 import { buildGmAggregates } from "./admin-zeiterfassung.js";
 import { sql as pgSql } from "./db.js";
 import { readGmKpiCache } from "./gm-kpi-cache.js";
@@ -369,6 +370,60 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
     "Returns the active RED year, current RED month, configured period boundaries, cycle, labels, and visit counts by period. Use it before period-based comparisons.",
     { year: { type: ["integer", "null"], minimum: 2020, maximum: 2100 } },
     ["year"],
+  ),
+  functionTool(
+    "render_admin_chart",
+    "Renders one validated chart in the Admin Kurti chat after the relevant data tools have returned the values. Use a line chart for chronological development/trends and a bar chart for comparisons/rankings. Never invent, interpolate, or estimate chart values.",
+    {
+      type: { type: "string", enum: ["line", "bar"] },
+      title: { type: "string", minLength: 1, maxLength: 120 },
+      subtitle: { type: ["string", "null"], maxLength: 240 },
+      xLabel: { type: ["string", "null"], maxLength: 80 },
+      yLabel: { type: ["string", "null"], maxLength: 80 },
+      valueFormat: { type: "string", enum: ["number", "decimal", "percent", "currency"] },
+      series: {
+        type: "array",
+        minItems: 1,
+        maxItems: 4,
+        items: {
+          type: "object",
+          properties: {
+            key: { type: "string", minLength: 1, maxLength: 40, pattern: "^[A-Za-z0-9_-]+$" },
+            label: { type: "string", minLength: 1, maxLength: 80 },
+          },
+          required: ["key", "label"],
+          additionalProperties: false,
+        },
+      },
+      points: {
+        type: "array",
+        minItems: 2,
+        maxItems: 40,
+        items: {
+          type: "object",
+          properties: {
+            label: { type: "string", minLength: 1, maxLength: 80 },
+            values: {
+              type: "array",
+              minItems: 1,
+              maxItems: 4,
+              items: {
+                type: "object",
+                properties: {
+                  seriesKey: { type: "string", minLength: 1, maxLength: 40, pattern: "^[A-Za-z0-9_-]+$" },
+                  value: { type: ["number", "null"] },
+                },
+                required: ["seriesKey", "value"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ["label", "values"],
+          additionalProperties: false,
+        },
+      },
+    },
+    ["type", "title", "subtitle", "xLabel", "yLabel", "valueFormat", "series", "points"],
   ),
 ];
 
@@ -2645,6 +2700,17 @@ async function getRedMonthContext(args: unknown): Promise<JsonRecord> {
   return envelope("get_red_month_context", { current: { id: current.redPeriodId, label: current.label, redYear: current.redYear, ...currentRange }, years, periods });
 }
 
+async function renderAdminChart(args: unknown): Promise<JsonRecord> {
+  const chart = adminKurtiChartSpecSchema.parse(args);
+  return envelope("render_admin_chart", {
+    accepted: true,
+    type: chart.type,
+    title: chart.title,
+    seriesCount: chart.series.length,
+    pointCount: chart.points.length,
+  });
+}
+
 const TOOL_HANDLERS: Record<string, (args: unknown) => Promise<JsonRecord>> = {
   get_admin_overview: getAdminOverview,
   get_user_access_context: getUserAccessContext,
@@ -2673,6 +2739,7 @@ const TOOL_HANDLERS: Record<string, (args: unknown) => Promise<JsonRecord>> = {
   get_pending_requests: getPendingRequests,
   get_audit_history_context: getAuditHistoryContext,
   get_red_month_context: getRedMonthContext,
+  render_admin_chart: renderAdminChart,
 };
 
 export async function executeAdminKurtiTool(name: string, rawArguments: string): Promise<string> {
