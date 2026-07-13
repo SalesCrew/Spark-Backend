@@ -246,6 +246,41 @@ async function validateGmTimelineInterval(input: {
   return { session: context.session };
 }
 
+async function validateGmTimelineIntervalStrict(input: {
+  gmUserId: string;
+  kind: TimelineIntervalKind;
+  id: string;
+  startAt: Date;
+  endAt: Date;
+  now?: Date;
+}): Promise<{ session: DaySessionForValidation }> {
+  const context = await getValidatedDayContext({
+    gmUserId: input.gmUserId,
+    startAt: input.startAt,
+    endAt: input.endAt,
+    ...(input.now ? { now: input.now } : {}),
+  });
+  if (input.endAt.getTime() <= input.startAt.getTime()) {
+    throw new TimelineValidationError(400, "invalid_interval", "Die Endzeit muss nach der Startzeit liegen.");
+  }
+  const intervals = await loadValidationIntervalsForSession({
+    gmUserId: input.gmUserId,
+    daySessionId: context.session.id,
+    dayStartAt: context.dayStartAt,
+    dayEndAt: context.dayEndAt,
+    now: context.now,
+  });
+  const overlaps = intervals.some((interval) => {
+    if (interval.kind === input.kind && interval.id === input.id) return false;
+    return input.startAt.getTime() < interval.endAt.getTime()
+      && input.endAt.getTime() > interval.startAt.getTime();
+  });
+  if (overlaps) {
+    throw new TimelineValidationError(409, "overlap", TIMELINE_OVERLAP_ERROR_MESSAGE);
+  }
+  return { session: context.session };
+}
+
 async function validateGmTimelineStartPoint(input: {
   gmUserId: string;
   kind: TimelineIntervalKind;
@@ -284,5 +319,6 @@ export {
   TimelineValidationError,
   respondTimelineValidationError,
   validateGmTimelineInterval,
+  validateGmTimelineIntervalStrict,
   validateGmTimelineStartPoint,
 };

@@ -2056,6 +2056,7 @@ export const timeEntryChangeRequests = pgTable(
     timezone: text("timezone").notNull().default("Europe/Vienna"),
     titleSnapshot: text("title_snapshot").notNull().default(""),
     subtitleSnapshot: text("subtitle_snapshot"),
+    requestedActivityType: timeTrackingActivityTypeEnum("requested_activity_type"),
     originalStartAt: timestamp("original_start_at", { withTimezone: true }).notNull(),
     originalEndAt: timestamp("original_end_at", { withTimezone: true }).notNull(),
     requestedStartAt: timestamp("requested_start_at", { withTimezone: true }).notNull(),

@@ -1,15 +1,17 @@
+import { randomUUID } from "node:crypto";
 import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { formatExtraLabel } from "../lib/admin-zeiterfassung.js";
 import { db } from "../lib/db.js";
-import { validateGmTimelineInterval } from "../lib/zeiterfassung-validation.js";
+import { validateGmTimelineInterval, validateGmTimelineIntervalStrict } from "../lib/zeiterfassung-validation.js";
 import {
   gmDaySessionPauses,
   gmDaySessions,
   markets,
   timeEntryChangeRequests,
   timeTrackingEntries,
+  timeTrackingEntryEvents,
   users,
   visitSessions,
 } from "../lib/schema.js";
@@ -42,6 +44,29 @@ const gmCreateTimeChangeRequestSchema = z
       context.addIssue({ code: z.ZodIssueCode.custom, message: "Start- und Endzeit sind erforderlich." });
     }
   });
+
+const additionalActivityTypeSchema = z.enum([
+  "sonderaufgabe",
+  "arztbesuch",
+  "werkstatt",
+  "homeoffice",
+  "schulung",
+  "lager",
+  "hoteluebernachtung",
+]);
+
+type AdditionalActivityType = z.infer<typeof additionalActivityTypeSchema>;
+
+const gmCreateAdditionalTimeRequestSchema = z
+  .object({
+    sessionId: z.string().uuid(),
+    activityType: additionalActivityTypeSchema,
+    requestedStartTime: z.string().regex(hhmmRegex),
+    requestedEndTime: z.string().regex(hhmmRegex),
+    comment: z.string().trim().max(2_000).optional(),
+    requestNote: z.string().trim().max(2_000).optional(),
+  })
+  .strict();
 
 const gmListTimeChangeRequestsSchema = z
   .object({
@@ -165,6 +190,7 @@ function mapRequestRow(row: {
   timezone: string;
   titleSnapshot: string;
   subtitleSnapshot: string | null;
+  requestedActivityType: AdditionalActivityType | "heimfahrt" | null;
   originalStartAt: Date;
   originalEndAt: Date;
   requestedStartAt: Date;
@@ -196,6 +222,7 @@ function mapRequestRow(row: {
     timezone: row.timezone,
     title: row.titleSnapshot,
     subtitle: row.subtitleSnapshot,
+    requestedActivityType: row.requestedActivityType,
     originalStartAt: row.originalStartAt.toISOString(),
     originalEndAt: row.originalEndAt.toISOString(),
     requestedStartAt: row.requestedStartAt.toISOString(),
@@ -768,6 +795,96 @@ gmTimeEntryChangeRequestsRouter.get("/", async (req: AuthedRequest, res, next) =
   }
 });
 
+gmTimeEntryChangeRequestsRouter.post("/zusatzzeit", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+    const parsed = gmCreateAdditionalTimeRequestSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Zusatzzeit-Anfrage ist ungültig.", code: "invalid_additional_time_request" });
+      return;
+    }
+    const session = await loadDaySession(parsed.data.sessionId, gmUserId);
+    if (!session) {
+      res.status(404).json({ error: "Arbeitstag nicht gefunden.", code: "day_session_not_found" });
+      return;
+    }
+    assertStartedDay(session);
+    const timezone = session.timezone || "Europe/Vienna";
+    const requestedStartAt = parseWorkDateHmToUtc(session.workDate, parsed.data.requestedStartTime, timezone);
+    const requestedEndAt = parseWorkDateHmToUtc(session.workDate, parsed.data.requestedEndTime, timezone);
+    if (!requestedStartAt || !requestedEndAt) {
+      res.status(400).json({ error: "Ungültige Uhrzeit.", code: "invalid_time" });
+      return;
+    }
+    const sourceId = randomUUID();
+    const validation = await validateGmTimelineIntervalStrict({
+      gmUserId,
+      kind: "zusatzzeit",
+      id: sourceId,
+      startAt: requestedStartAt,
+      endAt: requestedEndAt,
+    });
+    if (validation.session.id !== session.id) {
+      res.status(409).json({ error: "Die Zeit gehört nicht zu diesem Arbeitstag.", code: "wrong_day_session" });
+      return;
+    }
+    const [overlappingRequest] = await db
+      .select({ id: timeEntryChangeRequests.id })
+      .from(timeEntryChangeRequests)
+      .where(
+        and(
+          eq(timeEntryChangeRequests.gmUserId, gmUserId),
+          eq(timeEntryChangeRequests.daySessionId, session.id),
+          eq(timeEntryChangeRequests.status, "pending"),
+          eq(timeEntryChangeRequests.isDeleted, false),
+          sql`${timeEntryChangeRequests.requestedActivityType} is not null`,
+          sql`${timeEntryChangeRequests.requestedStartAt} < ${requestedEndAt.toISOString()}::timestamptz`,
+          sql`${timeEntryChangeRequests.requestedEndAt} > ${requestedStartAt.toISOString()}::timestamptz`,
+        ),
+      )
+      .limit(1);
+    if (overlappingRequest) {
+      res.status(409).json({ error: "Für diesen Zeitraum ist bereits eine Zusatzzeit angefragt.", code: "pending_request_overlap" });
+      return;
+    }
+    const now = new Date();
+    const [saved] = await db
+      .insert(timeEntryChangeRequests)
+      .values({
+        daySessionId: session.id,
+        gmUserId,
+        sourceKind: "zusatzzeit",
+        sourceId,
+        workDate: session.workDate,
+        timezone,
+        titleSnapshot: formatExtraLabel(parsed.data.activityType),
+        subtitleSnapshot: parsed.data.comment?.trim() || null,
+        requestedActivityType: parsed.data.activityType,
+        originalStartAt: requestedStartAt,
+        originalEndAt: requestedEndAt,
+        requestedStartAt,
+        requestedEndAt,
+        requestNote: parsed.data.requestNote?.trim() || null,
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning();
+    res.status(201).json({ ok: true, request: saved ? mapRequestRow(saved) : null });
+  } catch (error) {
+    const err = error as Error & { status?: number; code?: string };
+    if (err.status) {
+      res.status(err.status).json({ error: err.message, code: err.code });
+      return;
+    }
+    next(error);
+  }
+});
+
 gmTimeEntryChangeRequestsRouter.post("/", async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;
@@ -936,6 +1053,7 @@ adminTimeEntryChangeRequestsRouter.get("/", async (_req: AuthedRequest, res, nex
         timezone: timeEntryChangeRequests.timezone,
         titleSnapshot: timeEntryChangeRequests.titleSnapshot,
         subtitleSnapshot: timeEntryChangeRequests.subtitleSnapshot,
+        requestedActivityType: timeEntryChangeRequests.requestedActivityType,
         originalStartAt: timeEntryChangeRequests.originalStartAt,
         originalEndAt: timeEntryChangeRequests.originalEndAt,
         requestedStartAt: timeEntryChangeRequests.requestedStartAt,
@@ -1043,16 +1161,59 @@ adminTimeEntryChangeRequestsRouter.patch("/:requestId/approve", async (req: Auth
       }
       assertStartedDay(session);
 
-      const applied = await applyApprovedTimeChange({
-        kind: requestRow.sourceKind,
-        sourceId: requestRow.sourceId,
-        session,
-        requestedStartAt: requestRow.requestedStartAt,
-        requestedEndAt: requestRow.requestedEndAt,
-        requestedStartKm: requestRow.requestedStartKm,
-        requestedEndKm: requestRow.requestedEndKm,
-        now,
-      });
+      let applied = false;
+      if (requestRow.requestedActivityType) {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${`time-entry-additional:${requestRow.gmUserId}:${requestRow.workDate}`}))`,
+        );
+        const validation = await validateGmTimelineIntervalStrict({
+          gmUserId: requestRow.gmUserId,
+          kind: "zusatzzeit",
+          id: requestRow.sourceId,
+          startAt: requestRow.requestedStartAt,
+          endAt: requestRow.requestedEndAt,
+          now,
+        });
+        if (validation.session.id !== session.id) {
+          throw buildHttpError("Die Zeit gehört nicht zu diesem Arbeitstag.", 409, "wrong_day_session");
+        }
+        const [created] = await tx
+          .insert(timeTrackingEntries)
+          .values({
+            id: requestRow.sourceId,
+            gmUserId: requestRow.gmUserId,
+            activityType: requestRow.requestedActivityType,
+            startAt: requestRow.requestedStartAt,
+            endAt: requestRow.requestedEndAt,
+            comment: requestRow.subtitleSnapshot,
+            status: "submitted",
+            submittedAt: now,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning({ id: timeTrackingEntries.id });
+        if (created) {
+          await tx.insert(timeTrackingEntryEvents).values({
+            entryId: created.id,
+            gmUserId: requestRow.gmUserId,
+            eventType: "submitted",
+            payload: { source: "approved_time_change_request", requestId: requestRow.id },
+            createdAt: now,
+          });
+          applied = true;
+        }
+      } else {
+        applied = await applyApprovedTimeChange({
+          kind: requestRow.sourceKind,
+          sourceId: requestRow.sourceId,
+          session,
+          requestedStartAt: requestRow.requestedStartAt,
+          requestedEndAt: requestRow.requestedEndAt,
+          requestedStartKm: requestRow.requestedStartKm,
+          requestedEndKm: requestRow.requestedEndKm,
+          now,
+        });
+      }
       if (!applied) {
         const error = new Error("Zeiteintrag konnte nicht aktualisiert werden.") as Error & { status?: number; code?: string };
         error.status = 404;
