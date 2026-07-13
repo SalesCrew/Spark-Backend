@@ -193,6 +193,28 @@ export const gmKurtiMessages = pgTable(
   ],
 );
 
+export type AdminKurtiMessageRole = "user" | "assistant";
+
+export const adminKurtiMessages = pgTable(
+  "admin_kurti_messages",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    adminUserId: uuid("admin_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    role: text("role").$type<AdminKurtiMessageRole>().notNull(),
+    content: text("content").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("admin_kurti_messages_role_ck", sql`${table.role} in ('user', 'assistant')`),
+    check("admin_kurti_messages_content_length_ck", sql`char_length(${table.content}) between 1 and 60000`),
+    index("admin_kurti_messages_admin_created_idx").on(table.adminUserId, table.createdAt),
+    index("admin_kurti_messages_expires_idx").on(table.expiresAt),
+  ],
+);
+
 export const specialArthurFilter = pgTable(
   "special_arthur_filter",
   {

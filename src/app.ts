@@ -24,6 +24,7 @@ import { adminFragebogenRouter } from "./routes/fragebogen.js";
 import { gmVisitSessionsRouter } from "./routes/gm-visit-sessions.js";
 import { gmProfileRouter } from "./routes/gm-profile.js";
 import { gmKurtiRouter } from "./routes/gm-kurti.js";
+import { adminKurtiRouter } from "./routes/admin-kurti.js";
 import { adminIppRouter } from "./routes/ipp.js";
 import { kundenUsersRouter } from "./routes/kunden-users.js";
 import { adminMarketsRouter, marketsRouter } from "./routes/markets.js";
@@ -165,6 +166,7 @@ function createApp() {
   app.use("/telemetry", clientTelemetryRouter);
   app.use("/red-month", redMonthRouter);
   app.use("/admin/kunden-users", kundenUsersRouter);
+  app.use("/admin/kurti", adminKurtiRouter);
   app.use("/admin/users", adminUsersRouter);
   app.use("/admin/dsar", adminDsarRouter);
   app.use("/admin/markets", adminMarketsRouter);
