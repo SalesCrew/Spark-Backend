@@ -1,6 +1,10 @@
 import type { Responses } from "openai/resources/responses/responses";
 import { z } from "zod";
 import { ADMIN_KURTI_TOOLS } from "./admin-kurti-tools.js";
+import {
+  getAdminKurtiVisualizationToolNamesForSkills,
+  selectAdminKurtiVisualizationSkillIds,
+} from "./admin-kurti-visualization-skill-loader.js";
 
 export const ADMIN_KURTI_TOOL_GROUP_NAMES = [
   "overview",
@@ -30,6 +34,7 @@ export const ADMIN_KURTI_TOOL_GROUPS: Record<AdminKurtiToolGroup, readonly strin
   photos: ["search_photo_archive", "get_photo_analytics"],
   reviews_audit: ["get_pending_requests", "get_audit_history_context"],
   visualizations: [
+    "load_admin_visualization_skill",
     "render_series_visualization",
     "render_composition_visualization",
     "render_scatter_visualization",
@@ -38,6 +43,9 @@ export const ADMIN_KURTI_TOOL_GROUPS: Record<AdminKurtiToolGroup, readonly strin
     "render_table_visualization",
     "render_timeline_visualization",
     "render_radar_visualization",
+    "render_distribution_visualization",
+    "render_waterfall_visualization",
+    "render_treemap_visualization",
   ],
 };
 
@@ -59,12 +67,6 @@ const GROUP_KEYWORDS: Array<{ group: AdminKurtiToolGroup; pattern: RegExp }> = [
   { group: "reviews_audit", pattern: /\b(anfrage|anfragen|änderungsantrag|aenderungsantrag|löschantrag|loeschantrag|audit|historie|verlauf|datenschutz|dsgvo|dsar|freigabe)\b/i },
 ];
 
-const VISUALIZATION_PATTERN = /(chart|diagramm|grafik|visualis|dashboard|entwicklung|trend|verlauf|vergleich|ranking|anteil|verteilung|heatmap|tabelle|kpi|donut|pie|funnel|scatter|bubble|radar|timeline|torte|kreis|balken|s[äa]ule)/i;
-const COMPOSITION_PATTERN = /(anteil|verteilung|zusammensetzung|donut|pie|torte|kreis|funnel|trichter)/i;
-const RELATION_PATTERN = /\b(korrelation|zusammenhang|scatter|bubble|radar|dimension)\b/i;
-const HEATMAP_PATTERN = /\b(heatmap|matrix|intensität|intensitaet|vollständigkeit|vollstaendigkeit)\b/i;
-const TIMELINE_PATTERN = /\b(timeline|zeitstrahl|ereignis|historie|änderungsverlauf|aenderungsverlauf)\b/i;
-
 function toolsForNames(names: Iterable<string>): Responses.FunctionTool[] {
   const unique = new Set(names);
   return [...unique].flatMap((name) => {
@@ -77,7 +79,7 @@ export function getAdminKurtiToolsForGroups(groups: Iterable<AdminKurtiToolGroup
   // Keep the legacy chart renderer available for every turn. Follow-up messages
   // such as "yes, do that" do not repeat chart keywords, but still belong to the
   // same visualization request and must be able to complete it.
-  const names = new Set<string>(["load_admin_tool_group", "render_admin_chart"]);
+  const names = new Set<string>(["load_admin_tool_group", "load_admin_visualization_skill", "render_admin_chart"]);
   for (const group of groups) {
     for (const name of ADMIN_KURTI_TOOL_GROUPS[group]) names.add(name);
   }
@@ -93,22 +95,13 @@ export function selectAdminKurtiTools(message: string): Responses.FunctionTool[]
   if (groups.size <= 2) groups.add("overview");
 
   const tools = getAdminKurtiToolsForGroups(groups);
-  if (VISUALIZATION_PATTERN.test(message)) {
-    const preferredNames = new Set(["render_series_visualization", "render_metrics_visualization", "render_table_visualization"]);
-    if (COMPOSITION_PATTERN.test(message)) preferredNames.add("render_composition_visualization");
-    if (RELATION_PATTERN.test(message)) {
-      preferredNames.add("render_scatter_visualization");
-      preferredNames.add("render_radar_visualization");
-    }
-    if (HEATMAP_PATTERN.test(message)) preferredNames.add("render_heatmap_visualization");
-    if (TIMELINE_PATTERN.test(message)) preferredNames.add("render_timeline_visualization");
-    if (/\b(whatever|beliebig|alle|verschieden|dashboard)\b/i.test(message)) {
-      for (const name of ADMIN_KURTI_TOOL_GROUPS.visualizations) preferredNames.add(name);
-    }
-    for (const name of preferredNames) {
-      const tool = TOOL_BY_NAME.get(name);
-      if (tool) tools.push(tool);
-    }
+  const skillIds = selectAdminKurtiVisualizationSkillIds(message);
+  const requestedRenderTools = /(alle|all).*?(chart|diagramm|visualisierung)|(verschieden|different).*?(chart|diagramm|visualisierung)/i.test(message)
+    ? ADMIN_KURTI_TOOL_GROUPS.visualizations
+    : getAdminKurtiVisualizationToolNamesForSkills(skillIds);
+  for (const name of requestedRenderTools) {
+    const tool = TOOL_BY_NAME.get(name);
+    if (tool) tools.push(tool);
   }
   return [...new Map(tools.map((tool) => [tool.name, tool])).values()];
 }
@@ -119,6 +112,7 @@ export function addAdminKurtiToolGroups(
 ): Responses.FunctionTool[] {
   const names = new Set(currentTools.map((tool) => tool.name));
   names.add("load_admin_tool_group");
+  names.add("load_admin_visualization_skill");
   for (const group of groups) {
     for (const name of ADMIN_KURTI_TOOL_GROUPS[group]) names.add(name);
   }

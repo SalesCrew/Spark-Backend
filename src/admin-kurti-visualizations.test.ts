@@ -21,14 +21,20 @@ test("validates and persists every Admin Kurti visualization kind", () => {
     ["render_table_visualization", { ...common, columns: [{ key: "a", label: "A", align: "left" }], rows: [{ label: "R", values: ["1"], status: "neutral" }] }],
     ["render_timeline_visualization", { ...common, items: [{ date: "Heute", label: "A", description: null, value: null, status: "active" }] }],
     ["render_radar_visualization", { ...common, valueFormat: "number", maximum: null, axes: ["A", "B", "C"], series: [{ label: "S", tone: "red", values: [1, 2, 3] }] }],
+    ["render_distribution_visualization", { ...common, variant: "histogram", xLabel: "IPP", valueFormat: "decimal", binCount: null, showOutliers: true, series: [{ label: "Team", tone: "red", values: [1.8, 2.1, 2.4, 2.7] }] }],
+    ["render_waterfall_visualization", { ...common, valueFormat: "number", startLabel: "Start", startValue: 100, steps: [{ label: "Plus", value: 20 }, { label: "Minus", value: -5 }], endLabel: "Ende", showConnectors: true }],
+    ["render_treemap_visualization", { ...common, valueFormat: "number", items: [{ label: "A", value: 7, tone: "red" }, { label: "B", value: 3, tone: "slate" }] }],
   ];
   const visualizations = calls.map(([name, payload]) => parseAdminKurtiVisualizationToolCall(name, JSON.stringify(payload)));
-  assert.deepEqual(visualizations.map((visualization) => visualization.kind), ["series", "composition", "scatter", "heatmap", "metrics", "table", "timeline", "radar"]);
+  assert.deepEqual(visualizations.map((visualization) => visualization.kind), ["series", "composition", "scatter", "heatmap", "metrics", "table", "timeline", "radar", "distribution", "waterfall", "treemap"]);
 
-  const stored = appendAdminKurtiVisualizations("Antwort", visualizations);
-  const parsed = parseAdminKurtiStoredVisualizations(stored);
-  assert.equal(parsed.content, "Antwort");
-  assert.deepEqual(parsed.visualizations, visualizations);
+  for (let index = 0; index < visualizations.length; index += 8) {
+    const batch = visualizations.slice(index, index + 8);
+    const stored = appendAdminKurtiVisualizations("Antwort", batch);
+    const parsed = parseAdminKurtiStoredVisualizations(stored);
+    assert.equal(parsed.content, "Antwort");
+    assert.deepEqual(parsed.visualizations, batch);
+  }
 });
 
 test("rejects positional arrays that do not match their declared dimensions", () => {

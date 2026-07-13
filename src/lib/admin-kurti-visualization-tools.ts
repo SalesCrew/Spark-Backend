@@ -1,6 +1,7 @@
 import type { Responses } from "openai/resources/responses/responses";
 import {
   adminKurtiCompositionVisualizationSchema,
+  adminKurtiDistributionVisualizationSchema,
   adminKurtiHeatmapVisualizationSchema,
   adminKurtiMetricsVisualizationSchema,
   adminKurtiRadarVisualizationSchema,
@@ -8,6 +9,8 @@ import {
   adminKurtiSeriesVisualizationSchema,
   adminKurtiTableVisualizationSchema,
   adminKurtiTimelineVisualizationSchema,
+  adminKurtiTreemapVisualizationSchema,
+  adminKurtiWaterfallVisualizationSchema,
   type AdminKurtiVisualization,
 } from "./admin-kurti-visualizations.js";
 
@@ -278,6 +281,76 @@ export const ADMIN_KURTI_VISUALIZATION_TOOLS: Responses.FunctionTool[] = [
     },
     [...COMMON_REQUIRED, "valueFormat", "maximum", "axes", "series"],
   ),
+  visualizationTool(
+    "render_distribution_visualization",
+    "Renders a histogram or box plot from raw numeric observations. Use histogram for frequency shape and box_plot for median/quartile/spread comparisons. Pass raw values without manually calculating bins or quartiles. Histograms support at most three series; total observations across series must not exceed 600.",
+    {
+      ...COMMON_PROPERTIES,
+      variant: { type: "string", enum: ["histogram", "box_plot"] },
+      xLabel: { type: "string", minLength: 1, maxLength: 80 },
+      valueFormat: { type: "string", enum: VALUE_FORMATS },
+      binCount: { type: ["integer", "null"], minimum: 4, maximum: 20 },
+      showOutliers: { type: "boolean" },
+      series: {
+        type: "array", minItems: 1, maxItems: 12,
+        items: {
+          type: "object",
+          properties: {
+            label: { type: "string", minLength: 1, maxLength: 80 },
+            tone: { type: "string", enum: TONES },
+            values: { type: "array", minItems: 1, maxItems: 120, items: { type: "number" } },
+          },
+          required: ["label", "tone", "values"], additionalProperties: false,
+        },
+      },
+    },
+    [...COMMON_REQUIRED, "variant", "xLabel", "valueFormat", "binCount", "showOutliers", "series"],
+  ),
+  visualizationTool(
+    "render_waterfall_visualization",
+    "Renders an additive waterfall bridge from one starting value through signed contribution steps to a computed ending value. Use only when start plus every signed step exactly explains the end; do not use for overlapping or independent categories.",
+    {
+      ...COMMON_PROPERTIES,
+      valueFormat: { type: "string", enum: VALUE_FORMATS },
+      startLabel: { type: "string", minLength: 1, maxLength: 80 },
+      startValue: { type: "number" },
+      steps: {
+        type: "array", minItems: 1, maxItems: 20,
+        items: {
+          type: "object",
+          properties: {
+            label: { type: "string", minLength: 1, maxLength: 80 },
+            value: { type: "number" },
+          },
+          required: ["label", "value"], additionalProperties: false,
+        },
+      },
+      endLabel: { type: "string", minLength: 1, maxLength: 80 },
+      showConnectors: { type: "boolean" },
+    },
+    [...COMMON_REQUIRED, "valueFormat", "startLabel", "startValue", "steps", "endLabel", "showConnectors"],
+  ),
+  visualizationTool(
+    "render_treemap_visualization",
+    "Renders a treemap for 2-40 non-negative parts of one whole when a donut would be too crowded. Use a single denominator and unit, preserve uncategorized values honestly, and prefer horizontal bars when exact ranking is more important than contribution area.",
+    {
+      ...COMMON_PROPERTIES,
+      valueFormat: { type: "string", enum: VALUE_FORMATS },
+      items: {
+        type: "array", minItems: 2, maxItems: 40,
+        items: {
+          type: "object",
+          properties: {
+            label: { type: "string", minLength: 1, maxLength: 80 },
+            value: { type: "number", minimum: 0 },
+            tone: { type: "string", enum: TONES },
+          },
+          required: ["label", "value", "tone"], additionalProperties: false,
+        },
+      },
+    },
+    [...COMMON_REQUIRED, "valueFormat", "items"],
+  ),
 ];
 
 export const ADMIN_KURTI_VISUALIZATION_TOOL_NAMES = new Set(
@@ -303,6 +376,12 @@ export function parseAdminKurtiVisualizationToolCall(name: string, rawArguments:
       return adminKurtiTimelineVisualizationSchema.parse({ ...parsed, kind: "timeline" });
     case "render_radar_visualization":
       return adminKurtiRadarVisualizationSchema.parse({ ...parsed, kind: "radar" });
+    case "render_distribution_visualization":
+      return adminKurtiDistributionVisualizationSchema.parse({ ...parsed, kind: "distribution" });
+    case "render_waterfall_visualization":
+      return adminKurtiWaterfallVisualizationSchema.parse({ ...parsed, kind: "waterfall" });
+    case "render_treemap_visualization":
+      return adminKurtiTreemapVisualizationSchema.parse({ ...parsed, kind: "treemap" });
     default:
       throw new Error(`Unknown Admin Kurti visualization tool: ${name}`);
   }

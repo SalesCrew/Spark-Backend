@@ -17,6 +17,10 @@ import {
   ADMIN_KURTI_VISUALIZATION_TOOL_NAMES,
   parseAdminKurtiVisualizationToolCall,
 } from "../lib/admin-kurti-visualization-tools.js";
+import {
+  buildAdminKurtiVisualizationSkillContext,
+  selectAdminKurtiVisualizationSkillIds,
+} from "../lib/admin-kurti-visualization-skill-loader.js";
 import { loadActiveAdminKurtiMessages, saveAdminKurtiExchange } from "../lib/admin-kurti-memory.js";
 import { buildAdminKurtiModelHistory } from "../lib/admin-kurti-model-context.js";
 import { ADMIN_KURTI_SYSTEM_PROMPT } from "../lib/admin-kurti-system-prompt.js";
@@ -264,6 +268,12 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     ]);
 
     const admin = adminRows[0];
+    const routingText = [
+      ...history.slice(-8).filter((message) => message.role === "user").map((message) => message.content.slice(0, 2_000)),
+      parsed.data.message,
+    ].join("\n");
+    const visualizationSkillIds = selectAdminKurtiVisualizationSkillIds(routingText);
+    const visualizationSkillContext = buildAdminKurtiVisualizationSkillContext(visualizationSkillIds);
     const input: Responses.ResponseInput = [
       {
         role: "developer",
@@ -274,6 +284,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
           `Angemeldete Rolle: ${admin?.role ?? "admin"}`,
           `Admin: ${[admin?.firstName, admin?.lastName].filter(Boolean).join(" ") || "Admin"}`,
           "Der Assistent ist strikt read-only. Aktuelle Geschäftsdaten müssen über die bereitgestellten Werkzeuge gelesen werden.",
+          ...(visualizationSkillContext ? ["", visualizationSkillContext] : []),
         ].join("\n"),
       },
       ...buildAdminKurtiModelHistory(history),
@@ -284,10 +295,6 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     ];
     const renderedCharts: AdminKurtiChartSpec[] = [];
     const renderedVisualizations: AdminKurtiVisualization[] = [];
-    const routingText = [
-      ...history.slice(-8).filter((message) => message.role === "user").map((message) => message.content.slice(0, 2_000)),
-      parsed.data.message,
-    ].join("\n");
     let activeTools = selectAdminKurtiTools(routingText);
 
     let response = await createAdminKurtiResponse(openai, {

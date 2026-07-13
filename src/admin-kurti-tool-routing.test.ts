@@ -17,6 +17,7 @@ test("routes multi-GM work-time charts to precise analytics and specialized rend
   assert.ok(toolNames.includes("render_series_visualization"));
   assert.ok(toolNames.includes("render_metrics_visualization"));
   assert.ok(toolNames.includes("render_table_visualization"));
+  assert.ok(toolNames.includes("load_admin_visualization_skill"));
 });
 
 test("loads every specialized renderer for a broad visualization dashboard request", () => {
@@ -30,5 +31,16 @@ test("loads every specialized renderer for a broad visualization dashboard reque
     "render_table_visualization",
     "render_timeline_visualization",
     "render_radar_visualization",
+    "render_distribution_visualization",
+    "render_waterfall_visualization",
+    "render_treemap_visualization",
   ]) assert.ok(toolNames.has(name), name);
+});
+
+test("routes numeric distribution requests to the raw-observation renderer", () => {
+  const toolNames = selectAdminKurtiTools("Zeig die IPP-Verteilung als Histogramm und Boxplot")
+    .map((tool) => tool.name);
+  assert.ok(toolNames.includes("get_ipp_context"));
+  assert.ok(toolNames.includes("render_distribution_visualization"));
+  assert.ok(!toolNames.includes("render_composition_visualization"));
 });

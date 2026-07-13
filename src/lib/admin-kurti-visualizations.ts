@@ -230,6 +230,66 @@ export const adminKurtiRadarVisualizationSchema = z.object({
   });
 });
 
+const distributionSeriesSchema = z.object({
+  label: z.string().trim().min(1).max(80),
+  tone: toneSchema,
+  values: z.array(z.number().finite()).min(1).max(120),
+}).strict();
+
+export const adminKurtiDistributionVisualizationSchema = z.object({
+  kind: z.literal("distribution"),
+  ...commonFields,
+  variant: z.enum(["histogram", "box_plot"]),
+  xLabel: z.string().trim().min(1).max(80),
+  valueFormat: valueFormatSchema,
+  binCount: z.number().int().min(4).max(20).nullable(),
+  showOutliers: z.boolean(),
+  series: z.array(distributionSeriesSchema).min(1).max(12),
+}).strict().superRefine((visualization, context) => {
+  if (visualization.variant === "histogram" && visualization.series.length > 3) {
+    context.addIssue({
+      code: "custom",
+      path: ["series"],
+      message: "Histograms support at most three comparable series.",
+    });
+  }
+  const observationCount = visualization.series.reduce((sum, series) => sum + series.values.length, 0);
+  if (observationCount > 600) {
+    context.addIssue({
+      code: "custom",
+      path: ["series"],
+      message: "Distribution visualizations support at most 600 total observations.",
+    });
+  }
+});
+
+const waterfallStepSchema = z.object({
+  label: z.string().trim().min(1).max(80),
+  value: z.number().finite(),
+}).strict();
+
+export const adminKurtiWaterfallVisualizationSchema = z.object({
+  kind: z.literal("waterfall"),
+  ...commonFields,
+  valueFormat: valueFormatSchema,
+  startLabel: z.string().trim().min(1).max(80),
+  startValue: z.number().finite(),
+  steps: z.array(waterfallStepSchema).min(1).max(20),
+  endLabel: z.string().trim().min(1).max(80),
+  showConnectors: z.boolean(),
+}).strict();
+
+export const adminKurtiTreemapVisualizationSchema = z.object({
+  kind: z.literal("treemap"),
+  ...commonFields,
+  valueFormat: valueFormatSchema,
+  items: z.array(compositionItemSchema).min(2).max(40),
+}).strict().superRefine((visualization, context) => {
+  if (!visualization.items.some((item) => item.value > 0)) {
+    context.addIssue({ code: "custom", path: ["items"], message: "At least one item must be greater than zero." });
+  }
+});
+
 export const adminKurtiVisualizationSchema = z.discriminatedUnion("kind", [
   adminKurtiSeriesVisualizationSchema,
   adminKurtiCompositionVisualizationSchema,
@@ -239,6 +299,9 @@ export const adminKurtiVisualizationSchema = z.discriminatedUnion("kind", [
   adminKurtiTableVisualizationSchema,
   adminKurtiTimelineVisualizationSchema,
   adminKurtiRadarVisualizationSchema,
+  adminKurtiDistributionVisualizationSchema,
+  adminKurtiWaterfallVisualizationSchema,
+  adminKurtiTreemapVisualizationSchema,
 ]);
 
 const adminKurtiVisualizationsSchema = z.array(adminKurtiVisualizationSchema).max(8);
@@ -252,6 +315,9 @@ export type AdminKurtiMetricsVisualization = z.infer<typeof adminKurtiMetricsVis
 export type AdminKurtiTableVisualization = z.infer<typeof adminKurtiTableVisualizationSchema>;
 export type AdminKurtiTimelineVisualization = z.infer<typeof adminKurtiTimelineVisualizationSchema>;
 export type AdminKurtiRadarVisualization = z.infer<typeof adminKurtiRadarVisualizationSchema>;
+export type AdminKurtiDistributionVisualization = z.infer<typeof adminKurtiDistributionVisualizationSchema>;
+export type AdminKurtiWaterfallVisualization = z.infer<typeof adminKurtiWaterfallVisualizationSchema>;
+export type AdminKurtiTreemapVisualization = z.infer<typeof adminKurtiTreemapVisualizationSchema>;
 
 export function appendAdminKurtiVisualizations(content: string, visualizations: AdminKurtiVisualization[]): string {
   if (visualizations.length === 0) return content;

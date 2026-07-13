@@ -1,6 +1,10 @@
 import type { Responses } from "openai/resources/responses/responses";
 import { z } from "zod";
 import { adminKurtiChartSpecSchema } from "./admin-kurti-charts.js";
+import {
+  ADMIN_KURTI_VISUALIZATION_SKILL_IDS,
+  buildAdminKurtiVisualizationSkillContext,
+} from "./admin-kurti-visualization-skill-loader.js";
 import { ADMIN_KURTI_VISUALIZATION_TOOLS } from "./admin-kurti-visualization-tools.js";
 import {
   ADMIN_KURTI_WORKTIME_ANALYTICS_TOOL,
@@ -73,6 +77,22 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
       },
     },
     ["groups"],
+  ),
+  functionTool(
+    "load_admin_visualization_skill",
+    "Loads one to three trusted Admin Kurti SKILL.md guides before choosing or calling a visualization renderer. Call this when the needed specific visualization skill was not already included in the active developer context. Read every returned guide fully and obey its selection, integrity, and rendering rules.",
+    {
+      skillIds: {
+        type: "array",
+        minItems: 1,
+        maxItems: 3,
+        items: {
+          type: "string",
+          enum: ADMIN_KURTI_VISUALIZATION_SKILL_IDS,
+        },
+      },
+    },
+    ["skillIds"],
   ),
   functionTool(
     "get_admin_overview",
@@ -2750,8 +2770,20 @@ async function loadAdminToolGroup(args: unknown): Promise<JsonRecord> {
   });
 }
 
+async function loadAdminVisualizationSkill(args: unknown): Promise<JsonRecord> {
+  const input = z.object({
+    skillIds: z.array(z.enum(ADMIN_KURTI_VISUALIZATION_SKILL_IDS)).min(1).max(3),
+  }).strict().parse(args);
+  return envelope("load_admin_visualization_skill", {
+    loaded: true,
+    skillIds: input.skillIds,
+    skillContext: buildAdminKurtiVisualizationSkillContext(input.skillIds),
+  });
+}
+
 const TOOL_HANDLERS: Record<string, (args: unknown) => Promise<JsonRecord>> = {
   load_admin_tool_group: loadAdminToolGroup,
+  load_admin_visualization_skill: loadAdminVisualizationSkill,
   get_admin_overview: getAdminOverview,
   get_user_access_context: getUserAccessContext,
   search_gms: searchGms,
