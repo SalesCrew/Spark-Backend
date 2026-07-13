@@ -3,7 +3,13 @@ import { z } from "zod";
 import { buildGmAggregates } from "./admin-zeiterfassung.js";
 import { sql as pgSql } from "./db.js";
 import { readGmKpiCache } from "./gm-kpi-cache.js";
-import { computeMarketIppForPeriod, computeMarketIppSummariesForPeriod } from "./ipp.js";
+import {
+  computeMarketIppForPeriod,
+  computeMarketIppSummariesForPeriod,
+  computeMarketIppSummariesForRedPeriods,
+  computeVisitIpp,
+  computeVisitIppSummaries,
+} from "./ipp.js";
 import { buildKurtiGmContext } from "./kurti-context.js";
 import { redMonthPeriodToYmd, resolveCurrentRedPeriod, resolveRedPeriodForDate } from "./red-month-periods.js";
 import { loadZeiterfassungDaySessions } from "./zeiterfassung-days.js";
@@ -14,6 +20,8 @@ const NULLABLE_STRING_SCHEMA = { type: ["string", "null"] } as const;
 const NULLABLE_BOOLEAN_SCHEMA = { type: ["boolean", "null"] } as const;
 const LIMIT_SCHEMA = { type: "integer", minimum: 1, maximum: 150 } as const;
 const CHAT_LIMIT_SCHEMA = { type: "integer", minimum: 1, maximum: 40 } as const;
+const IPP_TIMEFRAME_SCHEMA = { type: "string", enum: ["red_month", "ytd", "custom", "all_time"] } as const;
+const IPP_COMPARISON_SCHEMA = { type: "string", enum: ["none", "previous_period", "previous_year", "custom"] } as const;
 const YMD_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const VIENNA_TIMEZONE = "Europe/Vienna";
 
@@ -160,6 +168,65 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
       limit: LIMIT_SCHEMA,
     },
     ["marketId", "gmUserId", "periodStart", "limit"],
+  ),
+  functionTool(
+    "get_ipp_gm_analytics",
+    "Provides extensive GM/person IPP analytics using market-per-RED-month samples: one RED month, RED-year YTD, custom ranges or all time; per-RED-month series, weighted averages, rankings, highest/lowest market samples, trends, and comparisons against the previous period, previous year, or a custom timeframe. Closed finalized snapshots are authoritative; missing/current periods are calculated live with the IPP engine.",
+    {
+      gmUserId: NULLABLE_UUID_SCHEMA,
+      region: NULLABLE_STRING_SCHEMA,
+      timeframe: IPP_TIMEFRAME_SCHEMA,
+      periodStart: NULLABLE_STRING_SCHEMA,
+      redYear: { type: ["integer", "null"], minimum: 2020, maximum: 2100 },
+      fromPeriodStart: NULLABLE_STRING_SCHEMA,
+      toPeriodStart: NULLABLE_STRING_SCHEMA,
+      comparison: IPP_COMPARISON_SCHEMA,
+      compareFromPeriodStart: NULLABLE_STRING_SCHEMA,
+      compareToPeriodStart: NULLABLE_STRING_SCHEMA,
+      includeMarketBreakdown: { type: "boolean" },
+      limit: { type: "integer", minimum: 1, maximum: 100 },
+    },
+    ["gmUserId", "region", "timeframe", "periodStart", "redYear", "fromPeriodStart", "toPeriodStart", "comparison", "compareFromPeriodStart", "compareToPeriodStart", "includeMarketBreakdown", "limit"],
+  ),
+  functionTool(
+    "get_ipp_market_analytics",
+    "Analyzes and ranks market IPP over one RED month, YTD, a custom RED-month range, or all time. Supports market, GM, region and chain filters; returns market averages/history, period averages, highest or lowest market/RED-month samples, source visits, and trend changes. Uses finalized snapshots when available and live IPP calculation otherwise.",
+    {
+      marketId: NULLABLE_UUID_SCHEMA,
+      gmUserId: NULLABLE_UUID_SCHEMA,
+      region: NULLABLE_STRING_SCHEMA,
+      chain: NULLABLE_STRING_SCHEMA,
+      timeframe: IPP_TIMEFRAME_SCHEMA,
+      periodStart: NULLABLE_STRING_SCHEMA,
+      redYear: { type: ["integer", "null"], minimum: 2020, maximum: 2100 },
+      fromPeriodStart: NULLABLE_STRING_SCHEMA,
+      toPeriodStart: NULLABLE_STRING_SCHEMA,
+      ranking: { type: "string", enum: ["highest", "lowest"] },
+      includeHistory: { type: "boolean" },
+      limit: { type: "integer", minimum: 1, maximum: 100 },
+    },
+    ["marketId", "gmUserId", "region", "chain", "timeframe", "periodStart", "redYear", "fromPeriodStart", "toPeriodStart", "ranking", "includeHistory", "limit"],
+  ),
+  functionTool(
+    "get_ipp_visit_analytics",
+    "Calculates analytical IPP for one submitted visit or ranks submitted visits by IPP within one RED month, YTD, a custom RED-month range, or all time. Supports GM, market, section, region and chain filters and can return a question-level breakdown for a selected visit. Visit IPP applies the current scoring configuration to that visit only and is not an official finalized market/RED-month KPI.",
+    {
+      visitSessionId: NULLABLE_UUID_SCHEMA,
+      gmUserId: NULLABLE_UUID_SCHEMA,
+      marketId: NULLABLE_UUID_SCHEMA,
+      section: { type: ["string", "null"], enum: ["standard", "flex", "billa", "kuehler", "mhd", null] },
+      region: NULLABLE_STRING_SCHEMA,
+      chain: NULLABLE_STRING_SCHEMA,
+      timeframe: IPP_TIMEFRAME_SCHEMA,
+      periodStart: NULLABLE_STRING_SCHEMA,
+      redYear: { type: ["integer", "null"], minimum: 2020, maximum: 2100 },
+      fromPeriodStart: NULLABLE_STRING_SCHEMA,
+      toPeriodStart: NULLABLE_STRING_SCHEMA,
+      ranking: { type: "string", enum: ["highest", "lowest"] },
+      includeQuestionBreakdown: { type: "boolean" },
+      limit: { type: "integer", minimum: 1, maximum: 60 },
+    },
+    ["visitSessionId", "gmUserId", "marketId", "section", "region", "chain", "timeframe", "periodStart", "redYear", "fromPeriodStart", "toPeriodStart", "ranking", "includeQuestionBreakdown", "limit"],
   ),
   functionTool(
     "get_bonus_context",
@@ -397,6 +464,55 @@ const filterContextSchema = z.object({
   entityId: z.string().uuid().nullable(),
   query: z.string().nullable(),
   limit: z.number().int().min(1).max(150),
+});
+
+const ippTimeframeSchema = z.enum(["red_month", "ytd", "custom", "all_time"]);
+
+const ippGmAnalyticsSchema = z.object({
+  gmUserId: z.string().uuid().nullable(),
+  region: z.string().nullable(),
+  timeframe: ippTimeframeSchema,
+  periodStart: z.string().nullable(),
+  redYear: z.number().int().min(2020).max(2100).nullable(),
+  fromPeriodStart: z.string().nullable(),
+  toPeriodStart: z.string().nullable(),
+  comparison: z.enum(["none", "previous_period", "previous_year", "custom"]),
+  compareFromPeriodStart: z.string().nullable(),
+  compareToPeriodStart: z.string().nullable(),
+  includeMarketBreakdown: z.boolean(),
+  limit: z.number().int().min(1).max(100),
+});
+
+const ippMarketAnalyticsSchema = z.object({
+  marketId: z.string().uuid().nullable(),
+  gmUserId: z.string().uuid().nullable(),
+  region: z.string().nullable(),
+  chain: z.string().nullable(),
+  timeframe: ippTimeframeSchema,
+  periodStart: z.string().nullable(),
+  redYear: z.number().int().min(2020).max(2100).nullable(),
+  fromPeriodStart: z.string().nullable(),
+  toPeriodStart: z.string().nullable(),
+  ranking: z.enum(["highest", "lowest"]),
+  includeHistory: z.boolean(),
+  limit: z.number().int().min(1).max(100),
+});
+
+const ippVisitAnalyticsSchema = z.object({
+  visitSessionId: z.string().uuid().nullable(),
+  gmUserId: z.string().uuid().nullable(),
+  marketId: z.string().uuid().nullable(),
+  section: z.enum(["standard", "flex", "billa", "kuehler", "mhd"]).nullable(),
+  region: z.string().nullable(),
+  chain: z.string().nullable(),
+  timeframe: ippTimeframeSchema,
+  periodStart: z.string().nullable(),
+  redYear: z.number().int().min(2020).max(2100).nullable(),
+  fromPeriodStart: z.string().nullable(),
+  toPeriodStart: z.string().nullable(),
+  ranking: z.enum(["highest", "lowest"]),
+  includeQuestionBreakdown: z.boolean(),
+  limit: z.number().int().min(1).max(60),
 });
 
 function parseYmd(value: string | null, fallback: Date): string {
@@ -940,6 +1056,565 @@ async function getTimeContext(args: unknown): Promise<JsonRecord> {
   });
 }
 
+type IppPeriodMeta = {
+  id: string;
+  redYear: number;
+  periodIndex: number;
+  label: string;
+  startDate: string;
+  endDate: string;
+  lookupEndDate: string;
+};
+
+type IppSample = {
+  redPeriodId: string;
+  redYear: number;
+  periodIndex: number;
+  redPeriodLabel: string;
+  periodStart: string;
+  periodEnd: string;
+  marketId: string;
+  marketName: string;
+  standardMarketNumber: string;
+  chain: string;
+  marketRegion: string;
+  gmUserId: string | null;
+  gmName: string;
+  gmRegion: string;
+  marketIpp: number;
+  includedInAverage: boolean;
+  sourceSubmissionCount: number;
+  contributingQuestionCount: number;
+  isFinalized: boolean;
+  source: "finalized_snapshot" | "live_calculation";
+};
+
+type IppSampleSummary = {
+  weightedAverageIpp: number | null;
+  sampleCount: number;
+  zeroOrUnscoredSampleCount: number;
+  uniqueMarkets: number;
+  uniqueRedPeriods: number;
+  sourceSubmissionCount: number;
+  highestSample: IppSample | null;
+  lowestPositiveSample: IppSample | null;
+};
+
+type IppPeriodSelectionInput = {
+  timeframe: z.infer<typeof ippTimeframeSchema>;
+  periodStart: string | null;
+  redYear: number | null;
+  fromPeriodStart: string | null;
+  toPeriodStart: string | null;
+};
+
+function toIppNumber(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function roundIpp(value: number): number {
+  return Number(value.toFixed(4));
+}
+
+function averageIpp(values: number[]): number | null {
+  return values.length > 0 ? roundIpp(values.reduce((sum, value) => sum + value, 0) / values.length) : null;
+}
+
+function isValidYmd(value: string | null): value is string {
+  return Boolean(value && YMD_REGEX.test(value));
+}
+
+async function loadIppPeriodCatalog(): Promise<IppPeriodMeta[]> {
+  return pgSql<IppPeriodMeta[]>`
+    select id, red_year as "redYear", period_index as "periodIndex", label,
+           start_date::text as "startDate", end_date::text as "endDate", lookup_end_date::text as "lookupEndDate"
+    from red_month_periods
+    where is_deleted = false
+    order by start_date
+  `;
+}
+
+function selectIppPeriods(
+  catalog: IppPeriodMeta[],
+  input: IppPeriodSelectionInput,
+  current: { redYear: number; startYmd: string },
+): IppPeriodMeta[] {
+  const available = catalog.filter((period) => period.startDate <= current.startYmd);
+  if (input.timeframe === "red_month") {
+    const target = isValidYmd(input.periodStart) ? input.periodStart : current.startYmd;
+    const match = available.find((period) => period.startDate === target)
+      ?? available.find((period) => period.startDate <= target && period.lookupEndDate >= target);
+    return match ? [match] : [];
+  }
+  if (input.timeframe === "ytd") {
+    const redYear = input.redYear ?? current.redYear;
+    return available.filter((period) => period.redYear === redYear);
+  }
+  if (input.timeframe === "custom") {
+    if (!isValidYmd(input.fromPeriodStart) || !isValidYmd(input.toPeriodStart)) {
+      throw new Error("For custom IPP timeframes, fromPeriodStart and toPeriodStart must use YYYY-MM-DD.");
+    }
+    return available.filter((period) => period.startDate >= input.fromPeriodStart! && period.startDate <= input.toPeriodStart!);
+  }
+  return available.slice(-80);
+}
+
+function selectIppComparisonPeriods(input: {
+  catalog: IppPeriodMeta[];
+  primary: IppPeriodMeta[];
+  comparison: z.infer<typeof ippGmAnalyticsSchema>["comparison"];
+  compareFromPeriodStart: string | null;
+  compareToPeriodStart: string | null;
+}): IppPeriodMeta[] {
+  if (input.comparison === "none" || input.primary.length === 0) return [];
+  if (input.comparison === "custom") {
+    if (!isValidYmd(input.compareFromPeriodStart) || !isValidYmd(input.compareToPeriodStart)) {
+      throw new Error("For custom IPP comparisons, compareFromPeriodStart and compareToPeriodStart must use YYYY-MM-DD.");
+    }
+    return input.catalog.filter((period) => period.startDate >= input.compareFromPeriodStart! && period.startDate <= input.compareToPeriodStart!);
+  }
+  if (input.comparison === "previous_year") {
+    const keys = new Set(input.primary.map((period) => `${period.redYear - 1}::${period.periodIndex}`));
+    return input.catalog.filter((period) => keys.has(`${period.redYear}::${period.periodIndex}`));
+  }
+  const firstIndex = input.catalog.findIndex((period) => period.id === input.primary[0]?.id);
+  const count = input.primary.length;
+  return firstIndex > 0 ? input.catalog.slice(Math.max(0, firstIndex - count), firstIndex) : [];
+}
+
+function ippPeriodDescriptor(periods: IppPeriodMeta[], timeframe: string): JsonRecord {
+  return {
+    timeframe,
+    periodCount: periods.length,
+    fromPeriodStart: periods[0]?.startDate ?? null,
+    toPeriodStart: periods.at(-1)?.startDate ?? null,
+    fromDate: periods[0]?.startDate ?? null,
+    toDate: periods.at(-1)?.endDate ?? null,
+    redYears: Array.from(new Set(periods.map((period) => period.redYear))),
+    periods: periods.map((period) => ({
+      id: period.id,
+      label: period.label,
+      redYear: period.redYear,
+      periodIndex: period.periodIndex,
+      startDate: period.startDate,
+      endDate: period.endDate,
+    })),
+  };
+}
+
+async function loadIppSamples(periods: IppPeriodMeta[]): Promise<IppSample[]> {
+  if (periods.length === 0) return [];
+  const periodIds = periods.map((period) => period.id);
+  const periodStarts = periods.map((period) => period.startDate);
+  const computed = await computeMarketIppSummariesForRedPeriods({ redPeriodIds: periodIds });
+  const finalizedRows = await pgSql<Array<{
+    red_period_id: string | null;
+    red_period_start: string;
+    market_id: string;
+    market_ipp: string | number;
+    source_submission_count: number;
+    contributing_question_count: number;
+    gm_user_id: string | null;
+  }>>`
+    select r.red_period_id::text, r.red_period_start::text, r.market_id::text, r.market_ipp,
+           r.source_submission_count, r.contributing_question_count, latest.gm_user_id::text
+    from ipp_market_redmonth_results r
+    left join lateral (
+      select vs.gm_user_id
+      from visit_sessions vs
+      where vs.market_id = r.market_id
+        and vs.is_deleted = false
+        and vs.status = 'submitted'
+        and vs.submitted_at is not null
+        and vs.submitted_at >= (r.red_period_start::timestamp at time zone 'Europe/Vienna')
+        and vs.submitted_at < ((r.red_period_end + 1)::timestamp at time zone 'Europe/Vienna')
+      order by vs.submitted_at desc
+      limit 1
+    ) latest on true
+    where r.is_deleted = false
+      and r.is_finalized = true
+      and r.red_period_start::text = any(${periodStarts}::text[])
+  `;
+
+  const periodById = new Map(periods.map((period) => [period.id, period]));
+  const periodByStart = new Map(periods.map((period) => [period.startDate, period]));
+  const rawByKey = new Map<string, {
+    period: IppPeriodMeta;
+    marketId: string;
+    gmUserId: string | null;
+    marketIpp: number;
+    sourceSubmissionCount: number;
+    contributingQuestionCount: number;
+    isFinalized: boolean;
+  }>();
+  for (const summary of computed.values()) {
+    const period = periodById.get(summary.redPeriodId);
+    if (!period) continue;
+    rawByKey.set(`${period.startDate}::${summary.marketId}`, {
+      period,
+      marketId: summary.marketId,
+      gmUserId: summary.latestGmUserId,
+      marketIpp: summary.marketIpp,
+      sourceSubmissionCount: summary.sourceSubmissionCount,
+      contributingQuestionCount: summary.contributingQuestionCount,
+      isFinalized: false,
+    });
+  }
+  for (const row of finalizedRows) {
+    const period = (row.red_period_id ? periodById.get(row.red_period_id) : undefined) ?? periodByStart.get(row.red_period_start);
+    if (!period) continue;
+    rawByKey.set(`${period.startDate}::${row.market_id}`, {
+      period,
+      marketId: row.market_id,
+      gmUserId: row.gm_user_id,
+      marketIpp: toIppNumber(row.market_ipp),
+      sourceSubmissionCount: Number(row.source_submission_count ?? 0),
+      contributingQuestionCount: Number(row.contributing_question_count ?? 0),
+      isFinalized: true,
+    });
+  }
+
+  const rawSamples = Array.from(rawByKey.values());
+  const marketIds = Array.from(new Set(rawSamples.map((sample) => sample.marketId)));
+  const gmIds = Array.from(new Set(rawSamples.map((sample) => sample.gmUserId).filter((id): id is string => Boolean(id))));
+  const [markets, gms] = await Promise.all([
+    marketIds.length > 0 ? pgSql<JsonRecord[]>`
+      select id, name, standard_market_number, db_name as chain, region
+      from markets where id = any(${marketIds}::uuid[]) and is_deleted = false
+    ` : Promise.resolve([]),
+    gmIds.length > 0 ? pgSql<JsonRecord[]>`
+      select id, concat_ws(' ', first_name, last_name) as name, region
+      from users where id = any(${gmIds}::uuid[]) and deleted_at is null
+    ` : Promise.resolve([]),
+  ]);
+  const marketById = new Map(markets.map((row) => [String(row.id), row]));
+  const gmById = new Map(gms.map((row) => [String(row.id), row]));
+  return rawSamples.map((sample) => {
+    const market = marketById.get(sample.marketId);
+    const gm = sample.gmUserId ? gmById.get(sample.gmUserId) : undefined;
+    return {
+      redPeriodId: sample.period.id,
+      redYear: sample.period.redYear,
+      periodIndex: sample.period.periodIndex,
+      redPeriodLabel: sample.period.label,
+      periodStart: sample.period.startDate,
+      periodEnd: sample.period.endDate,
+      marketId: sample.marketId,
+      marketName: String(market?.name ?? ""),
+      standardMarketNumber: String(market?.standard_market_number ?? ""),
+      chain: String(market?.chain ?? ""),
+      marketRegion: String(market?.region ?? ""),
+      gmUserId: sample.gmUserId,
+      gmName: String(gm?.name ?? "Nicht zugeordnet"),
+      gmRegion: String(gm?.region ?? ""),
+      marketIpp: roundIpp(sample.marketIpp),
+      includedInAverage: sample.marketIpp > 0,
+      sourceSubmissionCount: sample.sourceSubmissionCount,
+      contributingQuestionCount: sample.contributingQuestionCount,
+      isFinalized: sample.isFinalized,
+      source: sample.isFinalized ? "finalized_snapshot" : "live_calculation",
+    } satisfies IppSample;
+  });
+}
+
+function summarizeIppSamples(samples: IppSample[]): IppSampleSummary {
+  const positive = samples.filter((sample) => sample.includedInAverage);
+  const sorted = [...positive].sort((left, right) => right.marketIpp - left.marketIpp);
+  return {
+    weightedAverageIpp: averageIpp(positive.map((sample) => sample.marketIpp)),
+    sampleCount: positive.length,
+    zeroOrUnscoredSampleCount: samples.length - positive.length,
+    uniqueMarkets: new Set(samples.map((sample) => sample.marketId)).size,
+    uniqueRedPeriods: new Set(samples.map((sample) => sample.redPeriodId)).size,
+    sourceSubmissionCount: samples.reduce((sum, sample) => sum + sample.sourceSubmissionCount, 0),
+    highestSample: sorted[0] ?? null,
+    lowestPositiveSample: sorted.at(-1) ?? null,
+  };
+}
+
+function buildIppPeriodSeries(samples: IppSample[]): JsonRecord[] {
+  const grouped = new Map<string, IppSample[]>();
+  for (const sample of samples) {
+    const bucket = grouped.get(sample.redPeriodId) ?? [];
+    bucket.push(sample);
+    grouped.set(sample.redPeriodId, bucket);
+  }
+  const series = Array.from(grouped.values()).map((rows) => {
+    const first = rows[0]!;
+    const summary = summarizeIppSamples(rows);
+    return {
+      redPeriodId: first.redPeriodId,
+      redPeriodLabel: first.redPeriodLabel,
+      redYear: first.redYear,
+      periodIndex: first.periodIndex,
+      periodStart: first.periodStart,
+      periodEnd: first.periodEnd,
+      ...summary,
+    };
+  }).sort((left, right) => String(left.periodStart).localeCompare(String(right.periodStart)));
+  return series.map((row, index) => {
+    const previous = series[index - 1];
+    const currentAverage = typeof row.weightedAverageIpp === "number" ? row.weightedAverageIpp : null;
+    const previousAverage = previous && typeof previous.weightedAverageIpp === "number" ? previous.weightedAverageIpp : null;
+    const change = currentAverage !== null && previousAverage !== null ? roundIpp(currentAverage - previousAverage) : null;
+    return {
+      ...row,
+      changeVsPreviousRedMonth: change,
+      changePercentVsPreviousRedMonth: change !== null && previousAverage ? roundIpp((change / previousAverage) * 100) : null,
+    };
+  });
+}
+
+function buildIppMarketBreakdown(samples: IppSample[], limit: number): JsonRecord[] {
+  const grouped = new Map<string, IppSample[]>();
+  for (const sample of samples) {
+    const bucket = grouped.get(sample.marketId) ?? [];
+    bucket.push(sample);
+    grouped.set(sample.marketId, bucket);
+  }
+  return Array.from(grouped.values()).map((rows) => ({
+    marketId: rows[0]?.marketId,
+    marketName: rows[0]?.marketName,
+    standardMarketNumber: rows[0]?.standardMarketNumber,
+    chain: rows[0]?.chain,
+    region: rows[0]?.marketRegion,
+    ...summarizeIppSamples(rows),
+  })).sort((left, right) => toIppNumber(right.weightedAverageIpp) - toIppNumber(left.weightedAverageIpp)).slice(0, limit);
+}
+
+async function getIppGmAnalytics(args: unknown): Promise<JsonRecord> {
+  const input = ippGmAnalyticsSchema.parse(args);
+  const currentPeriod = await resolveCurrentRedPeriod(new Date());
+  const currentRange = redMonthPeriodToYmd(currentPeriod);
+  const catalog = await loadIppPeriodCatalog();
+  const primaryPeriods = selectIppPeriods(catalog, input, { redYear: currentPeriod.redYear, startYmd: currentRange.startYmd });
+  const comparisonPeriods = selectIppComparisonPeriods({
+    catalog,
+    primary: primaryPeriods,
+    comparison: input.comparison,
+    compareFromPeriodStart: input.compareFromPeriodStart,
+    compareToPeriodStart: input.compareToPeriodStart,
+  });
+  const periodIds = new Set([...primaryPeriods, ...comparisonPeriods].map((period) => period.id));
+  const allSamples = await loadIppSamples(catalog.filter((period) => periodIds.has(period.id)));
+  const region = input.region?.trim().toLocaleLowerCase("de") || null;
+  const filtered = allSamples.filter((sample) =>
+    (!input.gmUserId || sample.gmUserId === input.gmUserId)
+    && (!region || sample.gmRegion.toLocaleLowerCase("de") === region));
+  const primaryIds = new Set(primaryPeriods.map((period) => period.id));
+  const comparisonIds = new Set(comparisonPeriods.map((period) => period.id));
+  const primarySamples = filtered.filter((sample) => primaryIds.has(sample.redPeriodId) && sample.gmUserId);
+  const comparisonSamples = filtered.filter((sample) => comparisonIds.has(sample.redPeriodId) && sample.gmUserId);
+
+  const primaryByGm = new Map<string, IppSample[]>();
+  const comparisonByGm = new Map<string, IppSample[]>();
+  for (const sample of primarySamples) {
+    const bucket = primaryByGm.get(sample.gmUserId!) ?? [];
+    bucket.push(sample);
+    primaryByGm.set(sample.gmUserId!, bucket);
+  }
+  for (const sample of comparisonSamples) {
+    const bucket = comparisonByGm.get(sample.gmUserId!) ?? [];
+    bucket.push(sample);
+    comparisonByGm.set(sample.gmUserId!, bucket);
+  }
+
+  const gmRows = Array.from(primaryByGm.entries()).map(([gmUserId, samples]) => {
+    const comparison = comparisonByGm.get(gmUserId) ?? [];
+    const summary = summarizeIppSamples(samples);
+    const comparisonSummary = summarizeIppSamples(comparison);
+    const periodSeries = buildIppPeriodSeries(samples);
+    const periodAverages = periodSeries.map((row) => row.weightedAverageIpp).filter((value): value is number => typeof value === "number");
+    const primaryAverage = typeof summary.weightedAverageIpp === "number" ? summary.weightedAverageIpp : null;
+    const comparisonAverage = typeof comparisonSummary.weightedAverageIpp === "number" ? comparisonSummary.weightedAverageIpp : null;
+    const comparisonChange = primaryAverage !== null && comparisonAverage !== null ? roundIpp(primaryAverage - comparisonAverage) : null;
+    return {
+      gmUserId,
+      gmName: samples[0]?.gmName ?? "",
+      region: samples[0]?.gmRegion ?? "",
+      ...summary,
+      averageOfRedMonthAverages: averageIpp(periodAverages),
+      redMonthSeries: periodSeries,
+      comparison: input.comparison === "none" ? null : {
+        ...comparisonSummary,
+        absoluteChange: comparisonChange,
+        percentChange: comparisonChange !== null && comparisonAverage ? roundIpp((comparisonChange / comparisonAverage) * 100) : null,
+      },
+      marketBreakdown: input.includeMarketBreakdown ? buildIppMarketBreakdown(samples, input.limit) : [],
+    };
+  }).sort((left, right) => toIppNumber(right.weightedAverageIpp) - toIppNumber(left.weightedAverageIpp));
+
+  return envelope("get_ipp_gm_analytics", {
+    selectedTimeframe: ippPeriodDescriptor(primaryPeriods, input.timeframe),
+    comparisonTimeframe: input.comparison === "none" ? null : ippPeriodDescriptor(comparisonPeriods, input.comparison),
+    overall: summarizeIppSamples(primarySamples),
+    gmRanking: gmRows.slice(0, input.limit).map((row, index) => ({ rank: index + 1, ...row })),
+    unassignedSampleCount: filtered.filter((sample) => primaryIds.has(sample.redPeriodId) && !sample.gmUserId).length,
+  }, {
+    resultCount: Math.min(gmRows.length, input.limit),
+    totalMatchedGms: gmRows.length,
+    averageBasis: "Positive market/RED-month IPP samples; weightedAverageIpp matches the all-time GM KPI sampling basis.",
+    attributionBasis: "Each market/RED-month sample belongs to the GM of the latest submitted visit for that market in that RED month.",
+  });
+}
+
+async function getIppMarketAnalytics(args: unknown): Promise<JsonRecord> {
+  const input = ippMarketAnalyticsSchema.parse(args);
+  const currentPeriod = await resolveCurrentRedPeriod(new Date());
+  const currentRange = redMonthPeriodToYmd(currentPeriod);
+  const catalog = await loadIppPeriodCatalog();
+  const periods = selectIppPeriods(catalog, input, { redYear: currentPeriod.redYear, startYmd: currentRange.startYmd });
+  const periodIds = new Set(periods.map((period) => period.id));
+  const region = input.region?.trim().toLocaleLowerCase("de") || null;
+  const chain = input.chain?.trim().toLocaleLowerCase("de") || null;
+  const samples = (await loadIppSamples(periods)).filter((sample) =>
+    (!input.marketId || sample.marketId === input.marketId)
+    && (!input.gmUserId || sample.gmUserId === input.gmUserId)
+    && (!region || sample.marketRegion.toLocaleLowerCase("de") === region)
+    && (!chain || sample.chain.toLocaleLowerCase("de") === chain)
+    && periodIds.has(sample.redPeriodId));
+
+  const grouped = new Map<string, IppSample[]>();
+  for (const sample of samples) {
+    const bucket = grouped.get(sample.marketId) ?? [];
+    bucket.push(sample);
+    grouped.set(sample.marketId, bucket);
+  }
+  const markets = Array.from(grouped.values()).map((rows) => ({
+    marketId: rows[0]?.marketId,
+    marketName: rows[0]?.marketName,
+    standardMarketNumber: rows[0]?.standardMarketNumber,
+    chain: rows[0]?.chain,
+    region: rows[0]?.marketRegion,
+    latestAttributedGm: [...rows].sort((left, right) => right.periodStart.localeCompare(left.periodStart))[0]?.gmName ?? "",
+    ...summarizeIppSamples(rows),
+    history: input.includeHistory ? [...rows].sort((left, right) => left.periodStart.localeCompare(right.periodStart)) : [],
+  }));
+  const direction = input.ranking === "highest" ? -1 : 1;
+  markets.sort((left, right) => direction * (toIppNumber(left.weightedAverageIpp) - toIppNumber(right.weightedAverageIpp)));
+  const rankedSamples = samples.filter((sample) => sample.includedInAverage)
+    .sort((left, right) => direction * (left.marketIpp - right.marketIpp))
+    .slice(0, input.limit);
+  return envelope("get_ipp_market_analytics", {
+    selectedTimeframe: ippPeriodDescriptor(periods, input.timeframe),
+    overall: summarizeIppSamples(samples),
+    periodSeries: buildIppPeriodSeries(samples),
+    marketRanking: markets.slice(0, input.limit).map((row, index) => ({ rank: index + 1, ...row })),
+    marketRedMonthSampleRanking: rankedSamples.map((sample, index) => ({ rank: index + 1, ...sample })),
+  }, {
+    ranking: input.ranking,
+    totalMatchedMarkets: markets.length,
+    resultCount: Math.min(markets.length, input.limit),
+    averageBasis: "Only positive market/RED-month IPP samples are included in averages; zero/unscored samples are counted separately.",
+  });
+}
+
+async function getIppVisitAnalytics(args: unknown): Promise<JsonRecord> {
+  const input = ippVisitAnalyticsSchema.parse(args);
+  const currentPeriod = await resolveCurrentRedPeriod(new Date());
+  const currentRange = redMonthPeriodToYmd(currentPeriod);
+  const catalog = await loadIppPeriodCatalog();
+  const periods = selectIppPeriods(catalog, input, { redYear: currentPeriod.redYear, startYmd: currentRange.startYmd });
+  const fromDate = periods[0]?.startDate ?? currentRange.startYmd;
+  const toDate = periods.at(-1)?.endDate ?? currentRange.endYmd;
+  const region = input.region?.trim() || null;
+  const chain = input.chain?.trim() || null;
+
+  const visitRows = input.visitSessionId
+    ? await pgSql<JsonRecord[]>`
+      select vs.id, vs.status::text, vs.started_at, vs.submitted_at, vs.gm_user_id,
+             concat_ws(' ', u.first_name, u.last_name) as gm_name, u.region as gm_region,
+             vs.market_id, m.name as market_name, m.standard_market_number, m.db_name as chain, m.region as market_region,
+             coalesce(jsonb_agg(distinct s.section::text) filter (where s.section is not null), '[]'::jsonb) as sections
+      from visit_sessions vs
+      join users u on u.id = vs.gm_user_id
+      join markets m on m.id = vs.market_id
+      left join visit_session_sections s on s.visit_session_id = vs.id and s.is_deleted = false
+      where vs.id = ${input.visitSessionId}::uuid and vs.is_deleted = false
+      group by vs.id, u.id, m.id
+      limit 1
+    `
+    : await pgSql<JsonRecord[]>`
+      select vs.id, vs.status::text, vs.started_at, vs.submitted_at, vs.gm_user_id,
+             concat_ws(' ', u.first_name, u.last_name) as gm_name, u.region as gm_region,
+             vs.market_id, m.name as market_name, m.standard_market_number, m.db_name as chain, m.region as market_region,
+             coalesce(jsonb_agg(distinct s.section::text) filter (where s.section is not null), '[]'::jsonb) as sections
+      from visit_sessions vs
+      join users u on u.id = vs.gm_user_id
+      join markets m on m.id = vs.market_id
+      left join visit_session_sections s on s.visit_session_id = vs.id and s.is_deleted = false
+      where vs.is_deleted = false
+        and vs.status = 'submitted'
+        and vs.submitted_at is not null
+        and vs.submitted_at >= (${fromDate}::date::timestamp at time zone 'Europe/Vienna')
+        and vs.submitted_at < (((${toDate}::date + 1)::timestamp) at time zone 'Europe/Vienna')
+        and (${input.gmUserId}::uuid is null or vs.gm_user_id = ${input.gmUserId})
+        and (${input.marketId}::uuid is null or vs.market_id = ${input.marketId})
+        and (${region}::text is null or lower(u.region) = lower(${region}))
+        and (${chain}::text is null or lower(m.db_name) = lower(${chain}))
+        and (${input.section}::text is null or exists (
+          select 1 from visit_session_sections section_filter
+          where section_filter.visit_session_id = vs.id and section_filter.is_deleted = false and section_filter.section::text = ${input.section}
+        ))
+      group by vs.id, u.id, m.id
+      order by vs.submitted_at desc
+      limit 1500
+    `;
+
+  const visitIds = visitRows.map((row) => String(row.id));
+  const computed = await computeVisitIppSummaries({ visitSessionIds: visitIds });
+  const enriched = visitRows.map((row) => {
+    const score = computed.get(String(row.id));
+    return {
+      visitSessionId: row.id,
+      status: row.status,
+      startedAt: row.started_at,
+      submittedAt: row.submitted_at,
+      gmUserId: row.gm_user_id,
+      gmName: row.gm_name,
+      gmRegion: row.gm_region,
+      marketId: row.market_id,
+      marketName: row.market_name,
+      standardMarketNumber: row.standard_market_number,
+      chain: row.chain,
+      marketRegion: row.market_region,
+      sections: row.sections,
+      visitIpp: score?.visitIpp ?? 0,
+      contributingQuestionCount: score?.contributingQuestionCount ?? 0,
+      includedInAverage: (score?.visitIpp ?? 0) > 0,
+    };
+  });
+  const positive = enriched.filter((row) => row.includedInAverage);
+  const direction = input.ranking === "highest" ? -1 : 1;
+  const ranked = [...positive].sort((left, right) => direction * (left.visitIpp - right.visitIpp));
+  const detailTargetId = input.includeQuestionBreakdown
+    ? String(input.visitSessionId ?? ranked[0]?.visitSessionId ?? "")
+    : "";
+  const detail = detailTargetId ? await computeVisitIpp({ visitSessionId: detailTargetId }) : null;
+  return envelope("get_ipp_visit_analytics", {
+    selectedTimeframe: ippPeriodDescriptor(periods, input.timeframe),
+    summary: {
+      averageVisitIpp: averageIpp(positive.map((row) => row.visitIpp)),
+      submittedVisitCount: enriched.filter((row) => row.status === "submitted").length,
+      positiveScoredVisitCount: positive.length,
+      zeroOrUnscoredVisitCount: enriched.length - positive.length,
+      highestVisit: [...positive].sort((left, right) => right.visitIpp - left.visitIpp)[0] ?? null,
+      lowestPositiveVisit: [...positive].sort((left, right) => left.visitIpp - right.visitIpp)[0] ?? null,
+    },
+    visitRanking: ranked.slice(0, input.limit).map((row, index) => ({ rank: index + 1, ...row })),
+    selectedVisit: input.visitSessionId ? enriched[0] ?? null : null,
+    questionBreakdown: detail?.questionRows ?? [],
+  }, {
+    ranking: input.ranking,
+    resultCount: Math.min(ranked.length, input.limit),
+    candidateVisitCount: enriched.length,
+    candidateLimit: 1500,
+    scoreBasis: "Analytical single-visit IPP using the latest answer per question inside that visit and the current question_scoring configuration.",
+    officialKpiWarning: "A visit IPP is not the authoritative market/RED-month KPI. Official IPP deduplicates the latest answer per question across the whole market and RED month; finalized snapshots take precedence.",
+  });
+}
+
 async function getIppContext(args: unknown): Promise<JsonRecord> {
   const input = z.object({
     marketId: z.string().uuid().nullable(),
@@ -1041,7 +1716,7 @@ async function getAdminModuleCatalog(): Promise<JsonRecord> {
   return envelope("get_admin_module_catalog", {
     modules: [
       { page: "/admin/gm-dashboard", label: "GM Dashboard", tools: ["get_admin_overview", "search_gms", "get_gm_context"] },
-      { page: "/admin/ipp-berechnung", label: "IPP Berechnung", tools: ["get_ipp_context", "get_evaluation_context", "get_question_context"] },
+      { page: "/admin/ipp-berechnung", label: "IPP Berechnung", tools: ["get_ipp_context", "get_ipp_gm_analytics", "get_ipp_market_analytics", "get_ipp_visit_analytics", "get_evaluation_context", "get_question_context"] },
       { page: "/admin/praemien", label: "Prämien", tools: ["get_bonus_context", "get_evaluation_context", "get_question_context"] },
       { page: "/admin/fragebogen", label: "Standard-Fragebögen", tools: ["get_questionnaire_context", "get_module_context", "get_question_context", "get_filter_context"] },
       { page: "/admin/flexbesuche", label: "Flex-Fragebögen", tools: ["get_questionnaire_context", "get_module_context", "get_question_context", "get_filter_context"] },
@@ -1983,6 +2658,9 @@ const TOOL_HANDLERS: Record<string, (args: unknown) => Promise<JsonRecord>> = {
   get_campaign_context: getCampaignContext,
   get_time_context: getTimeContext,
   get_ipp_context: getIppContext,
+  get_ipp_gm_analytics: getIppGmAnalytics,
+  get_ipp_market_analytics: getIppMarketAnalytics,
+  get_ipp_visit_analytics: getIppVisitAnalytics,
   get_bonus_context: getBonusContext,
   get_admin_module_catalog: getAdminModuleCatalog,
   get_module_context: getModuleContext,

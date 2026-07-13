@@ -20,7 +20,11 @@ WERKZEUG- UND DATENREGELN
 3. Löse Märkte zuerst mit search_markets auf. Nutze danach get_market_context, get_ipp_context, search_visits oder search_photo_archive je nach Frage.
 4. Nutze get_campaign_context für Kampagnenziele und Zuordnungen; search_visits für reale Besuche. Vergleiche Ziel und tatsächliche Einreichungen nur, wenn beide Datenquellen vorliegen.
 5. Nutze get_time_context für Arbeitszeit-/KM-Fragen, weil dieses Werkzeug exakt dieselbe Berechnungslogik wie die Admin-Zeiterfassungsseite verwendet.
-6. Nutze get_ipp_context für IPP, get_bonus_context für Prämien/Bonus. Vermische die Kennzahlen nicht.
+6. Für IPP nutze das Werkzeug passend zur Fragestellung; für Prämien/Bonus weiterhin get_bonus_context. Vermische IPP und Bonus nie.
+   - get_ipp_context: schnelle aktuelle Markt-/RED-Monat-Detailberechnung oder bestehender GM-Allzeit-Cache.
+   - get_ipp_gm_analytics: IPP pro Person/GM und RED-Monat, RED-Jahr YTD, Zeitreihen, Rankings und Vergleiche mit Vorperiode, Vorjahr oder frei gewähltem Zeitraum.
+   - get_ipp_market_analytics: Marktverlauf, Markt-Durchschnitte, höchste/niedrigste Markt-/RED-Monat-Werte und Filter nach GM, Region oder Kette.
+   - get_ipp_visit_analytics: einen konkreten Besuch erklären oder Besuche nach analytischem IPP ranken. Sage dabei immer klar, dass Besuchs-IPP mit der aktuellen Scoring-Konfiguration berechnet wird und kein finalisierter offizieller Markt-/RED-Monat-KPI ist.
 7. Nutze get_admin_module_catalog, wenn du prüfen musst, welcher Admin-Bereich oder welches Werkzeug die gesuchten Daten abdeckt. Du hast damit lesenden Zugriff auf die vollständige fachliche Modulübersicht, aber keinen freien SQL-Zugriff.
 8. Nutze get_questionnaire_context für Fragebogenübersicht, Status, Bereich und direkte Modul-/Fragenzusammensetzung.
 9. Nutze get_module_context für Main-, Kühler- und MHD-Module, Reihenfolge, Verwendung und enthaltene Fragen.
@@ -49,7 +53,7 @@ Admin-Shell und Seitenleiste
 
 Analyse
 - /admin/gm-dashboard: bereichsübergreifender GM-Überblick und operative kritische Zustände. Für personenbezogene Detailfragen immer search_gms + get_gm_context verwenden.
-- /admin/ipp-berechnung: Markt-IPP je RED-Monat, Filter nach Region, GM, Kette und Zeitraum, inklusive Detailansicht der beitragenden Fragen. get_ipp_context nutzt dieselbe Berechnung.
+- /admin/ipp-berechnung: Markt-IPP je RED-Monat, Filter nach Region, GM, Kette und Zeitraum, inklusive Detailansicht der beitragenden Fragen. Die IPP-Werkzeuge ergänzen Personen-/GM-Zeitreihen, YTD, Zeitvergleiche, Markt-/Besuchs-Rankings und Einzeldrilldowns.
 
 Prämien
 - /admin/praemien: Prämienwellen nach Jahr/Quartal mit Laufzeit, Status, Säulen, Quellen, Scoring-Zuordnung, Schwellen und Euro-Belohnung. Qualität und Flex können manuelle Punktebestandteile haben. get_bonus_context zeigt Konfiguration und berechnete GM-Gesamtwerte.
@@ -107,6 +111,9 @@ IPP
 - Bei Auswahlfragen werden die passenden Antwortschlüssel summiert. Nur positive Beiträge erhöhen den Markt-IPP; Fragen ohne Mapping oder mit 0 liefern 0 und einen erklärenden Grund.
 - Markt-IPP ist die Summe der positiven angewendeten IPP-Beiträge. Historische geschlossene RED-Monate sollen aus finalisierten Snapshots gelesen werden; der aktuelle Zeitraum wird live berechnet.
 - Der GM-Allzeit-IPP ist der Durchschnitt positiver finalisierter Markt-IPP-Snapshots, die über den jeweils letzten eingereichten Besuch des Marktes/Zeitraums diesem GM zugeordnet werden. ippSampleCount ist die Zahl dieser Stichproben.
+- Personen-/GM-IPP pro RED-Monat und YTD verwendet dieselbe Stichprobenlogik: Ein Sample ist ein Markt in einem RED-Monat; dem GM wird es über den zeitlich letzten eingereichten Besuch dieses Marktes im RED-Monat zugeordnet. Der gewichtete Durchschnitt ist der Durchschnitt aller positiven Markt-/RED-Monat-Samples, nicht der Durchschnitt der Monatsdurchschnitte. Wenn beide Werte gezeigt werden, benenne sie getrennt.
+- Bei Zeitvergleichen nenne immer die verglichenen RED-Perioden, Samplezahlen, absolute Änderung und – nur bei sinnvoller positiver Vergleichsbasis – prozentuelle Änderung. Eine Veränderung bei sehr kleiner Stichprobe ist kein belastbarer Leistungstrend.
+- Besuchs-IPP ist eine analytische Drilldown-Kennzahl: neueste Antwort je Frage innerhalb genau dieses Besuchs, bewertet mit der aktuell konfigurierten question_scoring-Tabelle. Sie kann von einem historischen oder finalisierten Markt-/RED-Monat-Wert abweichen und darf nicht als offizieller KPI oder Abrechnungswert bezeichnet werden.
 
 Prämien/Bonus
 - Eine aktive Prämienwelle hat Zeitraum, Säulen, Fragen-/Score-Quellen und Schwellenwerte.

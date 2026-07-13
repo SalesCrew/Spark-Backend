@@ -72,6 +72,43 @@ export type IppMarketPeriodSummary = {
   latestGmUserId: string | null;
 };
 
+export type IppMarketRedPeriodSummary = IppMarketPeriodSummary & {
+  redPeriodId: string;
+  redPeriodLabel: string;
+  redPeriodYear: number;
+  periodIndex: number;
+};
+
+export type IppVisitSummary = {
+  visitSessionId: string;
+  visitIpp: number;
+  contributingQuestionCount: number;
+};
+
+export type IppVisitComputation = IppVisitSummary & {
+  questionRows: IppQuestionBreakdownRow[];
+};
+
+type RedPeriodMarketSummarySqlRow = {
+  red_period_id: string;
+  red_period_label: string;
+  red_period_year: number;
+  period_index: number;
+  period_start: string;
+  period_end: string;
+  market_id: string;
+  source_submission_count: number | string;
+  latest_gm_user_id: string | null;
+};
+
+type RedPeriodMarketAnswerSqlRow = LatestMarketAnswerSqlRow & {
+  red_period_id: string;
+};
+
+type VisitAnswerSummarySqlRow = LatestMarketAnswerSqlRow & {
+  visit_session_id: string;
+};
+
 const IPP_BATCH_SIZE = 500;
 
 function chunkArray<T>(values: T[], size = IPP_BATCH_SIZE): T[][] {
@@ -191,6 +228,11 @@ function toPeriodBounds(periodStart: Date, periodEnd: Date): { start: Date; endE
   return { start, endExclusive };
 }
 
+function parseYmdLocalDate(raw: string): Date {
+  const [year, month, day] = raw.split("-").map(Number);
+  return new Date(year ?? 0, Math.max(0, (month ?? 1) - 1), Math.max(1, day ?? 1));
+}
+
 function pickLatestAnswersByQuestionId(rows: LatestAnswerRow[]): LatestAnswerRow[] {
   const byQuestionId = new Map<string, LatestAnswerRow>();
   for (const row of rows) {
@@ -251,6 +293,58 @@ function buildScoringByQuestion(scoringRows: Array<typeof questionScoring.$infer
     scoringByQuestion.set(row.questionId, bucket);
   }
   return scoringByQuestion;
+}
+
+async function buildQuestionRowsFromLatestAnswers(latestAnswers: LatestAnswerRow[]): Promise<IppQuestionBreakdownRow[]> {
+  if (latestAnswers.length === 0) return [];
+  const latestAnswerIds = latestAnswers.map((row) => row.answer.id);
+  const questionIds = normalizeUnique(latestAnswers.map((row) => row.answer.questionId));
+  const [optionRows, scoringRows] = await Promise.all([
+    loadOptionsForAnswers(latestAnswerIds),
+    loadIppScoringForQuestions(questionIds),
+  ]);
+  const optionsByAnswerId = buildOptionsByAnswerId(optionRows);
+  const scoringByQuestion = buildScoringByQuestion(scoringRows);
+
+  const questionRows: IppQuestionBreakdownRow[] = latestAnswers.map((row) => {
+    const options = optionsByAnswerId.get(row.answer.id) ?? [];
+    const scoringByKey = scoringByQuestion.get(row.answer.questionId) ?? {};
+    const computed = computeAppliedIpp({
+      questionType: row.answer.questionType,
+      valueText: row.answer.valueText,
+      valueNumber: row.answer.valueNumber,
+      valueJson: (row.answer.valueJson as Record<string, unknown> | null) ?? null,
+      options,
+      scoringByKey,
+    });
+    return {
+      questionFingerprint: row.answer.questionId,
+      questionId: row.answer.questionId,
+      questionText: row.question.questionTextSnapshot,
+      questionType: row.answer.questionType,
+      selectedAnswer: extractSelectedAnswer({
+        questionType: row.answer.questionType,
+        valueText: row.answer.valueText,
+        valueNumber: row.answer.valueNumber,
+        options,
+        valueJson: (row.answer.valueJson as Record<string, unknown> | null) ?? null,
+      }),
+      appliedIppValue: computed.appliedIpp,
+      counted: computed.appliedIpp > 0,
+      countedReason: computed.countedReason,
+      sourceSections: row.section.section ? [row.section.section] : [],
+      sourceFrageboegen: row.section.fragebogenNameSnapshot ? [row.section.fragebogenNameSnapshot] : [],
+      deduped: false,
+      section: row.section.section,
+      fragebogenName: row.section.fragebogenNameSnapshot ?? null,
+      submittedAt: row.session.submittedAt ? row.session.submittedAt.toISOString() : null,
+    };
+  });
+  questionRows.sort((left, right) => {
+    if (left.counted !== right.counted) return left.counted ? -1 : 1;
+    return right.appliedIppValue - left.appliedIppValue;
+  });
+  return questionRows;
 }
 
 export async function computeMarketIppSummariesForPeriod(input: {
@@ -355,6 +449,105 @@ export async function computeMarketIppSummariesForPeriod(input: {
   return summaries;
 }
 
+export async function computeMarketIppSummariesForRedPeriods(input: {
+  redPeriodIds: string[];
+}): Promise<Map<string, IppMarketRedPeriodSummary>> {
+  const redPeriodIds = normalizeUnique(input.redPeriodIds);
+  const summaries = new Map<string, IppMarketRedPeriodSummary>();
+  if (redPeriodIds.length === 0) return summaries;
+
+  const summaryRows = await pgSql<RedPeriodMarketSummarySqlRow[]>`
+    select
+      p.id::text as red_period_id,
+      p.label as red_period_label,
+      p.red_year as red_period_year,
+      p.period_index,
+      p.start_date::text as period_start,
+      p.end_date::text as period_end,
+      vs.market_id::text as market_id,
+      count(*)::int as source_submission_count,
+      (array_agg(vs.gm_user_id::text order by vs.submitted_at desc))[1] as latest_gm_user_id
+    from red_month_periods p
+    join visit_sessions vs
+      on vs.submitted_at >= (p.start_date::timestamp at time zone 'Europe/Vienna')
+      and vs.submitted_at < ((p.end_date + 1)::timestamp at time zone 'Europe/Vienna')
+      and vs.is_deleted = false
+      and vs.status = 'submitted'
+    where p.id = any(${redPeriodIds}::uuid[])
+      and p.is_deleted = false
+    group by p.id, p.label, p.red_year, p.period_index, p.start_date, p.end_date, vs.market_id
+  `;
+
+  for (const row of summaryRows) {
+    summaries.set(`${row.red_period_id}::${row.market_id}`, {
+      redPeriodId: row.red_period_id,
+      redPeriodLabel: row.red_period_label,
+      redPeriodYear: row.red_period_year,
+      periodIndex: row.period_index,
+      marketId: row.market_id,
+      periodStart: parseYmdLocalDate(row.period_start),
+      periodEnd: parseYmdLocalDate(row.period_end),
+      marketIpp: 0,
+      sourceSubmissionCount: Number(row.source_submission_count ?? 0),
+      contributingQuestionCount: 0,
+      latestGmUserId: row.latest_gm_user_id,
+    });
+  }
+  if (summaryRows.length === 0) return summaries;
+
+  const latestAnswers = await pgSql<RedPeriodMarketAnswerSqlRow[]>`
+    select distinct on (p.id, vs.market_id, va.question_id)
+      p.id::text as red_period_id,
+      va.id::text as answer_id,
+      va.question_id::text as question_id,
+      va.question_type::text as question_type,
+      va.value_text,
+      va.value_number::text as value_number,
+      va.value_json,
+      vs.market_id::text as market_id
+    from red_month_periods p
+    join visit_sessions vs
+      on vs.submitted_at >= (p.start_date::timestamp at time zone 'Europe/Vienna')
+      and vs.submitted_at < ((p.end_date + 1)::timestamp at time zone 'Europe/Vienna')
+      and vs.is_deleted = false
+      and vs.status = 'submitted'
+    join visit_answers va on va.visit_session_id = vs.id and va.is_deleted = false
+    join visit_session_questions vsq on vsq.id = va.visit_session_question_id and vsq.is_deleted = false
+    join visit_session_sections vss on vss.id = va.visit_session_section_id and vss.is_deleted = false
+    where p.id = any(${redPeriodIds}::uuid[])
+      and p.is_deleted = false
+    order by p.id, vs.market_id, va.question_id, vs.submitted_at desc, va.changed_at desc, va.updated_at desc, va.created_at desc
+  `;
+  if (latestAnswers.length === 0) return summaries;
+
+  const latestAnswerIds = latestAnswers.map((row) => row.answer_id);
+  const questionIds = normalizeUnique(latestAnswers.map((row) => row.question_id));
+  const [optionRows, scoringRows] = await Promise.all([
+    loadOptionsForAnswers(latestAnswerIds),
+    loadIppScoringForQuestions(questionIds),
+  ]);
+  const optionsByAnswerId = buildOptionsByAnswerId(optionRows);
+  const scoringByQuestion = buildScoringByQuestion(scoringRows);
+
+  for (const row of latestAnswers) {
+    const summary = summaries.get(`${row.red_period_id}::${row.market_id}`);
+    if (!summary) continue;
+    const computed = computeAppliedIpp({
+      questionType: row.question_type,
+      valueText: row.value_text,
+      valueNumber: row.value_number,
+      valueJson: (row.value_json as Record<string, unknown> | null) ?? null,
+      options: optionsByAnswerId.get(row.answer_id) ?? [],
+      scoringByKey: scoringByQuestion.get(row.question_id) ?? {},
+    });
+    if (computed.appliedIpp > 0) {
+      summary.marketIpp = Number((summary.marketIpp + computed.appliedIpp).toFixed(4));
+      summary.contributingQuestionCount += 1;
+    }
+  }
+  return summaries;
+}
+
 export async function computeMarketIppForPeriod(input: {
   marketId: string;
   periodStart: Date;
@@ -435,55 +628,7 @@ export async function computeMarketIppForPeriod(input: {
     };
   }
 
-  const latestAnswerIds = latestAnswers.map((row) => row.answer.id);
-  const questionIds = normalizeUnique(latestAnswers.map((row) => row.answer.questionId));
-
-  const [optionRows, scoringRows] = await Promise.all([
-    loadOptionsForAnswers(latestAnswerIds),
-    loadIppScoringForQuestions(questionIds),
-  ]);
-  const optionsByAnswerId = buildOptionsByAnswerId(optionRows);
-  const scoringByQuestion = buildScoringByQuestion(scoringRows);
-
-  const questionRows: IppQuestionBreakdownRow[] = latestAnswers.map((row) => {
-    const options = optionsByAnswerId.get(row.answer.id) ?? [];
-    const scoringByKey = scoringByQuestion.get(row.answer.questionId) ?? {};
-    const computed = computeAppliedIpp({
-      questionType: row.answer.questionType,
-      valueText: row.answer.valueText,
-      valueNumber: row.answer.valueNumber,
-      valueJson: (row.answer.valueJson as Record<string, unknown> | null) ?? null,
-      options,
-      scoringByKey,
-    });
-    return {
-      questionFingerprint: row.answer.questionId,
-      questionId: row.answer.questionId,
-      questionText: row.question.questionTextSnapshot,
-      questionType: row.answer.questionType,
-      selectedAnswer: extractSelectedAnswer({
-        questionType: row.answer.questionType,
-        valueText: row.answer.valueText,
-        valueNumber: row.answer.valueNumber,
-        options,
-        valueJson: (row.answer.valueJson as Record<string, unknown> | null) ?? null,
-      }),
-      appliedIppValue: computed.appliedIpp,
-      counted: computed.appliedIpp > 0,
-      countedReason: computed.countedReason,
-      sourceSections: row.section.section ? [row.section.section] : [],
-      sourceFrageboegen: row.section.fragebogenNameSnapshot ? [row.section.fragebogenNameSnapshot] : [],
-      deduped: false,
-      section: row.section.section,
-      fragebogenName: row.section.fragebogenNameSnapshot ?? null,
-      submittedAt: row.session.submittedAt ? row.session.submittedAt.toISOString() : null,
-    };
-  });
-
-  questionRows.sort((left, right) => {
-    if (left.counted !== right.counted) return left.counted ? -1 : 1;
-    return right.appliedIppValue - left.appliedIppValue;
-  });
+  const questionRows = await buildQuestionRowsFromLatestAnswers(latestAnswers);
 
   const marketIpp = Number(
     questionRows
@@ -500,6 +645,111 @@ export async function computeMarketIppForPeriod(input: {
     marketIpp,
     sourceSubmissionCount,
     contributingQuestionCount,
+    questionRows,
+  };
+}
+
+export async function computeVisitIppSummaries(input: {
+  visitSessionIds: string[];
+}): Promise<Map<string, IppVisitSummary>> {
+  const visitSessionIds = normalizeUnique(input.visitSessionIds);
+  const summaries = new Map<string, IppVisitSummary>();
+  for (const visitSessionId of visitSessionIds) {
+    summaries.set(visitSessionId, { visitSessionId, visitIpp: 0, contributingQuestionCount: 0 });
+  }
+  if (visitSessionIds.length === 0) return summaries;
+
+  const latestAnswers = await pgSql<VisitAnswerSummarySqlRow[]>`
+    select distinct on (vs.id, va.question_id)
+      vs.id::text as visit_session_id,
+      va.id::text as answer_id,
+      va.question_id::text as question_id,
+      va.question_type::text as question_type,
+      va.value_text,
+      va.value_number::text as value_number,
+      va.value_json,
+      vs.market_id::text as market_id
+    from visit_sessions vs
+    join visit_answers va on va.visit_session_id = vs.id and va.is_deleted = false
+    join visit_session_questions vsq on vsq.id = va.visit_session_question_id and vsq.is_deleted = false
+    join visit_session_sections vss on vss.id = va.visit_session_section_id and vss.is_deleted = false
+    where vs.id = any(${visitSessionIds}::uuid[])
+      and vs.is_deleted = false
+      and vs.status = 'submitted'
+      and vs.submitted_at is not null
+    order by vs.id, va.question_id, va.changed_at desc, va.updated_at desc, va.created_at desc
+  `;
+  if (latestAnswers.length === 0) return summaries;
+
+  const latestAnswerIds = latestAnswers.map((row) => row.answer_id);
+  const questionIds = normalizeUnique(latestAnswers.map((row) => row.question_id));
+  const [optionRows, scoringRows] = await Promise.all([
+    loadOptionsForAnswers(latestAnswerIds),
+    loadIppScoringForQuestions(questionIds),
+  ]);
+  const optionsByAnswerId = buildOptionsByAnswerId(optionRows);
+  const scoringByQuestion = buildScoringByQuestion(scoringRows);
+
+  for (const row of latestAnswers) {
+    const summary = summaries.get(row.visit_session_id);
+    if (!summary) continue;
+    const computed = computeAppliedIpp({
+      questionType: row.question_type,
+      valueText: row.value_text,
+      valueNumber: row.value_number,
+      valueJson: (row.value_json as Record<string, unknown> | null) ?? null,
+      options: optionsByAnswerId.get(row.answer_id) ?? [],
+      scoringByKey: scoringByQuestion.get(row.question_id) ?? {},
+    });
+    if (computed.appliedIpp > 0) {
+      summary.visitIpp = Number((summary.visitIpp + computed.appliedIpp).toFixed(4));
+      summary.contributingQuestionCount += 1;
+    }
+  }
+  return summaries;
+}
+
+export async function computeVisitIpp(input: { visitSessionId: string }): Promise<IppVisitComputation> {
+  const [session] = await db
+    .select({ id: visitSessions.id, status: visitSessions.status })
+    .from(visitSessions)
+    .where(and(eq(visitSessions.id, input.visitSessionId), eq(visitSessions.isDeleted, false)))
+    .limit(1);
+  if (!session || session.status !== "submitted") {
+    return { visitSessionId: input.visitSessionId, visitIpp: 0, contributingQuestionCount: 0, questionRows: [] };
+  }
+
+  const answerRows = await db
+    .select({
+      answer: visitAnswers,
+      question: visitSessionQuestions,
+      section: visitSessionSections,
+      session: visitSessions,
+    })
+    .from(visitAnswers)
+    .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
+    .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswers.visitSessionSectionId))
+    .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
+    .where(
+      and(
+        eq(visitAnswers.visitSessionId, input.visitSessionId),
+        eq(visitAnswers.isDeleted, false),
+        eq(visitSessionQuestions.isDeleted, false),
+        eq(visitSessionSections.isDeleted, false),
+        eq(visitSessions.isDeleted, false),
+      ),
+    )
+    .orderBy(
+      asc(visitAnswers.questionId),
+      desc(visitAnswers.changedAt),
+      desc(visitAnswers.updatedAt),
+      desc(visitAnswers.createdAt),
+    );
+  const questionRows = await buildQuestionRowsFromLatestAnswers(pickLatestAnswersByQuestionId(answerRows));
+  return {
+    visitSessionId: input.visitSessionId,
+    visitIpp: Number(questionRows.filter((row) => row.counted).reduce((sum, row) => sum + row.appliedIppValue, 0).toFixed(4)),
+    contributingQuestionCount: questionRows.filter((row) => row.counted).length,
     questionRows,
   };
 }
