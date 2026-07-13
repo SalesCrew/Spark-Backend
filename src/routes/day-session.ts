@@ -958,6 +958,7 @@ daySessionRouter.patch("/review-edits", async (req: AuthedRequest, res, next) =>
 
 daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next) => {
   try {
+    res.set("Cache-Control", "no-store");
     const gmUserId = req.authUser?.appUserId;
     if (!gmUserId) {
       res.status(401).json({ error: "Nicht eingeloggt." });
