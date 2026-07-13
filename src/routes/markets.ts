@@ -3654,7 +3654,7 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
             : existingMarket.marketType
           : "kuehler"
         : existingMarket.marketType;
-    const resolvedUniverseMarket = deriveUniverseMarketFromType(resolvedMarketType);
+    const resolvedUniverseMarket = payload.universeMarket ?? existingMarket.universeMarket;
     const identityResolution = resolveKuehlerIdentity({
       marketType: resolvedMarketType,
       incomingKuehlerStammnr: payload.kuehlerStammnr,
