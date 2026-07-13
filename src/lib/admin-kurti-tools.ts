@@ -1,6 +1,15 @@
 import type { Responses } from "openai/resources/responses/responses";
 import { z } from "zod";
 import { adminKurtiChartSpecSchema } from "./admin-kurti-charts.js";
+import { ADMIN_KURTI_VISUALIZATION_TOOLS } from "./admin-kurti-visualization-tools.js";
+import {
+  ADMIN_KURTI_WORKTIME_ANALYTICS_TOOL,
+  executeAdminKurtiWorktimeAnalytics,
+} from "./admin-kurti-worktime-analytics.js";
+import {
+  ADMIN_KURTI_OPERATIONAL_ANALYTICS_TOOLS,
+  executeAdminKurtiOperationalAnalytics,
+} from "./admin-kurti-operational-analytics.js";
 import { buildGmAggregates } from "./admin-zeiterfassung.js";
 import { sql as pgSql } from "./db.js";
 import { readGmKpiCache } from "./gm-kpi-cache.js";
@@ -51,7 +60,7 @@ function functionTool(
 export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
   functionTool(
     "load_admin_tool_group",
-    "Loads additional read-only Admin Kurti research tools only when the currently available tools do not cover the question. Available groups: overview, people, markets_inventory, visits_campaigns, time, ipp, bonus, questionnaires, photos, reviews_audit. Call this instead of claiming that data is unavailable.",
+    "Loads additional read-only Admin Kurti research or visualization tools only when the currently available tools do not cover the question. Available groups: overview, people, markets_inventory, visits_campaigns, time, ipp, bonus, questionnaires, photos, reviews_audit, visualizations. Call this instead of claiming that data or a display type is unavailable.",
     {
       groups: {
         type: "array",
@@ -59,7 +68,7 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
         maxItems: 5,
         items: {
           type: "string",
-          enum: ["overview", "people", "markets_inventory", "visits_campaigns", "time", "ipp", "bonus", "questionnaires", "photos", "reviews_audit"],
+          enum: ["overview", "people", "markets_inventory", "visits_campaigns", "time", "ipp", "bonus", "questionnaires", "photos", "reviews_audit", "visualizations"],
         },
       },
     },
@@ -175,6 +184,8 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
     },
     ["gmUserId", "from", "to", "includeLive"],
   ),
+  ADMIN_KURTI_WORKTIME_ANALYTICS_TOOL,
+  ...ADMIN_KURTI_OPERATIONAL_ANALYTICS_TOOLS,
   functionTool(
     "get_ipp_context",
     "Uses the same authoritative IPP calculation as the admin IPP page. For a market it returns question-level applied IPP for a RED period; for a GM it returns cached all-time average/sample count; without filters it returns current-period market summaries.",
@@ -441,6 +452,7 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
     },
     ["type", "title", "subtitle", "xLabel", "yLabel", "valueFormat", "series", "points"],
   ),
+  ...ADMIN_KURTI_VISUALIZATION_TOOLS,
 ];
 
 const searchGmsSchema = z.object({
@@ -1794,9 +1806,9 @@ async function getAdminModuleCatalog(): Promise<JsonRecord> {
       { page: "/admin/billa", label: "Billa-Fragebögen", tools: ["get_questionnaire_context", "get_module_context", "get_question_context", "get_filter_context"] },
       { page: "/admin/kuehlerinventur", label: "Kühlerinventur", tools: ["get_questionnaire_context", "get_module_context", "get_question_context", "get_inventory_context"] },
       { page: "/admin/mhd", label: "MHD", tools: ["get_questionnaire_context", "get_module_context", "get_question_context"] },
-      { page: "/admin/fbmanagement", label: "Kampagnenmanagement", tools: ["get_campaign_context", "get_filter_context", "search_visits", "get_evaluation_context"] },
-      { page: "/admin/fotoarchiv", label: "Fotoarchiv", tools: ["search_photo_archive", "get_visit_context"] },
-      { page: "/admin/zeiterfassung", label: "Zeiterfassung", tools: ["get_time_context", "get_pending_requests", "get_audit_history_context"] },
+      { page: "/admin/fbmanagement", label: "Kampagnenmanagement", tools: ["get_campaign_context", "get_campaign_performance_analytics", "get_visit_analytics", "get_filter_context", "search_visits", "get_evaluation_context", "get_answer_distribution_analytics"] },
+      { page: "/admin/fotoarchiv", label: "Fotoarchiv", tools: ["search_photo_archive", "get_photo_analytics", "get_visit_context"] },
+      { page: "/admin/zeiterfassung", label: "Zeiterfassung", tools: ["get_time_context", "get_worktime_analytics", "get_pending_requests", "get_audit_history_context"] },
       { page: "/admin/maerkte", label: "Märkte", tools: ["search_markets", "get_market_context", "get_filter_context"] },
       { page: "/admin/lager", label: "Lager", tools: ["get_inventory_context"] },
       { page: "/admin/gebietsmanager", label: "Gebietsmanager", tools: ["search_gms", "get_gm_context", "get_user_access_context", "get_filter_context", "get_gm_kurti_chat_history"] },
@@ -2729,7 +2741,7 @@ async function renderAdminChart(args: unknown): Promise<JsonRecord> {
 
 async function loadAdminToolGroup(args: unknown): Promise<JsonRecord> {
   const input = z.object({
-    groups: z.array(z.enum(["overview", "people", "markets_inventory", "visits_campaigns", "time", "ipp", "bonus", "questionnaires", "photos", "reviews_audit"])).min(1).max(5),
+    groups: z.array(z.enum(["overview", "people", "markets_inventory", "visits_campaigns", "time", "ipp", "bonus", "questionnaires", "photos", "reviews_audit", "visualizations"])).min(1).max(5),
   }).parse(args);
   return envelope("load_admin_tool_group", {
     loaded: true,
@@ -2751,6 +2763,11 @@ const TOOL_HANDLERS: Record<string, (args: unknown) => Promise<JsonRecord>> = {
   get_visit_context: getVisitContext,
   get_campaign_context: getCampaignContext,
   get_time_context: getTimeContext,
+  get_worktime_analytics: executeAdminKurtiWorktimeAnalytics,
+  get_visit_analytics: (args) => executeAdminKurtiOperationalAnalytics("get_visit_analytics", args),
+  get_campaign_performance_analytics: (args) => executeAdminKurtiOperationalAnalytics("get_campaign_performance_analytics", args),
+  get_answer_distribution_analytics: (args) => executeAdminKurtiOperationalAnalytics("get_answer_distribution_analytics", args),
+  get_photo_analytics: (args) => executeAdminKurtiOperationalAnalytics("get_photo_analytics", args),
   get_ipp_context: getIppContext,
   get_ipp_gm_analytics: getIppGmAnalytics,
   get_ipp_market_analytics: getIppMarketAnalytics,

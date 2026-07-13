@@ -9,6 +9,7 @@ function memoryMessage(index: number, content: string): AdminKurtiMemoryMessage 
     role: index % 2 === 0 ? "user" : "assistant",
     content,
     charts: [],
+    visualizations: [],
     createdAt: new Date(2026, 6, 13, 8, index).toISOString(),
     expiresAt: new Date(2026, 6, 13, 16, index).toISOString(),
   };

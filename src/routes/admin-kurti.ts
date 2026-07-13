@@ -9,6 +9,14 @@ import {
   parseAdminKurtiChartArguments,
   type AdminKurtiChartSpec,
 } from "../lib/admin-kurti-charts.js";
+import {
+  appendAdminKurtiVisualizations,
+  type AdminKurtiVisualization,
+} from "../lib/admin-kurti-visualizations.js";
+import {
+  ADMIN_KURTI_VISUALIZATION_TOOL_NAMES,
+  parseAdminKurtiVisualizationToolCall,
+} from "../lib/admin-kurti-visualization-tools.js";
 import { loadActiveAdminKurtiMessages, saveAdminKurtiExchange } from "../lib/admin-kurti-memory.js";
 import { buildAdminKurtiModelHistory } from "../lib/admin-kurti-model-context.js";
 import { ADMIN_KURTI_SYSTEM_PROMPT } from "../lib/admin-kurti-system-prompt.js";
@@ -275,7 +283,12 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       },
     ];
     const renderedCharts: AdminKurtiChartSpec[] = [];
-    let activeTools = selectAdminKurtiTools(parsed.data.message);
+    const renderedVisualizations: AdminKurtiVisualization[] = [];
+    const routingText = [
+      ...history.slice(-8).filter((message) => message.role === "user").map((message) => message.content.slice(0, 2_000)),
+      parsed.data.message,
+    ].join("\n");
+    let activeTools = selectAdminKurtiTools(routingText);
 
     let response = await createAdminKurtiResponse(openai, {
       model: env.OPENAI_KURTI_MODEL,
@@ -313,6 +326,32 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
                 tool: toolCall.name,
                 error: "invalid_tool_group_request",
                 message: error instanceof Error ? error.message : "The requested tool group is invalid.",
+              });
+            }
+          } else if (ADMIN_KURTI_VISUALIZATION_TOOL_NAMES.has(toolCall.name)) {
+            try {
+              if (renderedVisualizations.length >= 8) {
+                output = JSON.stringify({
+                  tool: toolCall.name,
+                  error: "visualization_limit_reached",
+                  message: "At most eight visualizations can be rendered in one answer.",
+                });
+              } else {
+                const visualization = parseAdminKurtiVisualizationToolCall(toolCall.name, toolCall.arguments);
+                renderedVisualizations.push(visualization);
+                output = JSON.stringify({
+                  tool: toolCall.name,
+                  accepted: true,
+                  visualizationIndex: renderedVisualizations.length - 1,
+                  kind: visualization.kind,
+                  title: visualization.title,
+                });
+              }
+            } catch (error) {
+              output = JSON.stringify({
+                tool: toolCall.name,
+                error: "invalid_visualization_spec",
+                message: error instanceof Error ? error.message : "The visualization specification is invalid.",
               });
             }
           } else if (toolCall.name === "render_admin_chart") {
@@ -367,7 +406,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     }
 
     const assistantText = response.output_text.trim();
-    if (!assistantText && renderedCharts.length === 0) {
+    if (!assistantText && renderedCharts.length === 0 && renderedVisualizations.length === 0) {
       logger.warn("admin_kurti_empty_response", {
         ...getRequestLogMeta(req),
         action: "admin_kurti_chat",
@@ -380,10 +419,11 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       });
       return;
     }
-    const assistantContent = appendAdminKurtiCharts(
+    const contentWithLegacyCharts = appendAdminKurtiCharts(
       assistantText || "Hier ist die gewünschte Auswertung.",
       renderedCharts,
     );
+    const assistantContent = appendAdminKurtiVisualizations(contentWithLegacyCharts, renderedVisualizations);
 
     const messages = await saveAdminKurtiExchange({
       adminUserId,

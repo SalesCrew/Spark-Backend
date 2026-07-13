@@ -1,5 +1,6 @@
 import { and, desc, eq, gt, lte } from "drizzle-orm";
 import { parseAdminKurtiStoredContent, type AdminKurtiChartSpec } from "./admin-kurti-charts.js";
+import { parseAdminKurtiStoredVisualizations, type AdminKurtiVisualization } from "./admin-kurti-visualizations.js";
 import { db } from "./db.js";
 import { logger, serializeError } from "./logger.js";
 import { adminKurtiMessages, type AdminKurtiMessageRole } from "./schema.js";
@@ -12,17 +13,20 @@ export type AdminKurtiMemoryMessage = {
   role: AdminKurtiMessageRole;
   content: string;
   charts: AdminKurtiChartSpec[];
+  visualizations: AdminKurtiVisualization[];
   createdAt: string;
   expiresAt: string;
 };
 
 function toPayload(row: typeof adminKurtiMessages.$inferSelect): AdminKurtiMemoryMessage {
-  const parsedContent = parseAdminKurtiStoredContent(row.content);
+  const parsedVisualizations = parseAdminKurtiStoredVisualizations(row.content);
+  const parsedContent = parseAdminKurtiStoredContent(parsedVisualizations.content);
   return {
     id: row.id,
     role: row.role,
     content: parsedContent.content,
     charts: parsedContent.charts,
+    visualizations: parsedVisualizations.visualizations,
     createdAt: row.createdAt.toISOString(),
     expiresAt: row.expiresAt.toISOString(),
   };
