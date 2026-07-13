@@ -59,7 +59,10 @@ function toolsForNames(names: Iterable<string>): Responses.FunctionTool[] {
 }
 
 export function getAdminKurtiToolsForGroups(groups: Iterable<AdminKurtiToolGroup>): Responses.FunctionTool[] {
-  const names = new Set<string>(["load_admin_tool_group"]);
+  // Keep the legacy chart renderer available for every turn. Follow-up messages
+  // such as "yes, do that" do not repeat chart keywords, but still belong to the
+  // same visualization request and must be able to complete it.
+  const names = new Set<string>(["load_admin_tool_group", "render_admin_chart"]);
   for (const group of groups) {
     for (const name of ADMIN_KURTI_TOOL_GROUPS[group]) names.add(name);
   }
