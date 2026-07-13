@@ -10,7 +10,13 @@ import {
   type AdminKurtiChartSpec,
 } from "../lib/admin-kurti-charts.js";
 import { loadActiveAdminKurtiMessages, saveAdminKurtiExchange } from "../lib/admin-kurti-memory.js";
+import { buildAdminKurtiModelHistory } from "../lib/admin-kurti-model-context.js";
 import { ADMIN_KURTI_SYSTEM_PROMPT } from "../lib/admin-kurti-system-prompt.js";
+import {
+  addAdminKurtiToolGroups,
+  parseAdminKurtiToolGroupArguments,
+  selectAdminKurtiTools,
+} from "../lib/admin-kurti-tool-routing.js";
 import { ADMIN_KURTI_TOOLS, executeAdminKurtiTool } from "../lib/admin-kurti-tools.js";
 import { db } from "../lib/db.js";
 import { getRequestLogMeta, logger, serializeError } from "../lib/logger.js";
@@ -19,8 +25,7 @@ import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const adminKurtiRouter = Router();
 const activeAdminKurtiRequests = new Set<string>();
-const MAX_TOOL_ROUNDS = 8;
-const MAX_HISTORY_MESSAGES = 36;
+const MAX_TOOL_ROUNDS = 6;
 
 const messageSchema = z.object({
   message: z.string().trim().min(1).max(4000),
@@ -64,9 +69,42 @@ const openai = env.OPENAI_API_KEY
   ? new OpenAI({
       apiKey: env.OPENAI_API_KEY,
       timeout: env.OPENAI_KURTI_TIMEOUT_MS,
-      maxRetries: 1,
+      maxRetries: 0,
     })
   : null;
+
+function getRateLimitRetryDelayMs(error: { status?: number; message: string }): number | null {
+  if (error.status !== 429) return null;
+  const secondsMatch = error.message.match(/try again in\s+([\d.]+)s/i);
+  if (!secondsMatch?.[1]) return 3_000;
+  const seconds = Number(secondsMatch[1]);
+  if (!Number.isFinite(seconds)) return 3_000;
+  return Math.min(15_000, Math.max(1_000, Math.ceil(seconds * 1_000) + 350));
+}
+
+async function createAdminKurtiResponse(
+  client: OpenAI,
+  body: Responses.ResponseCreateParamsNonStreaming,
+  logMeta: ReturnType<typeof getRequestLogMeta>,
+) {
+  try {
+    return await client.responses.create(body);
+  } catch (error) {
+    if (!(error instanceof OpenAI.APIError)) throw error;
+    const retryDelayMs = getRateLimitRetryDelayMs(error);
+    if (retryDelayMs === null) throw error;
+    logger.warn("admin_kurti_rate_limit_retry_scheduled", {
+      ...logMeta,
+      action: "admin_kurti_chat",
+      result: "retry",
+      retryDelayMs,
+      providerStatus: error.status,
+      providerCode: error.code,
+    });
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    return client.responses.create(body);
+  }
+}
 
 adminKurtiRouter.use(requireAuth(["admin"]));
 
@@ -230,29 +268,27 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
           "Der Assistent ist strikt read-only. Aktuelle Geschäftsdaten müssen über die bereitgestellten Werkzeuge gelesen werden.",
         ].join("\n"),
       },
-      ...history.slice(-MAX_HISTORY_MESSAGES).map((message) => ({
-        role: message.role,
-        content: message.content,
-      } satisfies Responses.EasyInputMessage)),
+      ...buildAdminKurtiModelHistory(history),
       {
         role: "user",
         content: parsed.data.message,
       },
     ];
     const renderedCharts: AdminKurtiChartSpec[] = [];
+    let activeTools = selectAdminKurtiTools(parsed.data.message);
 
-    let response = await openai.responses.create({
+    let response = await createAdminKurtiResponse(openai, {
       model: env.OPENAI_KURTI_MODEL,
       instructions: ADMIN_KURTI_SYSTEM_PROMPT,
       input,
-      tools: ADMIN_KURTI_TOOLS,
+      tools: activeTools,
       tool_choice: "auto",
       parallel_tool_calls: true,
       reasoning: { effort: "low" },
       include: ["reasoning.encrypted_content"],
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
       store: false,
-    });
+    }, getRequestLogMeta(req));
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       const toolCalls = response.output.filter((item) => item.type === "function_call");
@@ -262,7 +298,24 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       const toolOutputs = await Promise.all(
         toolCalls.map(async (toolCall) => {
           let output: string;
-          if (toolCall.name === "render_admin_chart") {
+          if (toolCall.name === "load_admin_tool_group") {
+            try {
+              const groups = parseAdminKurtiToolGroupArguments(toolCall.arguments);
+              activeTools = addAdminKurtiToolGroups(activeTools, groups);
+              output = JSON.stringify({
+                tool: toolCall.name,
+                loaded: true,
+                groups,
+                availableTools: activeTools.map((tool) => tool.name),
+              });
+            } catch (error) {
+              output = JSON.stringify({
+                tool: toolCall.name,
+                error: "invalid_tool_group_request",
+                message: error instanceof Error ? error.message : "The requested tool group is invalid.",
+              });
+            }
+          } else if (toolCall.name === "render_admin_chart") {
             try {
               if (renderedCharts.length >= 3) {
                 output = JSON.stringify({
@@ -299,18 +352,18 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       );
       input.push(...toolOutputs);
 
-      response = await openai.responses.create({
+      response = await createAdminKurtiResponse(openai, {
         model: env.OPENAI_KURTI_MODEL,
         instructions: ADMIN_KURTI_SYSTEM_PROMPT,
         input,
-        tools: ADMIN_KURTI_TOOLS,
+        tools: activeTools,
         tool_choice: round === MAX_TOOL_ROUNDS - 1 ? "none" : "auto",
         parallel_tool_calls: true,
         reasoning: { effort: "low" },
         include: ["reasoning.encrypted_content"],
         max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
         store: false,
-      });
+      }, getRequestLogMeta(req));
     }
 
     const assistantText = response.output_text.trim();

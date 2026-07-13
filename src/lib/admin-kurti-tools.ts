@@ -50,6 +50,22 @@ function functionTool(
 
 export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
   functionTool(
+    "load_admin_tool_group",
+    "Loads additional read-only Admin Kurti research tools only when the currently available tools do not cover the question. Available groups: overview, people, markets_inventory, visits_campaigns, time, ipp, bonus, questionnaires, photos, reviews_audit. Call this instead of claiming that data is unavailable.",
+    {
+      groups: {
+        type: "array",
+        minItems: 1,
+        maxItems: 5,
+        items: {
+          type: "string",
+          enum: ["overview", "people", "markets_inventory", "visits_campaigns", "time", "ipp", "bonus", "questionnaires", "photos", "reviews_audit"],
+        },
+      },
+    },
+    ["groups"],
+  ),
+  functionTool(
     "get_admin_overview",
     "Returns the current Coke Spark admin overview across user roles, active GM Kurti conversations, markets, campaigns, visits, photos, time tracking, review queues, and the current RED period. Use this first for broad status questions.",
     {},
@@ -2711,7 +2727,19 @@ async function renderAdminChart(args: unknown): Promise<JsonRecord> {
   });
 }
 
+async function loadAdminToolGroup(args: unknown): Promise<JsonRecord> {
+  const input = z.object({
+    groups: z.array(z.enum(["overview", "people", "markets_inventory", "visits_campaigns", "time", "ipp", "bonus", "questionnaires", "photos", "reviews_audit"])).min(1).max(5),
+  }).parse(args);
+  return envelope("load_admin_tool_group", {
+    loaded: true,
+    groups: input.groups,
+    note: "The requested tool groups are available in the next research round.",
+  });
+}
+
 const TOOL_HANDLERS: Record<string, (args: unknown) => Promise<JsonRecord>> = {
+  load_admin_tool_group: loadAdminToolGroup,
   get_admin_overview: getAdminOverview,
   get_user_access_context: getUserAccessContext,
   search_gms: searchGms,
@@ -2749,12 +2777,12 @@ export async function executeAdminKurtiTool(name: string, rawArguments: string):
     const parsed = rawArguments.trim() ? JSON.parse(rawArguments) as unknown : {};
     const result = await handler(parsed);
     const serialized = JSON.stringify(result);
-    if (serialized.length <= 120_000) return serialized;
+    if (serialized.length <= 32_000) return serialized;
     return JSON.stringify({
       tool: name,
       error: "tool_result_too_large",
-      message: "The result exceeded 120,000 characters. Narrow the filters or request a smaller limit.",
-      preview: serialized.slice(0, 110_000),
+      message: "The result exceeded 32,000 characters. Narrow the filters or request a smaller limit.",
+      preview: serialized.slice(0, 28_000),
     });
   } catch (error) {
     const parsed = error as { message?: unknown; code?: unknown };
