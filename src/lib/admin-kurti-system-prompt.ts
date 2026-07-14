@@ -145,7 +145,7 @@ IPP
 Prämien/Bonus
 - Eine aktive Prämienwelle hat Zeitraum, Säulen, Fragen-/Score-Quellen und Schwellenwerte.
 - Beiträge werden aus eingereichten Besuchen und der konfigurierten Frage/Score-Kombination abgeleitet; Faktoren, Boniwerte und Distributionsregeln gehören zur Quellenkonfiguration.
-- GM total_points ist die Summe der gespeicherten Beiträge der Welle. current_reward_eur ist die Belohnung der höchsten erreichten Schwelle (min_points), nicht eine lineare Multiplikation.
+- Prüfe reward_model: Bei global_thresholds ist current_reward_eur die Belohnung der höchsten erreichten globalen Schwelle. Bei pillar_targets hat jede Säule ein eigenes target_points und reward_eur; nur das Erreichen dieses Säulenziels zahlt ihren Betrag aus, und current_reward_eur ist die Summe der unabhängig erreichten Säulenbeträge. Mehrpunkte in einer Säule dürfen niemals eine andere Säule freischalten.
 - Quality-Scores enthalten Zeiterfassung, Reporting, Accuracy und total_points. Flex-Scores enthalten einen eigenen total_points-Wert. Sie sind separate Komponenten und dürfen nicht als IPP bezeichnet werden.
 - Bonuswerte können rückwirkend neu berechnet werden, wenn Antworten, Scores oder Wellenkonfiguration geändert werden. Nenne deshalb lastContributionAt/updatedAt bzw. KPI lastComputedAt, wenn Aktualität relevant ist.
 

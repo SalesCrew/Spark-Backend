@@ -7,6 +7,7 @@ import { recomputeBonusWaveTx, type BonusWaveRecomputeResult } from "../lib/bonu
 import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
+import { isWaveAnswerPersistencePillarName } from "../lib/praemien-answer-persistence.js";
 import {
   buildSourceCatalog,
   normalizeMoney,
@@ -746,6 +747,7 @@ async function replacePillarsTx(tx: Tx, waveId: string, pillars: z.infer<typeof 
       name: praemienWavePillars.name,
       targetPoints: praemienWavePillars.targetPoints,
       rewardEur: praemienWavePillars.rewardEur,
+      carryAnswersForWave: praemienWavePillars.carryAnswersForWave,
     })
     .from(praemienWavePillars)
     .where(and(eq(praemienWavePillars.waveId, waveId), eq(praemienWavePillars.isDeleted, false)));
@@ -766,6 +768,8 @@ async function replacePillarsTx(tx: Tx, waveId: string, pillars: z.infer<typeof 
     const rewardEur = entry.rewardEur !== undefined
       ? String(entry.rewardEur)
       : (previous?.rewardEur ?? "0");
+    const carryAnswersForWave = previous?.carryAnswersForWave === true
+      || isWaveAnswerPersistencePillarName(entry.name);
     const pillarValues = {
       name: entry.name,
       description: entry.description,
@@ -776,6 +780,7 @@ async function replacePillarsTx(tx: Tx, waveId: string, pillars: z.infer<typeof 
       maxRewardEur: String(entry.maxRewardEur),
       targetPoints,
       rewardEur,
+      carryAnswersForWave,
       isDeleted: false,
       deletedAt: null,
       updatedAt: now,

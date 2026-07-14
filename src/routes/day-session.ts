@@ -1416,6 +1416,67 @@ daySessionRouter.patch("/end", async (req: AuthedRequest, res, next) => {
   }
 });
 
+daySessionRouter.patch("/end/reopen", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    if (!gmUserId) {
+      res.status(401).json({ error: "Nicht eingeloggt." });
+      return;
+    }
+
+    const now = new Date();
+    const session = await loadCurrentWritableSession(gmUserId, now, DEFAULT_TIMEZONE);
+    if (!session || session.status !== "ended") {
+      res.status(409).json({
+        error: "Der Arbeitstag kann nicht mehr fortgesetzt werden.",
+        code: "day_not_reopenable",
+      });
+      return;
+    }
+
+    const sessionTimezone = session.timezone || DEFAULT_TIMEZONE;
+    if (toYmdInTimezone(now, sessionTimezone) !== session.workDate) {
+      res.status(409).json({
+        error: "Ein vergangener Arbeitstag kann nicht wieder geoeffnet werden.",
+        code: "stale_day_not_reopenable",
+      });
+      return;
+    }
+
+    const [updated] = await db
+      .update(gmDaySessions)
+      .set({
+        status: "started",
+        dayEndedAt: null,
+        endKm: null,
+        endKmDeferred: false,
+        isEndKmCompleted: false,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(gmDaySessions.id, session.id),
+          eq(gmDaySessions.gmUserId, gmUserId),
+          eq(gmDaySessions.status, "ended"),
+          eq(gmDaySessions.isDeleted, false),
+        ),
+      )
+      .returning();
+
+    if (!updated) {
+      res.status(409).json({
+        error: "Der Arbeitstag wurde zwischenzeitlich geaendert.",
+        code: "day_not_reopenable",
+      });
+      return;
+    }
+
+    res.status(200).json({ session: serializeDaySession(updated) });
+  } catch (error) {
+    next(error);
+  }
+});
+
 daySessionRouter.patch("/end-km", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = setKmSchema.safeParse(req.body ?? {});

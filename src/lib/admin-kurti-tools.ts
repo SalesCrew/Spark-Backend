@@ -278,7 +278,7 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
   ),
   functionTool(
     "get_bonus_context",
-    "Returns configured bonus waves, thresholds, pillars, source/scoring mappings, quality/flex scores, GM points, rewards, and contribution counts. Values come from the finalized bonus tables used by the admin bonus page.",
+    "Returns configured bonus waves, reward model, legacy thresholds, per-pillar targets and rewards, source/scoring mappings, quality/flex scores, GM totals, per-pillar achievements, rewards, and contribution counts. Values come from the finalized bonus tables used by the admin bonus page.",
     {
       waveId: NULLABLE_UUID_SCHEMA,
       gmUserId: NULLABLE_UUID_SCHEMA,
@@ -1762,7 +1762,7 @@ async function getBonusContext(args: unknown): Promise<JsonRecord> {
     limit ${input.limit}
   `;
   if (!input.waveId && !input.gmUserId) return envelope("get_bonus_context", waves, { resultCount: waves.length });
-  const [thresholds, pillars, sources, totals, quality, flex] = await Promise.all([
+  const [thresholds, pillars, sources, totals, pillarTotals, quality, flex] = await Promise.all([
     pgSql<JsonRecord[]>`select * from praemien_wave_thresholds where is_deleted = false and (${input.waveId}::uuid is null or wave_id = ${input.waveId}::uuid) order by wave_id, order_index`,
     pgSql<JsonRecord[]>`select * from praemien_wave_pillars where is_deleted = false and (${input.waveId}::uuid is null or wave_id = ${input.waveId}::uuid) order by wave_id, order_index`,
     pgSql<JsonRecord[]>`select id, wave_id, pillar_id, section_type::text, fragebogen_id, fragebogen_name, module_id, module_name, question_id, question_text, score_key, display_label, is_factor_mode, boni_value, distribution_freq_rule::text from praemien_wave_sources where is_deleted = false and (${input.waveId}::uuid is null or wave_id = ${input.waveId}::uuid) order by wave_id, display_label limit 300`,
@@ -1772,6 +1772,16 @@ async function getBonusContext(args: unknown): Promise<JsonRecord> {
       where (${input.waveId}::uuid is null or gt.wave_id = ${input.waveId}::uuid)
         and (${input.gmUserId}::uuid is null or gt.gm_user_id = ${input.gmUserId}::uuid)
       order by gt.current_reward_eur desc, gt.total_points desc
+      limit ${input.limit}
+    `,
+    pgSql<JsonRecord[]>`
+      select pt.*, p.name as pillar_name, p.color as pillar_color, concat_ws(' ', u.first_name, u.last_name) as gm_name
+      from praemien_gm_wave_pillar_totals pt
+      join praemien_wave_pillars p on p.id = pt.pillar_id
+      join users u on u.id = pt.gm_user_id
+      where (${input.waveId}::uuid is null or pt.wave_id = ${input.waveId}::uuid)
+        and (${input.gmUserId}::uuid is null or pt.gm_user_id = ${input.gmUserId}::uuid)
+      order by pt.wave_id, pt.gm_user_id, p.order_index
       limit ${input.limit}
     `,
     pgSql<JsonRecord[]>`
@@ -1787,7 +1797,7 @@ async function getBonusContext(args: unknown): Promise<JsonRecord> {
       limit ${input.limit}
     `,
   ]);
-  return envelope("get_bonus_context", { waves, thresholds, pillars, sources, gmTotals: totals, qualityScores: quality, flexScores: flex });
+  return envelope("get_bonus_context", { waves, thresholds, pillars, sources, gmTotals: totals, gmPillarTotals: pillarTotals, qualityScores: quality, flexScores: flex });
 }
 
 async function getAdminModuleCatalog(): Promise<JsonRecord> {

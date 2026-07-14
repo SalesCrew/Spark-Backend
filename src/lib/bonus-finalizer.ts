@@ -552,6 +552,12 @@ async function loadActiveWaveForInstant(input: {
   return null;
 }
 
+export async function readActivePraemienWaveForInstant(at = new Date()) {
+  if (!(await ensureBonusTablesReady())) return null;
+  const fallbackTimezone = (await resolveCurrentRedPeriod(at)).timezone || DEFAULT_TIMEZONE;
+  return loadActiveWaveForInstant({ at, executor: db, fallbackTimezone });
+}
+
 type FinalizeBonusInput = {
   sessionId: string;
   gmUserId: string;

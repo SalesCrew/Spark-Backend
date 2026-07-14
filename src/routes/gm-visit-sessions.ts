@@ -3,12 +3,13 @@ import { Router } from "express";
 import { z } from "zod";
 import {
   finalizeBonusForSubmittedVisitSessionTx,
+  readActivePraemienWaveForInstant,
   readGmActiveBonusSummary,
 } from "../lib/bonus-finalizer.js";
 import { ensureAndGetGmKpiCache, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { db } from "../lib/db.js";
-import { ensureGmSubmissionGate, gmSubmissionGateError } from "../lib/day-session.js";
+import { DEFAULT_TIMEZONE, ensureGmSubmissionGate, gmSubmissionGateError } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import { addDays, startOfDay } from "../lib/red-monat.js";
@@ -30,6 +31,8 @@ import {
   marketKuehlerUnits,
   markets,
   photoTags,
+  praemienWavePillars,
+  praemienWaveSources,
   users,
   visitAnswerChangeRequests,
   visitAnswerMatrixCells,
@@ -534,7 +537,7 @@ async function verifyStorageObjectExists(bucket: string, storagePath: string): P
   return Array.isArray(data) && data.some((row) => row.name === fileName);
 }
 
-type RedMonthSourceAnswer = {
+type ReusableSourceAnswer = {
   answer: typeof visitAnswers.$inferSelect;
   options: Array<typeof visitAnswerOptions.$inferSelect>;
   matrixCells: Array<typeof visitAnswerMatrixCells.$inferSelect>;
@@ -542,6 +545,10 @@ type RedMonthSourceAnswer = {
   tagsByPhotoId: Map<string, Array<typeof visitAnswerPhotoTags.$inferSelect>>;
   commentText: string | null;
 };
+
+type AnswerReuseWindow =
+  | { kind: "timestamp"; start: Date; endExclusive: Date }
+  | { kind: "local-date"; startDate: string; endDate: string; timezone: string };
 
 function rewritePhotoStoragePathForAnswer(inputPath: string, sessionId: string, answerId: string): string {
   const normalized = inputPath.replace(/^\/+/, "");
@@ -589,18 +596,24 @@ async function loadSiblingSessionQuestions(
   }));
 }
 
-async function loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(input: {
+async function loadLatestSubmittedAnswersByQuestionId(input: {
   gmUserId: string;
   marketId: string;
   questionIds: string[];
-  now?: Date;
-}): Promise<Map<string, RedMonthSourceAnswer>> {
+  window: AnswerReuseWindow;
+}): Promise<Map<string, ReusableSourceAnswer>> {
   const questionIds = normalizeUnique(input.questionIds.filter((id) => isUuid(id)));
   if (questionIds.length === 0) return new Map();
 
-  const period = await resolveCurrentRedPeriod(input.now ?? new Date());
-  const periodStart = startOfDay(period.start);
-  const periodEndExclusive = addDays(startOfDay(period.end), 1);
+  const submittedAtWindow = input.window.kind === "timestamp"
+    ? and(
+        gte(visitSessions.submittedAt, input.window.start),
+        lt(visitSessions.submittedAt, input.window.endExclusive),
+      )
+    : and(
+        sql`${visitSessions.submittedAt} >= (${input.window.startDate}::date::timestamp at time zone ${input.window.timezone})`,
+        sql`${visitSessions.submittedAt} < (((${input.window.endDate}::date + 1)::timestamp) at time zone ${input.window.timezone})`,
+      );
 
   const candidates = await db
     .select({
@@ -618,8 +631,7 @@ async function loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(input: {
         eq(visitSessions.gmUserId, input.gmUserId),
         eq(visitSessions.marketId, input.marketId),
         isNotNull(visitSessions.submittedAt),
-        gte(visitSessions.submittedAt, periodStart),
-        lt(visitSessions.submittedAt, periodEndExclusive),
+        submittedAtWindow,
       ),
     )
     .orderBy(
@@ -712,7 +724,7 @@ async function loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(input: {
     }
   }
 
-  const output = new Map<string, RedMonthSourceAnswer>();
+  const output = new Map<string, ReusableSourceAnswer>();
   for (const row of selectedAnswers) {
     output.set(row.questionId, {
       answer: row,
@@ -724,6 +736,87 @@ async function loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(input: {
     });
   }
   return output;
+}
+
+async function loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(input: {
+  gmUserId: string;
+  marketId: string;
+  questionIds: string[];
+  now: Date;
+}): Promise<Map<string, ReusableSourceAnswer>> {
+  const period = await resolveCurrentRedPeriod(input.now);
+  return loadLatestSubmittedAnswersByQuestionId({
+    gmUserId: input.gmUserId,
+    marketId: input.marketId,
+    questionIds: input.questionIds,
+    window: {
+      kind: "timestamp",
+      start: startOfDay(period.start),
+      endExclusive: addDays(startOfDay(period.end), 1),
+    },
+  });
+}
+
+async function loadReusableSubmittedAnswersByQuestionId(input: {
+  gmUserId: string;
+  marketId: string;
+  questionIds: string[];
+  now: Date;
+}): Promise<Map<string, ReusableSourceAnswer>> {
+  const questionIds = normalizeUnique(input.questionIds.filter((id) => isUuid(id)));
+  if (questionIds.length === 0) return new Map();
+
+  const activeWave = await readActivePraemienWaveForInstant(input.now);
+  if (!activeWave) {
+    return loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({ ...input, questionIds });
+  }
+
+  const waveQuestionRows = await db
+    .select({ questionId: praemienWaveSources.questionId })
+    .from(praemienWaveSources)
+    .innerJoin(
+      praemienWavePillars,
+      and(
+        eq(praemienWavePillars.id, praemienWaveSources.pillarId),
+        eq(praemienWavePillars.waveId, activeWave.id),
+      ),
+    )
+    .where(
+      and(
+        eq(praemienWaveSources.waveId, activeWave.id),
+        inArray(praemienWaveSources.questionId, questionIds),
+        eq(praemienWaveSources.isDeleted, false),
+        eq(praemienWavePillars.isDeleted, false),
+        eq(praemienWavePillars.carryAnswersForWave, true),
+      ),
+    );
+  const waveQuestionIds = normalizeUnique(waveQuestionRows.map((row) => row.questionId));
+  if (waveQuestionIds.length === 0) {
+    return loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({ ...input, questionIds });
+  }
+
+  const waveQuestionIdSet = new Set(waveQuestionIds);
+  const redMonthQuestionIds = questionIds.filter((questionId) => !waveQuestionIdSet.has(questionId));
+  const timezone = activeWave.timezone.trim() || DEFAULT_TIMEZONE;
+  const [redMonthAnswers, waveAnswers] = await Promise.all([
+    loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({
+      ...input,
+      questionIds: redMonthQuestionIds,
+    }),
+    loadLatestSubmittedAnswersByQuestionId({
+      gmUserId: input.gmUserId,
+      marketId: input.marketId,
+      questionIds: waveQuestionIds,
+      window: {
+        kind: "local-date",
+        startDate: activeWave.startDate,
+        endDate: activeWave.endDate,
+        timezone,
+      },
+    }),
+  ]);
+
+  return new Map([...redMonthAnswers, ...waveAnswers]);
 }
 
 type RedMonthHistoryPhoto = {
@@ -2058,7 +2151,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
     const sessionQuestionIds = normalizeUnique(
       sections.flatMap((section) => section.questions.map((question) => question.questionId)),
     );
-    const latestRedMonthAnswersByQuestionId = await loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({
+    const latestReusableAnswersByQuestionId = await loadReusableSubmittedAnswersByQuestionId({
       gmUserId,
       marketId: market.id,
       questionIds: sessionQuestionIds,
@@ -2146,9 +2239,9 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
             .returning();
           if (!qRow) throw new Error("visit question konnte nicht erstellt werden.");
 
-          const redMonthSource = latestRedMonthAnswersByQuestionId.get(question.questionId);
-          if (redMonthSource) {
-            const sourceAnswer = redMonthSource.answer;
+          const reusableSource = latestReusableAnswersByQuestionId.get(question.questionId);
+          if (reusableSource) {
+            const sourceAnswer = reusableSource.answer;
             const isPhotoAnswer = sourceAnswer.questionType === "photo";
             const prefilledValueJson = isPhotoAnswer
               ? { storage: [] }
@@ -2178,9 +2271,9 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
               .returning();
             if (!insertedAnswer) throw new Error("Vorbelegte Antwort konnte nicht erstellt werden.");
 
-            if (redMonthSource.options.length > 0) {
+            if (reusableSource.options.length > 0) {
               await tx.insert(visitAnswerOptions).values(
-                redMonthSource.options.map((option, idx) => ({
+                reusableSource.options.map((option, idx) => ({
                   visitAnswerId: insertedAnswer.id,
                   optionRole: option.optionRole,
                   optionValue: option.optionValue,
@@ -2193,9 +2286,9 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
               );
             }
 
-            if (redMonthSource.matrixCells.length > 0) {
+            if (reusableSource.matrixCells.length > 0) {
               await tx.insert(visitAnswerMatrixCells).values(
-                redMonthSource.matrixCells.map((cell, idx) => ({
+                reusableSource.matrixCells.map((cell, idx) => ({
                   visitAnswerId: insertedAnswer.id,
                   rowKey: cell.rowKey,
                   columnKey: cell.columnKey,
@@ -2211,7 +2304,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
               );
             }
 
-            const sourceComment = redMonthSource.commentText?.trim() ?? "";
+            const sourceComment = reusableSource.commentText?.trim() ?? "";
             if (sourceComment.length > 0) {
               await tx.insert(visitQuestionComments).values({
                 visitSessionQuestionId: qRow.id,
