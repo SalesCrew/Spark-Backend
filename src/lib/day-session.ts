@@ -1,6 +1,6 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { db, sql } from "./db.js";
-import { gmDaySessions } from "./schema.js";
+import { gmDaySessionPauses, gmDaySessions, visitSessions } from "./schema.js";
 
 const DEFAULT_TIMEZONE = "Europe/Vienna";
 let checkedDaySessionTable = false;
@@ -96,6 +96,91 @@ async function ensureStartedDaySession(input: {
   return { ok: true, session, skipped: false };
 }
 
+type GmSubmissionGateReason =
+  | "day_not_started"
+  | "stale_day_open"
+  | "pause_active"
+  | "active_visit_open";
+
+type GmSubmissionGateResult =
+  | {
+      ok: true;
+      session: typeof gmDaySessions.$inferSelect | null;
+      skipped: boolean;
+    }
+  | {
+      ok: false;
+      reason: GmSubmissionGateReason;
+      activeVisitSessionId?: string;
+    };
+
+async function ensureGmSubmissionGate(input: {
+  gmUserId: string;
+  now?: Date;
+  timezone?: string;
+  blockActiveVisit?: boolean;
+}): Promise<GmSubmissionGateResult> {
+  const dayGuard = await ensureStartedDaySession(input);
+  if (!dayGuard.ok) return dayGuard;
+  if (dayGuard.skipped) return dayGuard;
+  if (!dayGuard.session || dayGuard.session.status !== "started") {
+    return { ok: false, reason: "day_not_started" };
+  }
+
+  const [openPause] = await db
+    .select({ id: gmDaySessionPauses.id })
+    .from(gmDaySessionPauses)
+    .where(
+      and(
+        eq(gmDaySessionPauses.gmUserId, input.gmUserId),
+        eq(gmDaySessionPauses.daySessionId, dayGuard.session.id),
+        eq(gmDaySessionPauses.isDeleted, false),
+        isNull(gmDaySessionPauses.pauseEndedAt),
+      ),
+    )
+    .limit(1);
+  if (openPause) return { ok: false, reason: "pause_active" };
+
+  if (input.blockActiveVisit) {
+    const [activeVisit] = await db
+      .select({ id: visitSessions.id })
+      .from(visitSessions)
+      .where(
+        and(
+          eq(visitSessions.gmUserId, input.gmUserId),
+          eq(visitSessions.status, "draft"),
+          eq(visitSessions.isDeleted, false),
+          isNull(visitSessions.submittedAt),
+        ),
+      )
+      .orderBy(desc(visitSessions.startedAt), desc(visitSessions.updatedAt))
+      .limit(1);
+    if (activeVisit) {
+      return {
+        ok: false,
+        reason: "active_visit_open",
+        activeVisitSessionId: activeVisit.id,
+      };
+    }
+  }
+
+  return dayGuard;
+}
+
+function gmSubmissionGateError(reason: GmSubmissionGateReason): { error: string; code: GmSubmissionGateReason } {
+  switch (reason) {
+    case "stale_day_open":
+      return { error: "Bitte zuerst den offenen Arbeitstag vom Vortag abschließen.", code: reason };
+    case "pause_active":
+      return { error: "Bitte zuerst die aktive Pause beenden.", code: reason };
+    case "active_visit_open":
+      return { error: "Bitte zuerst den laufenden Fragebogen abschließen.", code: reason };
+    case "day_not_started":
+    default:
+      return { error: "Bitte zuerst den Arbeitstag starten.", code: "day_not_started" };
+  }
+}
+
 function inArrayValue<T extends string>(value: T, values: readonly T[]): boolean {
   return values.includes(value);
 }
@@ -105,6 +190,9 @@ export {
   getCurrentDaySessionForUser,
   getCurrentWritableDaySessionForUser,
   ensureDaySessionTableReady,
+  ensureGmSubmissionGate,
   ensureStartedDaySession,
+  gmSubmissionGateError,
   toYmdInTimezone,
 };
+export type { GmSubmissionGateReason, GmSubmissionGateResult };

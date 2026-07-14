@@ -5,7 +5,7 @@ import { z } from "zod";
 import { logAction, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
-import { ensureStartedDaySession } from "../lib/day-session.js";
+import { ensureGmSubmissionGate, gmSubmissionGateError } from "../lib/day-session.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import {
   respondTimelineValidationError,
@@ -39,6 +39,30 @@ timeTrackingRouter.use((req, res, next) => {
     });
   });
   next();
+});
+timeTrackingRouter.use(async (req: AuthedRequest, res, next) => {
+  const method = req.method.toUpperCase();
+  const isCancellation = method === "PATCH" && /^\/entries\/[^/]+\/cancel$/.test(req.path);
+  if (req.authUser?.role !== "gm" || method === "GET" || isCancellation) {
+    next();
+    return;
+  }
+  try {
+    const gate = await ensureGmSubmissionGate({
+      gmUserId: req.authUser.appUserId,
+      blockActiveVisit: true,
+    });
+    if (!gate.ok) {
+      res.status(409).json({
+        ...gmSubmissionGateError(gate.reason),
+        ...(gate.activeVisitSessionId ? { activeVisitSessionId: gate.activeVisitSessionId } : {}),
+      });
+      return;
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
 });
 
 const uuidSchema = z.string().uuid();
@@ -227,17 +251,6 @@ timeTrackingRouter.post("/entries/draft/start", async (req: AuthedRequest, res, 
     const authUserId = req.authUser?.appUserId;
     if (!authUserId) {
       res.status(401).json({ error: "Nicht eingeloggt." });
-      return;
-    }
-    const dayGuard = await ensureStartedDaySession({ gmUserId: authUserId });
-    if (!dayGuard.ok) {
-      res.status(409).json({
-        error:
-          dayGuard.reason === "stale_day_open"
-            ? "Bitte zuerst den offenen Arbeitstag vom Vortag abschließen."
-            : "Bitte zuerst den Arbeitstag starten.",
-        code: dayGuard.reason,
-      });
       return;
     }
     const activityType = normalizeActivityType(parsed.data.activityType);

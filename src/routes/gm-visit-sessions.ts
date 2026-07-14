@@ -8,7 +8,7 @@ import {
 import { ensureAndGetGmKpiCache, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { db } from "../lib/db.js";
-import { ensureStartedDaySession } from "../lib/day-session.js";
+import { ensureGmSubmissionGate, gmSubmissionGateError } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import { addDays, startOfDay } from "../lib/red-monat.js";
@@ -67,6 +67,33 @@ gmVisitSessionsRouter.use((req, res, next) => {
     });
   });
   next();
+});
+
+function isGatedGmVisitMutation(method: string, path: string): boolean {
+  if (method === "POST" && path === "/gm/visit-sessions") return true;
+  if (method === "PATCH" && /^\/gm\/visit-sessions\/[^/]+\/(?:start|answers)$/.test(path)) return true;
+  if (method === "POST" && /^\/gm\/visit-sessions\/[^/]+\/submit$/.test(path)) return true;
+  if (method === "POST" && /^\/gm\/visit-sessions\/[^/]+\/photos\/(?:presign|commit|delete)$/.test(path)) return true;
+  return /^(?:PATCH|POST)$/.test(method)
+    && /^\/gm\/visit-sessions\/[^/]+\/inherited-photos\/(?:tags|delete)$/.test(path);
+}
+
+gmVisitSessionsRouter.use(async (req: AuthedRequest, res, next) => {
+  const method = req.method.toUpperCase();
+  if (req.authUser?.role !== "gm" || !isGatedGmVisitMutation(method, req.path)) {
+    next();
+    return;
+  }
+  try {
+    const gate = await ensureGmSubmissionGate({ gmUserId: req.authUser.appUserId });
+    if (!gate.ok) {
+      res.status(409).json(gmSubmissionGateError(gate.reason));
+      return;
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
 });
 
 const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
@@ -1827,18 +1854,6 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       res.status(401).json({ error: "Nicht eingeloggt." });
       return;
     }
-    const dayGuard = await ensureStartedDaySession({ gmUserId });
-    if (!dayGuard.ok) {
-      res.status(409).json({
-        error:
-          dayGuard.reason === "stale_day_open"
-            ? "Bitte zuerst den offenen Arbeitstag vom Vortag abschließen."
-            : "Bitte zuerst den Arbeitstag starten.",
-        code: dayGuard.reason,
-      });
-      return;
-    }
-
     const parsed = z
       .object({
         marketId: z.string().uuid(),
@@ -1987,6 +2002,17 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
         return;
       }
       res.status(200).json(existingPayload);
+      return;
+    }
+
+    const newVisitGate = await ensureGmSubmissionGate({ gmUserId, blockActiveVisit: true });
+    if (!newVisitGate.ok) {
+      res.status(409).json({
+        ...gmSubmissionGateError(newVisitGate.reason),
+        ...(newVisitGate.activeVisitSessionId
+          ? { activeVisitSessionId: newVisitGate.activeVisitSessionId }
+          : {}),
+      });
       return;
     }
 
