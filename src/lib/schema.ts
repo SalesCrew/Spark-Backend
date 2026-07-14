@@ -90,6 +90,7 @@ export const gmDaySessionStatusEnum = pgEnum("gm_day_session_status", [
 ]);
 export const praemienWaveStatusEnum = pgEnum("praemien_wave_status", ["draft", "active", "archived"]);
 export const praemienDistributionFreqRuleEnum = pgEnum("praemien_distribution_freq_rule", ["lt8", "gt8"]);
+export const praemienRewardModelEnum = pgEnum("praemien_reward_model", ["global_thresholds", "pillar_targets", "pillar_tiers"]);
 export const redMonthYearStatusEnum = pgEnum("red_month_year_status", ["draft", "active", "locked"]);
 
 export const users = pgTable(
@@ -950,6 +951,7 @@ export const praemienWaves = pgTable(
     status: praemienWaveStatusEnum("status").notNull().default("draft"),
     description: text("description").notNull().default(""),
     timezone: text("timezone").notNull().default("Europe/Vienna"),
+    rewardModel: praemienRewardModelEnum("reward_model").notNull().default("global_thresholds"),
     isDeleted: boolean("is_deleted").notNull().default(false),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
@@ -1004,12 +1006,20 @@ export const praemienWavePillars = pgTable(
     color: text("color").notNull().default("#DC2626"),
     orderIndex: integer("order_index").notNull().default(0),
     isManual: boolean("is_manual").notNull().default(false),
+    payoutMode: text("payout_mode").notNull().default("highest_tier"),
+    maxRewardEur: numeric("max_reward_eur", { precision: 12, scale: 2 }).notNull().default("0"),
+    targetPoints: numeric("target_points", { precision: 14, scale: 4 }),
+    rewardEur: numeric("reward_eur", { precision: 12, scale: 2 }).notNull().default("0"),
     isDeleted: boolean("is_deleted").notNull().default(false),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
+    check("praemien_wave_pillars_target_points_ck", sql`${table.targetPoints} is null or ${table.targetPoints} > 0`),
+    check("praemien_wave_pillars_reward_eur_ck", sql`${table.rewardEur} >= 0`),
+    check("praemien_wave_pillars_max_reward_eur_ck", sql`${table.maxRewardEur} >= 0`),
+    check("praemien_wave_pillars_payout_mode_ck", sql`${table.payoutMode} in ('highest_tier', 'sum_earned_tiers')`),
     uniqueIndex("praemien_wave_pillars_wave_order_active_unique")
       .on(table.waveId, table.orderIndex)
       .where(sql`${table.isDeleted} = false`),
@@ -1017,6 +1027,111 @@ export const praemienWavePillars = pgTable(
       .on(table.waveId, table.name)
       .where(sql`${table.isDeleted} = false`),
     index("praemien_wave_pillars_wave_idx").on(table.waveId, table.isDeleted),
+  ],
+);
+
+export const praemienWavePillarMetrics = pgTable(
+  "praemien_wave_pillar_metrics",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    waveId: uuid("wave_id")
+      .notNull()
+      .references(() => praemienWaves.id, { onDelete: "cascade" }),
+    pillarId: uuid("pillar_id")
+      .notNull()
+      .references(() => praemienWavePillars.id, { onDelete: "cascade" }),
+    key: text("key").notNull(),
+    label: text("label").notNull(),
+    unit: text("unit").notNull().default("points"),
+    valueSource: text("value_source").notNull().default("contribution_points"),
+    sourceKey: text("source_key"),
+    orderIndex: integer("order_index").notNull().default(0),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("praemien_wave_pillar_metrics_unit_ck", sql`${table.unit} in ('points', 'percent', 'count', 'currency')`),
+    check(
+      "praemien_wave_pillar_metrics_value_source_ck",
+      sql`${table.valueSource} in ('contribution_points', 'contribution_percent', 'quality_zeiterfassung', 'quality_reporting', 'quality_accuracy', 'quality_average', 'flex_total_points', 'flex_component')`,
+    ),
+    uniqueIndex("praemien_wave_pillar_metrics_pillar_key_active_unique")
+      .on(table.pillarId, table.key)
+      .where(sql`${table.isDeleted} = false`),
+    uniqueIndex("praemien_wave_pillar_metrics_pillar_order_active_unique")
+      .on(table.pillarId, table.orderIndex)
+      .where(sql`${table.isDeleted} = false`),
+    index("praemien_wave_pillar_metrics_wave_idx").on(table.waveId, table.isDeleted),
+    index("praemien_wave_pillar_metrics_pillar_idx").on(table.pillarId, table.isDeleted),
+  ],
+);
+
+export const praemienWavePillarTiers = pgTable(
+  "praemien_wave_pillar_tiers",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    waveId: uuid("wave_id")
+      .notNull()
+      .references(() => praemienWaves.id, { onDelete: "cascade" }),
+    pillarId: uuid("pillar_id")
+      .notNull()
+      .references(() => praemienWavePillars.id, { onDelete: "cascade" }),
+    label: text("label").notNull(),
+    orderIndex: integer("order_index").notNull().default(0),
+    rewardEur: numeric("reward_eur", { precision: 12, scale: 2 }).notNull().default("0"),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("praemien_wave_pillar_tiers_reward_eur_ck", sql`${table.rewardEur} >= 0`),
+    uniqueIndex("praemien_wave_pillar_tiers_pillar_order_active_unique")
+      .on(table.pillarId, table.orderIndex)
+      .where(sql`${table.isDeleted} = false`),
+    uniqueIndex("praemien_wave_pillar_tiers_pillar_label_active_unique")
+      .on(table.pillarId, table.label)
+      .where(sql`${table.isDeleted} = false`),
+    index("praemien_wave_pillar_tiers_wave_idx").on(table.waveId, table.isDeleted),
+    index("praemien_wave_pillar_tiers_pillar_idx").on(table.pillarId, table.isDeleted),
+  ],
+);
+
+export const praemienWavePillarTierConditions = pgTable(
+  "praemien_wave_pillar_tier_conditions",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    waveId: uuid("wave_id")
+      .notNull()
+      .references(() => praemienWaves.id, { onDelete: "cascade" }),
+    pillarId: uuid("pillar_id")
+      .notNull()
+      .references(() => praemienWavePillars.id, { onDelete: "cascade" }),
+    tierId: uuid("tier_id")
+      .notNull()
+      .references(() => praemienWavePillarTiers.id, { onDelete: "cascade" }),
+    metricId: uuid("metric_id")
+      .notNull()
+      .references(() => praemienWavePillarMetrics.id, { onDelete: "cascade" }),
+    operator: text("operator").notNull().default("gte"),
+    thresholdValue: numeric("threshold_value", { precision: 14, scale: 4 }).notNull(),
+    orderIndex: integer("order_index").notNull().default(0),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("praemien_wave_pillar_tier_conditions_operator_ck", sql`${table.operator} in ('gte', 'lte', 'eq')`),
+    uniqueIndex("praemien_wave_pillar_tier_conditions_tier_order_active_unique")
+      .on(table.tierId, table.orderIndex)
+      .where(sql`${table.isDeleted} = false`),
+    index("praemien_wave_pillar_tier_conditions_wave_idx").on(table.waveId, table.isDeleted),
+    index("praemien_wave_pillar_tier_conditions_pillar_idx").on(table.pillarId, table.isDeleted),
+    index("praemien_wave_pillar_tier_conditions_tier_idx").on(table.tierId, table.isDeleted),
+    index("praemien_wave_pillar_tier_conditions_metric_idx").on(table.metricId, table.isDeleted),
   ],
 );
 
@@ -1099,6 +1214,7 @@ export const praemienWaveFlexScores = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     totalPoints: integer("total_points").notNull().default(0),
+    componentValues: jsonb("component_values").$type<Record<string, number>>().notNull().default({}),
     note: text("note"),
     isDeleted: boolean("is_deleted").notNull().default(false),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
@@ -1134,6 +1250,46 @@ export const praemienGmWaveTotals = pgTable(
   (table) => [
     uniqueIndex("praemien_gm_wave_totals_wave_gm_unique").on(table.waveId, table.gmUserId),
     index("praemien_gm_wave_totals_gm_idx").on(table.gmUserId, table.updatedAt),
+  ],
+);
+
+export const praemienGmWavePillarTotals = pgTable(
+  "praemien_gm_wave_pillar_totals",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    waveId: uuid("wave_id")
+      .notNull()
+      .references(() => praemienWaves.id, { onDelete: "cascade" }),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    pillarId: uuid("pillar_id")
+      .notNull()
+      .references(() => praemienWavePillars.id, { onDelete: "cascade" }),
+    points: numeric("points", { precision: 14, scale: 4 }).notNull().default("0"),
+    targetPoints: numeric("target_points", { precision: 14, scale: 4 }),
+    rewardEur: numeric("reward_eur", { precision: 12, scale: 2 }).notNull().default("0"),
+    earnedRewardEur: numeric("earned_reward_eur", { precision: 12, scale: 2 }).notNull().default("0"),
+    goalAchieved: boolean("goal_achieved").notNull().default(false),
+    metricValues: jsonb("metric_values").$type<Record<string, number>>().notNull().default({}),
+    achievedTierIds: jsonb("achieved_tier_ids").$type<string[]>().notNull().default([]),
+    achievedTierLabels: jsonb("achieved_tier_labels").$type<string[]>().notNull().default([]),
+    nextTierId: uuid("next_tier_id").references(() => praemienWavePillarTiers.id, { onDelete: "set null" }),
+    nextTierLabel: text("next_tier_label"),
+    calculatedAt: timestamp("calculated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("praemien_gm_wave_pillar_totals_points_ck", sql`${table.points} >= 0`),
+    check("praemien_gm_wave_pillar_totals_target_points_ck", sql`${table.targetPoints} is null or ${table.targetPoints} > 0`),
+    check("praemien_gm_wave_pillar_totals_reward_eur_ck", sql`${table.rewardEur} >= 0`),
+    check("praemien_gm_wave_pillar_totals_earned_reward_eur_ck", sql`${table.earnedRewardEur} >= 0`),
+    uniqueIndex("praemien_gm_wave_pillar_totals_wave_gm_pillar_unique")
+      .on(table.waveId, table.gmUserId, table.pillarId),
+    index("praemien_gm_wave_pillar_totals_wave_gm_idx").on(table.waveId, table.gmUserId),
+    index("praemien_gm_wave_pillar_totals_gm_wave_idx").on(table.gmUserId, table.waveId),
+    index("praemien_gm_wave_pillar_totals_pillar_gm_idx").on(table.pillarId, table.gmUserId),
   ],
 );
 

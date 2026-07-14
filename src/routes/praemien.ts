@@ -16,6 +16,9 @@ import {
 } from "../lib/praemien-source-catalog.js";
 import {
   praemienWavePillars,
+  praemienWavePillarMetrics,
+  praemienWavePillarTierConditions,
+  praemienWavePillarTiers,
   praemienWaveFlexScores,
   praemienWaveQualityScores,
   praemienWaveSources,
@@ -46,6 +49,20 @@ adminPraemienRouter.use((req, res, next) => {
 });
 
 const waveStatusSchema = z.enum(["draft", "active", "archived"]);
+const rewardModelSchema = z.enum(["global_thresholds", "pillar_targets", "pillar_tiers"]);
+const pillarPayoutModeSchema = z.enum(["highest_tier", "sum_earned_tiers"]);
+const pillarMetricUnitSchema = z.enum(["points", "percent", "count", "currency"]);
+const pillarMetricValueSourceSchema = z.enum([
+  "contribution_points",
+  "contribution_percent",
+  "quality_zeiterfassung",
+  "quality_reporting",
+  "quality_accuracy",
+  "quality_average",
+  "flex_total_points",
+  "flex_component",
+]);
+const pillarConditionOperatorSchema = z.enum(["gte", "lte", "eq"]);
 const sectionTypeSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd"]) satisfies z.ZodType<PraemienSectionType>;
 const distributionFreqRuleSchema = z.enum(["lt8", "gt8"]);
 const dateYmdSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
@@ -59,6 +76,32 @@ const thresholdInputSchema = z.object({
   rewardEur: z.number().finite().gte(0),
 });
 
+const pillarMetricInputSchema = z.object({
+  id: z.string().uuid().optional(),
+  key: z.string().trim().min(1).max(100).regex(/^[a-z][a-z0-9_]*$/),
+  label: z.string().trim().min(1).max(160),
+  unit: pillarMetricUnitSchema,
+  valueSource: pillarMetricValueSourceSchema,
+  sourceKey: z.string().trim().min(1).max(100).nullable().optional(),
+  orderIndex: z.number().int().min(0),
+});
+
+const pillarTierConditionInputSchema = z.object({
+  id: z.string().uuid().optional(),
+  metricKey: z.string().trim().min(1).max(100),
+  operator: pillarConditionOperatorSchema,
+  thresholdValue: z.number().finite().gte(0),
+  orderIndex: z.number().int().min(0),
+});
+
+const pillarTierInputSchema = z.object({
+  id: z.string().uuid().optional(),
+  label: z.string().trim().min(1).max(160),
+  orderIndex: z.number().int().min(0),
+  rewardEur: z.number().finite().gte(0),
+  conditions: z.array(pillarTierConditionInputSchema).min(1),
+});
+
 const pillarInputSchema = z.object({
   id: z.string().uuid().optional(),
   name: z.string().trim().min(1).max(120),
@@ -66,6 +109,42 @@ const pillarInputSchema = z.object({
   color: z.string().trim().min(1).max(40).optional().default("#DC2626"),
   orderIndex: z.number().int().min(0),
   isManual: z.boolean().optional().default(false),
+  payoutMode: pillarPayoutModeSchema.optional().default("highest_tier"),
+  maxRewardEur: z.number().finite().gte(0).optional().default(0),
+  targetPoints: z.number().finite().gt(0).nullable().optional(),
+  rewardEur: z.number().finite().gte(0).optional(),
+  metrics: z.array(pillarMetricInputSchema).optional().default([]),
+  tiers: z.array(pillarTierInputSchema).optional().default([]),
+}).superRefine((value, ctx) => {
+  const metricKeys = new Set(value.metrics.map((metric) => metric.key));
+  if (metricKeys.size !== value.metrics.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Messgrößen-Keys müssen je Säule eindeutig sein." });
+  }
+  const metricOrders = new Set(value.metrics.map((metric) => metric.orderIndex));
+  if (metricOrders.size !== value.metrics.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Messgrößen-Reihenfolge enthält Duplikate." });
+  }
+  const tierOrders = new Set(value.tiers.map((tier) => tier.orderIndex));
+  if (tierOrders.size !== value.tiers.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Auszahlungsstufen-Reihenfolge enthält Duplikate." });
+  }
+  const tierLabels = new Set(value.tiers.map((tier) => tier.label.toLowerCase()));
+  if (tierLabels.size !== value.tiers.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Auszahlungsstufen-Namen müssen je Säule eindeutig sein." });
+  }
+  for (const tier of value.tiers) {
+    for (const condition of tier.conditions) {
+      if (!metricKeys.has(condition.metricKey)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Unbekannte Messgröße ${condition.metricKey} in ${tier.label}.` });
+      }
+    }
+  }
+  const configuredMaximum = value.payoutMode === "sum_earned_tiers"
+    ? value.tiers.reduce((sum, tier) => sum + tier.rewardEur, 0)
+    : Math.max(0, ...value.tiers.map((tier) => tier.rewardEur));
+  if (configuredMaximum > value.maxRewardEur + 0.001) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Auszahlungsstufen überschreiten den Maximalbetrag der Säule." });
+  }
 });
 
 const sourceInputSchema = z.object({
@@ -103,6 +182,7 @@ const flexScoreInputSchema = z.object({
   id: z.string().uuid().optional(),
   gmUserId: z.string().uuid(),
   totalPoints: z.number().int().min(0).max(100),
+  componentValues: z.record(z.string(), z.number().finite().gte(0)).optional().default({}),
   note: z.string().trim().max(2000).nullable().optional(),
 });
 
@@ -115,6 +195,7 @@ const createWaveSchema = z.object({
   status: waveStatusSchema.optional().default("draft"),
   description: z.string().trim().max(2000).optional().default(""),
   timezone: z.string().trim().min(1).max(120).optional().default("Europe/Vienna"),
+  rewardModel: rewardModelSchema.optional().default("global_thresholds"),
   thresholds: z.array(thresholdInputSchema).optional().default([]),
   pillars: z.array(pillarInputSchema).optional().default([]),
 });
@@ -128,6 +209,7 @@ const updateWaveSchema = z.object({
   status: waveStatusSchema.optional(),
   description: z.string().trim().max(2000).optional(),
   timezone: z.string().trim().min(1).max(120).optional(),
+  rewardModel: rewardModelSchema.optional(),
 });
 
 const replaceThresholdsSchema = z.object({
@@ -165,6 +247,7 @@ const waveResponseSchema = z.object({
   endDate: z.string(),
   description: z.string(),
   timezone: z.string(),
+  rewardModel: rewardModelSchema,
   thresholds: z.array(
     z.object({
       id: z.string().uuid(),
@@ -179,6 +262,33 @@ const waveResponseSchema = z.object({
       name: z.string(),
       description: z.string(),
       color: z.string(),
+      isManual: z.boolean(),
+      payoutMode: pillarPayoutModeSchema,
+      maxRewardEur: z.number(),
+      targetPoints: z.number().nullable(),
+      rewardEur: z.number(),
+      metrics: z.array(z.object({
+        id: z.string().uuid(),
+        key: z.string(),
+        label: z.string(),
+        unit: pillarMetricUnitSchema,
+        valueSource: pillarMetricValueSourceSchema,
+        sourceKey: z.string().nullable(),
+        orderIndex: z.number().int(),
+      })),
+      tiers: z.array(z.object({
+        id: z.string().uuid(),
+        label: z.string(),
+        orderIndex: z.number().int(),
+        rewardEur: z.number(),
+        conditions: z.array(z.object({
+          id: z.string().uuid(),
+          metricKey: z.string(),
+          operator: pillarConditionOperatorSchema,
+          thresholdValue: z.number(),
+          orderIndex: z.number().int(),
+        })),
+      })),
       sourceRefs: z.array(
         z.object({
           id: z.string().uuid(),
@@ -217,6 +327,7 @@ const waveResponseSchema = z.object({
       gmId: z.string().uuid(),
       gmName: z.string(),
       totalPoints: z.number().int(),
+      componentValues: z.record(z.string(), z.number()),
       note: z.string().optional(),
       updatedAt: z.string().datetime({ offset: true }),
     }),
@@ -286,7 +397,7 @@ async function loadWaveGraph(waveId: string) {
     .limit(1);
   if (!wave) return null;
 
-  const [thresholds, pillars, sources, qualityRows, flexRows] = await Promise.all([
+  const [thresholds, pillars, metrics, tiers, tierConditions, sources, qualityRows, flexRows] = await Promise.all([
     db
       .select()
       .from(praemienWaveThresholds)
@@ -297,6 +408,21 @@ async function loadWaveGraph(waveId: string) {
       .from(praemienWavePillars)
       .where(and(eq(praemienWavePillars.waveId, waveId), eq(praemienWavePillars.isDeleted, false)))
       .orderBy(asc(praemienWavePillars.orderIndex)),
+    db
+      .select()
+      .from(praemienWavePillarMetrics)
+      .where(and(eq(praemienWavePillarMetrics.waveId, waveId), eq(praemienWavePillarMetrics.isDeleted, false)))
+      .orderBy(asc(praemienWavePillarMetrics.orderIndex)),
+    db
+      .select()
+      .from(praemienWavePillarTiers)
+      .where(and(eq(praemienWavePillarTiers.waveId, waveId), eq(praemienWavePillarTiers.isDeleted, false)))
+      .orderBy(asc(praemienWavePillarTiers.orderIndex)),
+    db
+      .select()
+      .from(praemienWavePillarTierConditions)
+      .where(and(eq(praemienWavePillarTierConditions.waveId, waveId), eq(praemienWavePillarTierConditions.isDeleted, false)))
+      .orderBy(asc(praemienWavePillarTierConditions.orderIndex)),
     db
       .select()
       .from(praemienWaveSources)
@@ -326,6 +452,7 @@ async function loadWaveGraph(waveId: string) {
         waveId: praemienWaveFlexScores.waveId,
         gmUserId: praemienWaveFlexScores.gmUserId,
         totalPoints: praemienWaveFlexScores.totalPoints,
+        componentValues: praemienWaveFlexScores.componentValues,
         note: praemienWaveFlexScores.note,
         updatedAt: praemienWaveFlexScores.updatedAt,
         gmFirstName: users.firstName,
@@ -336,6 +463,26 @@ async function loadWaveGraph(waveId: string) {
       .where(and(eq(praemienWaveFlexScores.waveId, waveId), eq(praemienWaveFlexScores.isDeleted, false)))
       .orderBy(asc(users.lastName), asc(users.firstName)),
   ]);
+
+  const metricById = new Map(metrics.map((metric) => [metric.id, metric]));
+  const metricsByPillarId = new Map<string, typeof metrics>();
+  for (const metric of metrics) {
+    const list = metricsByPillarId.get(metric.pillarId) ?? [];
+    list.push(metric);
+    metricsByPillarId.set(metric.pillarId, list);
+  }
+  const conditionsByTierId = new Map<string, typeof tierConditions>();
+  for (const condition of tierConditions) {
+    const list = conditionsByTierId.get(condition.tierId) ?? [];
+    list.push(condition);
+    conditionsByTierId.set(condition.tierId, list);
+  }
+  const tiersByPillarId = new Map<string, typeof tiers>();
+  for (const tier of tiers) {
+    const list = tiersByPillarId.get(tier.pillarId) ?? [];
+    list.push(tier);
+    tiersByPillarId.set(tier.pillarId, list);
+  }
 
   const sourceRefsByPillarId = new Map<
     string,
@@ -386,6 +533,7 @@ async function loadWaveGraph(waveId: string) {
     endDate: wave.endDate,
     description: wave.description,
     timezone: wave.timezone,
+    rewardModel: wave.rewardModel,
     createdAt: wave.createdAt.toISOString(),
     updatedAt: wave.updatedAt.toISOString(),
     thresholds: thresholds.map((row) => ({
@@ -399,6 +547,33 @@ async function loadWaveGraph(waveId: string) {
       name: row.name,
       description: row.description,
       color: row.color,
+      isManual: row.isManual,
+      payoutMode: row.payoutMode as "highest_tier" | "sum_earned_tiers",
+      maxRewardEur: normalizeMoney(row.maxRewardEur),
+      targetPoints: row.targetPoints == null ? null : normalizeMoney(row.targetPoints),
+      rewardEur: normalizeMoney(row.rewardEur),
+      metrics: (metricsByPillarId.get(row.id) ?? []).map((metric) => ({
+        id: metric.id,
+        key: metric.key,
+        label: metric.label,
+        unit: metric.unit as "points" | "percent" | "count" | "currency",
+        valueSource: metric.valueSource as z.infer<typeof pillarMetricValueSourceSchema>,
+        sourceKey: metric.sourceKey,
+        orderIndex: metric.orderIndex,
+      })),
+      tiers: (tiersByPillarId.get(row.id) ?? []).map((tier) => ({
+        id: tier.id,
+        label: tier.label,
+        orderIndex: tier.orderIndex,
+        rewardEur: normalizeMoney(tier.rewardEur),
+        conditions: (conditionsByTierId.get(tier.id) ?? []).map((condition) => ({
+          id: condition.id,
+          metricKey: metricById.get(condition.metricId)?.key ?? "",
+          operator: condition.operator as "gte" | "lte" | "eq",
+          thresholdValue: normalizeMoney(condition.thresholdValue),
+          orderIndex: condition.orderIndex,
+        })),
+      })),
       sourceRefs: sourceRefsByPillarId.get(row.id) ?? [],
     })),
     qualitySubmissions: qualityRows.map((row) => ({
@@ -417,6 +592,7 @@ async function loadWaveGraph(waveId: string) {
       gmId: row.gmUserId,
       gmName: `${row.gmFirstName} ${row.gmLastName}`.trim(),
       totalPoints: row.totalPoints,
+      componentValues: row.componentValues ?? {},
       note: row.note ?? undefined,
       updatedAt: row.updatedAt.toISOString(),
     })),
@@ -564,28 +740,131 @@ async function replacePillarsTx(tx: Tx, waveId: string, pillars: z.infer<typeof 
   }
 
   const now = new Date();
-  await tx
-    .update(praemienWaveSources)
-    .set({ isDeleted: true, deletedAt: now, updatedAt: now })
-    .where(and(eq(praemienWaveSources.waveId, waveId), eq(praemienWaveSources.isDeleted, false)));
+  const existingPillars = await tx
+    .select({
+      id: praemienWavePillars.id,
+      name: praemienWavePillars.name,
+      targetPoints: praemienWavePillars.targetPoints,
+      rewardEur: praemienWavePillars.rewardEur,
+    })
+    .from(praemienWavePillars)
+    .where(and(eq(praemienWavePillars.waveId, waveId), eq(praemienWavePillars.isDeleted, false)));
+  const existingById = new Map(existingPillars.map((pillar) => [pillar.id, pillar]));
+  const existingByName = new Map(existingPillars.map((pillar) => [pillar.name.trim().toLowerCase(), pillar]));
   await tx
     .update(praemienWavePillars)
     .set({ isDeleted: true, deletedAt: now, updatedAt: now })
     .where(and(eq(praemienWavePillars.waveId, waveId), eq(praemienWavePillars.isDeleted, false)));
 
+  const retainedPillarIds = new Set<string>();
   for (const entry of pillars) {
-    await tx.insert(praemienWavePillars).values({
-      waveId,
+    const previous = (entry.id ? existingById.get(entry.id) : undefined)
+      ?? existingByName.get(entry.name.trim().toLowerCase());
+    const targetPoints = entry.targetPoints !== undefined
+      ? (entry.targetPoints == null ? null : String(entry.targetPoints))
+      : (previous?.targetPoints ?? null);
+    const rewardEur = entry.rewardEur !== undefined
+      ? String(entry.rewardEur)
+      : (previous?.rewardEur ?? "0");
+    const pillarValues = {
       name: entry.name,
       description: entry.description,
       color: entry.color,
       orderIndex: entry.orderIndex,
       isManual: entry.isManual,
+      payoutMode: entry.payoutMode,
+      maxRewardEur: String(entry.maxRewardEur),
+      targetPoints,
+      rewardEur,
       isDeleted: false,
       deletedAt: null,
-      createdAt: now,
       updatedAt: now,
-    });
+    } as const;
+    const pillarId = previous
+      ? previous.id
+      : (await tx.insert(praemienWavePillars).values({
+          waveId,
+          ...pillarValues,
+          createdAt: now,
+        }).returning({ id: praemienWavePillars.id }))[0]?.id;
+    if (!pillarId) throw new Error("praemien_pillar_create_failed");
+    if (previous) {
+      await tx.update(praemienWavePillars).set(pillarValues).where(eq(praemienWavePillars.id, pillarId));
+    }
+    retainedPillarIds.add(pillarId);
+
+    await tx
+      .update(praemienWavePillarTierConditions)
+      .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+      .where(and(eq(praemienWavePillarTierConditions.pillarId, pillarId), eq(praemienWavePillarTierConditions.isDeleted, false)));
+    await tx
+      .update(praemienWavePillarTiers)
+      .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+      .where(and(eq(praemienWavePillarTiers.pillarId, pillarId), eq(praemienWavePillarTiers.isDeleted, false)));
+    await tx
+      .update(praemienWavePillarMetrics)
+      .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+      .where(and(eq(praemienWavePillarMetrics.pillarId, pillarId), eq(praemienWavePillarMetrics.isDeleted, false)));
+
+    const metricIdByKey = new Map<string, string>();
+    for (const metric of entry.metrics) {
+      const [createdMetric] = await tx.insert(praemienWavePillarMetrics).values({
+        waveId,
+        pillarId,
+        key: metric.key,
+        label: metric.label,
+        unit: metric.unit,
+        valueSource: metric.valueSource,
+        sourceKey: metric.sourceKey ?? null,
+        orderIndex: metric.orderIndex,
+        isDeleted: false,
+        deletedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      }).returning({ id: praemienWavePillarMetrics.id });
+      if (!createdMetric) throw new Error("praemien_pillar_metric_create_failed");
+      metricIdByKey.set(metric.key, createdMetric.id);
+    }
+
+    for (const tier of entry.tiers) {
+      const [createdTier] = await tx.insert(praemienWavePillarTiers).values({
+        waveId,
+        pillarId,
+        label: tier.label,
+        orderIndex: tier.orderIndex,
+        rewardEur: String(tier.rewardEur),
+        isDeleted: false,
+        deletedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      }).returning({ id: praemienWavePillarTiers.id });
+      if (!createdTier) throw new Error("praemien_pillar_tier_create_failed");
+      for (const condition of tier.conditions) {
+        const metricId = metricIdByKey.get(condition.metricKey);
+        if (!metricId) throw new PraemienDomainError("pillar_tier_metric_missing", 400, "Auszahlungsstufe verweist auf eine unbekannte Messgröße.");
+        await tx.insert(praemienWavePillarTierConditions).values({
+          waveId,
+          pillarId,
+          tierId: createdTier.id,
+          metricId,
+          operator: condition.operator,
+          thresholdValue: String(condition.thresholdValue),
+          orderIndex: condition.orderIndex,
+          isDeleted: false,
+          deletedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    }
+  }
+
+  for (const existing of existingPillars) {
+    if (retainedPillarIds.has(existing.id)) continue;
+    await tx
+      .update(praemienWaveSources)
+      .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+      .where(and(eq(praemienWaveSources.pillarId, existing.id), eq(praemienWaveSources.isDeleted, false)));
   }
   await touchWaveTx(tx, waveId, now);
 }
@@ -734,6 +1013,7 @@ async function replaceFlexScoresTx(tx: Tx, waveId: string, flexScores: z.infer<t
       waveId,
       gmUserId: entry.gmUserId,
       totalPoints: entry.totalPoints,
+      componentValues: entry.componentValues,
       note: entry.note ?? null,
       isDeleted: false,
       deletedAt: null,
@@ -763,6 +1043,9 @@ async function ensurePraemienTablesReady(): Promise<boolean> {
   const result = await pgSql<{
     praemien_waves: string | null;
     praemien_wave_pillars: string | null;
+    praemien_wave_pillar_metrics: string | null;
+    praemien_wave_pillar_tiers: string | null;
+    praemien_wave_pillar_tier_conditions: string | null;
     praemien_wave_thresholds: string | null;
     praemien_wave_sources: string | null;
     praemien_wave_quality_scores: string | null;
@@ -771,6 +1054,9 @@ async function ensurePraemienTablesReady(): Promise<boolean> {
     select
       to_regclass('public.praemien_waves') as praemien_waves,
       to_regclass('public.praemien_wave_pillars') as praemien_wave_pillars,
+      to_regclass('public.praemien_wave_pillar_metrics') as praemien_wave_pillar_metrics,
+      to_regclass('public.praemien_wave_pillar_tiers') as praemien_wave_pillar_tiers,
+      to_regclass('public.praemien_wave_pillar_tier_conditions') as praemien_wave_pillar_tier_conditions,
       to_regclass('public.praemien_wave_thresholds') as praemien_wave_thresholds,
       to_regclass('public.praemien_wave_sources') as praemien_wave_sources,
       to_regclass('public.praemien_wave_quality_scores') as praemien_wave_quality_scores,
@@ -780,6 +1066,9 @@ async function ensurePraemienTablesReady(): Promise<boolean> {
   hasPraemienTables = Boolean(
     row?.praemien_waves &&
     row?.praemien_wave_pillars &&
+    row?.praemien_wave_pillar_metrics &&
+    row?.praemien_wave_pillar_tiers &&
+    row?.praemien_wave_pillar_tier_conditions &&
     row?.praemien_wave_thresholds &&
     row?.praemien_wave_sources &&
     row?.praemien_wave_quality_scores &&
@@ -843,6 +1132,7 @@ adminPraemienRouter.get("/waves", async (req: AuthedRequest, res, next) => {
         status: row.status,
         description: row.description,
         timezone: row.timezone,
+        rewardModel: row.rewardModel,
         createdAt: row.createdAt.toISOString(),
         updatedAt: row.updatedAt.toISOString(),
       })),
@@ -887,6 +1177,7 @@ adminPraemienRouter.post("/waves", async (req: AuthedRequest, res, next) => {
           status: parsed.data.status,
           description: parsed.data.description,
           timezone: parsed.data.timezone,
+          rewardModel: parsed.data.rewardModel,
           createdAt: now,
           updatedAt: now,
         })
@@ -970,7 +1261,8 @@ adminPraemienRouter.patch("/waves/:waveId", async (req: AuthedRequest, res, next
         parsed.data.startDate !== undefined ||
         parsed.data.endDate !== undefined ||
         parsed.data.status !== undefined ||
-        parsed.data.timezone !== undefined;
+        parsed.data.timezone !== undefined ||
+        parsed.data.rewardModel !== undefined;
       await tx
         .update(praemienWaves)
         .set({
@@ -982,6 +1274,7 @@ adminPraemienRouter.patch("/waves/:waveId", async (req: AuthedRequest, res, next
           status: parsed.data.status,
           description: parsed.data.description,
           timezone: parsed.data.timezone,
+          rewardModel: parsed.data.rewardModel,
           updatedAt: new Date(),
         })
         .where(eq(praemienWaves.id, waveId));
