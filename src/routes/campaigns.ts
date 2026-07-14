@@ -53,6 +53,14 @@ const campaignAssignmentSchema = z
     visitTargetCount: z.coerce.number().int().min(1).optional(),
   })
   .strict();
+const campaignVisitExportBatchSchema = z
+  .object({
+    visits: z.array(z.object({
+      marketId: z.string().uuid(),
+      sessionId: z.string().uuid(),
+    }).strict()).min(1).max(20),
+  })
+  .strict();
 
 type CampaignSection = z.infer<typeof campaignSectionSchema>;
 
@@ -1278,9 +1286,10 @@ async function mergeCampaignAssignment(
 
 async function buildCampaignMarketVisitSummaries(
   campaignId: string,
-  options?: { marketIds?: string[]; sessionId?: string | null; includePhotoSignedUrls?: boolean },
+  options?: { marketIds?: string[]; sessionId?: string | null; sessionIds?: string[]; includePhotoSignedUrls?: boolean },
 ) {
   const scopedMarketIds = normalizeUnique(options?.marketIds ?? []).filter(isUuid);
+  const scopedSessionIds = normalizeUnique(options?.sessionIds ?? []).filter(isUuid);
   const assignedConditions = [
     eq(campaignMarketAssignments.campaignId, campaignId),
     eq(campaignMarketAssignments.isDeleted, false),
@@ -1306,6 +1315,8 @@ async function buildCampaignMarketVisitSummaries(
   ];
   if (options?.sessionId && isUuid(options.sessionId)) {
     submittedConditions.push(eq(visitSessions.id, options.sessionId));
+  } else if (scopedSessionIds.length > 0) {
+    submittedConditions.push(inArray(visitSessions.id, scopedSessionIds));
   }
   const submittedSectionRows = await db
     .select({
@@ -1887,6 +1898,48 @@ adminCampaignsRouter.get("/campaigns/:id/market-visits", async (req, res, next) 
   }
 });
 
+adminCampaignsRouter.post("/campaigns/:campaignId/market-visits/export-details", async (req, res, next) => {
+  try {
+    const campaignId = String(req.params.campaignId ?? "");
+    if (!isUuid(campaignId)) {
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
+      return;
+    }
+
+    const parsed = campaignVisitExportBatchSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "Ungültige Export-Detailanfrage.",
+        code: "invalid_export_detail_batch",
+      });
+      return;
+    }
+
+    const [campaign] = await db
+      .select({ id: campaigns.id })
+      .from(campaigns)
+      .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
+      .limit(1);
+    if (!campaign) {
+      res.status(404).json({ error: "Kampagne nicht gefunden.", code: "campaign_not_found" });
+      return;
+    }
+
+    const visitsByMarketId = new Map(parsed.data.visits.map((visit) => [visit.marketId, visit]));
+    const visits = Array.from(visitsByMarketId.values());
+    const details = await buildCampaignMarketVisitSummaries(campaignId, {
+      marketIds: visits.map((visit) => visit.marketId),
+      sessionIds: visits.map((visit) => visit.sessionId),
+      includePhotoSignedUrls: false,
+    });
+    res.status(200).json({
+      markets: details.filter((detail) => detail.hasSubmittedVisit),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 adminCampaignsRouter.get("/campaigns/:campaignId/markets/:marketId/visit-detail", async (req, res, next) => {
   try {
     const campaignId = String(req.params.campaignId ?? "");
@@ -1894,6 +1947,7 @@ adminCampaignsRouter.get("/campaigns/:campaignId/markets/:marketId/visit-detail"
     const sessionId = typeof req.query.sessionId === "string" && req.query.sessionId.trim()
       ? req.query.sessionId.trim()
       : null;
+    const includePhotoSignedUrls = req.query.includePhotoSignedUrls !== "false";
     if (!isUuid(campaignId) || !isUuid(marketId) || (sessionId != null && !isUuid(sessionId))) {
       res.status(400).json({ error: "Ungültige Detail-Anfrage.", code: "invalid_id" });
       return;
@@ -1912,7 +1966,7 @@ adminCampaignsRouter.get("/campaigns/:campaignId/markets/:marketId/visit-detail"
     const [detail] = await buildCampaignMarketVisitSummaries(campaignId, {
       marketIds: [marketId],
       sessionId,
-      includePhotoSignedUrls: true,
+      includePhotoSignedUrls,
     });
     if (!detail) {
       res.status(404).json({ error: "Markt ist dieser Kampagne nicht zugewiesen.", code: "campaign_market_not_found" });
