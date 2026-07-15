@@ -65,6 +65,16 @@ const campaignVisitExportBatchSchema = z
     }).strict()).min(1).max(20),
   })
   .strict();
+const campaignVisitStatusDateRangeSchema = z
+  .object({
+    dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  })
+  .superRefine((value, context) => {
+    if (value.dateFrom && value.dateTo && value.dateFrom > value.dateTo) {
+      context.addIssue({ code: "custom", message: "dateFrom darf nicht nach dateTo liegen." });
+    }
+  });
 
 type CampaignSection = z.infer<typeof campaignSectionSchema>;
 
@@ -471,7 +481,10 @@ type CampaignMarketVisitStatusRow = {
   gmName: string | null;
 };
 
-async function buildCampaignMarketVisitStatusBatch(campaignIds: string[]) {
+async function buildCampaignMarketVisitStatusBatch(
+  campaignIds: string[],
+  dateRange: { dateFrom?: string | undefined; dateTo?: string | undefined } = {},
+) {
   const uniqueCampaignIds = normalizeUnique(campaignIds).filter(isUuid);
   if (uniqueCampaignIds.length === 0) return [];
 
@@ -523,6 +536,12 @@ async function buildCampaignMarketVisitStatusBatch(campaignIds: string[]) {
         eq(visitSessionSections.isDeleted, false),
         eq(visitSessions.isDeleted, false),
         eq(visitSessions.status, "submitted"),
+        dateRange.dateFrom
+          ? sql`${visitSessions.submittedAt} >= (${dateRange.dateFrom}::date::timestamp at time zone 'Europe/Vienna')`
+          : undefined,
+        dateRange.dateTo
+          ? sql`${visitSessions.submittedAt} < (((${dateRange.dateTo}::date + interval '1 day')::timestamp) at time zone 'Europe/Vienna')`
+          : undefined,
       ),
     )
     .orderBy(desc(visitSessions.submittedAt), desc(visitSessions.createdAt));
@@ -1843,7 +1862,16 @@ adminCampaignsRouter.get("/campaigns/market-visit-status", async (req, res, next
       return;
     }
 
-    const statusRows = await buildCampaignMarketVisitStatusBatch(campaignIds);
+    const parsedDateRange = campaignVisitStatusDateRangeSchema.safeParse({
+      dateFrom: typeof req.query.dateFrom === "string" && req.query.dateFrom ? req.query.dateFrom : undefined,
+      dateTo: typeof req.query.dateTo === "string" && req.query.dateTo ? req.query.dateTo : undefined,
+    });
+    if (!parsedDateRange.success) {
+      res.status(400).json({ error: "Ungültiger Export-Zeitraum.", code: "invalid_campaign_status_date_range" });
+      return;
+    }
+
+    const statusRows = await buildCampaignMarketVisitStatusBatch(campaignIds, parsedDateRange.data);
     res.status(200).json({ campaigns: statusRows });
   } catch (error) {
     next(error);
