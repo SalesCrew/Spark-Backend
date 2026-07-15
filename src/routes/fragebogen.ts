@@ -13,6 +13,7 @@ import {
 } from "../lib/logger.js";
 import { enqueueIppRecalcForQuestionScoringChanges } from "../lib/ipp-finalizer.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
+import { canonicalizeSpezialfragenIds } from "../lib/spezialfragen-persistence.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
   fragebogenKuehler,
@@ -895,44 +896,45 @@ async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen
   const existingRows = await tx
     .select()
     .from(fragebogenMainSpezialItems)
-    .where(and(eq(fragebogenMainSpezialItems.fragebogenId, fragebogenId), eq(fragebogenMainSpezialItems.isDeleted, false)));
+    .where(eq(fragebogenMainSpezialItems.fragebogenId, fragebogenId));
   const existingById = new Map(existingRows.map((row) => [row.id, row]));
-  await tx
-    .update(fragebogenMainSpezialItems)
-    .set({
-      isDeleted: true,
-      deletedAt: now,
-      updatedAt: now,
-    })
-    .where(and(eq(fragebogenMainSpezialItems.fragebogenId, fragebogenId), eq(fragebogenMainSpezialItems.isDeleted, false)));
-  if (spezialfragen.length === 0) return;
-
-  const rows: Array<typeof fragebogenMainSpezialItems.$inferInsert> = [];
-  const referencedSharedQuestionIds = new Set<string>();
-  for (const [orderIndex, spezial] of spezialfragen.entries()) {
+  const activeExistingRows = existingRows.filter((row) => !row.isDeleted);
+  const parsedQuestions = spezialfragen.map((spezial) => {
     const parsed = questionSchema.parse(spezial);
     validateQuestionDomain(parsed);
-    if (parsed.id && !isUuid(parsed.id)) {
-      throw new DomainValidationError("Spezialfrage-ID muss eine gültige UUID sein.");
-    }
+    return parsed;
+  });
+  let normalizedQuestions: ReturnType<typeof canonicalizeSpezialfragenIds<UiQuestion>>;
+  try {
+    normalizedQuestions = canonicalizeSpezialfragenIds(parsedQuestions);
+  } catch (error) {
+    throw new DomainValidationError(error instanceof Error ? error.message : "Spezialfrage-ID ist ungültig.");
+  }
+
+  const submittedIds = new Set(normalizedQuestions.map((question) => question.id));
+  const referencedSharedQuestionIds = new Set<string>();
+  const rows: Array<{
+    parsed: (typeof normalizedQuestions)[number];
+    values: typeof fragebogenMainSpezialItems.$inferInsert;
+  }> = [];
+
+  for (const [orderIndex, parsed] of normalizedQuestions.entries()) {
     for (const rule of parsed.rules ?? []) {
       if (rule.triggerQuestionId && !isUuid(rule.triggerQuestionId)) {
         throw new DomainValidationError("Spezialfrage-Regeltrigger muss eine gültige UUID sein.");
       }
       ensureAllUuids(rule.targetQuestionIds, "Spezialfrage-Regelziel");
       if (rule.triggerQuestionId) {
-        referencedSharedQuestionIds.add(rule.triggerQuestionId);
+        if (!submittedIds.has(rule.triggerQuestionId)) referencedSharedQuestionIds.add(rule.triggerQuestionId);
       }
       for (const targetId of rule.targetQuestionIds) {
-        referencedSharedQuestionIds.add(targetId);
+        if (!submittedIds.has(targetId)) referencedSharedQuestionIds.add(targetId);
       }
-      if (parsed.id && isUuid(parsed.id)) {
-        if (rule.triggerQuestionId === parsed.id) {
-          throw new DomainValidationError("Spezialfrage-Regeln dürfen nicht auf sich selbst triggern.");
-        }
-        if (rule.targetQuestionIds.some((id) => id === parsed.id)) {
-          throw new DomainValidationError("Spezialfrage-Regeln dürfen sich nicht selbst als Ziel haben.");
-        }
+      if (rule.triggerQuestionId === parsed.id) {
+        throw new DomainValidationError("Spezialfrage-Regeln dürfen nicht auf sich selbst triggern.");
+      }
+      if (rule.targetQuestionIds.some((id) => id === parsed.id)) {
+        throw new DomainValidationError("Spezialfrage-Regeln dürfen sich nicht selbst als Ziel haben.");
       }
     }
     const tagIds = parseArrayField(parsed.config?.tagIds);
@@ -940,7 +942,7 @@ async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen
       ensureAllUuids(tagIds, "Foto-Tag");
       await ensurePhotoTagsActive(tx, tagIds);
     }
-    const existing = parsed.id && isUuid(parsed.id) ? existingById.get(parsed.id) : undefined;
+    const existing = existingById.get(parsed.id);
     if (existing) {
       const previous = extractAnswerState(
         existing.questionType as UiQuestion["type"],
@@ -960,7 +962,8 @@ async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen
         });
       }
     }
-    rows.push({
+    rows.push({ parsed, values: {
+      id: parsed.id,
       fragebogenId,
       questionType: parsed.type,
       text: parsed.text,
@@ -977,10 +980,55 @@ async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen
       deletedAt: null,
       createdAt: now,
       updatedAt: now,
-    });
+    } });
   }
+
   await ensureQuestionRefsExist(tx, Array.from(referencedSharedQuestionIds));
-  await tx.insert(fragebogenMainSpezialItems).values(rows);
+
+  for (const { parsed, values } of rows) {
+    const existing = existingById.get(parsed.id);
+    if (existing) {
+      await tx
+        .update(fragebogenMainSpezialItems)
+        .set({
+          questionType: values.questionType,
+          text: values.text,
+          required: values.required,
+          redSurvey: values.redSurvey,
+          singleChoiceAvailability: values.singleChoiceAvailability,
+          singleChoiceAvailabilityType: values.singleChoiceAvailabilityType,
+          chains: values.chains,
+          config: values.config,
+          rules: values.rules,
+          scoring: values.scoring,
+          orderIndex: values.orderIndex,
+          isDeleted: false,
+          deletedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(fragebogenMainSpezialItems.id, parsed.id),
+            eq(fragebogenMainSpezialItems.fragebogenId, fragebogenId),
+          ),
+        );
+    } else {
+      await tx.insert(fragebogenMainSpezialItems).values(values);
+    }
+  }
+
+  for (const existing of activeExistingRows) {
+    if (submittedIds.has(existing.id)) continue;
+    await tx
+      .update(fragebogenMainSpezialItems)
+      .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+      .where(
+        and(
+          eq(fragebogenMainSpezialItems.id, existing.id),
+          eq(fragebogenMainSpezialItems.fragebogenId, fragebogenId),
+        ),
+      );
+  }
 }
 
 async function loadSpezialfragenByFragebogenIds(dbLike: DbLike, ids: string[]): Promise<Map<string, UiQuestion[]>> {
