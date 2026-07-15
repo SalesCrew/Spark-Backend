@@ -1878,6 +1878,91 @@ adminCampaignsRouter.get("/campaigns/market-visit-status", async (req, res, next
   }
 });
 
+adminCampaignsRouter.get("/campaigns/market-visit-export-index", async (req, res, next) => {
+  try {
+    const rawCampaignIds = String(req.query.campaignIds ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const campaignIds = normalizeUnique(rawCampaignIds);
+    if (campaignIds.length === 0 || campaignIds.some((campaignId) => !isUuid(campaignId))) {
+      res.status(400).json({ error: "Ungültige Kampagnen-IDs.", code: "invalid_campaign_ids" });
+      return;
+    }
+    if (campaignIds.length > 50) {
+      res.status(400).json({ error: "Maximal 50 Kampagnen pro Export-Anfrage erlaubt.", code: "campaign_export_index_batch_too_large" });
+      return;
+    }
+
+    const parsedDateRange = campaignVisitStatusDateRangeSchema.safeParse({
+      dateFrom: typeof req.query.dateFrom === "string" && req.query.dateFrom ? req.query.dateFrom : undefined,
+      dateTo: typeof req.query.dateTo === "string" && req.query.dateTo ? req.query.dateTo : undefined,
+    });
+    if (!parsedDateRange.success) {
+      res.status(400).json({ error: "Ungültiger Export-Zeitraum.", code: "invalid_campaign_export_date_range" });
+      return;
+    }
+
+    const rows = await db
+      .select({
+        campaignId: visitSessionSections.campaignId,
+        marketId: visitSessions.marketId,
+        sessionId: visitSessions.id,
+        gmUserId: visitSessions.gmUserId,
+        gmFirstName: users.firstName,
+        gmLastName: users.lastName,
+        startedAt: visitSessions.startedAt,
+        submittedAt: visitSessions.submittedAt,
+        createdAt: visitSessions.createdAt,
+      })
+      .from(visitSessionSections)
+      .innerJoin(visitSessions, eq(visitSessions.id, visitSessionSections.visitSessionId))
+      .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+      .leftJoin(users, eq(users.id, visitSessions.gmUserId))
+      .where(
+        and(
+          inArray(visitSessionSections.campaignId, campaignIds),
+          eq(visitSessionSections.isDeleted, false),
+          eq(campaigns.isDeleted, false),
+          eq(visitSessions.isDeleted, false),
+          eq(visitSessions.status, "submitted"),
+          parsedDateRange.data.dateFrom
+            ? sql`${visitSessions.submittedAt} >= (${parsedDateRange.data.dateFrom}::date::timestamp at time zone 'Europe/Vienna')`
+            : undefined,
+          parsedDateRange.data.dateTo
+            ? sql`${visitSessions.submittedAt} < (((${parsedDateRange.data.dateTo}::date + interval '1 day')::timestamp) at time zone 'Europe/Vienna')`
+            : undefined,
+        ),
+      )
+      .orderBy(
+        asc(visitSessionSections.campaignId),
+        asc(visitSessions.submittedAt),
+        asc(visitSessions.createdAt),
+        asc(visitSessions.id),
+      );
+
+    const seen = new Set<string>();
+    const visits = rows.flatMap((row) => {
+      const key = `${row.campaignId}:${row.sessionId}`;
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [{
+        campaignId: row.campaignId,
+        marketId: row.marketId,
+        sessionId: row.sessionId,
+        gmUserId: row.gmUserId ?? null,
+        gmName: row.gmFirstName && row.gmLastName ? `${row.gmFirstName} ${row.gmLastName}`.trim() : null,
+        startedAt: row.startedAt.toISOString(),
+        submittedAt: row.submittedAt?.toISOString() ?? null,
+      }];
+    });
+
+    res.status(200).json({ visits });
+  } catch (error) {
+    next(error);
+  }
+});
+
 adminCampaignsRouter.get("/campaigns/assigned-markets", async (req, res, next) => {
   try {
     const rawCampaignIds = String(req.query.campaignIds ?? "")
