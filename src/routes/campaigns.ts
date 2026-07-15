@@ -12,6 +12,10 @@ import { supabaseAdmin } from "../lib/supabase.js";
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { buildVisitAnswerValidationResult, computeMissingRequiredQuestions } from "../lib/visit-session-answer-validation.js";
 import {
+  reconcileCampaignVisitExportDetails,
+  uniqueCampaignVisitExportRequests,
+} from "../lib/campaign-visit-export.js";
+import {
   campaignMarketAssignmentHistory,
   campaignFragebogenHistory,
   campaignMarketAssignments,
@@ -1333,14 +1337,23 @@ async function buildCampaignMarketVisitSummaries(
     .orderBy(desc(visitSessions.submittedAt), desc(visitSessions.createdAt));
 
   const latestByMarket = new Map<string, (typeof submittedSectionRows)[number]>();
+  const submittedBySessionId = new Map<string, (typeof submittedSectionRows)[number]>();
   for (const row of submittedSectionRows) {
+    if (!submittedBySessionId.has(row.sessionId)) {
+      submittedBySessionId.set(row.sessionId, row);
+    }
     if (!latestByMarket.has(row.marketId)) {
       latestByMarket.set(row.marketId, row);
     }
   }
 
-  const selectedSessionIds = normalizeUnique(Array.from(latestByMarket.values()).map((row) => row.sessionId));
+  const hasSpecificSessionScope = Boolean(options?.sessionId) || scopedSessionIds.length > 0;
+  const selectedSessions = hasSpecificSessionScope
+    ? Array.from(submittedBySessionId.values())
+    : Array.from(latestByMarket.values());
+  const selectedSessionIds = normalizeUnique(selectedSessions.map((row) => row.sessionId));
   if (selectedSessionIds.length === 0) {
+    if (hasSpecificSessionScope) return [];
     return assignedMarketIds.map((marketId) => ({
       marketId,
       hasSubmittedVisit: false,
@@ -1465,7 +1478,7 @@ async function buildCampaignMarketVisitSummaries(
           .orderBy(asc(visitAnswerPhotoTags.createdAt));
 
   const gmUserIds = normalizeUnique(
-    Array.from(latestByMarket.values())
+    selectedSessions
       .map((entry) => entry.gmUserId)
       .filter((entry): entry is string => Boolean(entry)),
   );
@@ -1610,10 +1623,22 @@ async function buildCampaignMarketVisitSummaries(
     }
   >();
 
-  for (const marketId of assignedMarketIds) {
-    const selectedSession = latestByMarket.get(marketId);
+  const resultTargets = hasSpecificSessionScope
+    ? selectedSessions.map((selectedSession) => ({
+        resultKey: selectedSession.sessionId,
+        marketId: selectedSession.marketId,
+        selectedSession,
+      }))
+    : assignedMarketIds.map((marketId) => ({
+        resultKey: marketId,
+        marketId,
+        selectedSession: latestByMarket.get(marketId),
+      }));
+
+  for (const target of resultTargets) {
+    const { marketId, resultKey, selectedSession } = target;
     if (!selectedSession) {
-      byMarket.set(marketId, {
+      byMarket.set(resultKey, {
         marketId,
         hasSubmittedVisit: false,
         sessionId: null,
@@ -1722,7 +1747,7 @@ async function buildCampaignMarketVisitSummaries(
       };
     });
 
-    byMarket.set(marketId, {
+    byMarket.set(resultKey, {
       marketId,
       hasSubmittedVisit: true,
       sessionId: selectedSession.sessionId,
@@ -1735,8 +1760,8 @@ async function buildCampaignMarketVisitSummaries(
     });
   }
 
-  return assignedMarketIds.map((marketId) => {
-    const found = byMarket.get(marketId);
+  return resultTargets.map(({ resultKey, marketId }) => {
+    const found = byMarket.get(resultKey);
     if (found) return found;
     return {
       marketId,
@@ -1925,15 +1950,23 @@ adminCampaignsRouter.post("/campaigns/:campaignId/market-visits/export-details",
       return;
     }
 
-    const visitsByMarketId = new Map(parsed.data.visits.map((visit) => [visit.marketId, visit]));
-    const visits = Array.from(visitsByMarketId.values());
+    const visits = uniqueCampaignVisitExportRequests(parsed.data.visits);
     const details = await buildCampaignMarketVisitSummaries(campaignId, {
       marketIds: visits.map((visit) => visit.marketId),
       sessionIds: visits.map((visit) => visit.sessionId),
       includePhotoSignedUrls: false,
     });
+    const reconciled = reconcileCampaignVisitExportDetails(visits, details);
+    if (reconciled.missingVisits.length > 0) {
+      res.status(409).json({
+        error: `${reconciled.missingVisits.length} Besuch${reconciled.missingVisits.length === 1 ? " konnte" : "e konnten"} nicht vollst\u00e4ndig f\u00fcr den Export geladen werden.`,
+        code: "campaign_visit_export_incomplete",
+        missingVisits: reconciled.missingVisits,
+      });
+      return;
+    }
     res.status(200).json({
-      markets: details.filter((detail) => detail.hasSubmittedVisit),
+      markets: reconciled.orderedDetails,
     });
   } catch (error) {
     next(error);
