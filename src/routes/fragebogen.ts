@@ -18,11 +18,13 @@ import { requireAuth } from "../middleware/auth.js";
 import {
   fragebogenKuehler,
   fragebogenKuehlerModule,
+  fragebogenKuehlerSpezialQuestion,
   fragebogenMain,
   fragebogenMainModule,
-  fragebogenMainSpezialItems,
+  fragebogenMainSpezialQuestion,
   fragebogenMhd,
   fragebogenMhdModule,
+  fragebogenMhdSpezialQuestion,
   moduleKuehler,
   moduleKuehlerQuestion,
   moduleMain,
@@ -49,6 +51,7 @@ const fragebogenLogPrefixes = [
   "/photo-tags",
   "/markets/chains",
   "/questions",
+  "/spezialfragen",
   "/modules",
   "/fragebogen",
   "/question-map",
@@ -815,6 +818,7 @@ function pickScopeConfig(scope: Scope) {
       linkTable: moduleMainQuestion,
       fbTable: fragebogenMain,
       fbModuleLink: fragebogenMainModule,
+      spezialLink: fragebogenMainSpezialQuestion,
     };
   }
   if (scope === "kuehler") {
@@ -823,6 +827,7 @@ function pickScopeConfig(scope: Scope) {
       linkTable: moduleKuehlerQuestion,
       fbTable: fragebogenKuehler,
       fbModuleLink: fragebogenKuehlerModule,
+      spezialLink: fragebogenKuehlerSpezialQuestion,
     };
   }
   return {
@@ -830,6 +835,7 @@ function pickScopeConfig(scope: Scope) {
     linkTable: moduleMhdQuestion,
     fbTable: fragebogenMhd,
     fbModuleLink: fragebogenMhdModule,
+    spezialLink: fragebogenMhdSpezialQuestion,
   };
 }
 
@@ -891,14 +897,57 @@ async function upsertModuleQuestionChainsTx(
   }
 }
 
-async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen: UiQuestion[]) {
+async function fetchSharedSpezialfragenByIds(dbLike: DbLike, ids: string[]): Promise<Map<string, UiQuestion>> {
+  const uniqueIds = Array.from(new Set(ids.filter(isUuid)));
+  if (uniqueIds.length === 0) return new Map();
+
+  const [hydrated, legacyRows] = await Promise.all([
+    fetchQuestionsByIds(dbLike, uniqueIds),
+    dbLike
+      .select({
+        id: questionBankShared.id,
+        chains: questionBankShared.chains,
+        config: questionBankShared.config,
+        rules: questionBankShared.rules,
+        scoring: questionBankShared.scoring,
+      })
+      .from(questionBankShared)
+      .where(and(inArray(questionBankShared.id, uniqueIds), eq(questionBankShared.isDeleted, false))),
+  ]);
+
+  // Inline Spezialfragen stored their complete graph in JSON. Until a migrated
+  // question is edited once, retain those values as the fallback source.
+  for (const legacy of legacyRows) {
+    const question = hydrated.get(legacy.id);
+    if (!question) continue;
+    const legacyConfig = (legacy.config ?? {}) as Record<string, unknown>;
+    const hydratedTagIds = parseArrayField(question.config?.tagIds);
+    const legacyTagIds = parseArrayField(legacyConfig.tagIds);
+    hydrated.set(legacy.id, {
+      ...question,
+      chains: legacy.chains ?? undefined,
+      config:
+        question.type === "photo" && hydratedTagIds.length === 0 && legacyTagIds.length > 0
+          ? { ...question.config, tagIds: legacyTagIds, tagsEnabled: Boolean(legacyConfig.tagsEnabled) }
+          : question.config,
+      rules: (question.rules?.length ?? 0) > 0 ? question.rules : ((legacy.rules ?? []) as UiQuestion["rules"]),
+      scoring:
+        Object.keys(question.scoring ?? {}).length > 0
+          ? question.scoring
+          : ((legacy.scoring ?? {}) as UiQuestion["scoring"]),
+    });
+  }
+  return hydrated;
+}
+
+async function saveSharedSpezialfragenTx(
+  tx: DbTx,
+  scope: Scope,
+  fragebogenId: string,
+  spezialfragen: UiQuestion[],
+) {
   const now = new Date();
-  const existingRows = await tx
-    .select()
-    .from(fragebogenMainSpezialItems)
-    .where(eq(fragebogenMainSpezialItems.fragebogenId, fragebogenId));
-  const existingById = new Map(existingRows.map((row) => [row.id, row]));
-  const activeExistingRows = existingRows.filter((row) => !row.isDeleted);
+  const linkTable = pickScopeConfig(scope).spezialLink as typeof fragebogenMainSpezialQuestion;
   const parsedQuestions = spezialfragen.map((spezial) => {
     const parsed = questionSchema.parse(spezial);
     validateQuestionDomain(parsed);
@@ -911,60 +960,31 @@ async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen
     throw new DomainValidationError(error instanceof Error ? error.message : "Spezialfrage-ID ist ungültig.");
   }
 
-  const submittedIds = new Set(normalizedQuestions.map((question) => question.id));
-  const referencedSharedQuestionIds = new Set<string>();
-  const rows: Array<{
-    parsed: (typeof normalizedQuestions)[number];
-    values: typeof fragebogenMainSpezialItems.$inferInsert;
-  }> = [];
-
-  for (const [orderIndex, parsed] of normalizedQuestions.entries()) {
+  for (const parsed of normalizedQuestions) {
     for (const rule of parsed.rules ?? []) {
       if (rule.triggerQuestionId && !isUuid(rule.triggerQuestionId)) {
         throw new DomainValidationError("Spezialfrage-Regeltrigger muss eine gültige UUID sein.");
       }
       ensureAllUuids(rule.targetQuestionIds, "Spezialfrage-Regelziel");
-      if (rule.triggerQuestionId) {
-        if (!submittedIds.has(rule.triggerQuestionId)) referencedSharedQuestionIds.add(rule.triggerQuestionId);
-      }
-      for (const targetId of rule.targetQuestionIds) {
-        if (!submittedIds.has(targetId)) referencedSharedQuestionIds.add(targetId);
-      }
-      if (rule.triggerQuestionId === parsed.id) {
-        throw new DomainValidationError("Spezialfrage-Regeln dürfen nicht auf sich selbst triggern.");
-      }
-      if (rule.targetQuestionIds.some((id) => id === parsed.id)) {
-        throw new DomainValidationError("Spezialfrage-Regeln dürfen sich nicht selbst als Ziel haben.");
+      if (rule.triggerQuestionId === parsed.id || rule.targetQuestionIds.includes(parsed.id)) {
+        throw new DomainValidationError("Spezialfrage-Regeln dürfen nicht auf sich selbst verweisen.");
       }
     }
-    const tagIds = parseArrayField(parsed.config?.tagIds);
-    if (tagIds.length > 0) {
-      ensureAllUuids(tagIds, "Foto-Tag");
-      await ensurePhotoTagsActive(tx, tagIds);
-    }
-    const existing = existingById.get(parsed.id);
-    if (existing) {
-      const previous = extractAnswerState(
-        existing.questionType as UiQuestion["type"],
-        (existing.config ?? {}) as Record<string, unknown>,
-        (existing.scoring ?? {}) as UiQuestion["scoring"],
-      );
-      const next = extractAnswerState(parsed.type, parsed.config ?? {}, parsed.scoring ?? {});
-      if (hasAnswerStateChanged(previous, next)) {
-        await insertQuestionAnswerHistoryTx(tx, {
-          now,
-          changeKind: previous.questionType === next.questionType ? "answer_edit" : "type_change",
-          questionId: null,
-          fragebogenId,
-          spezialItemId: existing.id,
-          previous,
-          next,
-        });
-      }
-    }
-    rows.push({ parsed, values: {
+  }
+
+  // Reserve every new UUID first so two newly-created Spezialfragen can safely
+  // reference each other through conditional rules in one transaction.
+  const existingRows = normalizedQuestions.length > 0
+    ? await tx
+        .select({ id: questionBankShared.id })
+        .from(questionBankShared)
+        .where(inArray(questionBankShared.id, normalizedQuestions.map((question) => question.id)))
+    : [];
+  const existingIds = new Set(existingRows.map((row) => row.id));
+  for (const parsed of normalizedQuestions) {
+    if (existingIds.has(parsed.id)) continue;
+    await tx.insert(questionBankShared).values({
       id: parsed.id,
-      fragebogenId,
       questionType: parsed.type,
       text: parsed.text,
       required: parsed.required,
@@ -975,96 +995,104 @@ async function saveSpezialfragenTx(tx: DbTx, fragebogenId: string, spezialfragen
       config: parsed.config ?? {},
       rules: parsed.rules ?? [],
       scoring: parsed.scoring ?? {},
-      orderIndex,
+      isSpezial: true,
       isDeleted: false,
-      deletedAt: null,
       createdAt: now,
       updatedAt: now,
-    } });
+    });
   }
 
-  await ensureQuestionRefsExist(tx, Array.from(referencedSharedQuestionIds));
-
-  for (const { parsed, values } of rows) {
-    const existing = existingById.get(parsed.id);
-    if (existing) {
-      await tx
-        .update(fragebogenMainSpezialItems)
-        .set({
-          questionType: values.questionType,
-          text: values.text,
-          required: values.required,
-          redSurvey: values.redSurvey,
-          singleChoiceAvailability: values.singleChoiceAvailability,
-          singleChoiceAvailabilityType: values.singleChoiceAvailabilityType,
-          chains: values.chains,
-          config: values.config,
-          rules: values.rules,
-          scoring: values.scoring,
-          orderIndex: values.orderIndex,
-          isDeleted: false,
-          deletedAt: null,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(fragebogenMainSpezialItems.id, parsed.id),
-            eq(fragebogenMainSpezialItems.fragebogenId, fragebogenId),
-          ),
-        );
-    } else {
-      await tx.insert(fragebogenMainSpezialItems).values(values);
-    }
-  }
-
-  for (const existing of activeExistingRows) {
-    if (submittedIds.has(existing.id)) continue;
+  const submittedIds = new Set<string>();
+  for (const [orderIndex, parsed] of normalizedQuestions.entries()) {
+    const saved = await upsertQuestionGraphTx(tx, parsed);
+    if (!saved.id) throw new Error("Spezialfrage konnte nach dem Speichern nicht geladen werden.");
+    const savedId = saved.id;
+    submittedIds.add(savedId);
     await tx
-      .update(fragebogenMainSpezialItems)
+      .update(questionBankShared)
+      .set({
+        chains: parsed.chains && parsed.chains.length > 0 ? parsed.chains : null,
+        isSpezial: true,
+        isDeleted: false,
+        updatedAt: now,
+      })
+      .where(eq(questionBankShared.id, savedId));
+    await tx
+      .insert(linkTable)
+      .values({
+        fragebogenId,
+        questionId: savedId,
+        orderIndex,
+        isDeleted: false,
+        deletedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [linkTable.fragebogenId, linkTable.questionId],
+        set: { orderIndex, isDeleted: false, deletedAt: null, updatedAt: now },
+      });
+  }
+
+  const activeLinks = await tx
+    .select({ questionId: linkTable.questionId })
+    .from(linkTable)
+    .where(
+      and(
+        eq(linkTable.fragebogenId, fragebogenId),
+        eq(linkTable.isDeleted, false),
+      ),
+    );
+  for (const link of activeLinks) {
+    if (submittedIds.has(link.questionId)) continue;
+    await tx
+      .update(linkTable)
       .set({ isDeleted: true, deletedAt: now, updatedAt: now })
       .where(
         and(
-          eq(fragebogenMainSpezialItems.id, existing.id),
-          eq(fragebogenMainSpezialItems.fragebogenId, fragebogenId),
+          eq(linkTable.fragebogenId, fragebogenId),
+          eq(linkTable.questionId, link.questionId),
         ),
       );
   }
 }
 
-async function loadSpezialfragenByFragebogenIds(dbLike: DbLike, ids: string[]): Promise<Map<string, UiQuestion[]>> {
+async function loadSharedSpezialfragenByFragebogenIds(
+  dbLike: DbLike,
+  scope: Scope,
+  ids: string[],
+): Promise<Map<string, UiQuestion[]>> {
   const validIds = Array.from(new Set(ids.filter(isUuid)));
-  const spezialByFragebogen = new Map<string, UiQuestion[]>();
-  if (validIds.length === 0) return spezialByFragebogen;
+  const output = new Map<string, UiQuestion[]>();
+  if (validIds.length === 0) return output;
+  const linkTable = pickScopeConfig(scope).spezialLink as typeof fragebogenMainSpezialQuestion;
 
-  const rows = await dbLike
-    .select()
-    .from(fragebogenMainSpezialItems)
+  const links = await dbLike
+    .select({
+      fragebogenId: linkTable.fragebogenId,
+      questionId: linkTable.questionId,
+      orderIndex: linkTable.orderIndex,
+    })
+    .from(linkTable)
     .where(
       and(
-        inArray(fragebogenMainSpezialItems.fragebogenId, validIds),
-        eq(fragebogenMainSpezialItems.isDeleted, false),
+        inArray(linkTable.fragebogenId, validIds),
+        eq(linkTable.isDeleted, false),
       ),
     )
-    .orderBy(asc(fragebogenMainSpezialItems.fragebogenId), asc(fragebogenMainSpezialItems.orderIndex));
-
-  for (const row of rows) {
-    const current = spezialByFragebogen.get(row.fragebogenId) ?? [];
-    current.push({
-      id: row.id,
-      type: row.questionType as UiQuestion["type"],
-      text: row.text,
-      required: row.required,
-      redSurvey: row.redSurvey,
-      singleChoiceAvailability: row.singleChoiceAvailability,
-      singleChoiceAvailabilityType: row.singleChoiceAvailabilityType as UiQuestion["singleChoiceAvailabilityType"],
-      config: (row.config ?? {}) as Record<string, unknown>,
-      rules: (row.rules ?? []) as UiQuestion["rules"],
-      scoring: (row.scoring ?? {}) as UiQuestion["scoring"],
-      chains: row.chains ?? undefined,
-    });
-    spezialByFragebogen.set(row.fragebogenId, current);
+    .orderBy(
+      asc(linkTable.fragebogenId),
+      asc(linkTable.orderIndex),
+    );
+  const questions = await fetchSharedSpezialfragenByIds(dbLike, links.map((link) => link.questionId));
+  for (const link of links) {
+    const question = questions.get(link.questionId);
+    if (!question) continue;
+    const current = output.get(link.fragebogenId) ?? [];
+    current.push(question);
+    output.set(link.fragebogenId, current);
   }
-  return spezialByFragebogen;
+  return output;
 }
 
 async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<string, UiQuestion>> {
@@ -1723,7 +1751,7 @@ export async function fetchFragebogenUi(scope: Scope, ids?: string[]): Promise<U
     moduleIdsByFragebogen.set(link.fragebogenId, current);
   }
 
-  const spezialByFragebogen = scope === "main" ? await loadSpezialfragenByFragebogenIds(db, fragebogenIds) : new Map<string, UiQuestion[]>();
+  const spezialByFragebogen = await loadSharedSpezialfragenByFragebogenIds(db, scope, fragebogenIds);
 
   return fbRows.map((row) => ({
     id: row.id,
@@ -1881,13 +1909,15 @@ adminFragebogenRouter.get("/questions", async (_req, res, next) => {
           .select({ id: questionBankShared.id })
           .from(questionBankShared)
           .where(
-            sql`${questionBankShared.isDeleted} = false AND coalesce(${questionBankShared.singleChoiceAvailability}, false) = false`,
+            sql`${questionBankShared.isDeleted} = false
+              AND ${questionBankShared.isSpezial} = false
+              AND coalesce(${questionBankShared.singleChoiceAvailability}, false) = false`,
           )
           .orderBy(desc(questionBankShared.updatedAt))
       : await db
           .select({ id: questionBankShared.id })
           .from(questionBankShared)
-          .where(eq(questionBankShared.isDeleted, false))
+          .where(and(eq(questionBankShared.isDeleted, false), eq(questionBankShared.isSpezial, false)))
           .orderBy(desc(questionBankShared.updatedAt));
     const questionsMap = await fetchQuestionsByIds(db, rows.map((row) => row.id));
     res.status(200).json({ questions: rows.map((row) => questionsMap.get(row.id)).filter(Boolean) });
@@ -2402,6 +2432,23 @@ adminFragebogenRouter.patch("/modules/:scope/:id/delete", async (req, res, next)
   }
 });
 
+adminFragebogenRouter.get("/spezialfragen", async (_req, res, next) => {
+  try {
+    const rows = await db
+      .select({ id: questionBankShared.id })
+      .from(questionBankShared)
+      .where(and(eq(questionBankShared.isSpezial, true), eq(questionBankShared.isDeleted, false)));
+    const questions = await fetchSharedSpezialfragenByIds(db, rows.map((row) => row.id));
+    res.status(200).json({
+      spezialfragen: Array.from(questions.values()).sort((left, right) =>
+        left.text.localeCompare(right.text, "de", { sensitivity: "base" }),
+      ),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 adminFragebogenRouter.get("/fragebogen/:scope", async (req, res, next) => {
   try {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
@@ -2432,11 +2479,6 @@ adminFragebogenRouter.post("/fragebogen/:scope", async (req, res, next) => {
       res.status(400).json({ error: "Ungültiger Fragebogen." });
       return;
     }
-    if (scope !== "main" && parsed.data.spezialfragen.length > 0) {
-      res.status(400).json({ error: "Spezialfragen sind nur für den Main-Scope erlaubt." });
-      return;
-    }
-
     const now = new Date();
     const schedule = normalizeSchedule(parsed.data);
     const fragebogenId = await db.transaction(async (tx) => {
@@ -2484,9 +2526,7 @@ adminFragebogenRouter.post("/fragebogen/:scope", async (req, res, next) => {
         );
       }
 
-      if (scope === "main") {
-        await saveSpezialfragenTx(tx, created.id, parsed.data.spezialfragen);
-      }
+      await saveSharedSpezialfragenTx(tx, scope, created.id, parsed.data.spezialfragen);
 
       return created.id;
     });
@@ -2514,11 +2554,6 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id", async (req, res, next) => 
       res.status(400).json({ error: "Ungültiger Fragebogen." });
       return;
     }
-    if (scope !== "main" && parsed.data.spezialfragen.length > 0) {
-      res.status(400).json({ error: "Spezialfragen sind nur für den Main-Scope erlaubt." });
-      return;
-    }
-
     const now = new Date();
     const schedule = normalizeSchedule(parsed.data);
     await db.transaction(async (tx) => {
@@ -2598,9 +2633,7 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id", async (req, res, next) => 
         }
       }
 
-      if (scope === "main") {
-        await saveSpezialfragenTx(tx, req.params.id, parsed.data.spezialfragen);
-      }
+      await saveSharedSpezialfragenTx(tx, scope, req.params.id, parsed.data.spezialfragen);
     });
 
     const [fragebogen] = await fetchFragebogenUi(scope, [req.params.id]);
@@ -2734,19 +2767,6 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
       }
     }
 
-    if (targetScope !== "main" && (source.spezialfragen?.length ?? 0) > 0) {
-      logAction("warn", "fragebogen_duplicate_invalid_spezialfragen_scope", {
-        req,
-        action: "fragebogen_duplicate",
-        result: "rejected",
-        statusCode: 400,
-        requestClass: "client_error",
-        startedAtNs,
-      });
-      res.status(400).json({ error: "Spezialfragen können nur im Main-Scope dupliziert werden." });
-      return;
-    }
-
     const now = new Date();
     const createdId = await db.transaction(async (tx) => {
       const targetCfg = pickScopeConfig(targetScope);
@@ -2876,9 +2896,7 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
           })),
         );
       }
-      if (targetScope === "main") {
-        await saveSpezialfragenTx(tx, created.id, source.spezialfragen ?? []);
-      }
+      await saveSharedSpezialfragenTx(tx, targetScope, created.id, source.spezialfragen ?? []);
       return created.id;
     });
 

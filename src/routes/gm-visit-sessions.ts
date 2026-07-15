@@ -319,6 +319,42 @@ function toResolvedQuestion(question: {
   };
 }
 
+function appendSpezialfragen(
+  moduleQuestions: ResolvedQuestion[],
+  spezialfragen: Awaited<ReturnType<typeof fetchFragebogenUi>>[number]["spezialfragen"],
+  marketChain: string,
+): ResolvedQuestion[] {
+  const moduleQuestionIds = new Set(moduleQuestions.map((question) => question.questionId));
+  const resolvedSpezialfragen = (spezialfragen ?? [])
+    .map((question) =>
+      toResolvedQuestion(
+        {
+          id: question.id ?? "",
+          type: question.type,
+          text: question.text,
+          required: question.required,
+          redSurvey: question.redSurvey ?? null,
+          singleChoiceAvailability: question.singleChoiceAvailability ?? null,
+          singleChoiceAvailabilityType:
+            (question.singleChoiceAvailabilityType as SingleChoiceAvailabilityType | null) ?? null,
+          config: question.config ?? {},
+          rules: (question.rules ?? []) as Array<Record<string, unknown>>,
+          scoring: question.scoring ?? {},
+          chains: question.chains ?? [],
+        },
+        { name: "Spezialfragen" },
+      ),
+    )
+    .filter((question): question is ResolvedQuestion =>
+      Boolean(
+        question
+          && !moduleQuestionIds.has(question.questionId)
+          && isQuestionApplicableToMarketChain(question.chains, marketChain),
+      ),
+    );
+  return [...moduleQuestions, ...resolvedSpezialfragen];
+}
+
 function decodePhotoAnswer(raw: unknown): { photos: string[]; selectedTagIds: string[] } {
   if (!raw) return { photos: [], selectedTagIds: [] };
   if (Array.isArray(raw)) return { photos: raw.filter((v): v is string => typeof v === "string"), selectedTagIds: [] };
@@ -1169,7 +1205,7 @@ async function resolveVisitSectionsForSelection(input: {
       if (selected.section === "kuehler") {
         const fb = kuehlerFbById.get(selected.currentFragebogenId);
         if (!fb) return null;
-        const questions = (fb.moduleIds ?? []).flatMap((moduleId) => {
+        const moduleQuestions = (fb.moduleIds ?? []).flatMap((moduleId) => {
           const module = kuehlerModuleById.get(moduleId);
           if (!module) return [];
           return (module.questions ?? [])
@@ -1195,6 +1231,7 @@ async function resolveVisitSectionsForSelection(input: {
               Boolean(question && isQuestionApplicableToMarketChain(question.chains, marketChain)),
             );
         });
+        const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain);
         if (!fb.id) return null;
         return {
           section: selected.section,
@@ -1208,7 +1245,7 @@ async function resolveVisitSectionsForSelection(input: {
       if (selected.section === "mhd") {
         const fb = mhdFbById.get(selected.currentFragebogenId);
         if (!fb) return null;
-        const questions = (fb.moduleIds ?? []).flatMap((moduleId) => {
+        const moduleQuestions = (fb.moduleIds ?? []).flatMap((moduleId) => {
           const module = mhdModuleById.get(moduleId);
           if (!module) return [];
           return (module.questions ?? [])
@@ -1234,6 +1271,7 @@ async function resolveVisitSectionsForSelection(input: {
               Boolean(question && isQuestionApplicableToMarketChain(question.chains, marketChain)),
             );
         });
+        const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain);
         if (!fb.id) return null;
         return {
           section: selected.section,
@@ -1247,7 +1285,7 @@ async function resolveVisitSectionsForSelection(input: {
 
       const fb = mainFbById.get(selected.currentFragebogenId);
       if (!fb?.id) return null;
-      const questions = (fb.moduleIds ?? []).flatMap((moduleId) => {
+      const moduleQuestions = (fb.moduleIds ?? []).flatMap((moduleId) => {
         const module = mainModuleById.get(moduleId);
         if (!module) return [];
         return (module.questions ?? [])
@@ -1273,6 +1311,7 @@ async function resolveVisitSectionsForSelection(input: {
             Boolean(question && isQuestionApplicableToMarketChain(question.chains, marketChain)),
           );
       });
+      const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain);
 
       return {
         section: selected.section as "standard" | "flex" | "billa",

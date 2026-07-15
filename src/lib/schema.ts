@@ -841,12 +841,14 @@ export const questionBankShared = pgTable(
     config: jsonb("config").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
     rules: jsonb("rules").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
     scoring: jsonb("scoring").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    isSpezial: boolean("is_spezial").notNull().default(false),
     isDeleted: boolean("is_deleted").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     index("question_bank_shared_type_idx").on(table.questionType),
+    index("question_bank_shared_spezial_idx").on(table.isSpezial, table.isDeleted),
     index("question_bank_shared_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -1482,6 +1484,12 @@ export const fragebogenMainSpezialQuestion = pgTable(
   },
   (table) => [
     primaryKey({ columns: [table.fragebogenId, table.questionId] }),
+    index("fragebogen_main_spezial_question_question_idx").on(table.questionId),
+    index("fragebogen_main_spezial_question_active_order_idx").on(
+      table.fragebogenId,
+      table.isDeleted,
+      table.orderIndex,
+    ),
     index("fragebogen_main_spezial_question_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -1615,6 +1623,33 @@ export const fragebogenKuehlerModule = pgTable(
   ],
 );
 
+export const fragebogenKuehlerSpezialQuestion = pgTable(
+  "fragebogen_kuehler_spezial_question",
+  {
+    fragebogenId: uuid("fragebogen_id")
+      .notNull()
+      .references(() => fragebogenKuehler.id, { onDelete: "cascade" }),
+    questionId: uuid("question_id")
+      .notNull()
+      .references(() => questionBankShared.id, { onDelete: "cascade" }),
+    orderIndex: integer("order_index").notNull().default(0),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.fragebogenId, table.questionId] }),
+    index("fragebogen_kuehler_spezial_question_question_idx").on(table.questionId),
+    index("fragebogen_kuehler_spezial_question_active_order_idx").on(
+      table.fragebogenId,
+      table.isDeleted,
+      table.orderIndex,
+    ),
+    index("fragebogen_kuehler_spezial_question_deleted_idx").on(table.isDeleted),
+  ],
+);
+
 export const moduleMhd = pgTable("module_mhd", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: text("name").notNull(),
@@ -1712,6 +1747,33 @@ export const fragebogenMhdModule = pgTable(
     primaryKey({ columns: [table.fragebogenId, table.moduleId] }),
     index("fragebogen_mhd_module_module_idx").on(table.moduleId),
     index("fragebogen_mhd_module_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const fragebogenMhdSpezialQuestion = pgTable(
+  "fragebogen_mhd_spezial_question",
+  {
+    fragebogenId: uuid("fragebogen_id")
+      .notNull()
+      .references(() => fragebogenMhd.id, { onDelete: "cascade" }),
+    questionId: uuid("question_id")
+      .notNull()
+      .references(() => questionBankShared.id, { onDelete: "cascade" }),
+    orderIndex: integer("order_index").notNull().default(0),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.fragebogenId, table.questionId] }),
+    index("fragebogen_mhd_spezial_question_question_idx").on(table.questionId),
+    index("fragebogen_mhd_spezial_question_active_order_idx").on(
+      table.fragebogenId,
+      table.isDeleted,
+      table.orderIndex,
+    ),
+    index("fragebogen_mhd_spezial_question_deleted_idx").on(table.isDeleted),
   ],
 );
 
