@@ -56,6 +56,8 @@ const additionalActivityTypeSchema = z.enum([
 ]);
 
 type AdditionalActivityType = z.infer<typeof additionalActivityTypeSchema>;
+type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+type DbLike = typeof db | DbTransaction;
 
 const gmCreateAdditionalTimeRequestSchema = z
   .object({
@@ -250,13 +252,17 @@ function mapRequestRow(row: {
   };
 }
 
-async function loadDaySession(sessionId: string, gmUserId?: string): Promise<DaySessionContext | null> {
+async function loadDaySession(
+  sessionId: string,
+  gmUserId?: string,
+  database: DbLike = db,
+): Promise<DaySessionContext | null> {
   const clauses = [
     eq(gmDaySessions.id, sessionId),
     eq(gmDaySessions.isDeleted, false),
   ];
   if (gmUserId) clauses.push(eq(gmDaySessions.gmUserId, gmUserId));
-  const [session] = await db
+  const [session] = await database
     .select({
       id: gmDaySessions.id,
       gmUserId: gmDaySessions.gmUserId,
@@ -274,45 +280,54 @@ async function loadDaySession(sessionId: string, gmUserId?: string): Promise<Day
   return session ?? null;
 }
 
-async function loadFirstRealActionStart(session: DaySessionContext, now = new Date()): Promise<Date | null> {
+async function loadFirstRealActionStart(
+  session: DaySessionContext,
+  now = new Date(),
+  database: DbLike = db,
+  includeActive = false,
+): Promise<Date | null> {
   if (!session.dayStartedAt) return null;
   const lower = session.dayStartedAt;
   const upper = session.dayEndedAt ?? now;
 
   const [visitRows, extraRows, pauseRows] = await Promise.all([
-    db
+    database
       .select({ startAt: visitSessions.startedAt })
       .from(visitSessions)
       .where(
         and(
           eq(visitSessions.gmUserId, session.gmUserId),
-          eq(visitSessions.status, "submitted"),
+          includeActive
+            ? sql`${visitSessions.status}::text in ('draft', 'submitted')`
+            : eq(visitSessions.status, "submitted"),
           eq(visitSessions.isDeleted, false),
           sql`${visitSessions.startedAt} is not null`,
-          sql`${visitSessions.submittedAt} is not null`,
+          includeActive ? sql`true` : sql`${visitSessions.submittedAt} is not null`,
           gte(visitSessions.startedAt, lower),
           lte(visitSessions.startedAt, upper),
         ),
       )
       .orderBy(sql`${visitSessions.startedAt} asc`)
       .limit(1),
-    db
+    database
       .select({ startAt: timeTrackingEntries.startAt })
       .from(timeTrackingEntries)
       .where(
         and(
           eq(timeTrackingEntries.gmUserId, session.gmUserId),
-          eq(timeTrackingEntries.status, "submitted"),
+          includeActive
+            ? sql`${timeTrackingEntries.status}::text in ('draft', 'submitted')`
+            : eq(timeTrackingEntries.status, "submitted"),
           eq(timeTrackingEntries.isDeleted, false),
           sql`${timeTrackingEntries.startAt} is not null`,
-          sql`${timeTrackingEntries.endAt} is not null`,
+          includeActive ? sql`true` : sql`${timeTrackingEntries.endAt} is not null`,
           gte(timeTrackingEntries.startAt, lower),
           lte(timeTrackingEntries.startAt, upper),
         ),
       )
       .orderBy(sql`${timeTrackingEntries.startAt} asc`)
       .limit(1),
-    db
+    database
       .select({ startAt: gmDaySessionPauses.pauseStartedAt })
       .from(gmDaySessionPauses)
       .where(
@@ -321,7 +336,7 @@ async function loadFirstRealActionStart(session: DaySessionContext, now = new Da
           eq(gmDaySessionPauses.gmUserId, session.gmUserId),
           eq(gmDaySessionPauses.isDeleted, false),
           sql`${gmDaySessionPauses.pauseStartedAt} is not null`,
-          sql`${gmDaySessionPauses.pauseEndedAt} is not null`,
+          includeActive ? sql`true` : sql`${gmDaySessionPauses.pauseEndedAt} is not null`,
           gte(gmDaySessionPauses.pauseStartedAt, lower),
           lte(gmDaySessionPauses.pauseStartedAt, upper),
         ),
@@ -336,13 +351,17 @@ async function loadFirstRealActionStart(session: DaySessionContext, now = new Da
   return remainingStarts.reduce((earliest, value) => (value.getTime() < earliest.getTime() ? value : earliest), firstStart);
 }
 
-async function loadLastRealActionEnd(session: DaySessionContext, now = new Date()): Promise<Date | null> {
+async function loadLastRealActionEnd(
+  session: DaySessionContext,
+  now = new Date(),
+  database: DbLike = db,
+): Promise<Date | null> {
   if (!session.dayStartedAt) return null;
   const lower = session.dayStartedAt;
   const upper = session.dayEndedAt ?? now;
 
   const [visitRows, extraRows, pauseRows] = await Promise.all([
-    db
+    database
       .select({ endAt: visitSessions.submittedAt })
       .from(visitSessions)
       .where(
@@ -358,7 +377,7 @@ async function loadLastRealActionEnd(session: DaySessionContext, now = new Date(
       )
       .orderBy(sql`${visitSessions.submittedAt} desc`)
       .limit(1),
-    db
+    database
       .select({ endAt: timeTrackingEntries.endAt })
       .from(timeTrackingEntries)
       .where(
@@ -374,7 +393,7 @@ async function loadLastRealActionEnd(session: DaySessionContext, now = new Date(
       )
       .orderBy(sql`${timeTrackingEntries.endAt} desc`)
       .limit(1),
-    db
+    database
       .select({ endAt: gmDaySessionPauses.pauseEndedAt })
       .from(gmDaySessionPauses)
       .where(
@@ -404,6 +423,8 @@ async function validateDayStartChange(input: {
   requestedStartAt: Date;
   requestedEndAt: Date;
   now?: Date;
+  lockedBoundaryAt?: Date;
+  database?: DbLike;
 }) {
   if (!input.session.dayStartedAt) {
     throw buildHttpError("Arbeitstag ist unvollständig und kann nicht korrigiert werden.", 409, "day_incomplete");
@@ -416,11 +437,20 @@ async function validateDayStartChange(input: {
     throw buildHttpError("Startzeit muss am Arbeitstag liegen.", 409, "outside_day");
   }
 
-  const boundary = await loadFirstRealActionStart(input.session, input.now ?? new Date()) ?? input.session.dayEndedAt ?? input.now ?? new Date();
-  if (!sameMinute(input.requestedEndAt, boundary)) {
+  const now = input.now ?? new Date();
+  const currentBoundary = await loadFirstRealActionStart(
+    input.session,
+    now,
+    input.database ?? db,
+    Boolean(input.lockedBoundaryAt),
+  )
+    ?? input.session.dayEndedAt
+    ?? now;
+  const lockedBoundary = input.lockedBoundaryAt ?? currentBoundary;
+  if (!sameMinute(input.requestedEndAt, lockedBoundary)) {
     throw buildHttpError("Das Ende der Anfahrt wird durch den nächsten Eintrag bestimmt. Bitte nur die Startzeit ändern.", 409, "day_start_end_locked");
   }
-  if (input.requestedStartAt.getTime() >= boundary.getTime()) {
+  if (input.requestedStartAt.getTime() >= currentBoundary.getTime()) {
     throw buildHttpError("Die Startzeit darf den nächsten Eintrag nicht überschneiden.", 409, "overlap");
   }
   if (input.requestedStartAt.getTime() >= input.requestedEndAt.getTime()) {
@@ -434,6 +464,8 @@ async function validateDayEndChange(input: {
   requestedStartAt: Date;
   requestedEndAt: Date;
   now?: Date;
+  lockedBoundaryAt?: Date;
+  database?: DbLike;
 }) {
   if (!input.session.dayStartedAt || !input.session.dayEndedAt) {
     throw buildHttpError("Arbeitstag ist unvollständig und kann nicht korrigiert werden.", 409, "day_incomplete");
@@ -446,11 +478,13 @@ async function validateDayEndChange(input: {
     throw buildHttpError("Endzeit muss am Arbeitstag liegen.", 409, "outside_day");
   }
 
-  const boundary = await loadLastRealActionEnd(input.session, input.now ?? new Date()) ?? input.session.dayStartedAt;
-  if (!sameMinute(input.requestedStartAt, boundary)) {
+  const now = input.now ?? new Date();
+  const currentBoundary = await loadLastRealActionEnd(input.session, now, input.database ?? db) ?? input.session.dayStartedAt;
+  const lockedBoundary = input.lockedBoundaryAt ?? currentBoundary;
+  if (!sameMinute(input.requestedStartAt, lockedBoundary)) {
     throw buildHttpError("Der Start der Heimfahrt wird durch den letzten Eintrag bestimmt. Bitte nur die Endzeit ändern.", 409, "day_end_start_locked");
   }
-  if (input.requestedEndAt.getTime() <= boundary.getTime()) {
+  if (input.requestedEndAt.getTime() <= currentBoundary.getTime()) {
     throw buildHttpError("Die Endzeit muss nach dem letzten Eintrag liegen.", 409, "invalid_interval");
   }
 }
@@ -639,9 +673,12 @@ async function applyApprovedTimeChange(input: {
   session: DaySessionContext;
   requestedStartAt: Date;
   requestedEndAt: Date;
+  originalStartAt: Date;
+  originalEndAt: Date;
   requestedStartKm: number | null;
   requestedEndKm: number | null;
   now: Date;
+  database: DbLike;
 }) {
   if (input.kind === "day_km") {
     validateKmChange({
@@ -650,7 +687,7 @@ async function applyApprovedTimeChange(input: {
       requestedStartKm: input.requestedStartKm,
       requestedEndKm: input.requestedEndKm,
     });
-    const [updated] = await db
+    const [updated] = await input.database
       .update(gmDaySessions)
       .set({
         ...(input.requestedStartKm !== null
@@ -673,8 +710,10 @@ async function applyApprovedTimeChange(input: {
       requestedStartAt: input.requestedStartAt,
       requestedEndAt: input.requestedEndAt,
       now: input.now,
+      lockedBoundaryAt: input.originalEndAt,
+      database: input.database,
     });
-    const [updated] = await db
+    const [updated] = await input.database
       .update(gmDaySessions)
       .set({ dayStartedAt: input.requestedStartAt, updatedAt: input.now })
       .where(and(eq(gmDaySessions.id, input.session.id), eq(gmDaySessions.gmUserId, input.session.gmUserId), eq(gmDaySessions.isDeleted, false)))
@@ -689,8 +728,10 @@ async function applyApprovedTimeChange(input: {
       requestedStartAt: input.requestedStartAt,
       requestedEndAt: input.requestedEndAt,
       now: input.now,
+      lockedBoundaryAt: input.originalStartAt,
+      database: input.database,
     });
-    const [updated] = await db
+    const [updated] = await input.database
       .update(gmDaySessions)
       .set({ dayEndedAt: input.requestedEndAt, updatedAt: input.now })
       .where(and(eq(gmDaySessions.id, input.session.id), eq(gmDaySessions.gmUserId, input.session.gmUserId), eq(gmDaySessions.isDeleted, false)))
@@ -705,10 +746,11 @@ async function applyApprovedTimeChange(input: {
     startAt: input.requestedStartAt,
     endAt: input.requestedEndAt,
     now: input.now,
+    database: input.database,
   });
 
   if (input.kind === "marktbesuch") {
-    const [updated] = await db
+    const [updated] = await input.database
       .update(visitSessions)
       .set({ startedAt: input.requestedStartAt, submittedAt: input.requestedEndAt, updatedAt: input.now })
       .where(
@@ -724,7 +766,7 @@ async function applyApprovedTimeChange(input: {
   }
 
   if (input.kind === "pause") {
-    const [updated] = await db
+    const [updated] = await input.database
       .update(gmDaySessionPauses)
       .set({ pauseStartedAt: input.requestedStartAt, pauseEndedAt: input.requestedEndAt, updatedAt: input.now })
       .where(
@@ -739,7 +781,7 @@ async function applyApprovedTimeChange(input: {
     return Boolean(updated);
   }
 
-  const [updated] = await db
+  const [updated] = await input.database
     .update(timeTrackingEntries)
     .set({ startAt: input.requestedStartAt, endAt: input.requestedEndAt, updatedAt: input.now })
     .where(
@@ -1152,7 +1194,8 @@ adminTimeEntryChangeRequestsRouter.patch("/:requestId/approve", async (req: Auth
         throw error;
       }
 
-      const session = await loadDaySession(requestRow.daySessionId, requestRow.gmUserId);
+      await tx.execute(sql`select id from ${gmDaySessions} where ${gmDaySessions.id} = ${requestRow.daySessionId} for update`);
+      const session = await loadDaySession(requestRow.daySessionId, requestRow.gmUserId, tx);
       if (!session) {
         const error = new Error("Arbeitstag nicht gefunden.") as Error & { status?: number; code?: string };
         error.status = 404;
@@ -1160,6 +1203,16 @@ adminTimeEntryChangeRequestsRouter.patch("/:requestId/approve", async (req: Auth
         throw error;
       }
       assertStartedDay(session);
+
+      if (!requestRow.requestedActivityType) {
+        if (requestRow.sourceKind === "marktbesuch") {
+          await tx.execute(sql`select id from ${visitSessions} where ${visitSessions.id} = ${requestRow.sourceId} for update`);
+        } else if (requestRow.sourceKind === "pause") {
+          await tx.execute(sql`select id from ${gmDaySessionPauses} where ${gmDaySessionPauses.id} = ${requestRow.sourceId} for update`);
+        } else if (requestRow.sourceKind === "zusatzzeit") {
+          await tx.execute(sql`select id from ${timeTrackingEntries} where ${timeTrackingEntries.id} = ${requestRow.sourceId} for update`);
+        }
+      }
 
       let applied = false;
       if (requestRow.requestedActivityType) {
@@ -1173,6 +1226,7 @@ adminTimeEntryChangeRequestsRouter.patch("/:requestId/approve", async (req: Auth
           startAt: requestRow.requestedStartAt,
           endAt: requestRow.requestedEndAt,
           now,
+          database: tx,
         });
         if (validation.session.id !== session.id) {
           throw buildHttpError("Die Zeit gehört nicht zu diesem Arbeitstag.", 409, "wrong_day_session");
@@ -1209,9 +1263,12 @@ adminTimeEntryChangeRequestsRouter.patch("/:requestId/approve", async (req: Auth
           session,
           requestedStartAt: requestRow.requestedStartAt,
           requestedEndAt: requestRow.requestedEndAt,
+          originalStartAt: requestRow.originalStartAt,
+          originalEndAt: requestRow.originalEndAt,
           requestedStartKm: requestRow.requestedStartKm,
           requestedEndKm: requestRow.requestedEndKm,
           now,
+          database: tx,
         });
       }
       if (!applied) {

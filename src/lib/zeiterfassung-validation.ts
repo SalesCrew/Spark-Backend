@@ -15,6 +15,9 @@ import {
   visitSessions,
 } from "./schema.js";
 
+type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+type DbLike = typeof db | DbTransaction;
+
 const TIMELINE_DAY_NOT_STARTED_MESSAGE = "Bitte zuerst den Arbeitstag starten.";
 const TIMELINE_OUTSIDE_DAY_MESSAGE = "Zeit liegt ausserhalb des Arbeitstags.";
 
@@ -64,8 +67,9 @@ function toPgTimestampParam(date: Date): string {
 async function loadNearestStartedDaySession(input: {
   gmUserId: string;
   startAt: Date;
+  database: DbLike;
 }): Promise<DaySessionForValidation | null> {
-  const [session] = await db
+  const [session] = await input.database
     .select({
       id: gmDaySessions.id,
       gmUserId: gmDaySessions.gmUserId,
@@ -104,12 +108,13 @@ async function loadValidationIntervalsForSession(input: {
   dayStartAt: Date;
   dayEndAt: Date;
   now: Date;
+  database: DbLike;
 }): Promise<TimelineInterval[]> {
   const dayStartAt = toPgTimestampParam(input.dayStartAt);
   const dayEndAt = toPgTimestampParam(input.dayEndAt);
   const now = toPgTimestampParam(input.now);
   const [pauseRows, visitRows, extraRows] = await Promise.all([
-    db
+    input.database
       .select({
         id: gmDaySessionPauses.id,
         startAt: gmDaySessionPauses.pauseStartedAt,
@@ -125,7 +130,7 @@ async function loadValidationIntervalsForSession(input: {
           sql`coalesce(${gmDaySessionPauses.pauseEndedAt}, ${now}::timestamptz) > ${dayStartAt}::timestamptz`,
         ),
       ),
-    db
+    input.database
       .select({
         id: visitSessions.id,
         status: visitSessions.status,
@@ -142,7 +147,7 @@ async function loadValidationIntervalsForSession(input: {
           sql`coalesce(${visitSessions.submittedAt}, ${now}::timestamptz) > ${dayStartAt}::timestamptz`,
         ),
       ),
-    db
+    input.database
       .select({
         id: timeTrackingEntries.id,
         status: timeTrackingEntries.status,
@@ -184,6 +189,7 @@ async function getValidatedDayContext(input: {
   startAt: Date;
   endAt?: Date;
   now?: Date;
+  database?: DbLike;
 }): Promise<{
   session: DaySessionForValidation;
   dayStartAt: Date;
@@ -191,9 +197,11 @@ async function getValidatedDayContext(input: {
   now: Date;
 }> {
   const now = input.now ?? new Date();
+  const database = input.database ?? db;
   const session = await loadNearestStartedDaySession({
     gmUserId: input.gmUserId,
     startAt: input.startAt,
+    database,
   });
   if (!session?.dayStartedAt) {
     throw new TimelineValidationError(409, "day_not_started", TIMELINE_DAY_NOT_STARTED_MESSAGE);
@@ -216,12 +224,14 @@ async function validateGmTimelineInterval(input: {
   startAt: Date;
   endAt: Date;
   now?: Date;
+  database?: DbLike;
 }): Promise<{ session: DaySessionForValidation }> {
   const context = await getValidatedDayContext({
     gmUserId: input.gmUserId,
     startAt: input.startAt,
     endAt: input.endAt,
     ...(input.now ? { now: input.now } : {}),
+    ...(input.database ? { database: input.database } : {}),
   });
   const intervals = await loadValidationIntervalsForSession({
     gmUserId: input.gmUserId,
@@ -229,6 +239,7 @@ async function validateGmTimelineInterval(input: {
     dayStartAt: context.dayStartAt,
     dayEndAt: context.dayEndAt,
     now: context.now,
+    database: input.database ?? db,
   });
   const result = validateTimelineInterval({
     kind: input.kind,
@@ -253,12 +264,14 @@ async function validateGmTimelineIntervalStrict(input: {
   startAt: Date;
   endAt: Date;
   now?: Date;
+  database?: DbLike;
 }): Promise<{ session: DaySessionForValidation }> {
   const context = await getValidatedDayContext({
     gmUserId: input.gmUserId,
     startAt: input.startAt,
     endAt: input.endAt,
     ...(input.now ? { now: input.now } : {}),
+    ...(input.database ? { database: input.database } : {}),
   });
   if (input.endAt.getTime() <= input.startAt.getTime()) {
     throw new TimelineValidationError(400, "invalid_interval", "Die Endzeit muss nach der Startzeit liegen.");
@@ -269,6 +282,7 @@ async function validateGmTimelineIntervalStrict(input: {
     dayStartAt: context.dayStartAt,
     dayEndAt: context.dayEndAt,
     now: context.now,
+    database: input.database ?? db,
   });
   const overlaps = intervals.some((interval) => {
     if (interval.kind === input.kind && interval.id === input.id) return false;
@@ -287,6 +301,7 @@ async function validateGmTimelineStartPoint(input: {
   id: string;
   startAt: Date;
   now?: Date;
+  database?: DbLike;
 }): Promise<{ session: DaySessionForValidation }> {
   const baseNow = input.now ?? new Date();
   const validationNow = input.startAt.getTime() > baseNow.getTime() ? input.startAt : baseNow;
@@ -294,6 +309,7 @@ async function validateGmTimelineStartPoint(input: {
     gmUserId: input.gmUserId,
     startAt: input.startAt,
     now: validationNow,
+    ...(input.database ? { database: input.database } : {}),
   });
   const intervals = await loadValidationIntervalsForSession({
     gmUserId: input.gmUserId,
@@ -301,6 +317,7 @@ async function validateGmTimelineStartPoint(input: {
     dayStartAt: context.dayStartAt,
     dayEndAt: context.dayEndAt,
     now: context.now,
+    database: input.database ?? db,
   });
   const pointMs = input.startAt.getTime();
   for (const interval of intervals) {
