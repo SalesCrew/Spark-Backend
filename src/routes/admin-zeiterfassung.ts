@@ -16,14 +16,23 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import {
   gmDaySessionPauses,
   gmDaySessions,
+  campaigns,
   lager,
   lagerGmAssignments,
   markets,
   timeTrackingEntries,
   users,
+  visitAnswerPhotos,
+  visitAnswers,
+  visitQuestionComments,
+  visitSessionQuestions,
   visitSessionSections,
   visitSessions,
 } from "../lib/schema.js";
+import {
+  buildZeitenaufstellungRows,
+  type ZeitenaufstellungSectionMetrics,
+} from "../lib/zeitenaufstellung-export.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const adminZeiterfassungRouter = Router();
@@ -60,11 +69,29 @@ const querySchema = z
   .strict();
 const diaetenExportQuerySchema = z
   .object({
-    month: z.coerce.number().int().min(0).max(11),
-    year: z.coerce.number().int().min(2020).max(2100),
+    month: z.coerce.number().int().min(0).max(11).optional(),
+    year: z.coerce.number().int().min(2020).max(2100).optional(),
+    from: z.string().regex(ymdRegex).optional(),
+    to: z.string().regex(ymdRegex).optional(),
     timezone: z.string().trim().min(1).max(120).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const hasMonth = value.month != null || value.year != null;
+    const hasRange = value.from != null || value.to != null;
+    if (hasMonth && (value.month == null || value.year == null)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Monat und Jahr müssen gemeinsam angegeben werden." });
+    }
+    if (hasRange && (value.from == null || value.to == null)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Von und Bis müssen gemeinsam angegeben werden." });
+    }
+    if (!hasMonth && !hasRange) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Ein Exportzeitraum ist erforderlich." });
+    }
+    if (value.from && value.to && value.from > value.to) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Von darf nicht nach Bis liegen." });
+    }
+  });
 
 const editableSegmentKindSchema = z.enum(["marktbesuch", "pause", "zusatzzeit"]);
 const hhmmRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -650,6 +677,295 @@ async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayloa
   return payload.sort((a, b) => b.date.localeCompare(a.date) || a.gmName.localeCompare(b.gmName));
 }
 
+async function loadZeitenaufstellungExport(input: QueryInput) {
+  const rangeStartExpr = sql`(${input.from}::timestamp at time zone ${input.timezone})`;
+  const rangeEndExpr = sql`((${input.to}::timestamp at time zone ${input.timezone}) + interval '1 day')`;
+
+  const [rawDayRows, rawVisitRows, rawExtraRows] = await Promise.all([
+    db
+      .select({
+        id: gmDaySessions.id,
+        gmId: gmDaySessions.gmUserId,
+        workDate: gmDaySessions.workDate,
+        dayStartedAt: gmDaySessions.dayStartedAt,
+        dayEndedAt: gmDaySessions.dayEndedAt,
+        createdAt: gmDaySessions.createdAt,
+        firstName: users.firstName,
+        lastName: users.lastName,
+      })
+      .from(gmDaySessions)
+      .innerJoin(users, eq(users.id, gmDaySessions.gmUserId))
+      .where(
+        and(
+          eq(gmDaySessions.isDeleted, false),
+          eq(users.role, "gm"),
+          gte(gmDaySessions.workDate, input.from),
+          lte(gmDaySessions.workDate, input.to),
+        ),
+      )
+      .orderBy(asc(gmDaySessions.workDate), asc(users.lastName), asc(users.firstName)),
+    db
+      .select({
+        id: visitSessions.id,
+        gmId: visitSessions.gmUserId,
+        startedAt: visitSessions.startedAt,
+        submittedAt: visitSessions.submittedAt,
+        firstName: users.firstName,
+        lastName: users.lastName,
+        marketName: markets.name,
+        marketDbName: markets.dbName,
+        marketAddress: markets.address,
+        marketPostalCode: markets.postalCode,
+        marketCity: markets.city,
+        marketRegion: markets.region,
+        cokeMasterNumber: markets.cokeMasterNumber,
+        standardMarketNumber: markets.standardMarketNumber,
+        flexNumber: markets.flexNumber,
+        kuehlerStammnr: markets.kuehlerStammnr,
+        universeMarket: markets.universeMarket,
+      })
+      .from(visitSessions)
+      .innerJoin(users, eq(users.id, visitSessions.gmUserId))
+      .innerJoin(markets, eq(markets.id, visitSessions.marketId))
+      .where(
+        and(
+          eq(visitSessions.status, "submitted"),
+          eq(visitSessions.isDeleted, false),
+          isNotNull(visitSessions.submittedAt),
+          sql`${visitSessions.startedAt} >= ${rangeStartExpr}`,
+          sql`${visitSessions.startedAt} < ${rangeEndExpr}`,
+        ),
+      )
+      .orderBy(asc(visitSessions.startedAt)),
+    db
+      .select({
+        id: timeTrackingEntries.id,
+        gmId: timeTrackingEntries.gmUserId,
+        activityType: timeTrackingEntries.activityType,
+        comment: timeTrackingEntries.comment,
+        startedAt: timeTrackingEntries.startAt,
+        endedAt: timeTrackingEntries.endAt,
+        firstName: users.firstName,
+        lastName: users.lastName,
+      })
+      .from(timeTrackingEntries)
+      .innerJoin(users, eq(users.id, timeTrackingEntries.gmUserId))
+      .where(
+        and(
+          eq(timeTrackingEntries.status, "submitted"),
+          eq(timeTrackingEntries.isDeleted, false),
+          isNotNull(timeTrackingEntries.startAt),
+          isNotNull(timeTrackingEntries.endAt),
+          sql`${timeTrackingEntries.startAt} >= ${rangeStartExpr}`,
+          sql`${timeTrackingEntries.startAt} < ${rangeEndExpr}`,
+        ),
+      )
+      .orderBy(asc(timeTrackingEntries.startAt)),
+  ]);
+
+  const days = rawDayRows.map((row) => ({
+    id: row.id,
+    gmId: row.gmId,
+    workDate: row.workDate,
+    startedAt: row.dayStartedAt ?? row.createdAt,
+    endedAt: row.dayEndedAt,
+  }));
+  const personByGmId = new Map(
+    rawDayRows.map((row) => [row.gmId, `${row.firstName} ${row.lastName}`.trim()]),
+  );
+  const visits = rawVisitRows.flatMap((row) => {
+    if (!row.submittedAt) return [];
+    const workDate = toYmdInTimezone(row.startedAt, input.timezone);
+    const person = `${row.firstName} ${row.lastName}`.trim();
+    personByGmId.set(row.gmId, person);
+    return [{
+      id: row.id,
+      gmId: row.gmId,
+      workDate,
+      startedAt: row.startedAt,
+      submittedAt: row.submittedAt,
+      person,
+      market: {
+        name: row.marketName,
+        dbName: row.marketDbName,
+        address: row.marketAddress,
+        postalCode: row.marketPostalCode,
+        city: row.marketCity,
+        region: row.marketRegion,
+        cokeMasterNumber: row.cokeMasterNumber,
+        standardMarketNumber: row.standardMarketNumber,
+        flexNumber: row.flexNumber,
+        kuehlerStammnr: row.kuehlerStammnr,
+        universeMarket: row.universeMarket,
+      },
+    }];
+  });
+  const extras = rawExtraRows.flatMap((row) => {
+    if (!row.startedAt || !row.endedAt || row.endedAt.getTime() <= row.startedAt.getTime()) return [];
+    const person = `${row.firstName} ${row.lastName}`.trim();
+    personByGmId.set(row.gmId, person);
+    return [{
+      id: row.id,
+      gmId: row.gmId,
+      workDate: toYmdInTimezone(row.startedAt, input.timezone),
+      startedAt: row.startedAt,
+      endedAt: row.endedAt,
+      activityType: row.activityType,
+      comment: row.comment,
+      person,
+    }];
+  });
+
+  const visitIds = visits.map((row) => row.id);
+  const dayIds = days.map((row) => row.id);
+  const [rawSectionRows, rawAnswerRows, rawPhotoRows, rawCommentRows, rawPauseRows] = await Promise.all([
+    visitIds.length === 0
+      ? Promise.resolve([])
+      : db
+          .select({
+            id: visitSessionSections.id,
+            visitSessionId: visitSessionSections.visitSessionId,
+            section: visitSessionSections.section,
+            orderIndex: visitSessionSections.orderIndex,
+            fragebogenName: visitSessionSections.fragebogenNameSnapshot,
+            campaignName: campaigns.name,
+            createdAt: visitSessionSections.createdAt,
+            updatedAt: visitSessionSections.updatedAt,
+          })
+          .from(visitSessionSections)
+          .leftJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+          .where(
+            and(
+              inArray(visitSessionSections.visitSessionId, visitIds),
+              eq(visitSessionSections.status, "submitted"),
+              eq(visitSessionSections.isDeleted, false),
+            ),
+          )
+          .orderBy(asc(visitSessionSections.visitSessionId), asc(visitSessionSections.orderIndex)),
+    visitIds.length === 0
+      ? Promise.resolve([])
+      : db
+          .select({
+            sectionId: visitAnswers.visitSessionSectionId,
+            answeredAt: visitAnswers.answeredAt,
+            changedAt: visitAnswers.changedAt,
+            createdAt: visitAnswers.createdAt,
+          })
+          .from(visitAnswers)
+          .where(and(inArray(visitAnswers.visitSessionId, visitIds), eq(visitAnswers.isDeleted, false))),
+    visitIds.length === 0
+      ? Promise.resolve([])
+      : db
+          .select({ sectionId: visitAnswers.visitSessionSectionId })
+          .from(visitAnswerPhotos)
+          .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
+          .where(
+            and(
+              inArray(visitAnswers.visitSessionId, visitIds),
+              eq(visitAnswers.isDeleted, false),
+              eq(visitAnswerPhotos.isDeleted, false),
+            ),
+          ),
+    visitIds.length === 0
+      ? Promise.resolve([])
+      : db
+          .select({
+            sectionId: visitSessionQuestions.visitSessionSectionId,
+            comment: visitQuestionComments.commentText,
+          })
+          .from(visitQuestionComments)
+          .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitQuestionComments.visitSessionQuestionId))
+          .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+          .where(
+            and(
+              inArray(visitSessionSections.visitSessionId, visitIds),
+              eq(visitQuestionComments.isDeleted, false),
+              eq(visitSessionQuestions.isDeleted, false),
+            ),
+          ),
+    dayIds.length === 0
+      ? Promise.resolve([])
+      : db
+          .select({
+            id: gmDaySessionPauses.id,
+            daySessionId: gmDaySessionPauses.daySessionId,
+            gmId: gmDaySessionPauses.gmUserId,
+            startedAt: gmDaySessionPauses.pauseStartedAt,
+            endedAt: gmDaySessionPauses.pauseEndedAt,
+          })
+          .from(gmDaySessionPauses)
+          .where(
+            and(
+              inArray(gmDaySessionPauses.daySessionId, dayIds),
+              eq(gmDaySessionPauses.isDeleted, false),
+              isNotNull(gmDaySessionPauses.pauseEndedAt),
+            ),
+          ),
+  ]);
+
+  const sectionMetrics = new Map<string, ZeitenaufstellungSectionMetrics>();
+  for (const section of rawSectionRows) {
+    sectionMetrics.set(section.id, { photoCount: 0, fillDurationMin: 0, comments: [] });
+  }
+  const answerBoundsBySectionId = new Map<string, { first: Date; last: Date }>();
+  for (const answer of rawAnswerRows) {
+    const first = answer.answeredAt ?? answer.createdAt;
+    const last = answer.changedAt;
+    const current = answerBoundsBySectionId.get(answer.sectionId);
+    answerBoundsBySectionId.set(answer.sectionId, {
+      first: !current || first.getTime() < current.first.getTime() ? first : current.first,
+      last: !current || last.getTime() > current.last.getTime() ? last : current.last,
+    });
+  }
+  for (const [sectionId, bounds] of answerBoundsBySectionId) {
+    const metrics = sectionMetrics.get(sectionId);
+    if (!metrics) continue;
+    metrics.fillDurationMin = Math.max(0, Math.floor((bounds.last.getTime() - bounds.first.getTime()) / 60_000));
+  }
+  for (const photo of rawPhotoRows) {
+    const metrics = sectionMetrics.get(photo.sectionId);
+    if (metrics) metrics.photoCount += 1;
+  }
+  for (const comment of rawCommentRows) {
+    const metrics = sectionMetrics.get(comment.sectionId);
+    if (metrics && comment.comment.trim()) metrics.comments.push(comment.comment.trim());
+  }
+
+  const workDateByDayId = new Map(days.map((row) => [row.id, row.workDate]));
+  const pauses = rawPauseRows.flatMap((row) => {
+    const workDate = workDateByDayId.get(row.daySessionId);
+    if (!workDate || !row.endedAt || row.endedAt.getTime() <= row.startedAt.getTime()) return [];
+    return [{
+      id: row.id,
+      gmId: row.gmId,
+      workDate,
+      startedAt: row.startedAt,
+      endedAt: row.endedAt,
+    }];
+  });
+  const sections = rawSectionRows.map((row) => ({
+    id: row.id,
+    visitSessionId: row.visitSessionId,
+    section: row.section,
+    orderIndex: row.orderIndex,
+    fragebogenName: row.fragebogenName,
+    campaignName: row.campaignName ?? "",
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }));
+
+  return buildZeitenaufstellungRows({
+    timezone: input.timezone,
+    days,
+    visits,
+    sections,
+    extras,
+    pauses,
+    sectionMetrics,
+    personByGmId,
+  });
+}
+
 adminZeiterfassungRouter.get("/days", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = parseQuery(req);
@@ -697,21 +1013,48 @@ adminZeiterfassungRouter.get("/gm-aggregates", async (req: AuthedRequest, res, n
   }
 });
 
+adminZeiterfassungRouter.get("/zeitenaufstellung-export", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = parseQuery(req);
+    if (!parsed) {
+      res.status(400).json({ error: "Ungültiger Zeitraum für die Zeitenaufstellung." });
+      return;
+    }
+    const rows = await loadZeitenaufstellungExport({ ...parsed, includeLive: false });
+    res.status(200).json({
+      rows,
+      meta: {
+        from: parsed.from,
+        to: parsed.to,
+        timezone: parsed.timezone,
+        totalRows: rows.length,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 adminZeiterfassungRouter.get("/diaeten-export", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = diaetenExportQuerySchema.safeParse({
       month: typeof req.query.month === "string" ? req.query.month : undefined,
       year: typeof req.query.year === "string" ? req.query.year : undefined,
+      from: typeof req.query.from === "string" ? req.query.from : undefined,
+      to: typeof req.query.to === "string" ? req.query.to : undefined,
       timezone: typeof req.query.timezone === "string" ? req.query.timezone : undefined,
     });
     if (!parsed.success) {
-      res.status(400).json({ error: "Ungültiger Monat für den Diäten-Export." });
+      res.status(400).json({ error: "Ungültiger Zeitraum für den Diäten-Export." });
       return;
     }
 
-    const { month, year } = parsed.data;
     const timezone = parsed.data.timezone ?? "Europe/Vienna";
-    const bounds = getMonthBounds(year, month);
+    const bounds = parsed.data.from && parsed.data.to
+      ? { from: parsed.data.from, to: parsed.data.to, next: addDaysToYmd(parsed.data.to, 1) }
+      : getMonthBounds(parsed.data.year!, parsed.data.month!);
+    const year = Number(bounds.from.slice(0, 4));
+    const month = Number(bounds.from.slice(5, 7)) - 1;
     const rangeStart = parseWorkDateHmToUtc(bounds.from, "00:00", timezone);
     const rangeEnd = parseWorkDateHmToUtc(bounds.next, "00:00", timezone);
     if (!rangeStart || !rangeEnd) {
