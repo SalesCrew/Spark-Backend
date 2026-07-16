@@ -496,6 +496,7 @@ export const campaigns = pgTable("campaigns", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: text("name").notNull(),
   section: campaignSectionEnum("section").notNull(),
+  assignedGmUserId: uuid("assigned_gm_user_id").references(() => users.id, { onDelete: "set null" }),
   currentFragebogenId: uuid("current_fragebogen_id"),
   status: fragebogenStatusEnum("status").notNull().default("inactive"),
   scheduleType: fragebogenScheduleTypeEnum("schedule_type").notNull().default("always"),
@@ -510,10 +511,17 @@ export const campaigns = pgTable("campaigns", {
     "campaigns_schedule_dates_ck",
     sql`(${table.scheduleType} = 'always') OR (${table.startDate} IS NOT NULL AND ${table.endDate} IS NOT NULL AND ${table.startDate} <= ${table.endDate})`,
   ),
+  check(
+    "campaigns_assigned_gm_flex_only_ck",
+    sql`${table.assignedGmUserId} IS NULL OR ${table.section} = 'flex'`,
+  ),
   index("campaigns_section_idx").on(table.section),
   index("campaigns_status_idx").on(table.status),
   index("campaigns_deleted_idx").on(table.isDeleted),
   index("campaigns_current_fragebogen_idx").on(table.currentFragebogenId),
+  index("campaigns_assigned_gm_active_idx")
+    .on(table.assignedGmUserId, table.section, table.status)
+    .where(sql`${table.isDeleted} = false AND ${table.assignedGmUserId} IS NOT NULL`),
 ]);
 
 export const campaignMarketAssignments = pgTable(

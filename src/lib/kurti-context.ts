@@ -1,4 +1,4 @@
-import { and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { db } from "./db.js";
 import { getCurrentWritableDaySessionForUser } from "./day-session.js";
 import { EMPLOYEE_AGREEMENT_KEY, EMPLOYEE_AGREEMENT_VERSION } from "./employee-agreement-meta.js";
@@ -397,7 +397,10 @@ export async function buildKurtiGmContext(gmUserId: string, now = new Date()): P
       .innerJoin(markets, eq(markets.id, campaignMarketAssignments.marketId))
       .where(
         and(
-          eq(campaignMarketAssignments.gmUserId, gmUserId),
+          or(
+            and(ne(campaigns.section, "flex"), eq(campaignMarketAssignments.gmUserId, gmUserId)),
+            and(eq(campaigns.section, "flex"), eq(campaigns.assignedGmUserId, gmUserId)),
+          ),
           eq(campaignMarketAssignments.isDeleted, false),
           eq(campaigns.isDeleted, false),
           eq(markets.isDeleted, false),
@@ -434,6 +437,7 @@ export async function buildKurtiGmContext(gmUserId: string, now = new Date()): P
       .where(
         and(
           eq(campaigns.section, "flex"),
+          or(isNull(campaigns.assignedGmUserId), eq(campaigns.assignedGmUserId, gmUserId)),
           eq(campaigns.isDeleted, false),
           liveCampaignCondition,
         ),

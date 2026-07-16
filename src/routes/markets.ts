@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, ilike, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, ilike, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
@@ -6,6 +6,7 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { aggregateHighVolumeLoad, logAction, logger, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
+import { selectEffectiveFlexCampaigns } from "../lib/flex-campaign-selection.js";
 import { resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
 import {
   campaignMarketAssignments,
@@ -1231,7 +1232,7 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
       .limit(1);
     const isBillaGm = Boolean(gmUser?.isBillaGm);
     const specialFilterValues = isBillaGm ? await loadSpecialArthurFilterValues(gmUserId) : [];
-    const [rows, activeFlexCampaignRows] = await Promise.all([
+    const [globalMarketRows, flexAssignmentRows] = await Promise.all([
       db
         .select()
         .from(markets)
@@ -1246,13 +1247,18 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
         .orderBy(desc(markets.createdAt)),
       db
         .select({
+          marketId: campaignMarketAssignments.marketId,
+          assignedGmUserId: campaigns.assignedGmUserId,
           campaignId: campaigns.id,
           campaignName: campaigns.name,
           section: campaigns.section,
         })
-        .from(campaigns)
+        .from(campaignMarketAssignments)
+        .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
         .where(
           and(
+            or(isNull(campaigns.assignedGmUserId), eq(campaigns.assignedGmUserId, gmUserId)),
+            eq(campaignMarketAssignments.isDeleted, false),
             eq(campaigns.section, "flex"),
             eq(campaigns.isDeleted, false),
             isNotNull(campaigns.currentFragebogenId),
@@ -1262,18 +1268,31 @@ marketsRouter.get("/gm/flex-start-markets", async (req: AuthedRequest, res, next
         .orderBy(asc(campaigns.name)),
     ]);
 
-    const activeFlexCampaigns: ActiveNowCampaignSummary[] = activeFlexCampaignRows.map((row) => ({
-      campaignId: row.campaignId,
-      campaignName: row.campaignName,
-      section: row.section,
-    }));
+    const rows = globalMarketRows;
+    const assignmentsByMarketId = new Map<string, typeof flexAssignmentRows>();
+    for (const row of flexAssignmentRows) {
+      const bucket = assignmentsByMarketId.get(row.marketId) ?? [];
+      bucket.push(row);
+      assignmentsByMarketId.set(row.marketId, bucket);
+    }
     const gmNamesByMarketId = await resolveActiveStandardGmNamesByMarketIds(rows.map((row) => row.id));
     res.status(200).json({
-      markets: rows.map((row) => ({
-        ...mapMarketRow(row),
-        plannedByActiveStandardGmName: gmNamesByMarketId.get(row.id) ?? null,
-        activeNowCampaigns: activeFlexCampaigns,
-      })),
+      markets: rows
+        .map((row) => {
+          const marketAssignments = assignmentsByMarketId.get(row.id) ?? [];
+          const activeNowCampaigns: ActiveNowCampaignSummary[] = selectEffectiveFlexCampaigns(marketAssignments, gmUserId)
+            .map((entry) => ({
+              campaignId: entry.campaignId,
+              campaignName: entry.campaignName,
+              section: entry.section,
+            }));
+          return {
+            ...mapMarketRow(row),
+            plannedByActiveStandardGmName: gmNamesByMarketId.get(row.id) ?? null,
+            activeNowCampaigns,
+          };
+        })
+        .filter((row) => row.activeNowCampaigns.length > 0),
     });
   } catch (err) {
     next(err);
@@ -1319,6 +1338,17 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
       .limit(1);
     const isBillaGm = Boolean(gmUser?.isBillaGm);
     const specialFilterValues = isBillaGm ? await loadSpecialArthurFilterValues(gmUserId) : [];
+    const canUseFlexCampaignAtMarket = Boolean(
+      marketRow.isActive
+      && (marketRow.marketType === "universum" || marketRow.marketType === "both")
+      && (!isBillaGm || isMarketVisibleForBillaGm(marketRow, specialFilterValues)),
+    );
+    const assignedCampaignAudienceCondition = canUseFlexCampaignAtMarket
+      ? or(
+          and(ne(campaigns.section, "flex"), eq(campaignMarketAssignments.gmUserId, gmUserId)),
+          and(eq(campaigns.section, "flex"), eq(campaigns.assignedGmUserId, gmUserId)),
+        )
+      : and(ne(campaigns.section, "flex"), eq(campaignMarketAssignments.gmUserId, gmUserId));
 
     const assignedCampaignRows = await db
       .select({
@@ -1332,7 +1362,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
       .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
       .where(
         and(
-          eq(campaignMarketAssignments.gmUserId, gmUserId),
+          assignedCampaignAudienceCondition,
           eq(campaignMarketAssignments.marketId, marketId),
           eq(campaignMarketAssignments.isDeleted, false),
           eq(campaigns.isDeleted, false),
@@ -1367,10 +1397,13 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
       });
     }
 
+    const hasAssignedFlexCampaign = assignedCampaignRows.some(
+      (row) => row.section === "flex" && Boolean(row.currentFragebogenId),
+    );
+
     if (
-      marketRow.isActive &&
-      (marketRow.marketType === "universum" || marketRow.marketType === "both") &&
-      (!isBillaGm || isMarketVisibleForBillaGm(marketRow, specialFilterValues))
+      !hasAssignedFlexCampaign &&
+      canUseFlexCampaignAtMarket
     ) {
       const activeFlexRows = await db
         .select({
@@ -1378,11 +1411,16 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
           campaignName: campaigns.name,
           section: campaigns.section,
           currentFragebogenId: campaigns.currentFragebogenId,
+          visitTargetCount: campaignMarketAssignments.visitTargetCount,
         })
-        .from(campaigns)
+        .from(campaignMarketAssignments)
+        .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
         .where(
           and(
+            eq(campaignMarketAssignments.marketId, marketId),
+            eq(campaignMarketAssignments.isDeleted, false),
             eq(campaigns.section, "flex"),
+            isNull(campaigns.assignedGmUserId),
             eq(campaigns.isDeleted, false),
             isNotNull(campaigns.currentFragebogenId),
             campaignIsLiveNowCondition(),
@@ -1397,7 +1435,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
           campaignName: row.campaignName,
           section: row.section,
           currentFragebogenId: row.currentFragebogenId,
-          targetVisitCount: 1,
+          targetVisitCount: Math.max(1, Number(row.visitTargetCount ?? 1)),
         });
       }
     }
@@ -1936,6 +1974,47 @@ marketsRouter.get("/gm/visit-start", async (req: AuthedRequest, res, next) => {
       return;
     }
     const marketChain = normalizeMarketChain(market.dbName);
+    const [gmUser] = await db
+      .select({ isBillaGm: users.isBillaGm })
+      .from(users)
+      .where(eq(users.id, gmUserId))
+      .limit(1);
+    const isBillaGm = Boolean(gmUser?.isBillaGm);
+    const specialFilterValues = isBillaGm ? await loadSpecialArthurFilterValues(gmUserId) : [];
+    const canUseFlexCampaignAtMarket = Boolean(
+      market.isActive
+      && (market.marketType === "universum" || market.marketType === "both")
+      && (!isBillaGm || isMarketVisibleForBillaGm(market, specialFilterValues)),
+    );
+    const [dedicatedFlexCampaign] = canUseFlexCampaignAtMarket
+      ? await db
+          .select({ campaignId: campaigns.id })
+          .from(campaignMarketAssignments)
+          .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
+          .where(
+            and(
+              eq(campaignMarketAssignments.marketId, marketId),
+              eq(campaignMarketAssignments.isDeleted, false),
+              eq(campaigns.section, "flex"),
+              eq(campaigns.assignedGmUserId, gmUserId),
+              eq(campaigns.isDeleted, false),
+              isNotNull(campaigns.currentFragebogenId),
+              campaignIsLiveNowCondition(),
+            ),
+          )
+          .limit(1)
+      : [];
+    const selectedCampaignAudienceCondition = or(
+      and(ne(campaigns.section, "flex"), eq(campaignMarketAssignments.gmUserId, gmUserId)),
+      canUseFlexCampaignAtMarket
+        ? and(
+            eq(campaigns.section, "flex"),
+            dedicatedFlexCampaign
+              ? eq(campaigns.assignedGmUserId, gmUserId)
+              : isNull(campaigns.assignedGmUserId),
+          )
+        : sql`false`,
+    );
 
     const selectedRows = await db
       .select({
@@ -1949,7 +2028,7 @@ marketsRouter.get("/gm/visit-start", async (req: AuthedRequest, res, next) => {
       .where(
         and(
           eq(campaignMarketAssignments.marketId, marketId),
-          eq(campaignMarketAssignments.gmUserId, gmUserId),
+          selectedCampaignAudienceCondition,
           inArray(campaigns.id, campaignIds),
           eq(campaignMarketAssignments.isDeleted, false),
           eq(campaigns.isDeleted, false),

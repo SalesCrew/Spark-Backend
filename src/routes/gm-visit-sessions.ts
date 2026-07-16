@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import {
@@ -1106,6 +1106,14 @@ async function resolveVisitSectionsForSelection(input: {
     .where(eq(users.id, input.gmUserId))
     .limit(1);
   const canUseGlobalFlexFallback = !gmUser?.isBillaGm || isBillaMarketRow(marketRow ?? { name: "", dbName: "" });
+  const selectedCampaignAudienceCondition = or(
+    and(ne(campaigns.section, "flex"), eq(campaignMarketAssignments.gmUserId, input.gmUserId)),
+    and(
+      eq(campaigns.section, "flex"),
+      eq(campaigns.assignedGmUserId, input.gmUserId),
+      canUseGlobalFlexFallback ? sql`true` : sql`false`,
+    ),
+  );
 
   const selectedRows = await db
     .select({
@@ -1119,7 +1127,7 @@ async function resolveVisitSectionsForSelection(input: {
     .where(
       and(
         eq(campaignMarketAssignments.marketId, input.marketId),
-        eq(campaignMarketAssignments.gmUserId, input.gmUserId),
+        selectedCampaignAudienceCondition,
         inArray(campaigns.id, input.campaignIds),
         eq(campaignMarketAssignments.isDeleted, false),
         eq(campaigns.isDeleted, false),
@@ -1128,7 +1136,23 @@ async function resolveVisitSectionsForSelection(input: {
     );
 
   const selectedById = new Map(selectedRows.map((row) => [row.campaignId, row]));
-  const missingAfterAssignment = canUseGlobalFlexFallback
+  const [targetedFlexAssignment] = await db
+    .select({ campaignId: campaigns.id })
+    .from(campaignMarketAssignments)
+    .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
+    .where(
+      and(
+        eq(campaignMarketAssignments.marketId, input.marketId),
+        eq(campaignMarketAssignments.isDeleted, false),
+        eq(campaigns.section, "flex"),
+        eq(campaigns.assignedGmUserId, input.gmUserId),
+        eq(campaigns.isDeleted, false),
+        isNotNull(campaigns.currentFragebogenId),
+        liveNowCondition,
+      ),
+    )
+    .limit(1);
+  const missingAfterAssignment = canUseGlobalFlexFallback && !targetedFlexAssignment
     ? input.campaignIds.filter((id) => !selectedById.has(id))
     : [];
   if (missingAfterAssignment.length > 0) {
@@ -1139,11 +1163,15 @@ async function resolveVisitSectionsForSelection(input: {
         section: campaigns.section,
         currentFragebogenId: campaigns.currentFragebogenId,
       })
-      .from(campaigns)
+      .from(campaignMarketAssignments)
+      .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
       .where(
         and(
+          eq(campaignMarketAssignments.marketId, input.marketId),
+          eq(campaignMarketAssignments.isDeleted, false),
           inArray(campaigns.id, missingAfterAssignment),
           eq(campaigns.section, "flex"),
+          isNull(campaigns.assignedGmUserId),
           eq(campaigns.isDeleted, false),
           liveNowCondition,
         ),

@@ -158,6 +158,12 @@ const reassignCampaignGmsSchema = z
   })
   .strict();
 
+const setFlexCampaignAudienceSchema = z
+  .object({
+    gmUserId: z.string().uuid().nullable(),
+  })
+  .strict();
+
 const HARD_DELETE_CAMPAIGN_CONFIRMATION_TEXT = "Ich bin mir sicher, dass ich alle Daten zu dieser Kampagne Löschen will!";
 const adminSubmittedVisitAnswerPatchSchema = z
   .object({
@@ -1133,8 +1139,10 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
 
   const gmUserIds = Array.from(
     new Set(
-      assignments
-        .map((row) => row.gmUserId)
+      [
+        ...assignments.map((row) => row.gmUserId),
+        ...rows.map((row) => row.assignedGmUserId),
+      ]
         .filter((id): id is string => Boolean(id)),
     ),
   );
@@ -1217,6 +1225,8 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
     id: row.id,
     name: row.name,
     section: row.section,
+    assignedGmUserId: row.assignedGmUserId,
+    assignedGmName: row.assignedGmUserId ? (gmNameById.get(row.assignedGmUserId) ?? null) : null,
     currentFragebogenId: row.currentFragebogenId,
     currentFragebogenName: row.currentFragebogenId ? (fbNameBySectionAndId.get(`${row.section}:${row.currentFragebogenId}`) ?? null) : null,
     status: deriveEffectiveCampaignStatus({
@@ -4683,6 +4693,85 @@ adminCampaignsRouter.patch("/campaigns/:id/gm-reassignments", async (req: Authed
     logAction("error", "campaign_gm_reassign_failed", {
       req,
       action: "campaign_gm_reassign",
+      result: "failure",
+      statusCode: 500,
+      requestClass: "server_error",
+      startedAtNs,
+      error,
+    });
+    markErrorAsLogged(error);
+    next(error);
+  }
+});
+
+adminCampaignsRouter.patch("/campaigns/:id/flex-audience", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    const campaignId = String(req.params.id ?? "");
+    if (!isUuid(campaignId)) {
+      res.status(400).json({ error: "Ungültige Kampagnen-ID.", code: "invalid_id" });
+      return;
+    }
+    const parsed = setFlexCampaignAudienceSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige Flex-Zielgruppe.", code: "invalid_payload" });
+      return;
+    }
+
+    const targetGmUserId = parsed.data.gmUserId;
+    if (targetGmUserId) await ensureGmUsersExist([targetGmUserId]);
+    const now = new Date();
+    let previousGmUserId: string | null = null;
+
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT ${campaigns.id} FROM ${campaigns} WHERE ${campaigns.id} = ${campaignId} FOR UPDATE`);
+      const [campaignRow] = await tx
+        .select({
+          id: campaigns.id,
+          section: campaigns.section,
+          assignedGmUserId: campaigns.assignedGmUserId,
+        })
+        .from(campaigns)
+        .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
+        .limit(1);
+      if (!campaignRow) throw new CampaignDomainError("campaign_not_found", 404, "Kampagne nicht gefunden.");
+      if (campaignRow.section !== "flex") {
+        throw new CampaignDomainError("invalid_payload", 400, "Die Kampagnen-Zielgruppe ist nur für Flex-Kampagnen verfügbar.");
+      }
+      previousGmUserId = campaignRow.assignedGmUserId;
+      if (previousGmUserId === targetGmUserId) return;
+
+      await tx
+        .update(campaigns)
+        .set({ assignedGmUserId: targetGmUserId, updatedAt: now })
+        .where(eq(campaigns.id, campaignId));
+    });
+
+    const [row] = await db
+      .select()
+      .from(campaigns)
+      .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
+      .limit(1);
+    if (!row) throw new CampaignDomainError("campaign_not_found", 404, "Kampagne nicht gefunden.");
+    const [campaign] = await mapCampaignRows([row]);
+    res.status(200).json({ campaign });
+    logAction("info", "flex_campaign_audience_updated", {
+      req,
+      action: "flex_campaign_audience_update",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { campaignId, previousGmUserId, targetGmUserId },
+    });
+  } catch (error) {
+    if (error instanceof CampaignDomainError) {
+      respondDomainError(res, error);
+      return;
+    }
+    logAction("error", "flex_campaign_audience_update_failed", {
+      req,
+      action: "flex_campaign_audience_update",
       result: "failure",
       statusCode: 500,
       requestClass: "server_error",
