@@ -3,6 +3,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { db } from "../lib/db.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
+import { shouldExcludeMhdPhotos } from "../lib/photo-archive-access.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import {
@@ -57,6 +58,7 @@ const photoListQuerySchema = z.object({
 
 type PhotoListQuery = z.infer<typeof photoListQuerySchema>;
 type PhotoSignVariant = z.infer<typeof photoSignVariantSchema>;
+type PhotoAccessScope = { excludeMhd: boolean };
 
 const photoSignedUrlsBodySchema = z.object({
   photoIds: z.array(z.string().regex(uuidRegex)).min(1).max(40),
@@ -230,7 +232,11 @@ function marketChainExpression() {
   end`;
 }
 
-function buildPhotoWhere(input: PhotoListQuery, photoId?: string): SQL {
+function buildPhotoWhere(
+  input: PhotoListQuery,
+  photoId?: string,
+  access: PhotoAccessScope = { excludeMhd: false },
+): SQL {
   const conditions: SQL[] = [
     eq(visitAnswerPhotos.isDeleted, false),
     eq(visitAnswers.isDeleted, false),
@@ -245,6 +251,7 @@ function buildPhotoWhere(input: PhotoListQuery, photoId?: string): SQL {
     eq(markets.isDeleted, false),
   ];
 
+  if (access.excludeMhd) conditions.push(sql`${campaigns.section} <> 'mhd'`);
   if (photoId) conditions.push(eq(visitAnswerPhotos.id, photoId));
   if (input.campaignId) conditions.push(eq(campaigns.id, input.campaignId));
   if (input.campaignType) conditions.push(eq(campaigns.section, input.campaignType));
@@ -471,8 +478,8 @@ async function mapPhotoRows(rows: PhotoRow[], options: { signOriginal?: boolean 
   );
 }
 
-async function loadFacets() {
-  const baseWhere = buildPhotoWhere({ page: 1, pageSize: 1 });
+async function loadFacets(access: PhotoAccessScope) {
+  const baseWhere = buildPhotoWhere({ page: 1, pageSize: 1 }, undefined, access);
   const [campaignRows, gmRows, tagRows, regionRows, chainRows] = await Promise.all([
     db
       .selectDistinct({ id: campaigns.id, name: campaigns.name, type: campaigns.section })
@@ -551,7 +558,7 @@ async function loadFacets() {
   };
 }
 
-adminPhotosRouter.get("/photos", async (req, res, next) => {
+adminPhotosRouter.get("/photos", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = photoListQuerySchema.safeParse(req.query);
     if (!parsed.success) {
@@ -560,7 +567,8 @@ adminPhotosRouter.get("/photos", async (req, res, next) => {
     }
 
     const filters = parsed.data;
-    const where = buildPhotoWhere(filters);
+    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
+    const where = buildPhotoWhere(filters, undefined, access);
     const offset = (filters.page - 1) * filters.pageSize;
 
     const [rows, totalRows, statsRows] = await Promise.all([
@@ -610,15 +618,16 @@ adminPhotosRouter.get("/photos", async (req, res, next) => {
   }
 });
 
-adminPhotosRouter.get("/photos/facets", async (_req, res, next) => {
+adminPhotosRouter.get("/photos/facets", async (req: AuthedRequest, res, next) => {
   try {
-    res.status(200).json({ facets: await loadFacets() });
+    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
+    res.status(200).json({ facets: await loadFacets(access) });
   } catch (error) {
     next(error);
   }
 });
 
-adminPhotosRouter.post("/photos/signed-urls", async (req, res, next) => {
+adminPhotosRouter.post("/photos/signed-urls", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = photoSignedUrlsBodySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -627,8 +636,9 @@ adminPhotosRouter.post("/photos/signed-urls", async (req, res, next) => {
     }
 
     const uniquePhotoIds = Array.from(new Set(parsed.data.photoIds));
+    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
     const where = and(
-      buildPhotoWhere({ page: 1, pageSize: 1 }),
+      buildPhotoWhere({ page: 1, pageSize: 1 }, undefined, access),
       inArray(visitAnswerPhotos.id, uniquePhotoIds),
     ) ?? sql`false`;
     const rows = (await basePhotoSelect(where)) as PhotoRow[];
@@ -738,7 +748,7 @@ adminPhotosRouter.patch("/photos/:photoId/tags", async (req: AuthedRequest, res,
   }
 });
 
-adminPhotosRouter.get("/photos/:photoId", async (req, res, next) => {
+adminPhotosRouter.get("/photos/:photoId", async (req: AuthedRequest, res, next) => {
   try {
     const photoId = String(req.params.photoId ?? "");
     if (!uuidRegex.test(photoId)) {
@@ -746,7 +756,8 @@ adminPhotosRouter.get("/photos/:photoId", async (req, res, next) => {
       return;
     }
 
-    const where = buildPhotoWhere({ page: 1, pageSize: 1 }, photoId);
+    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
+    const where = buildPhotoWhere({ page: 1, pageSize: 1 }, photoId, access);
     const rows = (await basePhotoSelect(where).limit(1)) as PhotoRow[];
     if (!rows[0]) {
       res.status(404).json({ error: "Foto nicht gefunden.", code: "photo_not_found" });
