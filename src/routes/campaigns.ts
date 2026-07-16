@@ -1309,7 +1309,13 @@ async function mergeCampaignAssignment(
 
 async function buildCampaignMarketVisitSummaries(
   campaignId: string,
-  options?: { marketIds?: string[]; sessionId?: string | null; sessionIds?: string[]; includePhotoSignedUrls?: boolean },
+  options?: {
+    marketIds?: string[];
+    sessionId?: string | null;
+    sessionIds?: string[];
+    includePhotoSignedUrls?: boolean;
+    exportSlim?: boolean;
+  },
 ) {
   const scopedMarketIds = normalizeUnique(options?.marketIds ?? []).filter(isUuid);
   const scopedSessionIds = normalizeUnique(options?.sessionIds ?? []).filter(isUuid);
@@ -1386,19 +1392,21 @@ async function buildCampaignMarketVisitSummaries(
     }));
   }
 
-  const sections = await db
-    .select()
-    .from(visitSessionSections)
-    .where(
-      and(
-        inArray(visitSessionSections.visitSessionId, selectedSessionIds),
-        eq(visitSessionSections.campaignId, campaignId),
-        eq(visitSessionSections.isDeleted, false),
-      ),
-    )
-    .orderBy(asc(visitSessionSections.orderIndex));
+  const [sections, hasAvailabilityTypeSnapshotColumn] = await Promise.all([
+    db
+      .select()
+      .from(visitSessionSections)
+      .where(
+        and(
+          inArray(visitSessionSections.visitSessionId, selectedSessionIds),
+          eq(visitSessionSections.campaignId, campaignId),
+          eq(visitSessionSections.isDeleted, false),
+        ),
+      )
+      .orderBy(asc(visitSessionSections.orderIndex)),
+    ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady(),
+  ]);
   const sectionIds = sections.map((section) => section.id);
-  const hasAvailabilityTypeSnapshotColumn = await ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady();
   const questions =
     sectionIds.length === 0
       ? []
@@ -1416,9 +1424,16 @@ async function buildCampaignMarketVisitSummaries(
             singleChoiceAvailabilityTypeSnapshot: hasAvailabilityTypeSnapshotColumn
               ? visitSessionQuestions.singleChoiceAvailabilityTypeSnapshot
               : sql<string | null>`null::text`,
-            questionConfigSnapshot: visitSessionQuestions.questionConfigSnapshot,
+            // The FB export only needs the recorded answer values. Some historical
+            // Flex snapshots contain very large option payloads in this JSON column;
+            // replacing it with an empty object prevents hundreds of MB per batch.
+            questionConfigSnapshot: options?.exportSlim
+              ? sql<Record<string, unknown>>`'{}'::jsonb`
+              : visitSessionQuestions.questionConfigSnapshot,
             questionRulesSnapshot: visitSessionQuestions.questionRulesSnapshot,
-            questionChainsSnapshot: visitSessionQuestions.questionChainsSnapshot,
+            questionChainsSnapshot: options?.exportSlim
+              ? sql<string[]>`'[]'::jsonb`
+              : visitSessionQuestions.questionChainsSnapshot,
             appliesToMarketChainSnapshot: visitSessionQuestions.appliesToMarketChainSnapshot,
             orderIndex: visitSessionQuestions.orderIndex,
           })
@@ -1432,17 +1447,21 @@ async function buildCampaignMarketVisitSummaries(
           .orderBy(asc(visitSessionQuestions.orderIndex));
   const questionIds = questions.map((question) => question.id);
 
-  const answers =
+  const gmUserIds = normalizeUnique(
+    selectedSessions
+      .map((entry) => entry.gmUserId)
+      .filter((entry): entry is string => Boolean(entry)),
+  );
+  const [answers, comments, gmRows] = await Promise.all([
     questionIds.length === 0
-      ? []
-      : await db
+      ? Promise.resolve([])
+      : db
           .select()
           .from(visitAnswers)
-          .where(and(inArray(visitAnswers.visitSessionQuestionId, questionIds), eq(visitAnswers.isDeleted, false)));
-  const comments =
+          .where(and(inArray(visitAnswers.visitSessionQuestionId, questionIds), eq(visitAnswers.isDeleted, false))),
     questionIds.length === 0
-      ? []
-      : await db
+      ? Promise.resolve([])
+      : db
           .select()
           .from(visitQuestionComments)
           .where(
@@ -1450,20 +1469,24 @@ async function buildCampaignMarketVisitSummaries(
               inArray(visitQuestionComments.visitSessionQuestionId, questionIds),
               eq(visitQuestionComments.isDeleted, false),
             ),
-          );
+          ),
+    gmUserIds.length === 0
+      ? Promise.resolve([])
+      : db
+          .select({ id: users.id, firstName: users.firstName, lastName: users.lastName })
+          .from(users)
+          .where(inArray(users.id, gmUserIds)),
+  ]);
   const answerIds = answers.map((answer) => answer.id);
-  const answerOptions =
-    answerIds.length === 0
-      ? []
-      : await db
+  const [answerOptions, answerMatrixCells, answerPhotos] = answerIds.length === 0
+    ? [[], [], []]
+    : await Promise.all([
+        db
           .select()
           .from(visitAnswerOptions)
           .where(and(inArray(visitAnswerOptions.visitAnswerId, answerIds), eq(visitAnswerOptions.isDeleted, false)))
-          .orderBy(asc(visitAnswerOptions.orderIndex));
-  const answerMatrixCells =
-    answerIds.length === 0
-      ? []
-      : await db
+          .orderBy(asc(visitAnswerOptions.orderIndex)),
+        db
           .select()
           .from(visitAnswerMatrixCells)
           .where(
@@ -1472,15 +1495,13 @@ async function buildCampaignMarketVisitSummaries(
               eq(visitAnswerMatrixCells.isDeleted, false),
             ),
           )
-          .orderBy(asc(visitAnswerMatrixCells.orderIndex));
-  const answerPhotos =
-    answerIds.length === 0
-      ? []
-      : await db
+          .orderBy(asc(visitAnswerMatrixCells.orderIndex)),
+        db
           .select()
           .from(visitAnswerPhotos)
           .where(and(inArray(visitAnswerPhotos.visitAnswerId, answerIds), eq(visitAnswerPhotos.isDeleted, false)))
-          .orderBy(asc(visitAnswerPhotos.createdAt));
+          .orderBy(asc(visitAnswerPhotos.createdAt)),
+      ]);
   const answerPhotoIds = answerPhotos.map((photo) => photo.id);
   const answerPhotoTags =
     answerPhotoIds.length === 0
@@ -1496,20 +1517,9 @@ async function buildCampaignMarketVisitSummaries(
           )
           .orderBy(asc(visitAnswerPhotoTags.createdAt));
 
-  const gmUserIds = normalizeUnique(
-    selectedSessions
-      .map((entry) => entry.gmUserId)
-      .filter((entry): entry is string => Boolean(entry)),
-  );
   const gmNameById = new Map<string, string>();
-  if (gmUserIds.length > 0) {
-    const gmRows = await db
-      .select({ id: users.id, firstName: users.firstName, lastName: users.lastName })
-      .from(users)
-      .where(inArray(users.id, gmUserIds));
-    for (const row of gmRows) {
-      gmNameById.set(row.id, `${row.firstName} ${row.lastName}`.trim());
-    }
+  for (const row of gmRows) {
+    gmNameById.set(row.id, `${row.firstName} ${row.lastName}`.trim());
   }
 
   const sectionsBySessionId = new Map<string, typeof sections>();
@@ -2068,6 +2078,7 @@ adminCampaignsRouter.post("/campaigns/:campaignId/market-visits/export-details",
       marketIds: visits.map((visit) => visit.marketId),
       sessionIds: visits.map((visit) => visit.sessionId),
       includePhotoSignedUrls: false,
+      exportSlim: true,
     });
     const reconciled = reconcileCampaignVisitExportDetails(visits, details);
     if (reconciled.missingVisits.length > 0) {
