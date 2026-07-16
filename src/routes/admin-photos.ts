@@ -205,7 +205,29 @@ function toIso(value: Date | string | null | undefined): string | null {
 }
 
 function marketChainExpression() {
-  return sql<string>`coalesce(nullif(split_part(trim(${markets.name}), ' ', 1), ''), 'Unbekannt')`;
+  const rawChain = sql<string>`coalesce(
+    nullif(regexp_replace(trim(${markets.dbName}), '\\s+', ' ', 'g'), ''),
+    nullif(split_part(trim(${markets.name}), ' ', 1), ''),
+    'Unbekannt'
+  )`;
+
+  return sql<string>`case lower(${rawChain})
+    when 'adeg' then 'ADEG'
+    when 'billa' then 'Billa'
+    when 'billa+' then 'Billa Plus'
+    when 'billa plus' then 'Billa Plus'
+    when 'esp' then 'ESP'
+    when 'eurospar' then 'EUROSPAR'
+    when 'isp' then 'ISP'
+    when 'maxi' then 'Maxi'
+    when 'mpreis' then 'MPreis'
+    when 'n&fp' then 'N&FP'
+    when 'rewe' then 'REWE'
+    when 'saprmarkt' then 'SPAR'
+    when 'sm' then 'sM'
+    when 'spar' then 'SPAR'
+    else initcap(lower(${rawChain}))
+  end`;
 }
 
 function buildPhotoWhere(input: PhotoListQuery, photoId?: string): SQL {
