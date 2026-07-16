@@ -14,6 +14,7 @@ import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import { addDays, startOfDay } from "../lib/red-monat.js";
 import { resolveCurrentRedPeriod, resolveRedPeriodForDate } from "../lib/red-month-periods.js";
+import { selectMissingSpezialfragenForSession } from "../lib/spezialfragen-session-sync.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import {
@@ -100,11 +101,19 @@ gmVisitSessionsRouter.use(async (req: AuthedRequest, res, next) => {
 });
 
 const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
+type VisitSectionName = (typeof SECTION_ORDER)[number];
+type FragebogenScope = "main" | "kuehler" | "mhd";
 const VISIT_PHOTOS_BUCKET = "visit-photos";
 const VISIT_PHOTO_READ_URL_TTL_SECONDS = 30 * 60;
 
 function isBillaMarketRow(input: { name: string | null | undefined; dbName: string | null | undefined }): boolean {
   return `${input.name ?? ""} ${input.dbName ?? ""}`.toUpperCase().includes("BILLA");
+}
+
+function fragebogenScopeForVisitSection(section: VisitSectionName): FragebogenScope {
+  if (section === "kuehler") return "kuehler";
+  if (section === "mhd") return "mhd";
+  return "main";
 }
 const VISIT_PHOTO_READ_URL_TIMEOUT_MS = 1800;
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -325,7 +334,16 @@ function appendSpezialfragen(
   marketChain: string,
 ): ResolvedQuestion[] {
   const moduleQuestionIds = new Set(moduleQuestions.map((question) => question.questionId));
-  const resolvedSpezialfragen = (spezialfragen ?? [])
+  const resolvedSpezialfragen = resolveSpezialfragenForMarket(spezialfragen, marketChain)
+    .filter((question) => !moduleQuestionIds.has(question.questionId));
+  return [...moduleQuestions, ...resolvedSpezialfragen];
+}
+
+function resolveSpezialfragenForMarket(
+  spezialfragen: Awaited<ReturnType<typeof fetchFragebogenUi>>[number]["spezialfragen"],
+  marketChain: string,
+): ResolvedQuestion[] {
+  return (spezialfragen ?? [])
     .map((question) =>
       toResolvedQuestion(
         {
@@ -348,11 +366,9 @@ function appendSpezialfragen(
     .filter((question): question is ResolvedQuestion =>
       Boolean(
         question
-          && !moduleQuestionIds.has(question.questionId)
           && isQuestionApplicableToMarketChain(question.chains, marketChain),
       ),
     );
-  return [...moduleQuestions, ...resolvedSpezialfragen];
 }
 
 function decodePhotoAnswer(raw: unknown): { photos: string[]; selectedTagIds: string[] } {
@@ -2448,6 +2464,184 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       res.status(err.status).json({ error: err.message ?? "visit session Fehler", code: err.code, details: err.details });
       return;
     }
+    next(error);
+  }
+});
+
+gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/spezialfragen/sync", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    if (!gmUserId || req.authUser?.role !== "gm") {
+      res.status(403).json({ error: "Nur Gebietsmanager koennen eigene Spezialfragen nachtragen.", code: "gm_required" });
+      return;
+    }
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungueltige Session-ID.", code: "invalid_session_id" });
+      return;
+    }
+
+    const [session] = await db
+      .select({
+        id: visitSessions.id,
+        status: visitSessions.status,
+        submittedAt: visitSessions.submittedAt,
+        marketDbName: markets.dbName,
+      })
+      .from(visitSessions)
+      .innerJoin(markets, eq(markets.id, visitSessions.marketId))
+      .where(
+        and(
+          eq(visitSessions.id, sessionId),
+          eq(visitSessions.gmUserId, gmUserId),
+          eq(visitSessions.status, "submitted"),
+          isNotNull(visitSessions.submittedAt),
+          eq(visitSessions.isDeleted, false),
+          eq(markets.isDeleted, false),
+        ),
+      )
+      .limit(1);
+    if (!session) {
+      res.status(404).json({ error: "Abgeschlossener Fragebogen wurde nicht gefunden.", code: "session_not_found" });
+      return;
+    }
+
+    const sectionRows = await db
+      .select({
+        id: visitSessionSections.id,
+        section: visitSessionSections.section,
+        fragebogenId: visitSessionSections.fragebogenId,
+      })
+      .from(visitSessionSections)
+      .where(
+        and(
+          eq(visitSessionSections.visitSessionId, session.id),
+          eq(visitSessionSections.isDeleted, false),
+        ),
+      )
+      .orderBy(asc(visitSessionSections.orderIndex));
+
+    const sectionRowsWithFragebogen = sectionRows.filter(
+      (section): section is typeof section & { fragebogenId: string } => isUuid(section.fragebogenId),
+    );
+    if (sectionRowsWithFragebogen.length === 0) {
+      res.status(200).json({ ok: true, addedQuestionCount: 0 });
+      return;
+    }
+
+    const idsByScope: Record<FragebogenScope, string[]> = { main: [], kuehler: [], mhd: [] };
+    for (const section of sectionRowsWithFragebogen) {
+      idsByScope[fragebogenScopeForVisitSection(section.section)].push(section.fragebogenId);
+    }
+    const [mainFragebogen, kuehlerFragebogen, mhdFragebogen] = await Promise.all([
+      idsByScope.main.length > 0
+        ? fetchFragebogenUi("main", Array.from(new Set(idsByScope.main)))
+        : Promise.resolve([]),
+      idsByScope.kuehler.length > 0
+        ? fetchFragebogenUi("kuehler", Array.from(new Set(idsByScope.kuehler)))
+        : Promise.resolve([]),
+      idsByScope.mhd.length > 0
+        ? fetchFragebogenUi("mhd", Array.from(new Set(idsByScope.mhd)))
+        : Promise.resolve([]),
+    ]);
+    const fragebogenByScope = {
+      main: new Map(mainFragebogen.map((entry) => [entry.id, entry])),
+      kuehler: new Map(kuehlerFragebogen.map((entry) => [entry.id, entry])),
+      mhd: new Map(mhdFragebogen.map((entry) => [entry.id, entry])),
+    };
+    const marketChain = normalizeMarketChain(session.marketDbName);
+    const candidatesBySectionId = new Map<string, ResolvedQuestion[]>();
+    for (const section of sectionRowsWithFragebogen) {
+      const scope = fragebogenScopeForVisitSection(section.section);
+      const fragebogen = fragebogenByScope[scope].get(section.fragebogenId);
+      if (!fragebogen) continue;
+      const candidates = resolveSpezialfragenForMarket(fragebogen.spezialfragen, marketChain);
+      if (candidates.length > 0) candidatesBySectionId.set(section.id, candidates);
+    }
+    if (candidatesBySectionId.size === 0) {
+      res.status(200).json({ ok: true, addedQuestionCount: 0 });
+      return;
+    }
+
+    const hasAvailabilityTypeSnapshotColumn = await ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady();
+    const now = new Date();
+    const addedQuestionCount = await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT ${visitSessions.id} FROM ${visitSessions} WHERE ${visitSessions.id} = ${session.id} FOR UPDATE`);
+      const [lockedSession] = await tx
+        .select({ status: visitSessions.status, submittedAt: visitSessions.submittedAt })
+        .from(visitSessions)
+        .where(
+          and(
+            eq(visitSessions.id, session.id),
+            eq(visitSessions.gmUserId, gmUserId),
+            eq(visitSessions.isDeleted, false),
+          ),
+        )
+        .limit(1);
+      if (!lockedSession || lockedSession.status !== "submitted" || !lockedSession.submittedAt) return 0;
+
+      const existingRows = await tx
+        .select({
+          sectionId: visitSessionQuestions.visitSessionSectionId,
+          questionId: visitSessionQuestions.questionId,
+          orderIndex: visitSessionQuestions.orderIndex,
+        })
+        .from(visitSessionQuestions)
+        .where(
+          and(
+            inArray(visitSessionQuestions.visitSessionSectionId, Array.from(candidatesBySectionId.keys())),
+            eq(visitSessionQuestions.isDeleted, false),
+          ),
+        );
+      const existingIdsBySection = new Map<string, Set<string>>();
+      const nextOrderBySection = new Map<string, number>();
+      for (const row of existingRows) {
+        const ids = existingIdsBySection.get(row.sectionId) ?? new Set<string>();
+        ids.add(row.questionId);
+        existingIdsBySection.set(row.sectionId, ids);
+        nextOrderBySection.set(row.sectionId, Math.max(nextOrderBySection.get(row.sectionId) ?? 0, row.orderIndex + 1));
+      }
+
+      let insertedCount = 0;
+      for (const [sectionId, candidates] of candidatesBySectionId) {
+        const missing = selectMissingSpezialfragenForSession(
+          candidates,
+          existingIdsBySection.get(sectionId) ?? [],
+        );
+        let orderIndex = nextOrderBySection.get(sectionId) ?? 0;
+        for (const question of missing) {
+          const questionInsertValues = {
+            visitSessionSectionId: sectionId,
+            questionId: question.questionId,
+            moduleId: null,
+            moduleNameSnapshot: "Spezialfragen",
+            questionType: question.type,
+            questionTextSnapshot: question.text,
+            questionConfigSnapshot: question.config,
+            questionRulesSnapshot: question.rules as unknown as Array<Record<string, unknown>>,
+            questionChainsSnapshot: normalizeQuestionChains(question.chains),
+            appliesToMarketChainSnapshot: true,
+            requiredSnapshot: question.required,
+            redSurveySnapshot: question.redSurvey,
+            singleChoiceAvailabilitySnapshot: question.singleChoiceAvailability,
+            ...(hasAvailabilityTypeSnapshotColumn
+              ? { singleChoiceAvailabilityTypeSnapshot: question.singleChoiceAvailabilityType }
+              : {}),
+            orderIndex: orderIndex++,
+            isDeleted: false,
+            deletedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          };
+          await tx.insert(visitSessionQuestions).values(questionInsertValues);
+          insertedCount += 1;
+        }
+      }
+      return insertedCount;
+    });
+
+    res.status(200).json({ ok: true, addedQuestionCount });
+  } catch (error) {
     next(error);
   }
 });
