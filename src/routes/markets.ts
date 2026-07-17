@@ -461,7 +461,7 @@ function choosePreferredMarketByStammnr(
   return candidate.createdAt < current.createdAt ? candidate : current;
 }
 
-function resolveKuehlerIdentity(input: {
+export function resolveKuehlerIdentity(input: {
   marketType: MarketType;
   incomingKuehlerStammnr?: unknown;
   incomingCokeMasterNumber?: unknown;
@@ -472,11 +472,30 @@ function resolveKuehlerIdentity(input: {
   const incomingCokeStammnr = normalizeStammnrForMatch(input.incomingCokeMasterNumber);
   const existingStammnr = normalizeStammnrForMatch(input.existingKuehlerStammnr);
   const existingCokeStammnr = normalizeStammnrForMatch(input.existingCokeMasterNumber);
-  const stammnr = incomingStammnr ?? incomingCokeStammnr ?? existingStammnr ?? existingCokeStammnr;
 
   if (input.marketType === "universum") {
     return { ok: true, stammnr: null };
   }
+
+  const existingIdentity = existingStammnr ?? existingCokeStammnr;
+  const incomingWasProvided =
+    input.incomingKuehlerStammnr !== undefined || input.incomingCokeMasterNumber !== undefined;
+  const incomingCandidates = Array.from(
+    new Set([incomingStammnr, incomingCokeStammnr].filter((value): value is string => Boolean(value))),
+  );
+  const changedCandidates = incomingCandidates.filter((value) => value !== existingIdentity);
+
+  if (changedCandidates.length > 1) {
+    return {
+      ok: false,
+      error: "Stammnr. Coke und Kühler-Stammnr dürfen nicht auf unterschiedliche Werte geändert werden.",
+    };
+  }
+
+  const stammnr =
+    changedCandidates[0] ??
+    incomingCandidates[0] ??
+    (incomingWasProvided ? null : existingIdentity);
   if (!stammnr) {
     return { ok: false, error: "Für Markt-Typ Kühler/Beides ist eine gültige Stammnr erforderlich." };
   }
@@ -540,6 +559,113 @@ function normalizeStammnrForMatch(value: unknown): string | null {
 
 function normalizeStammnrKey(value: unknown): string {
   return normStr(normalizeStammnrForMatch(value) ?? "");
+}
+
+type MarketIdentityFields = Pick<
+  typeof markets.$inferSelect,
+  "cokeMasterNumber" | "flexNumber" | "kuehlerStammnr"
+>;
+
+type MarketIdentifierPropagationResult = {
+  matchedFilterRows: number;
+  recreatedFilterRows: number;
+  mergedOrRemovedFilterRows: number;
+};
+
+export function buildSpecialArthurIdentifierReplacements(
+  previous: MarketIdentityFields,
+  next: MarketIdentityFields,
+): Map<string, string | null> {
+  const previousStammnr = normalizeSpecialArthurMatchValue(
+    previous.kuehlerStammnr ?? previous.cokeMasterNumber,
+  );
+  const nextStammnr = normalizeSpecialArthurMatchValue(next.kuehlerStammnr ?? next.cokeMasterNumber);
+  const previousCoke = normalizeSpecialArthurMatchValue(previous.cokeMasterNumber);
+  const nextCoke = normalizeSpecialArthurMatchValue(next.cokeMasterNumber);
+  const previousFlex = normalizeSpecialArthurMatchValue(previous.flexNumber);
+  const nextFlex = normalizeSpecialArthurMatchValue(next.flexNumber);
+  const preferredNext = nextStammnr ?? nextCoke ?? nextFlex;
+  const replacements = new Map<string, string | null>();
+
+  const addReplacement = (previousValue: string | null, nextValue: string | null) => {
+    if (!previousValue || previousValue === nextValue) return;
+    if (replacements.has(previousValue) && replacements.get(previousValue) !== nextValue) {
+      replacements.set(previousValue, preferredNext);
+      return;
+    }
+    replacements.set(previousValue, nextValue);
+  };
+
+  addReplacement(previousStammnr, nextStammnr ?? preferredNext);
+  addReplacement(previousCoke, nextCoke ?? nextStammnr ?? nextFlex);
+  addReplacement(previousFlex, nextFlex ?? nextStammnr ?? nextCoke);
+  return replacements;
+}
+
+async function propagateSpecialArthurMarketIdentifiers(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  previous: MarketIdentityFields,
+  next: MarketIdentityFields,
+  now: Date,
+): Promise<MarketIdentifierPropagationResult> {
+  const replacements = buildSpecialArthurIdentifierReplacements(previous, next);
+  const previousValues = Array.from(replacements.keys());
+  if (previousValues.length === 0) {
+    return { matchedFilterRows: 0, recreatedFilterRows: 0, mergedOrRemovedFilterRows: 0 };
+  }
+
+  const affectedRows = await tx
+    .select({
+      id: specialArthurFilter.id,
+      gmUserId: specialArthurFilter.gmUserId,
+      matchValue: specialArthurFilter.matchValue,
+      createdByUserId: specialArthurFilter.createdByUserId,
+    })
+    .from(specialArthurFilter)
+    .where(
+      and(
+        eq(specialArthurFilter.isDeleted, false),
+        inArray(specialArthurFilter.matchValue, previousValues),
+      ),
+    );
+
+  if (affectedRows.length === 0) {
+    return { matchedFilterRows: 0, recreatedFilterRows: 0, mergedOrRemovedFilterRows: 0 };
+  }
+
+  await tx
+    .update(specialArthurFilter)
+    .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+    .where(inArray(specialArthurFilter.id, affectedRows.map((row) => row.id)));
+
+  const desiredRows = new Map<
+    string,
+    { gmUserId: string; matchValue: string; createdByUserId: string | null }
+  >();
+  for (const row of affectedRows) {
+    const replacement = replacements.get(row.matchValue) ?? null;
+    if (!replacement) continue;
+    desiredRows.set(`${row.gmUserId}::${replacement}`, {
+      gmUserId: row.gmUserId,
+      matchValue: replacement,
+      createdByUserId: row.createdByUserId,
+    });
+  }
+
+  const values = Array.from(desiredRows.values());
+  const recreatedRows = values.length > 0
+    ? await tx
+        .insert(specialArthurFilter)
+        .values(values)
+        .onConflictDoNothing()
+        .returning({ id: specialArthurFilter.id })
+    : [];
+
+  return {
+    matchedFilterRows: affectedRows.length,
+    recreatedFilterRows: recreatedRows.length,
+    mergedOrRemovedFilterRows: affectedRows.length - recreatedRows.length,
+  };
 }
 
 function isPgUniqueViolation(err: unknown): err is { code: string; constraint?: string } {
@@ -3763,9 +3889,11 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       });
       return;
     }
-    const [updated] = await db
-      .update(markets)
-      .set({
+    const now = new Date();
+    const transactionResult = await db.transaction(async (tx) => {
+      const [updated] = await tx
+        .update(markets)
+        .set({
         standardMarketNumber:
           payload.standardMarketNumber != null
             ? normalizeIdentity(payload.standardMarketNumber)
@@ -3800,10 +3928,22 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         importSourceFileName: payload.importSourceFileName,
         importedAt: payload.importedAt ? new Date(payload.importedAt) : undefined,
         plannedToId: payload.plannedToId,
-        updatedAt: new Date(),
-      })
-      .where(eq(markets.id, existingMarket.id))
-      .returning();
+          updatedAt: now,
+        })
+        .where(eq(markets.id, existingMarket.id))
+        .returning();
+
+      if (!updated) return null;
+      const identifierPropagation = await propagateSpecialArthurMarketIdentifiers(
+        tx,
+        existingMarket,
+        updated,
+        now,
+      );
+      return { updated, identifierPropagation };
+    });
+
+    const updated = transactionResult?.updated;
 
     if (!updated) {
       res.status(404).json({ error: "Market not found." });
@@ -3816,6 +3956,7 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         ...mapMarketRow(updated),
         plannedByActiveStandardGmName: gmNamesByMarketId.get(updated.id) ?? null,
       },
+      identifierPropagation: transactionResult.identifierPropagation,
     });
     logAction("info", "market_update_success", {
       req,
@@ -3824,7 +3965,10 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       statusCode: 200,
       requestClass: "success",
       startedAtNs,
-      details: { marketId: updated.id },
+      details: {
+        marketId: updated.id,
+        identifierPropagation: transactionResult.identifierPropagation,
+      },
     });
   } catch (err) {
     if (isIdentityConstraintViolation(err)) {
@@ -3839,7 +3983,7 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       });
       markErrorAsLogged(err);
       res.status(409).json({
-        error: "Markt konnte nicht angelegt werden: Identitätsnummer bereits bei aktivem Markt vorhanden.",
+        error: "Markt konnte nicht aktualisiert werden: Identitätsnummer bereits bei aktivem Markt vorhanden.",
       });
       return;
     }
