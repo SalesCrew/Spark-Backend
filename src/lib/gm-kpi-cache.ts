@@ -1,5 +1,6 @@
 import { and, desc, eq, gte, isNotNull, lt } from "drizzle-orm";
 import { db, sql as pgSql } from "./db.js";
+import { loadEffectiveGmIppPeriods, loadIppPeriodCatalog } from "./ipp-gm-effective.js";
 import { gmKpiCache, visitSessions } from "./schema.js";
 
 export type GmKpiSummary = {
@@ -11,8 +12,6 @@ export type GmKpiSummary = {
 
 let checkedGmKpiCacheTable = false;
 let hasGmKpiCacheTable = false;
-let checkedIppSnapshotTable = false;
-let hasIppSnapshotTable = false;
 let checkedBonusTotalsTable = false;
 let hasBonusTotalsTable = false;
 
@@ -49,16 +48,6 @@ async function ensureGmKpiCacheTableReady(): Promise<boolean> {
   return hasGmKpiCacheTable;
 }
 
-async function ensureIppSnapshotTableReady(): Promise<boolean> {
-  if (checkedIppSnapshotTable) return hasIppSnapshotTable;
-  const rows = await pgSql<{ ipp_market_redmonth_results: string | null }[]>`
-    select to_regclass('public.ipp_market_redmonth_results') as ipp_market_redmonth_results
-  `;
-  hasIppSnapshotTable = Boolean(rows[0]?.ipp_market_redmonth_results);
-  checkedIppSnapshotTable = hasIppSnapshotTable;
-  return hasIppSnapshotTable;
-}
-
 async function ensureBonusTotalsTableReady(): Promise<boolean> {
   if (checkedBonusTotalsTable) return hasBonusTotalsTable;
   const rows = await pgSql<{ praemien_gm_wave_totals: string | null }[]>`
@@ -70,37 +59,18 @@ async function ensureBonusTotalsTableReady(): Promise<boolean> {
 }
 
 async function loadIppAggregateForGm(gmUserId: string): Promise<{ avg: number; count: number }> {
-  if (!(await ensureIppSnapshotTableReady())) {
-    return { avg: 0, count: 0 };
-  }
-  const rows = await pgSql<{ avg_ipp: string | number | null; sample_count: number | null }[]>`
-    select
-      coalesce(avg(r.market_ipp), 0) as avg_ipp,
-      count(*)::int as sample_count
-    from ipp_market_redmonth_results r
-    join lateral (
-      select vs.gm_user_id
-      from visit_sessions vs
-      where
-        vs.market_id = r.market_id
-        and vs.status = 'submitted'
-        and vs.is_deleted = false
-        and vs.submitted_at is not null
-        and (vs.submitted_at at time zone 'UTC')::date >= r.red_period_start
-        and (vs.submitted_at at time zone 'UTC')::date <= r.red_period_end
-      order by vs.submitted_at desc
-      limit 1
-    ) latest on true
-    where
-      r.is_deleted = false
-      and r.is_finalized = true
-      and r.market_ipp > 0
-      and latest.gm_user_id = ${gmUserId}
-  `;
-  const row = rows[0];
+  const periods = await loadIppPeriodCatalog({ throughCurrent: true });
+  const rows = await loadEffectiveGmIppPeriods({
+    redPeriodIds: periods.map((period) => period.id),
+    gmUserIds: [gmUserId],
+    includeEmptyGms: false,
+  });
+  const included = rows.filter((row) => row.marketSampleCount > 0 && row.effectiveIpp > 0);
+  const sampleCount = included.reduce((sum, row) => sum + row.marketSampleCount, 0);
+  const weightedTotal = included.reduce((sum, row) => sum + row.effectiveIpp * row.marketSampleCount, 0);
   return {
-    avg: normalizeNumber(row?.avg_ipp),
-    count: Number(row?.sample_count ?? 0),
+    avg: sampleCount > 0 ? weightedTotal / sampleCount : 0,
+    count: sampleCount,
   };
 }
 

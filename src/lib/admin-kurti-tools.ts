@@ -17,6 +17,7 @@ import {
 import { buildGmAggregates } from "./admin-zeiterfassung.js";
 import { sql as pgSql } from "./db.js";
 import { readGmKpiCache } from "./gm-kpi-cache.js";
+import { loadEffectiveGmIppPeriods, type EffectiveGmIppPeriodRow } from "./ipp-gm-effective.js";
 import {
   computeMarketIppForPeriod,
   computeMarketIppSummariesForPeriod,
@@ -1224,6 +1225,25 @@ function averageIpp(values: number[]): number | null {
   return values.length > 0 ? roundIpp(values.reduce((sum, value) => sum + value, 0) / values.length) : null;
 }
 
+function summarizeEffectiveGmRows(rows: EffectiveGmIppPeriodRow[]) {
+  const included = rows.filter((row) => row.marketSampleCount > 0 && row.effectiveIpp > 0);
+  const sampleCount = included.reduce((sum, row) => sum + row.marketSampleCount, 0);
+  const calculatedWeightedAverageIpp = sampleCount > 0
+    ? roundIpp(included.reduce((sum, row) => sum + row.calculatedIpp * row.marketSampleCount, 0) / sampleCount)
+    : null;
+  const weightedAverageIpp = sampleCount > 0
+    ? roundIpp(included.reduce((sum, row) => sum + row.effectiveIpp * row.marketSampleCount, 0) / sampleCount)
+    : null;
+  return {
+    calculatedWeightedAverageIpp,
+    weightedAverageIpp,
+    sampleCount,
+    redMonthCount: included.length,
+    correctedRedMonthCount: included.filter((row) => row.adjustment).length,
+    staleCorrectionCount: included.filter((row) => row.adjustmentIsStale).length,
+  };
+}
+
 function isValidYmd(value: string | null): value is string {
   return Boolean(value && YMD_REGEX.test(value));
 }
@@ -1500,7 +1520,11 @@ async function getIppGmAnalytics(args: unknown): Promise<JsonRecord> {
     compareToPeriodStart: input.compareToPeriodStart,
   });
   const periodIds = new Set([...primaryPeriods, ...comparisonPeriods].map((period) => period.id));
-  const allSamples = await loadIppSamples(catalog.filter((period) => periodIds.has(period.id)));
+  const selectedPeriods = catalog.filter((period) => periodIds.has(period.id));
+  const [allSamples, allEffectiveRows] = await Promise.all([
+    loadIppSamples(selectedPeriods),
+    loadEffectiveGmIppPeriods({ redPeriodIds: selectedPeriods.map((period) => period.id), includeEmptyGms: false }),
+  ]);
   const region = input.region?.trim().toLocaleLowerCase("de") || null;
   const filtered = allSamples.filter((sample) =>
     (!input.gmUserId || sample.gmUserId === input.gmUserId)
@@ -1509,6 +1533,9 @@ async function getIppGmAnalytics(args: unknown): Promise<JsonRecord> {
   const comparisonIds = new Set(comparisonPeriods.map((period) => period.id));
   const primarySamples = filtered.filter((sample) => primaryIds.has(sample.redPeriodId) && sample.gmUserId);
   const comparisonSamples = filtered.filter((sample) => comparisonIds.has(sample.redPeriodId) && sample.gmUserId);
+  const effectiveFiltered = allEffectiveRows.filter((row) =>
+    (!input.gmUserId || row.gmUserId === input.gmUserId)
+    && (!region || row.region.toLocaleLowerCase("de") === region));
 
   const primaryByGm = new Map<string, IppSample[]>();
   const comparisonByGm = new Map<string, IppSample[]>();
@@ -1527,20 +1554,38 @@ async function getIppGmAnalytics(args: unknown): Promise<JsonRecord> {
     const comparison = comparisonByGm.get(gmUserId) ?? [];
     const summary = summarizeIppSamples(samples);
     const comparisonSummary = summarizeIppSamples(comparison);
-    const periodSeries = buildIppPeriodSeries(samples);
+    const gmEffectiveRows = effectiveFiltered.filter((row) => row.gmUserId === gmUserId);
+    const primaryEffectiveRows = gmEffectiveRows.filter((row) => primaryIds.has(row.redPeriodId));
+    const comparisonEffectiveRows = gmEffectiveRows.filter((row) => comparisonIds.has(row.redPeriodId));
+    const effectiveByPeriod = new Map(primaryEffectiveRows.map((row) => [row.redPeriodId, row]));
+    const periodSeries = buildIppPeriodSeries(samples).map((row) => {
+      const effective = effectiveByPeriod.get(String(row.redPeriodId));
+      return {
+        ...row,
+        calculatedIpp: effective?.calculatedIpp ?? row.weightedAverageIpp,
+        weightedAverageIpp: effective?.effectiveIpp ?? row.weightedAverageIpp,
+        effectiveIpp: effective?.effectiveIpp ?? row.weightedAverageIpp,
+        adjustment: effective?.adjustment ?? null,
+        adjustmentIsStale: effective?.adjustmentIsStale ?? false,
+      };
+    });
     const periodAverages = periodSeries.map((row) => row.weightedAverageIpp).filter((value): value is number => typeof value === "number");
-    const primaryAverage = typeof summary.weightedAverageIpp === "number" ? summary.weightedAverageIpp : null;
-    const comparisonAverage = typeof comparisonSummary.weightedAverageIpp === "number" ? comparisonSummary.weightedAverageIpp : null;
+    const effectiveSummary = summarizeEffectiveGmRows(primaryEffectiveRows);
+    const effectiveComparisonSummary = summarizeEffectiveGmRows(comparisonEffectiveRows);
+    const primaryAverage = effectiveSummary.weightedAverageIpp;
+    const comparisonAverage = effectiveComparisonSummary.weightedAverageIpp;
     const comparisonChange = primaryAverage !== null && comparisonAverage !== null ? roundIpp(primaryAverage - comparisonAverage) : null;
     return {
       gmUserId,
       gmName: samples[0]?.gmName ?? "",
       region: samples[0]?.gmRegion ?? "",
       ...summary,
+      ...effectiveSummary,
       averageOfRedMonthAverages: averageIpp(periodAverages),
       redMonthSeries: periodSeries,
       comparison: input.comparison === "none" ? null : {
         ...comparisonSummary,
+        ...effectiveComparisonSummary,
         absoluteChange: comparisonChange,
         percentChange: comparisonChange !== null && comparisonAverage ? roundIpp((comparisonChange / comparisonAverage) * 100) : null,
       },
@@ -1551,13 +1596,16 @@ async function getIppGmAnalytics(args: unknown): Promise<JsonRecord> {
   return envelope("get_ipp_gm_analytics", {
     selectedTimeframe: ippPeriodDescriptor(primaryPeriods, input.timeframe),
     comparisonTimeframe: input.comparison === "none" ? null : ippPeriodDescriptor(comparisonPeriods, input.comparison),
-    overall: summarizeIppSamples(primarySamples),
+    overall: {
+      ...summarizeIppSamples(primarySamples),
+      ...summarizeEffectiveGmRows(effectiveFiltered.filter((row) => primaryIds.has(row.redPeriodId))),
+    },
     gmRanking: gmRows.slice(0, input.limit).map((row, index) => ({ rank: index + 1, ...row })),
     unassignedSampleCount: filtered.filter((sample) => primaryIds.has(sample.redPeriodId) && !sample.gmUserId).length,
   }, {
     resultCount: Math.min(gmRows.length, input.limit),
     totalMatchedGms: gmRows.length,
-    averageBasis: "Positive market/RED-month IPP samples; weightedAverageIpp matches the all-time GM KPI sampling basis.",
+    averageBasis: "Effective GL/RED-month IPP weighted by the underlying positive market sample count. Admin corrections replace only the GL-month aggregate; calculated market/question evidence remains unchanged.",
     attributionBasis: "Each market/RED-month sample belongs to the GM of the latest submitted visit for that market in that RED month.",
   });
 }

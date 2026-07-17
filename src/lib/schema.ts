@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   check,
   date,
@@ -92,6 +93,7 @@ export const praemienWaveStatusEnum = pgEnum("praemien_wave_status", ["draft", "
 export const praemienDistributionFreqRuleEnum = pgEnum("praemien_distribution_freq_rule", ["lt8", "gt8"]);
 export const praemienRewardModelEnum = pgEnum("praemien_reward_model", ["global_thresholds", "pillar_targets", "pillar_tiers"]);
 export const redMonthYearStatusEnum = pgEnum("red_month_year_status", ["draft", "active", "locked"]);
+export const ippGmAdjustmentEventTypeEnum = pgEnum("ipp_gm_adjustment_event_type", ["set", "clear"]);
 
 export const users = pgTable(
   "users",
@@ -815,6 +817,48 @@ export const gmKpiCache = pgTable(
     index("gm_kpi_cache_gm_user_idx").on(table.gmUserId),
     index("gm_kpi_cache_last_computed_idx").on(table.lastComputedAt),
     index("gm_kpi_cache_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const ippGmRedmonthAdjustmentEvents = pgTable(
+  "ipp_gm_redmonth_adjustment_events",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    revisionNumber: bigint("revision_number", { mode: "number" }).generatedAlwaysAsIdentity().notNull(),
+    requestId: uuid("request_id").notNull(),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    redPeriodId: uuid("red_period_id")
+      .notNull()
+      .references(() => redMonthPeriods.id, { onDelete: "restrict" }),
+    eventType: ippGmAdjustmentEventTypeEnum("event_type").notNull(),
+    correctedIpp: numeric("corrected_ipp", { precision: 12, scale: 4 }),
+    baseCalculatedIpp: numeric("base_calculated_ipp", { precision: 12, scale: 4 }).notNull(),
+    baseSampleCount: integer("base_sample_count").notNull(),
+    baseFingerprint: text("base_fingerprint").notNull(),
+    reason: text("reason").notNull(),
+    createdByUserId: uuid("created_by_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("ipp_gm_redmonth_adjustment_events_revision_unique").on(table.revisionNumber),
+    uniqueIndex("ipp_gm_redmonth_adjustment_events_request_unique").on(table.requestId),
+    index("ipp_gm_redmonth_adjustment_events_latest_idx").on(
+      table.gmUserId,
+      table.redPeriodId,
+      table.revisionNumber,
+    ),
+    index("ipp_gm_redmonth_adjustment_events_period_idx").on(table.redPeriodId, table.gmUserId),
+    index("ipp_gm_redmonth_adjustment_events_created_by_idx").on(table.createdByUserId),
+    check("ipp_gm_redmonth_adjustment_events_base_sample_count_ck", sql`${table.baseSampleCount} >= 0`),
+    check(
+      "ipp_gm_redmonth_adjustment_events_value_ck",
+      sql`(${table.eventType} = 'set' and ${table.correctedIpp} is not null and ${table.correctedIpp} >= 0) or (${table.eventType} = 'clear' and ${table.correctedIpp} is null)`,
+    ),
+    check("ipp_gm_redmonth_adjustment_events_reason_ck", sql`char_length(btrim(${table.reason})) >= 8`),
   ],
 );
 

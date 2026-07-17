@@ -1,13 +1,21 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { Router } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import { computeMarketIppForPeriod, computeMarketIppSummariesForPeriod } from "../lib/ipp.js";
+import {
+  appendIppAdjustmentEvent,
+  IppAdjustmentConflictError,
+  loadEffectiveGmIppPeriods,
+  loadIppAdjustmentHistory,
+  loadIppPeriodCatalog,
+} from "../lib/ipp-gm-effective.js";
+import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { logAction, startActionTimer } from "../lib/logger.js";
 import { redMonthPeriodToYmd, resolveCurrentRedPeriod, resolveRedPeriodForDate, type ResolvedRedMonthPeriod } from "../lib/red-month-periods.js";
 import { db, sql as pgSql } from "../lib/db.js";
 import { ippMarketRedmonthResults, markets, users } from "../lib/schema.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const adminIppRouter = Router();
 adminIppRouter.use(requireAuth(["admin", "kunde"]));
@@ -18,7 +26,7 @@ adminIppRouter.use("/ipp", (req, res, next) => {
     const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
     logAction(level, "admin_ipp_action_completed", {
       req,
-      action: "admin_ipp_read",
+      action: req.method === "GET" ? "admin_ipp_read" : "admin_ipp_update",
       result: res.statusCode >= 400 ? "failure" : "success",
       statusCode: res.statusCode,
       requestClass: res.statusCode >= 500 ? "server_error" : res.statusCode >= 400 ? "client_error" : "success",
@@ -282,6 +290,136 @@ adminIppRouter.get("/ipp", async (_req, res, next) => {
 
 const detailQuerySchema = z.object({
   periodStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+});
+
+const gmPeriodQuerySchema = z.object({
+  periodStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+const gmAdjustmentSchema = z.object({
+  requestId: z.string().uuid(),
+  redPeriodId: z.string().uuid(),
+  correctedIpp: z.number().finite().min(0).max(99_999),
+  reason: z.string().trim().min(8).max(1_000),
+  expectedBaseFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+  expectedLatestRevisionNumber: z.number().int().positive().nullable(),
+});
+
+const gmAdjustmentClearSchema = z.object({
+  requestId: z.string().uuid(),
+  redPeriodId: z.string().uuid(),
+  reason: z.string().trim().min(8).max(1_000),
+  expectedBaseFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+  expectedLatestRevisionNumber: z.number().int().positive(),
+});
+
+const gmAdjustmentHistoryQuerySchema = z.object({
+  redPeriodId: z.string().uuid(),
+});
+
+function requireIppAdmin(req: Request, res: Response, next: NextFunction) {
+  if ((req as AuthedRequest).authUser?.role !== "admin") {
+    res.status(403).json({ error: "Nur Admins duerfen IPP-Korrekturen aendern.", code: "ipp_adjustment_admin_only" });
+    return;
+  }
+  next();
+}
+
+function respondIppAdjustmentError(error: unknown, res: Response): boolean {
+  if (!(error instanceof IppAdjustmentConflictError)) return false;
+  const status = error.code === "ipp_adjustment_schema_not_ready" ? 503 : 409;
+  res.status(status).json({ error: error.message, code: error.code });
+  return true;
+}
+
+adminIppRouter.get("/ipp/gm-periods", async (req, res, next) => {
+  try {
+    const parsed = gmPeriodQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({ error: "periodStart muss im Format YYYY-MM-DD uebergeben werden.", code: "invalid_period" });
+      return;
+    }
+    const catalog = await loadIppPeriodCatalog({ throughCurrent: true });
+    const current = buildIppPeriodPayload(await resolveCurrentRedPeriod(new Date()));
+    const selected = parsed.data.periodStart
+      ? catalog.find((period) => period.startDate === parsed.data.periodStart)
+      : catalog.find((period) => period.startDate === current.redPeriodStart);
+    if (!selected) {
+      res.status(404).json({ error: "RED-Monat wurde nicht gefunden.", code: "red_period_not_found" });
+      return;
+    }
+    const rows = await loadEffectiveGmIppPeriods({ redPeriodIds: [selected.id], includeEmptyGms: true });
+    res.status(200).json({
+      periods: catalog.map((period) => ({ ...period, isCurrent: period.startDate === current.redPeriodStart })),
+      selectedPeriod: { ...selected, isCurrent: selected.startDate === current.redPeriodStart },
+      rows,
+      canEdit: (req as AuthedRequest).authUser?.role === "admin",
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminIppRouter.get("/ipp/gm-periods/:gmUserId/history", requireIppAdmin, async (req, res, next) => {
+  try {
+    const gmUserId = String(req.params.gmUserId ?? "");
+    const parsed = gmAdjustmentHistoryQuerySchema.safeParse(req.query);
+    if (!z.string().uuid().safeParse(gmUserId).success || !parsed.success) {
+      res.status(400).json({ error: "Ungueltige GL- oder RED-Monat-ID.", code: "invalid_adjustment_history_query" });
+      return;
+    }
+    const events = await loadIppAdjustmentHistory({ gmUserId, redPeriodId: parsed.data.redPeriodId });
+    res.status(200).json({ events });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminIppRouter.post("/ipp/gm-periods/:gmUserId/adjustments", requireIppAdmin, async (req, res, next) => {
+  try {
+    const authedReq = req as AuthedRequest;
+    const gmUserId = String(req.params.gmUserId ?? "");
+    const parsed = gmAdjustmentSchema.safeParse(req.body);
+    if (!z.string().uuid().safeParse(gmUserId).success || !parsed.success || !authedReq.authUser) {
+      res.status(400).json({ error: "Ungueltige IPP-Korrektur.", code: "invalid_ipp_adjustment", details: parsed.success ? undefined : parsed.error.flatten() });
+      return;
+    }
+    const row = await appendIppAdjustmentEvent({
+      ...parsed.data,
+      gmUserId,
+      eventType: "set",
+      createdByUserId: authedReq.authUser.appUserId,
+    });
+    await recomputeGmKpiCache(gmUserId);
+    res.status(201).json({ row });
+  } catch (error) {
+    if (respondIppAdjustmentError(error, res)) return;
+    next(error);
+  }
+});
+
+adminIppRouter.post("/ipp/gm-periods/:gmUserId/adjustments/clear", requireIppAdmin, async (req, res, next) => {
+  try {
+    const authedReq = req as AuthedRequest;
+    const gmUserId = String(req.params.gmUserId ?? "");
+    const parsed = gmAdjustmentClearSchema.safeParse(req.body);
+    if (!z.string().uuid().safeParse(gmUserId).success || !parsed.success || !authedReq.authUser) {
+      res.status(400).json({ error: "Ungueltige IPP-Ruecksetzung.", code: "invalid_ipp_adjustment_clear", details: parsed.success ? undefined : parsed.error.flatten() });
+      return;
+    }
+    const row = await appendIppAdjustmentEvent({
+      ...parsed.data,
+      gmUserId,
+      eventType: "clear",
+      correctedIpp: null,
+      createdByUserId: authedReq.authUser.appUserId,
+    });
+    await recomputeGmKpiCache(gmUserId);
+    res.status(201).json({ row });
+  } catch (error) {
+    if (respondIppAdjustmentError(error, res)) return;
+    next(error);
+  }
 });
 
 adminIppRouter.get("/ipp/:marketId/detail", async (req, res, next) => {
