@@ -668,18 +668,113 @@ async function propagateSpecialArthurMarketIdentifiers(
   };
 }
 
-function isPgUniqueViolation(err: unknown): err is { code: string; constraint?: string } {
-  if (!err || typeof err !== "object") return false;
-  return "code" in err && (err as { code?: string }).code === "23505";
+type PgUniqueViolation = { code: "23505"; constraint?: string };
+
+function getPgUniqueViolation(err: unknown): PgUniqueViolation | null {
+  let current = err;
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < 6 && current && typeof current === "object"; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if ("code" in current && (current as { code?: unknown }).code === "23505") {
+      return current as PgUniqueViolation;
+    }
+    current = "cause" in current ? (current as { cause?: unknown }).cause : null;
+  }
+  return null;
 }
 
 function isIdentityConstraintViolation(err: unknown): boolean {
-  if (!isPgUniqueViolation(err)) return false;
+  const violation = getPgUniqueViolation(err);
+  if (!violation) return false;
   return (
-    err.constraint === "markets_standard_market_number_unique" ||
-    err.constraint === "markets_coke_master_number_unique" ||
-    err.constraint === "markets_flex_number_unique"
+    violation.constraint === "markets_standard_market_number_unique" ||
+    violation.constraint === "markets_coke_master_number_unique" ||
+    violation.constraint === "markets_flex_number_unique"
   );
+}
+
+type NormalizedMarketIdentityInput = {
+  standardMarketNumber: string | null;
+  stammnr: string | null;
+  flexNumber: string | null;
+};
+
+type MarketIdentityConflict = {
+  marketId: string;
+  name: string;
+  address: string;
+  postalCode: string;
+  city: string;
+  matches: string[];
+};
+
+async function findMarketIdentityConflicts(
+  input: NormalizedMarketIdentityInput,
+): Promise<MarketIdentityConflict[]> {
+  const conditions = [
+    ...(input.standardMarketNumber
+      ? [eq(markets.standardMarketNumber, input.standardMarketNumber)]
+      : []),
+    ...(input.stammnr
+      ? [eq(markets.cokeMasterNumber, input.stammnr), eq(markets.kuehlerStammnr, input.stammnr)]
+      : []),
+    ...(input.flexNumber ? [eq(markets.flexNumber, input.flexNumber)] : []),
+  ];
+  if (conditions.length === 0) return [];
+
+  const rows = await db
+    .select({
+      id: markets.id,
+      name: markets.name,
+      address: markets.address,
+      postalCode: markets.postalCode,
+      city: markets.city,
+      standardMarketNumber: markets.standardMarketNumber,
+      cokeMasterNumber: markets.cokeMasterNumber,
+      kuehlerStammnr: markets.kuehlerStammnr,
+      flexNumber: markets.flexNumber,
+    })
+    .from(markets)
+    .where(and(eq(markets.isDeleted, false), or(...conditions)))
+    .limit(10);
+
+  return rows.map((row) => {
+    const matches: string[] = [];
+    if (input.standardMarketNumber && row.standardMarketNumber === input.standardMarketNumber) {
+      matches.push(`Standardmarkt Nr. ${input.standardMarketNumber}`);
+    }
+    if (
+      input.stammnr &&
+      (row.cokeMasterNumber === input.stammnr || row.kuehlerStammnr === input.stammnr)
+    ) {
+      matches.push(`Stammnr. ${input.stammnr}`);
+    }
+    if (input.flexNumber && row.flexNumber === input.flexNumber) {
+      matches.push(`Flex-Nr. ${input.flexNumber}`);
+    }
+    return {
+      marketId: row.id,
+      name: row.name,
+      address: row.address,
+      postalCode: row.postalCode,
+      city: row.city,
+      matches,
+    };
+  });
+}
+
+function formatMarketIdentityConflictError(conflicts: MarketIdentityConflict[]): string {
+  const details = conflicts
+    .slice(0, 3)
+    .map((conflict) => {
+      const location = [conflict.address, [conflict.postalCode, conflict.city].filter(Boolean).join(" ")]
+        .filter(Boolean)
+        .join(", ");
+      return `${conflict.matches.join(" / ")} gehört bereits zu „${conflict.name}“${location ? ` (${location})` : ""}`;
+    })
+    .join("; ");
+  return `Markt konnte nicht angelegt werden: ${details}. Bitte den bestehenden Markt bearbeiten statt einen zweiten Datensatz anzulegen.`;
 }
 
 function isPgStatementTimeout(err: unknown): err is { code: string } {
@@ -3688,7 +3783,8 @@ adminMarketsRouter.post("/:id/kuehler-units", async (req: AuthedRequest, res, ne
 
     res.status(201).json({ unit: mapKuehlerUnitRow(txResult.unit) });
   } catch (err) {
-    if (isPgUniqueViolation(err) && err.constraint === "market_kuehler_units_internal_id_active_unique") {
+    const uniqueViolation = getPgUniqueViolation(err);
+    if (uniqueViolation?.constraint === "market_kuehler_units_internal_id_active_unique") {
       res.status(409).json({ error: "Kühler konnte nicht angelegt werden: internal_id bereits vorhanden." });
       return;
     }
@@ -3754,7 +3850,8 @@ adminMarketsRouter.patch("/:marketId/kuehler-units/:unitId", async (req: AuthedR
     }
     res.status(200).json({ unit: mapKuehlerUnitRow(updatedUnit) });
   } catch (err) {
-    if (isPgUniqueViolation(err) && err.constraint === "market_kuehler_units_internal_id_active_unique") {
+    const uniqueViolation = getPgUniqueViolation(err);
+    if (uniqueViolation?.constraint === "market_kuehler_units_internal_id_active_unique") {
       res.status(409).json({ error: "Kühler konnte nicht aktualisiert werden: internal_id bereits vorhanden." });
       return;
     }
@@ -4030,6 +4127,37 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
       return;
     }
     const resolvedStammnr = identityResolution.stammnr;
+    const normalizedIdentities: NormalizedMarketIdentityInput = {
+      standardMarketNumber: normalizeIdentity(payload.standardMarketNumber),
+      stammnr:
+        resolvedMarketType === "universum"
+          ? normalizeIdentity(payload.cokeMasterNumber)
+          : resolvedStammnr,
+      flexNumber: normalizeIdentity(payload.flexNumber),
+    };
+    const identityConflicts = await findMarketIdentityConflicts(normalizedIdentities);
+    if (identityConflicts.length > 0) {
+      const error = formatMarketIdentityConflictError(identityConflicts);
+      logAction("warn", "market_create_identity_conflict", {
+        req,
+        action: "market_create",
+        result: "rejected",
+        statusCode: 409,
+        requestClass: "client_error",
+        startedAtNs,
+        details: {
+          conflictingMarketIds: identityConflicts.map((conflict) => conflict.marketId),
+          matches: identityConflicts.map((conflict) => conflict.matches),
+        },
+      });
+      res.status(409).json({
+        error,
+        code: "market_identity_conflict",
+        conflictingMarket: identityConflicts[0],
+        conflicts: identityConflicts,
+      });
+      return;
+    }
     const normalizedRegion = normalizeRegionValue(payload.region);
     if (!normalizedRegion.ok) {
       logAction("warn", "market_create_invalid_region", {
@@ -4049,10 +4177,9 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
     const [created] = await db
       .insert(markets)
       .values({
-        standardMarketNumber: normalizeIdentity(payload.standardMarketNumber),
-        cokeMasterNumber:
-          resolvedMarketType === "universum" ? normalizeIdentity(payload.cokeMasterNumber) : resolvedStammnr,
-        flexNumber: normalizeIdentity(payload.flexNumber),
+        standardMarketNumber: normalizedIdentities.standardMarketNumber,
+        cokeMasterNumber: normalizedIdentities.stammnr,
+        flexNumber: normalizedIdentities.flexNumber,
         name: payload.name,
         dbName: normalizeOptionalText(payload.dbName) ?? "",
         address: payload.address,
@@ -4104,6 +4231,25 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
       details: { marketId: created.id },
     });
   } catch (err) {
+    if (isIdentityConstraintViolation(err)) {
+      logAction("warn", "market_create_identity_conflict", {
+        req,
+        action: "market_create",
+        result: "rejected",
+        statusCode: 409,
+        requestClass: "client_error",
+        startedAtNs,
+        error: err,
+        details: { detectedAfterInsertRace: true },
+      });
+      markErrorAsLogged(err);
+      res.status(409).json({
+        error:
+          "Markt konnte nicht angelegt werden: Mindestens eine Identitätsnummer gehört bereits zu einem aktiven Markt. Bitte den bestehenden Markt bearbeiten.",
+        code: "market_identity_conflict",
+      });
+      return;
+    }
     logAction("error", "market_create_failed", {
       req,
       action: "market_create",
