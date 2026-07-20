@@ -668,7 +668,16 @@ async function propagateSpecialArthurMarketIdentifiers(
   };
 }
 
-type PgUniqueViolation = { code: "23505"; constraint?: string };
+type PgUniqueViolation = {
+  code: "23505";
+  constraint?: string;
+  constraint_name?: string;
+  detail?: string;
+};
+
+function getPgConstraintName(violation: PgUniqueViolation | null): string | null {
+  return violation?.constraint ?? violation?.constraint_name ?? null;
+}
 
 function getPgUniqueViolation(err: unknown): PgUniqueViolation | null {
   let current = err;
@@ -687,10 +696,11 @@ function getPgUniqueViolation(err: unknown): PgUniqueViolation | null {
 function isIdentityConstraintViolation(err: unknown): boolean {
   const violation = getPgUniqueViolation(err);
   if (!violation) return false;
+  const constraint = getPgConstraintName(violation);
   return (
-    violation.constraint === "markets_standard_market_number_unique" ||
-    violation.constraint === "markets_coke_master_number_unique" ||
-    violation.constraint === "markets_flex_number_unique"
+    constraint === "markets_standard_market_number_unique" ||
+    constraint === "markets_coke_master_number_unique" ||
+    constraint === "markets_flex_number_unique"
   );
 }
 
@@ -2472,6 +2482,14 @@ adminMarketsRouter.use((req, res, next) => {
 
 adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
   const startedAtNs = startActionTimer();
+  const activeUpdateRowContextRef: {
+    current: {
+      row: number;
+      flexNumber: string;
+      marketName: string;
+      identityValues: Partial<Record<"standardMarketNumber" | "cokeMasterNumber", string | null>>;
+    } | null;
+  } = { current: null };
   try {
     const parsed = importMarketsSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -2577,12 +2595,31 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
         const existingMarkets = await tx.select().from(markets).where(eq(markets.isDeleted, false));
         const byFlex = new Map<string, Array<typeof markets.$inferSelect>>();
+        const updateIdentityFields = [
+          {
+            key: "standardMarketNumber" as const,
+            label: "Standardmarkt Nr.",
+          },
+          {
+            key: "cokeMasterNumber" as const,
+            label: "Stammnr. von Coke",
+          },
+        ];
+        const identityOwners = {
+          standardMarketNumber: new Map<string, typeof markets.$inferSelect>(),
+          cokeMasterNumber: new Map<string, typeof markets.$inferSelect>(),
+        };
         for (const market of existingMarkets) {
           const key = normStr(normalizeIdentity(market.flexNumber) ?? "");
-          if (!key) continue;
-          const bucket = byFlex.get(key) ?? [];
-          bucket.push(market);
-          byFlex.set(key, bucket);
+          if (key) {
+            const bucket = byFlex.get(key) ?? [];
+            bucket.push(market);
+            byFlex.set(key, bucket);
+          }
+          for (const identityField of updateIdentityFields) {
+            const identityValue = normalizeIdentity(market[identityField.key]);
+            if (identityValue) identityOwners[identityField.key].set(identityValue, market);
+          }
         }
 
         const universeMarketUpdatesByMarketId = new Map<string, boolean>();
@@ -2704,6 +2741,49 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             summary.skipped += 1;
             continue;
           }
+
+          const identityConflict = updateIdentityFields
+            .map((identityField) => {
+              if (!Object.prototype.hasOwnProperty.call(patch, identityField.key)) return null;
+              const proposedValue = normalizeIdentity(patch[identityField.key]);
+              if (!proposedValue) return null;
+              const owner = identityOwners[identityField.key].get(proposedValue);
+              if (!owner || owner.id === matched.id) return null;
+              return { ...identityField, value: proposedValue, owner };
+            })
+            .find((conflict) => conflict != null);
+
+          if (identityConflict) {
+            summary.skipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              const ownerLocation = [
+                identityConflict.owner.address,
+                [identityConflict.owner.postalCode, identityConflict.owner.city].filter(Boolean).join(" "),
+              ]
+                .filter(Boolean)
+                .join(", ");
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason:
+                  `${identityConflict.label} ${identityConflict.value} gehört bereits zu ` +
+                  `„${identityConflict.owner.name}“` +
+                  `${identityConflict.owner.flexNumber ? ` (Flex ${identityConflict.owner.flexNumber})` : ""}` +
+                  `${ownerLocation ? `, ${ownerLocation}` : ""}. Diese Zeile wurde nicht geändert.`,
+                sample: sampleText,
+                draft,
+                fetchedFields: [
+                  { label: "Flex-Nummer der Excel-Zeile", value: String(draft.flexNumber ?? flexIdentity) },
+                  { label: identityConflict.label, value: identityConflict.value },
+                  {
+                    label: "Bereits zugeordnet zu",
+                    value: `${identityConflict.owner.name}${identityConflict.owner.flexNumber ? ` / Flex ${identityConflict.owner.flexNumber}` : ""}`,
+                  },
+                ],
+              });
+            }
+            continue;
+          }
+
           if (!marketPatchHasChanges(matched, patch)) {
             summary.unchanged += 1;
             continue;
@@ -2713,6 +2793,16 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             universeMarketUpdatesByMarketId.set(matched.id, value);
             continue;
           }
+          activeUpdateRowContextRef.current = {
+            row: rowNum,
+            flexNumber: String(draft.flexNumber ?? flexIdentity),
+            marketName: matched.name,
+            identityValues: Object.fromEntries(
+              updateIdentityFields
+                .filter((identityField) => Object.prototype.hasOwnProperty.call(patch, identityField.key))
+                .map((identityField) => [identityField.key, normalizeIdentity(patch[identityField.key])]),
+            ),
+          };
           const [updated] = await tx
             .update(markets)
             .set({
@@ -2723,8 +2813,23 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             })
             .where(eq(markets.id, matched.id))
             .returning();
+          activeUpdateRowContextRef.current = null;
 
           if (updated) {
+            for (const identityField of updateIdentityFields) {
+              if (!Object.prototype.hasOwnProperty.call(patch, identityField.key)) continue;
+              const previousValue = normalizeIdentity(matched[identityField.key]);
+              const nextValue = normalizeIdentity(updated[identityField.key]);
+              if (
+                previousValue &&
+                identityOwners[identityField.key].get(previousValue)?.id === matched.id &&
+                previousValue !== nextValue
+              ) {
+                identityOwners[identityField.key].delete(previousValue);
+              }
+              if (nextValue) identityOwners[identityField.key].set(nextValue, updated);
+            }
+            matches[0] = updated;
             summary.updated += 1;
             summary.matchedBy.flexNumber += 1;
           }
@@ -3601,6 +3706,25 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       return;
     }
     if (isIdentityConstraintViolation(err)) {
+      const activeUpdateRowContext = activeUpdateRowContextRef.current;
+      const violation = getPgUniqueViolation(err);
+      const constraint = getPgConstraintName(violation);
+      const identityField =
+        constraint === "markets_standard_market_number_unique"
+          ? "standardMarketNumber"
+          : constraint === "markets_coke_master_number_unique"
+            ? "cokeMasterNumber"
+            : null;
+      const identityLabel =
+        identityField === "standardMarketNumber"
+          ? "Standardmarkt Nr."
+          : identityField === "cokeMasterNumber"
+            ? "Stammnr. von Coke"
+            : "Identitätsnummer";
+      const identityValue = identityField ? activeUpdateRowContext?.identityValues[identityField] : null;
+      const rowPrefix = activeUpdateRowContext
+        ? `Excel-Zeile ${activeUpdateRowContext.row} (Flex ${activeUpdateRowContext.flexNumber}, ${activeUpdateRowContext.marketName}): `
+        : "";
       logAction("warn", "market_import_identity_conflict", {
         req,
         action: "market_import",
@@ -3609,11 +3733,28 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         requestClass: "client_error",
         startedAtNs,
         error: err,
+        details: {
+          constraint,
+          row: activeUpdateRowContext?.row ?? null,
+          flexNumber: activeUpdateRowContext?.flexNumber ?? null,
+          identityField,
+          identityValue,
+        },
       });
       markErrorAsLogged(err);
       res.status(409).json({
         error:
-          "Import konnte nicht abgeschlossen werden: aktive Märkte mit gleicher Identität existieren bereits.",
+          `${rowPrefix}${identityLabel}${identityValue ? ` ${identityValue}` : ""} ist bereits einem anderen aktiven Markt zugeordnet. ` +
+          "Es wurde nichts aus dieser Datei gespeichert. Bitte die Nummer in der genannten Excel-Zeile korrigieren und erneut importieren.",
+        code: "market_import_identity_conflict",
+        details: {
+          row: activeUpdateRowContext?.row ?? null,
+          flexNumber: activeUpdateRowContext?.flexNumber ?? null,
+          marketName: activeUpdateRowContext?.marketName ?? null,
+          identityField,
+          identityLabel,
+          identityValue,
+        },
       });
       return;
     }
