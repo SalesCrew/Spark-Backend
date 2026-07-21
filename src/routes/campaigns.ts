@@ -1361,6 +1361,8 @@ async function buildCampaignMarketVisitSummaries(
     .select({
       marketId: visitSessions.marketId,
       sessionId: visitSessions.id,
+      kuehlerUnitId: visitSessions.kuehlerUnitId,
+      kuehlerInternalId: marketKuehlerUnits.kuehlerInternalId,
       gmUserId: visitSessions.gmUserId,
       startedAt: visitSessions.startedAt,
       submittedAt: visitSessions.submittedAt,
@@ -1368,6 +1370,7 @@ async function buildCampaignMarketVisitSummaries(
     })
     .from(visitSessionSections)
     .innerJoin(visitSessions, eq(visitSessions.id, visitSessionSections.visitSessionId))
+    .leftJoin(marketKuehlerUnits, eq(marketKuehlerUnits.id, visitSessions.kuehlerUnitId))
     .where(and(...submittedConditions))
     .orderBy(desc(visitSessions.submittedAt), desc(visitSessions.createdAt));
 
@@ -1393,6 +1396,8 @@ async function buildCampaignMarketVisitSummaries(
       marketId,
       hasSubmittedVisit: false,
       sessionId: null,
+      kuehlerUnitId: null,
+      kuehlerInternalId: null,
       startedAt: null,
       submittedAt: null,
       durationMinutes: null,
@@ -1591,6 +1596,8 @@ async function buildCampaignMarketVisitSummaries(
       marketId: string;
       hasSubmittedVisit: boolean;
       sessionId: string | null;
+      kuehlerUnitId: string | null;
+      kuehlerInternalId: string | null;
       startedAt: string | null;
       submittedAt: string | null;
       durationMinutes: number | null;
@@ -1681,6 +1688,8 @@ async function buildCampaignMarketVisitSummaries(
         marketId,
         hasSubmittedVisit: false,
         sessionId: null,
+        kuehlerUnitId: null,
+        kuehlerInternalId: null,
         startedAt: null,
         submittedAt: null,
         durationMinutes: null,
@@ -1790,6 +1799,8 @@ async function buildCampaignMarketVisitSummaries(
       marketId,
       hasSubmittedVisit: true,
       sessionId: selectedSession.sessionId,
+      kuehlerUnitId: selectedSession.kuehlerUnitId ?? null,
+      kuehlerInternalId: selectedSession.kuehlerInternalId ?? null,
       startedAt: selectedSession.startedAt?.toISOString() ?? null,
       submittedAt: selectedSession.submittedAt?.toISOString() ?? null,
       durationMinutes: calculateDurationMinutes(selectedSession.startedAt, selectedSession.submittedAt),
@@ -1806,6 +1817,8 @@ async function buildCampaignMarketVisitSummaries(
       marketId,
       hasSubmittedVisit: false,
       sessionId: null,
+      kuehlerUnitId: null,
+      kuehlerInternalId: null,
       startedAt: null,
       submittedAt: null,
       durationMinutes: null,
