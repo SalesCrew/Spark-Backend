@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { type Response, Router } from "express";
 import { z } from "zod";
 import { env } from "../config/env.js";
@@ -695,6 +695,37 @@ async function touchWaveTx(tx: Tx, waveId: string, now: Date) {
   await tx.update(praemienWaves).set({ updatedAt: now }).where(eq(praemienWaves.id, waveId));
 }
 
+async function ensureWavePillarTargetsConfiguredTx(tx: Tx, waveId: string) {
+  const pillars = await tx
+    .select({
+      name: praemienWavePillars.name,
+      targetPoints: praemienWavePillars.targetPoints,
+    })
+    .from(praemienWavePillars)
+    .where(and(eq(praemienWavePillars.waveId, waveId), eq(praemienWavePillars.isDeleted, false)));
+  const missingTargets = pillars
+    .filter((pillar) => pillar.targetPoints == null || Number(pillar.targetPoints) <= 0)
+    .map((pillar) => pillar.name);
+  if (pillars.length === 0 || missingTargets.length > 0) {
+    const detail = missingTargets.length > 0 ? ` (${missingTargets.join(", ")})` : "";
+    throw new PraemienDomainError(
+      "pillar_target_points_required",
+      400,
+      `Vor der Aktivierung benötigen alle Säulen positive Zielpunkte${detail}.`,
+    );
+  }
+}
+
+async function readWaveStatusTx(tx: Tx, waveId: string) {
+  const [wave] = await tx
+    .select({ status: praemienWaves.status })
+    .from(praemienWaves)
+    .where(and(eq(praemienWaves.id, waveId), eq(praemienWaves.isDeleted, false)))
+    .limit(1);
+  if (!wave) throw new PraemienDomainError("wave_not_found", 404, "Prämien-Welle nicht gefunden.");
+  return wave.status;
+}
+
 async function refreshBonusKpiCachesAfterRecompute(result: BonusWaveRecomputeResult | null | undefined) {
   if (!result?.applied || result.affectedGmUserIds.length === 0) return;
   for (const gmUserId of result.affectedGmUserIds) {
@@ -1240,6 +1271,7 @@ adminPraemienRouter.get("/waves", async (req: AuthedRequest, res, next) => {
         status: waveStatusSchema.optional(),
         limit: z.coerce.number().int().min(1).max(200).optional().default(50),
         offset: z.coerce.number().int().min(0).optional().default(0),
+        includeInitial: z.enum(["true", "false"]).optional().transform((value) => value === "true"),
       })
       .safeParse(req.query);
     if (!parsed.success) {
@@ -1252,20 +1284,31 @@ adminPraemienRouter.get("/waves", async (req: AuthedRequest, res, next) => {
         limit: parsed.data.limit,
         offset: parsed.data.offset,
         total: 0,
+        initialWave: null,
       });
       return;
     }
     const whereParts = [eq(praemienWaves.isDeleted, false)];
     if (parsed.data.year != null) whereParts.push(eq(praemienWaves.year, parsed.data.year));
     if (parsed.data.status) whereParts.push(eq(praemienWaves.status, parsed.data.status));
-    const totalRows = await db.select({ total: sql<number>`count(*)` }).from(praemienWaves).where(and(...whereParts));
-    const rows = await db
-      .select()
-      .from(praemienWaves)
-      .where(and(...whereParts))
-      .orderBy(asc(praemienWaves.year), asc(praemienWaves.quarter), asc(praemienWaves.createdAt))
-      .limit(parsed.data.limit)
-      .offset(parsed.data.offset);
+    const [totalRows, rows] = await Promise.all([
+      db.select({ total: sql<number>`count(*)` }).from(praemienWaves).where(and(...whereParts)),
+      db
+        .select()
+        .from(praemienWaves)
+        .where(and(...whereParts))
+        .orderBy(
+          sql`case when ${praemienWaves.status} = 'active' then 0 when ${praemienWaves.status} = 'draft' then 1 else 2 end`,
+          desc(praemienWaves.year),
+          desc(praemienWaves.quarter),
+          desc(praemienWaves.createdAt),
+        )
+        .limit(parsed.data.limit)
+        .offset(parsed.data.offset),
+    ]);
+    const initialWave = parsed.data.includeInitial && rows[0]
+      ? await loadWaveGraph(rows[0].id)
+      : null;
     res.status(200).json({
       waves: rows.map((row) => ({
         id: row.id,
@@ -1284,6 +1327,7 @@ adminPraemienRouter.get("/waves", async (req: AuthedRequest, res, next) => {
       limit: parsed.data.limit,
       offset: parsed.data.offset,
       total: Number(totalRows[0]?.total ?? 0),
+      initialWave,
     });
   } catch (error) {
     next(error);
@@ -1334,6 +1378,9 @@ adminPraemienRouter.post("/waves", async (req: AuthedRequest, res, next) => {
       }
       if (parsed.data.thresholds.length > 0) {
         await replaceThresholdsTx(tx, wave.id, parsed.data.thresholds);
+      }
+      if (parsed.data.status === "active") {
+        await ensureWavePillarTargetsConfiguredTx(tx, wave.id);
       }
       return wave;
     });
@@ -1401,7 +1448,11 @@ adminPraemienRouter.patch("/waves/:waveId", async (req: AuthedRequest, res, next
       if (!existing) throw new PraemienDomainError("wave_not_found", 404, "Prämien-Welle nicht gefunden.");
       const nextStartDate = parsed.data.startDate ?? existing.startDate;
       const nextEndDate = parsed.data.endDate ?? existing.endDate;
+      const nextStatus = parsed.data.status ?? existing.status;
       ensureWaveDateRange(nextStartDate, nextEndDate);
+      if (nextStatus === "active") {
+        await ensureWavePillarTargetsConfiguredTx(tx, waveId);
+      }
       const shouldRecompute =
         parsed.data.startDate !== undefined ||
         parsed.data.endDate !== undefined ||
@@ -1503,6 +1554,9 @@ adminPraemienRouter.put("/waves/:waveId/pillars", async (req: AuthedRequest, res
     await db.transaction(async (tx) => {
       await lockWaveTx(tx, waveId, parsed.data.expectedUpdatedAt);
       await replacePillarsTx(tx, waveId, parsed.data.pillars);
+      if (await readWaveStatusTx(tx, waveId) === "active") {
+        await ensureWavePillarTargetsConfiguredTx(tx, waveId);
+      }
     });
     scheduleBonusWaveRecompute(waveId, "replace_pillars");
     const payload = await loadWaveGraph(waveId);

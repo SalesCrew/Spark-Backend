@@ -224,17 +224,38 @@ export function resolveManualPillarOverrideMetricValue(input: {
   valueSource: string;
   points: number;
   maxPoints: number;
+  targetPoints?: number | null | undefined;
 }): number {
   if (input.valueSource === "contribution_percent") {
-    return input.maxPoints > 0 ? (input.points / input.maxPoints) * 100 : input.points;
+    return resolvePillarProgressPercent(input.points, input.targetPoints, input.maxPoints);
   }
   return input.points;
+}
+
+export function resolvePillarProgressTarget(
+  targetPoints: number | null | undefined,
+  sourceMaximumPoints: number,
+): number {
+  const configuredTarget = normalizeNumber(targetPoints);
+  if (configuredTarget > 0) return configuredTarget;
+  return Math.max(0, normalizeNumber(sourceMaximumPoints));
+}
+
+export function resolvePillarProgressPercent(
+  points: number,
+  targetPoints: number | null | undefined,
+  sourceMaximumPoints: number,
+): number {
+  const denominator = resolvePillarProgressTarget(targetPoints, sourceMaximumPoints);
+  if (denominator <= 0) return normalizeNumber(points);
+  return (normalizeNumber(points) / denominator) * 100;
 }
 
 function resolvePillarMetricValues(input: {
   metrics: PillarMetricRow[];
   points: number;
   maxPoints: number;
+  targetPoints?: number | null;
   quality: {
     zeiterfassung: number;
     reporting: number;
@@ -255,13 +276,14 @@ function resolvePillarMetricValues(input: {
         valueSource: metric.valueSource,
         points: input.manualOverridePoints,
         maxPoints: input.maxPoints,
+        targetPoints: input.targetPoints,
       });
       result[metric.key] = Number(value.toFixed(4));
       continue;
     }
     if (metric.valueSource === "contribution_points") value = input.points;
     if (metric.valueSource === "contribution_percent") {
-      value = input.maxPoints > 0 ? (input.points / input.maxPoints) * 100 : 0;
+      value = resolvePillarProgressPercent(input.points, input.targetPoints, input.maxPoints);
     }
     if (metric.valueSource === "quality_zeiterfassung") value = input.quality?.zeiterfassung ?? 0;
     if (metric.valueSource === "quality_reporting") value = input.quality?.reporting ?? 0;
@@ -428,6 +450,7 @@ async function calculateGmWaveRewardSnapshot(
       metrics: metricsByPillarId.get(pillar.id) ?? [],
       points,
       maxPoints: maxPointsByPillar.get(pillar.id) ?? 0,
+      targetPoints: pillar.targetPoints == null ? null : normalizeNumber(pillar.targetPoints),
       quality: qualityRows[0] ?? null,
       flex: flexRows[0] ? {
         totalPoints: flexRows[0].totalPoints,
@@ -1070,6 +1093,7 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
         metrics: metricsByPillarId.get(pillar.id) ?? [],
         points,
         maxPoints,
+        targetPoints: pillar.targetPoints == null ? null : normalizeNumber(pillar.targetPoints),
         quality: qualityRows[0] ?? null,
         flex: flexRows[0] ? {
           totalPoints: flexRows[0].totalPoints,
@@ -1167,11 +1191,10 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
   const rewardByPillarId = new Map(reward.pillarResults.map((pillar) => [pillar.pillarId, pillar]));
   const goals: GmBonusSummaryGoal[] = rawGoals.map((goal) => {
     const pillarReward = rewardByPillarId.get(goal.pillarId);
-    const progressTarget = wave.rewardModel === "pillar_targets" && pillarReward?.targetPoints != null
-      ? pillarReward.targetPoints
-      : goal.maxPoints;
+    const progressTarget = resolvePillarProgressTarget(pillarReward?.targetPoints, goal.maxPoints);
     return {
       ...goal,
+      maxPoints: progressTarget,
       percent: progressTarget > 0
         ? Math.max(0, Math.min(100, Math.round((goal.points / progressTarget) * 100)))
         : 0,
