@@ -21,6 +21,7 @@ import {
   praemienWavePillarTierConditions,
   praemienWavePillarTiers,
   praemienWaveFlexScores,
+  praemienWavePillarOverrides,
   praemienWaveQualityScores,
   praemienWaveSources,
   praemienWaveThresholds,
@@ -187,6 +188,14 @@ const flexScoreInputSchema = z.object({
   note: z.string().trim().max(2000).nullable().optional(),
 });
 
+const pillarOverrideInputSchema = z.object({
+  id: z.string().uuid().optional(),
+  pillarId: z.string().uuid(),
+  gmUserId: z.string().uuid(),
+  points: z.number().finite().gte(0).max(1_000_000),
+  note: z.string().trim().max(2000).nullable().optional(),
+});
+
 const createWaveSchema = z.object({
   name: z.string().trim().min(1).max(180),
   year: z.number().int().min(2000).max(2100),
@@ -235,6 +244,11 @@ const replaceQualityScoresSchema = z.object({
 
 const replaceFlexScoresSchema = z.object({
   flexScores: z.array(flexScoreInputSchema),
+  expectedUpdatedAt: isoDatetimeSchema.optional(),
+});
+
+const replacePillarOverridesSchema = z.object({
+  pillarOverrides: z.array(pillarOverrideInputSchema),
   expectedUpdatedAt: isoDatetimeSchema.optional(),
 });
 
@@ -333,6 +347,17 @@ const waveResponseSchema = z.object({
       updatedAt: z.string().datetime({ offset: true }),
     }),
   ),
+  pillarOverrides: z.array(
+    z.object({
+      id: z.string().uuid(),
+      pillarId: z.string().uuid(),
+      gmId: z.string().uuid(),
+      gmName: z.string(),
+      points: z.number(),
+      note: z.string().optional(),
+      updatedAt: z.string().datetime({ offset: true }),
+    }),
+  ),
   createdAt: z.string().datetime({ offset: true }),
   updatedAt: z.string().datetime({ offset: true }),
 });
@@ -398,7 +423,7 @@ async function loadWaveGraph(waveId: string) {
     .limit(1);
   if (!wave) return null;
 
-  const [thresholds, pillars, metrics, tiers, tierConditions, sources, qualityRows, flexRows] = await Promise.all([
+  const [thresholds, pillars, metrics, tiers, tierConditions, sources, qualityRows, flexRows, pillarOverrideRows] = await Promise.all([
     db
       .select()
       .from(praemienWaveThresholds)
@@ -463,6 +488,24 @@ async function loadWaveGraph(waveId: string) {
       .innerJoin(users, eq(users.id, praemienWaveFlexScores.gmUserId))
       .where(and(eq(praemienWaveFlexScores.waveId, waveId), eq(praemienWaveFlexScores.isDeleted, false)))
       .orderBy(asc(users.lastName), asc(users.firstName)),
+    db
+      .select({
+        id: praemienWavePillarOverrides.id,
+        pillarId: praemienWavePillarOverrides.pillarId,
+        gmUserId: praemienWavePillarOverrides.gmUserId,
+        points: praemienWavePillarOverrides.points,
+        note: praemienWavePillarOverrides.note,
+        updatedAt: praemienWavePillarOverrides.updatedAt,
+        gmFirstName: users.firstName,
+        gmLastName: users.lastName,
+      })
+      .from(praemienWavePillarOverrides)
+      .innerJoin(users, eq(users.id, praemienWavePillarOverrides.gmUserId))
+      .where(and(
+        eq(praemienWavePillarOverrides.waveId, waveId),
+        eq(praemienWavePillarOverrides.isDeleted, false),
+      ))
+      .orderBy(asc(users.lastName), asc(users.firstName), asc(praemienWavePillarOverrides.pillarId)),
   ]);
 
   const metricById = new Map(metrics.map((metric) => [metric.id, metric]));
@@ -594,6 +637,15 @@ async function loadWaveGraph(waveId: string) {
       gmName: `${row.gmFirstName} ${row.gmLastName}`.trim(),
       totalPoints: row.totalPoints,
       componentValues: row.componentValues ?? {},
+      note: row.note ?? undefined,
+      updatedAt: row.updatedAt.toISOString(),
+    })),
+    pillarOverrides: pillarOverrideRows.map((row) => ({
+      id: row.id,
+      pillarId: row.pillarId,
+      gmId: row.gmUserId,
+      gmName: `${row.gmFirstName} ${row.gmLastName}`.trim(),
+      points: normalizeMoney(row.points),
       note: row.note ?? undefined,
       updatedAt: row.updatedAt.toISOString(),
     })),
@@ -1029,6 +1081,91 @@ async function replaceFlexScoresTx(tx: Tx, waveId: string, flexScores: z.infer<t
   await touchWaveTx(tx, waveId, now);
 }
 
+async function replacePillarOverridesTx(
+  tx: Tx,
+  waveId: string,
+  pillarOverrides: z.infer<typeof pillarOverrideInputSchema>[],
+) {
+  const now = new Date();
+  const uniqueKeys = new Set<string>();
+  for (const entry of pillarOverrides) {
+    const key = `${entry.pillarId}:${entry.gmUserId}`;
+    if (uniqueKeys.has(key)) {
+      throw new PraemienDomainError(
+        "pillar_override_duplicate",
+        400,
+        "Eine Säule darf je GM nur einen manuellen Wert enthalten.",
+      );
+    }
+    uniqueKeys.add(key);
+  }
+
+  const gmIds = Array.from(new Set(pillarOverrides.map((entry) => entry.gmUserId)));
+  const pillarIds = Array.from(new Set(pillarOverrides.map((entry) => entry.pillarId)));
+  const [gmUsers, pillars] = await Promise.all([
+    gmIds.length
+      ? tx
+          .select({ id: users.id })
+          .from(users)
+          .where(and(
+            inArray(users.id, gmIds),
+            eq(users.isActive, true),
+            eq(users.role, "gm"),
+            sql`${users.deletedAt} is null`,
+          ))
+      : [],
+    pillarIds.length
+      ? tx
+          .select({ id: praemienWavePillars.id })
+          .from(praemienWavePillars)
+          .where(and(
+            inArray(praemienWavePillars.id, pillarIds),
+            eq(praemienWavePillars.waveId, waveId),
+            eq(praemienWavePillars.isDeleted, false),
+          ))
+      : [],
+  ]);
+  const validGmIds = new Set(gmUsers.map((entry) => entry.id));
+  const validPillarIds = new Set(pillars.map((entry) => entry.id));
+  if (pillarOverrides.some((entry) => !validGmIds.has(entry.gmUserId))) {
+    throw new PraemienDomainError(
+      "pillar_override_invalid_gm",
+      400,
+      "Mindestens ein manueller Säulenwert referenziert keinen gültigen GM.",
+    );
+  }
+  if (pillarOverrides.some((entry) => !validPillarIds.has(entry.pillarId))) {
+    throw new PraemienDomainError(
+      "pillar_override_invalid_pillar",
+      400,
+      "Mindestens ein manueller Säulenwert gehört nicht zu dieser Prämienwelle.",
+    );
+  }
+
+  await tx
+    .update(praemienWavePillarOverrides)
+    .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+    .where(and(
+      eq(praemienWavePillarOverrides.waveId, waveId),
+      eq(praemienWavePillarOverrides.isDeleted, false),
+    ));
+
+  for (const entry of pillarOverrides) {
+    await tx.insert(praemienWavePillarOverrides).values({
+      waveId,
+      pillarId: entry.pillarId,
+      gmUserId: entry.gmUserId,
+      points: String(entry.points),
+      note: entry.note ?? null,
+      isDeleted: false,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+  await touchWaveTx(tx, waveId, now);
+}
+
 function readWaveIdParam(req: AuthedRequest): string | null {
   const raw = req.params.waveId;
   if (typeof raw === "string" && raw.length > 0) return raw;
@@ -1055,6 +1192,7 @@ async function ensurePraemienTablesReady(): Promise<boolean> {
     praemien_wave_sources: string | null;
     praemien_wave_quality_scores: string | null;
     praemien_wave_flex_scores: string | null;
+    praemien_wave_pillar_overrides: string | null;
   }[]>`
     select
       to_regclass('public.praemien_waves') as praemien_waves,
@@ -1065,7 +1203,8 @@ async function ensurePraemienTablesReady(): Promise<boolean> {
       to_regclass('public.praemien_wave_thresholds') as praemien_wave_thresholds,
       to_regclass('public.praemien_wave_sources') as praemien_wave_sources,
       to_regclass('public.praemien_wave_quality_scores') as praemien_wave_quality_scores,
-      to_regclass('public.praemien_wave_flex_scores') as praemien_wave_flex_scores
+      to_regclass('public.praemien_wave_flex_scores') as praemien_wave_flex_scores,
+      to_regclass('public.praemien_wave_pillar_overrides') as praemien_wave_pillar_overrides
   `;
   const row = result[0];
   hasPraemienTables = Boolean(
@@ -1077,7 +1216,8 @@ async function ensurePraemienTablesReady(): Promise<boolean> {
     row?.praemien_wave_thresholds &&
     row?.praemien_wave_sources &&
     row?.praemien_wave_quality_scores &&
-    row?.praemien_wave_flex_scores,
+    row?.praemien_wave_flex_scores &&
+    row?.praemien_wave_pillar_overrides,
   );
   // Cache only positive readiness. If DB is pushed later in a running dev process,
   // the next request should re-check and unlock the feature automatically.
@@ -1472,6 +1612,43 @@ adminPraemienRouter.put("/waves/:waveId/flex-scores", async (req: AuthedRequest,
     });
     const payload = await loadWaveGraph(waveId);
     logMutation(req, "replace_flex_scores", { waveId, count: parsed.data.flexScores.length });
+    res.status(200).json({ wave: payload });
+  } catch (error) {
+    if (error instanceof PraemienDomainError) {
+      sendDomainError(res, error);
+      return;
+    }
+    next(error);
+  }
+});
+
+adminPraemienRouter.put("/waves/:waveId/pillar-overrides", async (req: AuthedRequest, res, next) => {
+  try {
+    if (!(await ensurePraemienTablesReady())) {
+      sendPraemienNotInitialized(res);
+      return;
+    }
+    const waveId = readWaveIdParam(req);
+    if (!waveId) {
+      res.status(400).json({ error: "Wave-ID fehlt.", code: "wave_id_missing" });
+      return;
+    }
+    const parsed = replacePillarOverridesSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige manuelle Säulenwerte.", code: "invalid_payload" });
+      return;
+    }
+    await db.transaction(async (tx) => {
+      await lockWaveTx(tx, waveId, parsed.data.expectedUpdatedAt);
+      await replacePillarOverridesTx(tx, waveId, parsed.data.pillarOverrides);
+    });
+    scheduleBonusWaveRecompute(waveId, "replace_pillar_overrides");
+    const payload = await loadWaveGraph(waveId);
+    logMutation(req, "replace_pillar_overrides", {
+      waveId,
+      count: parsed.data.pillarOverrides.length,
+      recomputeScheduled: true,
+    });
     res.status(200).json({ wave: payload });
   } catch (error) {
     if (error instanceof PraemienDomainError) {

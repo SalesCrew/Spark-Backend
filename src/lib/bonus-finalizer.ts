@@ -12,6 +12,7 @@ import {
   praemienGmWaveTotals,
   praemienWaveFlexScores,
   praemienWavePillarMetrics,
+  praemienWavePillarOverrides,
   praemienWavePillars,
   praemienWavePillarTierConditions,
   praemienWavePillarTiers,
@@ -60,6 +61,7 @@ async function ensureBonusTablesReady(): Promise<boolean> {
     praemien_wave_thresholds: string | null;
     praemien_wave_quality_scores: string | null;
     praemien_wave_flex_scores: string | null;
+    praemien_wave_pillar_overrides: string | null;
     praemien_gm_wave_contributions: string | null;
     praemien_gm_wave_pillar_totals: string | null;
     praemien_gm_wave_totals: string | null;
@@ -73,6 +75,7 @@ async function ensureBonusTablesReady(): Promise<boolean> {
       to_regclass('public.praemien_wave_thresholds') as praemien_wave_thresholds,
       to_regclass('public.praemien_wave_quality_scores') as praemien_wave_quality_scores,
       to_regclass('public.praemien_wave_flex_scores') as praemien_wave_flex_scores,
+      to_regclass('public.praemien_wave_pillar_overrides') as praemien_wave_pillar_overrides,
       to_regclass('public.praemien_gm_wave_contributions') as praemien_gm_wave_contributions,
       to_regclass('public.praemien_gm_wave_pillar_totals') as praemien_gm_wave_pillar_totals,
       to_regclass('public.praemien_gm_wave_totals') as praemien_gm_wave_totals
@@ -87,6 +90,7 @@ async function ensureBonusTablesReady(): Promise<boolean> {
     row?.praemien_wave_thresholds &&
     row?.praemien_wave_quality_scores &&
     row?.praemien_wave_flex_scores &&
+    row?.praemien_wave_pillar_overrides &&
     row?.praemien_gm_wave_contributions &&
     row?.praemien_gm_wave_pillar_totals &&
     row?.praemien_gm_wave_totals,
@@ -216,6 +220,17 @@ type PillarMetricRow = typeof praemienWavePillarMetrics.$inferSelect;
 type PillarTierRow = typeof praemienWavePillarTiers.$inferSelect;
 type PillarConditionRow = typeof praemienWavePillarTierConditions.$inferSelect;
 
+export function resolveManualPillarOverrideMetricValue(input: {
+  valueSource: string;
+  points: number;
+  maxPoints: number;
+}): number {
+  if (input.valueSource === "contribution_percent") {
+    return input.maxPoints > 0 ? (input.points / input.maxPoints) * 100 : input.points;
+  }
+  return input.points;
+}
+
 function resolvePillarMetricValues(input: {
   metrics: PillarMetricRow[];
   points: number;
@@ -230,10 +245,20 @@ function resolvePillarMetricValues(input: {
     totalPoints: number;
     componentValues: Record<string, number>;
   } | null;
+  manualOverridePoints?: number | null | undefined;
 }): Record<string, number> {
   const result: Record<string, number> = { points: input.points };
   for (const metric of input.metrics) {
     let value = 0;
+    if (input.manualOverridePoints != null) {
+      value = resolveManualPillarOverrideMetricValue({
+        valueSource: metric.valueSource,
+        points: input.manualOverridePoints,
+        maxPoints: input.maxPoints,
+      });
+      result[metric.key] = Number(value.toFixed(4));
+      continue;
+    }
     if (metric.valueSource === "contribution_points") value = input.points;
     if (metric.valueSource === "contribution_percent") {
       value = input.maxPoints > 0 ? (input.points / input.maxPoints) * 100 : 0;
@@ -293,7 +318,7 @@ async function calculateGmWaveRewardSnapshot(
   wave: typeof praemienWaves.$inferSelect,
   gmUserId: string,
 ): Promise<GmWaveRewardSnapshot> {
-  const [pillars, thresholds, metrics, tiers, tierConditions, sourceMaximumRows, contributionRows, qualityRows, flexRows] = await Promise.all([
+  const [pillars, thresholds, metrics, tiers, tierConditions, sourceMaximumRows, contributionRows, qualityRows, flexRows, overrideRows] = await Promise.all([
     executor
       .select()
       .from(praemienWavePillars)
@@ -370,10 +395,22 @@ async function calculateGmWaveRewardSnapshot(
         eq(praemienWaveFlexScores.isDeleted, false),
       ))
       .limit(1),
+    executor
+      .select({
+        pillarId: praemienWavePillarOverrides.pillarId,
+        points: praemienWavePillarOverrides.points,
+      })
+      .from(praemienWavePillarOverrides)
+      .where(and(
+        eq(praemienWavePillarOverrides.waveId, wave.id),
+        eq(praemienWavePillarOverrides.gmUserId, gmUserId),
+        eq(praemienWavePillarOverrides.isDeleted, false),
+      )),
   ]);
 
   const pointsByPillar = new Map(contributionRows.map((row) => [row.pillarId, normalizeNumber(row.points)]));
   const maxPointsByPillar = new Map(sourceMaximumRows.map((row) => [row.pillarId, normalizeNumber(row.maxPoints)]));
+  const overrideByPillar = new Map(overrideRows.map((row) => [row.pillarId, normalizeNumber(row.points)]));
   const metricsByPillarId = new Map<string, PillarMetricRow[]>();
   for (const metric of metrics) {
     const list = metricsByPillarId.get(metric.pillarId) ?? [];
@@ -385,6 +422,8 @@ async function calculateGmWaveRewardSnapshot(
     let points = pointsByPillar.get(pillar.id) ?? 0;
     if (isQualityPillarName(pillar.name)) points = normalizeNumber(qualityRows[0]?.totalPoints);
     if (isFlexPillarName(pillar.name)) points = normalizeNumber(flexRows[0]?.totalPoints);
+    const manualOverridePoints = overrideByPillar.get(pillar.id);
+    if (manualOverridePoints != null) points = manualOverridePoints;
     const metricValues = resolvePillarMetricValues({
       metrics: metricsByPillarId.get(pillar.id) ?? [],
       points,
@@ -394,6 +433,7 @@ async function calculateGmWaveRewardSnapshot(
         totalPoints: flexRows[0].totalPoints,
         componentValues: flexRows[0].componentValues ?? {},
       } : null,
+      manualOverridePoints,
     });
     return {
       pillarId: pillar.id,
@@ -751,6 +791,12 @@ export async function recomputeBonusWaveTx(
     return { applied: false, waveId, processedSessions: 0, affectedGmUserIds: [], skippedReason: "wave_not_active" };
   }
 
+  const previousGmRows = await executor
+    .select({ gmUserId: praemienGmWaveTotals.gmUserId })
+    .from(praemienGmWaveTotals)
+    .where(eq(praemienGmWaveTotals.waveId, waveId));
+  const affectedGmUserIdSet = new Set(previousGmRows.map((row) => row.gmUserId));
+
   await executor.delete(praemienGmWaveContributions).where(eq(praemienGmWaveContributions.waveId, waveId));
   await executor.delete(praemienGmWavePillarTotals).where(eq(praemienGmWavePillarTotals.waveId, waveId));
   await executor.delete(praemienGmWaveTotals).where(eq(praemienGmWaveTotals.waveId, waveId));
@@ -780,7 +826,6 @@ export async function recomputeBonusWaveTx(
         ))
         .orderBy(asc(visitSessions.submittedAt));
 
-  const affectedGmUserIdSet = new Set<string>();
   for (const session of sessions) {
     if (!session.submittedAt) continue;
     const redPeriod = await resolveRedPeriodForDate(session.submittedAt);
@@ -793,7 +838,7 @@ export async function recomputeBonusWaveTx(
     affectedGmUserIdSet.add(session.gmUserId);
   }
 
-  const [qualityGmRows, flexGmRows] = await Promise.all([
+  const [qualityGmRows, flexGmRows, overrideGmRows] = await Promise.all([
     executor
       .select({ gmUserId: praemienWaveQualityScores.gmUserId })
       .from(praemienWaveQualityScores)
@@ -802,8 +847,15 @@ export async function recomputeBonusWaveTx(
       .select({ gmUserId: praemienWaveFlexScores.gmUserId })
       .from(praemienWaveFlexScores)
       .where(and(eq(praemienWaveFlexScores.waveId, waveId), eq(praemienWaveFlexScores.isDeleted, false))),
+    executor
+      .select({ gmUserId: praemienWavePillarOverrides.gmUserId })
+      .from(praemienWavePillarOverrides)
+      .where(and(
+        eq(praemienWavePillarOverrides.waveId, waveId),
+        eq(praemienWavePillarOverrides.isDeleted, false),
+      )),
   ]);
-  for (const row of [...qualityGmRows, ...flexGmRows]) affectedGmUserIdSet.add(row.gmUserId);
+  for (const row of [...qualityGmRows, ...flexGmRows, ...overrideGmRows]) affectedGmUserIdSet.add(row.gmUserId);
   const recalculatedAt = new Date();
   for (const gmUserId of affectedGmUserIdSet) {
     await persistGmWaveRewardSnapshot(executor, wave, gmUserId, recalculatedAt);
@@ -899,7 +951,7 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
     };
   }
 
-  const [pillars, sources, thresholds, metrics, tiers, tierConditions, pillarRows, qualityRows, flexRows] = await Promise.all([
+  const [pillars, sources, thresholds, metrics, tiers, tierConditions, pillarRows, qualityRows, flexRows, overrideRows] = await Promise.all([
     db
       .select()
       .from(praemienWavePillars)
@@ -976,6 +1028,17 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
         eq(praemienWaveFlexScores.isDeleted, false),
       ))
       .limit(1),
+    db
+      .select({
+        pillarId: praemienWavePillarOverrides.pillarId,
+        points: praemienWavePillarOverrides.points,
+      })
+      .from(praemienWavePillarOverrides)
+      .where(and(
+        eq(praemienWavePillarOverrides.waveId, wave.id),
+        eq(praemienWavePillarOverrides.gmUserId, gmUserId),
+        eq(praemienWavePillarOverrides.isDeleted, false),
+      )),
   ]);
 
   const maxByPillar = new Map<string, number>();
@@ -994,8 +1057,10 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
     metricsByPillarId.set(metric.pillarId, list);
   }
   const metricById = new Map(metrics.map((metric) => [metric.id, metric]));
+  const overrideByPillar = new Map(overrideRows.map((row) => [row.pillarId, normalizeNumber(row.points)]));
 
   const rawGoals = pillars.map((pillar) => {
+    const manualOverridePoints = overrideByPillar.get(pillar.id);
     const buildRewardFields = (points: number, maxPoints: number) => ({
       targetPoints: pillar.targetPoints == null ? null : normalizeNumber(pillar.targetPoints),
       rewardEur: normalizeNumber(pillar.rewardEur),
@@ -1010,6 +1075,7 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
           totalPoints: flexRows[0].totalPoints,
           componentValues: flexRows[0].componentValues ?? {},
         } : null,
+        manualOverridePoints,
       }),
       tiers: buildPillarTierInputs({
         pillarId: pillar.id,
@@ -1018,6 +1084,21 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
         metricById,
       }),
     });
+    if (manualOverridePoints != null) {
+      const maxPoints = isQualityPillarName(pillar.name) || isFlexPillarName(pillar.name)
+        ? 100
+        : Number((maxByPillar.get(pillar.id) ?? 0).toFixed(4));
+      return {
+        pillarId: pillar.id,
+        name: pillar.name,
+        color: pillar.color,
+        points: manualOverridePoints,
+        maxPoints,
+        isManual: true,
+        isPending: false,
+        ...buildRewardFields(manualOverridePoints, maxPoints),
+      };
+    }
     if (isQualityPillarName(pillar.name)) {
       const qualityScore = qualityRows[0];
       const points = qualityScore ? normalizeNumber(qualityScore.totalPoints) : 0;
