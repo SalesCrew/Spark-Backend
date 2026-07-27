@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { type NextFunction, type Request, type Response, Router } from "express";
 import { z } from "zod";
 import { db, sql as pgSql } from "../lib/db.js";
@@ -16,6 +16,9 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { canonicalizeSpezialfragenIds } from "../lib/spezialfragen-persistence.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
+  fragebogenDurcharbeit,
+  fragebogenDurcharbeitModule,
+  fragebogenDurcharbeitSpezialQuestion,
   fragebogenKuehler,
   fragebogenKuehlerModule,
   fragebogenKuehlerSpezialQuestion,
@@ -25,6 +28,8 @@ import {
   fragebogenMhd,
   fragebogenMhdModule,
   fragebogenMhdSpezialQuestion,
+  moduleDurcharbeit,
+  moduleDurcharbeitQuestion,
   moduleKuehler,
   moduleKuehlerQuestion,
   moduleMain,
@@ -93,7 +98,7 @@ function isPhotoTagLabelConflict(error: unknown): error is { code: string; const
   );
 }
 
-const scopeSchema = z.enum(["main", "kuehler", "mhd"]);
+const scopeSchema = z.enum(["main", "kuehler", "mhd", "durcharbeit"]);
 const mainSectionSchema = z.enum(["standard", "flex", "billa"]);
 
 const questionTypeSchema = z.enum([
@@ -292,7 +297,17 @@ async function ensureQuestionBankSingleChoiceAvailabilityTypeColumnReady(): Prom
 }
 
 function getScopeParam(params: Record<string, string | undefined>): Scope {
-  return scopeSchema.parse(params.scope ?? params["scope(main|kuehler|mhd)"]);
+  return scopeSchema.parse(params.scope ?? params["scope(main|kuehler|mhd|durcharbeit)"]);
+}
+
+function questionPoolScope(scope: Scope): "durcharbeit" | null {
+  return scope === "durcharbeit" ? "durcharbeit" : null;
+}
+
+function questionPoolCondition(scope: Scope) {
+  return scope === "durcharbeit"
+    ? eq(questionBankShared.poolScope, "durcharbeit")
+    : isNull(questionBankShared.poolScope);
 }
 
 function parseArrayField(raw: unknown): string[] {
@@ -503,13 +518,19 @@ function validateQuestionDomain(question: UiQuestion) {
   }
 }
 
-async function ensureQuestionRefsExist(dbLike: DbLike, ids: string[]) {
+async function ensureQuestionRefsExist(dbLike: DbLike, ids: string[], scope?: Scope) {
   const uniqueIds = Array.from(new Set(ids.filter(isUuid)));
   if (uniqueIds.length === 0) return;
   const rows = await dbLike
     .select({ id: questionBankShared.id })
     .from(questionBankShared)
-    .where(and(eq(questionBankShared.isDeleted, false), inArray(questionBankShared.id, uniqueIds)));
+    .where(
+      and(
+        eq(questionBankShared.isDeleted, false),
+        inArray(questionBankShared.id, uniqueIds),
+        ...(scope ? [questionPoolCondition(scope)] : []),
+      ),
+    );
   const found = new Set(rows.map((row) => row.id));
   const missing = uniqueIds.filter((id) => !found.has(id));
   if (missing.length > 0) {
@@ -830,12 +851,21 @@ function pickScopeConfig(scope: Scope) {
       spezialLink: fragebogenKuehlerSpezialQuestion,
     };
   }
+  if (scope === "mhd") {
+    return {
+      moduleTable: moduleMhd,
+      linkTable: moduleMhdQuestion,
+      fbTable: fragebogenMhd,
+      fbModuleLink: fragebogenMhdModule,
+      spezialLink: fragebogenMhdSpezialQuestion,
+    };
+  }
   return {
-    moduleTable: moduleMhd,
-    linkTable: moduleMhdQuestion,
-    fbTable: fragebogenMhd,
-    fbModuleLink: fragebogenMhdModule,
-    spezialLink: fragebogenMhdSpezialQuestion,
+    moduleTable: moduleDurcharbeit,
+    linkTable: moduleDurcharbeitQuestion,
+    fbTable: fragebogenDurcharbeit,
+    fbModuleLink: fragebogenDurcharbeitModule,
+    spezialLink: fragebogenDurcharbeitSpezialQuestion,
   };
 }
 
@@ -844,7 +874,7 @@ function normalizeSingleChoiceAvailabilityForScope(
   scope: Scope,
   previousQuestion: UiQuestion | null,
 ): UiQuestion {
-  if (scope === "main") return question;
+  if (scope === "main" || scope === "durcharbeit") return question;
   return {
     ...question,
     singleChoiceAvailability: previousQuestion?.singleChoiceAvailability ?? false,
@@ -897,12 +927,16 @@ async function upsertModuleQuestionChainsTx(
   }
 }
 
-async function fetchSharedSpezialfragenByIds(dbLike: DbLike, ids: string[]): Promise<Map<string, UiQuestion>> {
+async function fetchSharedSpezialfragenByIds(
+  dbLike: DbLike,
+  ids: string[],
+  scope?: Scope,
+): Promise<Map<string, UiQuestion>> {
   const uniqueIds = Array.from(new Set(ids.filter(isUuid)));
   if (uniqueIds.length === 0) return new Map();
 
   const [hydrated, legacyRows] = await Promise.all([
-    fetchQuestionsByIds(dbLike, uniqueIds),
+    fetchQuestionsByIds(dbLike, uniqueIds, scope),
     dbLike
       .select({
         id: questionBankShared.id,
@@ -912,7 +946,13 @@ async function fetchSharedSpezialfragenByIds(dbLike: DbLike, ids: string[]): Pro
         scoring: questionBankShared.scoring,
       })
       .from(questionBankShared)
-      .where(and(inArray(questionBankShared.id, uniqueIds), eq(questionBankShared.isDeleted, false))),
+      .where(
+        and(
+          inArray(questionBankShared.id, uniqueIds),
+          eq(questionBankShared.isDeleted, false),
+          ...(scope ? [questionPoolCondition(scope)] : []),
+        ),
+      ),
   ]);
 
   // Inline Spezialfragen stored their complete graph in JSON. Until a migrated
@@ -976,10 +1016,18 @@ async function saveSharedSpezialfragenTx(
   // reference each other through conditional rules in one transaction.
   const existingRows = normalizedQuestions.length > 0
     ? await tx
-        .select({ id: questionBankShared.id })
+        .select({ id: questionBankShared.id, poolScope: questionBankShared.poolScope })
         .from(questionBankShared)
         .where(inArray(questionBankShared.id, normalizedQuestions.map((question) => question.id)))
     : [];
+  const wrongPoolQuestion = existingRows.find((row) => row.poolScope !== questionPoolScope(scope));
+  if (wrongPoolQuestion) {
+    throw new DomainValidationError(
+      scope === "durcharbeit"
+        ? "Mindestens eine Spezialfrage gehört nicht zum Durcharbeit-Fragenpool."
+        : "Durcharbeit-Spezialfragen dürfen in diesem Fragebogentyp nicht verwendet werden.",
+    );
+  }
   const existingIds = new Set(existingRows.map((row) => row.id));
   for (const parsed of normalizedQuestions) {
     if (existingIds.has(parsed.id)) continue;
@@ -996,6 +1044,7 @@ async function saveSharedSpezialfragenTx(
       rules: parsed.rules ?? [],
       scoring: parsed.scoring ?? {},
       isSpezial: true,
+      poolScope: questionPoolScope(scope),
       isDeleted: false,
       createdAt: now,
       updatedAt: now,
@@ -1004,7 +1053,7 @@ async function saveSharedSpezialfragenTx(
 
   const submittedIds = new Set<string>();
   for (const [orderIndex, parsed] of normalizedQuestions.entries()) {
-    const saved = await upsertQuestionGraphTx(tx, parsed);
+    const saved = await upsertQuestionGraphTx(tx, parsed, scope);
     if (!saved.id) throw new Error("Spezialfrage konnte nach dem Speichern nicht geladen werden.");
     const savedId = saved.id;
     submittedIds.add(savedId);
@@ -1084,7 +1133,7 @@ async function loadSharedSpezialfragenByFragebogenIds(
       asc(linkTable.fragebogenId),
       asc(linkTable.orderIndex),
     );
-  const questions = await fetchSharedSpezialfragenByIds(dbLike, links.map((link) => link.questionId));
+  const questions = await fetchSharedSpezialfragenByIds(dbLike, links.map((link) => link.questionId), scope);
   for (const link of links) {
     const question = questions.get(link.questionId);
     if (!question) continue;
@@ -1095,7 +1144,11 @@ async function loadSharedSpezialfragenByFragebogenIds(
   return output;
 }
 
-async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<string, UiQuestion>> {
+async function fetchQuestionsByIds(
+  dbLike: DbLike,
+  ids: string[],
+  scope?: Scope,
+): Promise<Map<string, UiQuestion>> {
   const uniqueIds = Array.from(new Set(ids.filter(isUuid)));
   if (uniqueIds.length === 0) return new Map();
   const hasSingleChoiceAvailabilityColumn = await ensureQuestionBankSingleChoiceAvailabilityColumnReady();
@@ -1113,6 +1166,7 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
           redSurvey: questionBankShared.redSurvey,
           singleChoiceAvailability: questionBankShared.singleChoiceAvailability,
           singleChoiceAvailabilityType: questionBankShared.singleChoiceAvailabilityType,
+          poolScope: questionBankShared.poolScope,
           config: questionBankShared.config,
         })
         .from(questionBankShared)
@@ -1127,6 +1181,7 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
             redSurvey: questionBankShared.redSurvey,
             singleChoiceAvailability: questionBankShared.singleChoiceAvailability,
             singleChoiceAvailabilityType: sql<string | null>`null::text`.as("single_choice_availability_type"),
+            poolScope: questionBankShared.poolScope,
             config: questionBankShared.config,
           })
           .from(questionBankShared)
@@ -1140,13 +1195,17 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
           redSurvey: questionBankShared.redSurvey,
           singleChoiceAvailability: sql<boolean | null>`null::boolean`.as("single_choice_availability"),
           singleChoiceAvailabilityType: sql<string | null>`null::text`.as("single_choice_availability_type"),
+          poolScope: questionBankShared.poolScope,
           config: questionBankShared.config,
         })
         .from(questionBankShared)
         .where(and(eq(questionBankShared.isDeleted, false), inArray(questionBankShared.id, uniqueIds)));
-  if (baseRows.length === 0) return new Map();
+  const scopedBaseRows = scope
+    ? baseRows.filter((row) => row.poolScope === questionPoolScope(scope))
+    : baseRows;
+  if (scopedBaseRows.length === 0) return new Map();
 
-  const questionIds = baseRows.map((row) => row.id);
+  const questionIds = scopedBaseRows.map((row) => row.id);
   const hasZweitplatzierungColumn = await hasQuestionScoringZweitplatzierungColumn();
   const hasMitbewerberabfrageColumn = await hasQuestionScoringMitbewerberabfrageColumn();
   const matrixRows = await dbLike
@@ -1246,7 +1305,7 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
   }
 
   const output = new Map<string, UiQuestion>();
-  for (const base of baseRows) {
+  for (const base of scopedBaseRows) {
     const config = { ...(base.config ?? {}) } as Record<string, unknown>;
     const matrix = matrixByQuestion.get(base.id);
     if (matrix) {
@@ -1281,14 +1340,30 @@ async function fetchQuestionsByIds(dbLike: DbLike, ids: string[]): Promise<Map<s
   return output;
 }
 
-async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQuestion> {
+async function upsertQuestionGraphTx(
+  tx: DbTx,
+  input: UiQuestion,
+  scope: Scope = "main",
+): Promise<UiQuestion> {
   const parsed = questionSchema.parse(input);
   validateQuestionDomain(parsed);
 
   let questionId = parsed.id && isUuid(parsed.id) ? parsed.id : null;
   if (questionId) {
-    const [existing] = await tx.select({ id: questionBankShared.id }).from(questionBankShared).where(eq(questionBankShared.id, questionId)).limit(1);
-    if (!existing) questionId = null;
+    const [existing] = await tx
+      .select({ id: questionBankShared.id, poolScope: questionBankShared.poolScope })
+      .from(questionBankShared)
+      .where(eq(questionBankShared.id, questionId))
+      .limit(1);
+    if (!existing) {
+      questionId = null;
+    } else if (existing.poolScope !== questionPoolScope(scope)) {
+      throw new DomainValidationError(
+        scope === "durcharbeit"
+          ? "Diese Frage gehört nicht zum Durcharbeit-Fragenpool."
+          : "Durcharbeit-Fragen dürfen in diesem Fragebogentyp nicht verwendet werden.",
+      );
+    }
   }
 
   const now = new Date();
@@ -1315,12 +1390,12 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
   if (questionId && rules.some((rule) => rule.targetQuestionIds.includes(questionId!))) {
     throw new DomainValidationError("Regeln dürfen nicht auf dieselbe Frage verweisen.");
   }
-  await ensureQuestionRefsExist(tx, referencedIds);
+  await ensureQuestionRefsExist(tx, referencedIds, scope);
   await ensurePhotoTagsActive(tx, tagIds);
 
   const previousQuestion =
     questionId && isUuid(questionId)
-      ? (await fetchQuestionsByIds(tx, [questionId])).get(questionId) ?? null
+      ? (await fetchQuestionsByIds(tx, [questionId], scope)).get(questionId) ?? null
       : null;
   const hasZweitplatzierungColumn = await hasQuestionScoringZweitplatzierungColumn();
   const hasMitbewerberabfrageColumn = await hasQuestionScoringMitbewerberabfrageColumn();
@@ -1427,6 +1502,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
         config: cleanConfig,
         rules: [],
         scoring: {},
+        poolScope: questionPoolScope(scope),
         createdAt: now,
         updatedAt: now,
       })
@@ -1579,7 +1655,7 @@ async function upsertQuestionGraphTx(tx: DbTx, input: UiQuestion): Promise<UiQue
     }
   }
 
-  const hydrated = await fetchQuestionsByIds(tx, [questionId]);
+  const hydrated = await fetchQuestionsByIds(tx, [questionId], scope);
   const output = hydrated.get(questionId);
   if (!output) throw new Error("Frage konnte nach dem Speichern nicht geladen werden.");
   return output;
@@ -1643,7 +1719,7 @@ export async function fetchModulesUi(scope: Scope, ids?: string[]): Promise<UiMo
     .orderBy(asc((cfg.linkTable as AnyTable).moduleId), asc((cfg.linkTable as AnyTable).orderIndex));
 
   const questionIds = Array.from(new Set(links.map((link) => link.questionId)));
-  const questionMap = await fetchQuestionsByIds(db, questionIds);
+  const questionMap = await fetchQuestionsByIds(db, questionIds, scope);
   const chainsReady = await ensureModuleQuestionChainsReady();
   const chainRows =
     moduleIds.length === 0 || !chainsReady
@@ -1676,7 +1752,13 @@ export async function fetchModulesUi(scope: Scope, ids?: string[]): Promise<UiMo
   }
 
   const usageTable: AnyTable =
-    scope === "main" ? fragebogenMainModule : scope === "kuehler" ? fragebogenKuehlerModule : fragebogenMhdModule;
+    scope === "main"
+      ? fragebogenMainModule
+      : scope === "kuehler"
+        ? fragebogenKuehlerModule
+        : scope === "mhd"
+          ? fragebogenMhdModule
+          : fragebogenDurcharbeitModule;
 
   const usageRows = await db
     .select({
@@ -1901,8 +1983,9 @@ adminFragebogenRouter.patch("/photo-tags/:id", async (req, res, next) => {
   }
 });
 
-adminFragebogenRouter.get("/questions", async (_req, res, next) => {
+adminFragebogenRouter.get("/questions", async (req, res, next) => {
   try {
+    const scope = scopeSchema.catch("main").parse(req.query.scope);
     const hasSingleChoiceAvailabilityColumn = await ensureQuestionBankSingleChoiceAvailabilityColumnReady();
     const rows = hasSingleChoiceAvailabilityColumn
       ? await db
@@ -1911,15 +1994,22 @@ adminFragebogenRouter.get("/questions", async (_req, res, next) => {
           .where(
             sql`${questionBankShared.isDeleted} = false
               AND ${questionBankShared.isSpezial} = false
+              AND ${questionPoolCondition(scope)}
               AND coalesce(${questionBankShared.singleChoiceAvailability}, false) = false`,
           )
           .orderBy(desc(questionBankShared.updatedAt))
       : await db
           .select({ id: questionBankShared.id })
           .from(questionBankShared)
-          .where(and(eq(questionBankShared.isDeleted, false), eq(questionBankShared.isSpezial, false)))
+          .where(
+            and(
+              eq(questionBankShared.isDeleted, false),
+              eq(questionBankShared.isSpezial, false),
+              questionPoolCondition(scope),
+            ),
+          )
           .orderBy(desc(questionBankShared.updatedAt));
-    const questionsMap = await fetchQuestionsByIds(db, rows.map((row) => row.id));
+    const questionsMap = await fetchQuestionsByIds(db, rows.map((row) => row.id), scope);
     res.status(200).json({ questions: rows.map((row) => questionsMap.get(row.id)).filter(Boolean) });
   } catch (error) {
     next(error);
@@ -1928,12 +2018,13 @@ adminFragebogenRouter.get("/questions", async (_req, res, next) => {
 
 adminFragebogenRouter.post("/questions", async (req, res, next) => {
   try {
+    const scope = scopeSchema.catch("main").parse(req.query.scope);
     const parsed = questionSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: "Ungültige Frage." });
       return;
     }
-    const question = await db.transaction((tx) => upsertQuestionGraphTx(tx, parsed.data));
+    const question = await db.transaction((tx) => upsertQuestionGraphTx(tx, parsed.data, scope));
     if (question.id) {
       await enqueueIppRecalcForQuestionScoringChanges([question.id], "question_scoring_changed");
     }
@@ -1945,6 +2036,7 @@ adminFragebogenRouter.post("/questions", async (req, res, next) => {
 
 adminFragebogenRouter.patch("/questions/:id", async (req, res, next) => {
   try {
+    const scope = scopeSchema.catch("main").parse(req.query.scope);
     if (!isUuid(req.params.id)) {
       res.status(400).json({ error: "Ungültige Frage-ID." });
       return;
@@ -1954,7 +2046,7 @@ adminFragebogenRouter.patch("/questions/:id", async (req, res, next) => {
       res.status(400).json({ error: "Ungültige Frage." });
       return;
     }
-    const currentMap = await fetchQuestionsByIds(db, [req.params.id]);
+    const currentMap = await fetchQuestionsByIds(db, [req.params.id], scope);
     const existing = currentMap.get(req.params.id);
     if (!existing) {
       res.status(404).json({ error: "Frage nicht gefunden." });
@@ -1979,7 +2071,7 @@ adminFragebogenRouter.patch("/questions/:id", async (req, res, next) => {
       scoring: partial.data.scoring ?? existing.scoring,
       chains: partial.data.chains ?? existing.chains,
     };
-    const question = await db.transaction((tx) => upsertQuestionGraphTx(tx, merged));
+    const question = await db.transaction((tx) => upsertQuestionGraphTx(tx, merged, scope));
     if (question.id) {
       await enqueueIppRecalcForQuestionScoringChanges([question.id], "question_scoring_changed");
     }
@@ -2055,7 +2147,7 @@ adminFragebogenRouter.post("/modules/:scope", async (req, res, next) => {
         .filter((questionId): questionId is string => isUuid(questionId));
       const previousQuestionsById =
         existingQuestionIds.length > 0
-          ? await fetchQuestionsByIds(tx, existingQuestionIds)
+          ? await fetchQuestionsByIds(tx, existingQuestionIds, scope)
           : new Map<string, UiQuestion>();
       for (const question of payload.questions) {
         const previousQuestion =
@@ -2065,7 +2157,7 @@ adminFragebogenRouter.post("/modules/:scope", async (req, res, next) => {
           scope,
           previousQuestion,
         );
-        const saved = await upsertQuestionGraphTx(tx, scopedQuestion);
+        const saved = await upsertQuestionGraphTx(tx, scopedQuestion, scope);
         if (saved.id) {
           questionIds.push(saved.id);
           if (needsIppRecalcForQuestionChange(previousQuestion, scopedQuestion)) {
@@ -2093,7 +2185,7 @@ adminFragebogenRouter.post("/modules/:scope", async (req, res, next) => {
           ...(rule.triggerQuestionId ? [rule.triggerQuestionId] : []),
           ...rule.targetQuestionIds,
         ]);
-        await ensureQuestionRefsExist(tx, referencedIds);
+        await ensureQuestionRefsExist(tx, referencedIds, scope);
         await persistQuestionRulesTx(tx, savedQuestionRow.persistedQuestionId, remappedRules, now);
       }
       if (questionIds.length > 0) {
@@ -2196,7 +2288,7 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
       );
       const previousQuestionsById =
         questionIdsForLookup.length > 0
-          ? await fetchQuestionsByIds(tx, questionIdsForLookup)
+          ? await fetchQuestionsByIds(tx, questionIdsForLookup, scope)
           : new Map<string, UiQuestion>();
 
       const chainsReady = await ensureModuleQuestionChainsReady();
@@ -2246,7 +2338,7 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
         let persistedQuestionId: string;
 
         if (shouldPersistQuestion) {
-          const saved = await upsertQuestionGraphTx(tx, scopedQuestion);
+          const saved = await upsertQuestionGraphTx(tx, scopedQuestion, scope);
           if (!saved.id) continue;
           persistedQuestionId = saved.id;
           if (needsIppRecalcForQuestionChange(previousQuestion, scopedQuestion)) {
@@ -2283,7 +2375,7 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
           ...(rule.triggerQuestionId ? [rule.triggerQuestionId] : []),
           ...rule.targetQuestionIds,
         ]);
-        await ensureQuestionRefsExist(tx, referencedIds);
+        await ensureQuestionRefsExist(tx, referencedIds, scope);
         await persistQuestionRulesTx(tx, savedQuestionRow.persistedQuestionId, remappedRules, now);
       }
 
@@ -2432,13 +2524,20 @@ adminFragebogenRouter.patch("/modules/:scope/:id/delete", async (req, res, next)
   }
 });
 
-adminFragebogenRouter.get("/spezialfragen", async (_req, res, next) => {
+adminFragebogenRouter.get("/spezialfragen", async (req, res, next) => {
   try {
+    const scope = scopeSchema.catch("main").parse(req.query.scope);
     const rows = await db
       .select({ id: questionBankShared.id })
       .from(questionBankShared)
-      .where(and(eq(questionBankShared.isSpezial, true), eq(questionBankShared.isDeleted, false)));
-    const questions = await fetchSharedSpezialfragenByIds(db, rows.map((row) => row.id));
+      .where(
+        and(
+          eq(questionBankShared.isSpezial, true),
+          eq(questionBankShared.isDeleted, false),
+          questionPoolCondition(scope),
+        ),
+      );
+    const questions = await fetchSharedSpezialfragenByIds(db, rows.map((row) => row.id), scope);
     res.status(200).json({
       spezialfragen: Array.from(questions.values()).sort((left, right) =>
         left.text.localeCompare(right.text, "de", { sensitivity: "base" }),
@@ -2706,6 +2805,12 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
       return;
     }
     const targetScope = body.data.targetScope ?? sourceScope;
+    if (questionPoolScope(sourceScope) !== questionPoolScope(targetScope)) {
+      res.status(400).json({
+        error: "Durcharbeit-Fragebögen können wegen des isolierten Fragenpools nur innerhalb von Durcharbeit dupliziert werden.",
+      });
+      return;
+    }
 
     const [source] = await fetchFragebogenUi(sourceScope, [req.params.id]);
     if (!source) {
@@ -2982,6 +3087,12 @@ adminFragebogenRouter.post("/modules/:scope/:id/duplicate", async (req, res, nex
       return;
     }
     const targetScope = body.data.targetScope ?? sourceScope;
+    if (questionPoolScope(sourceScope) !== questionPoolScope(targetScope)) {
+      res.status(400).json({
+        error: "Durcharbeit-Module können wegen des isolierten Fragenpools nur innerhalb von Durcharbeit dupliziert werden.",
+      });
+      return;
+    }
 
     const [source] = await fetchModulesUi(sourceScope, [req.params.id]);
     if (!source) {
@@ -3100,6 +3211,7 @@ adminFragebogenRouter.get("/question-map", async (req, res, next) => {
     const parsed = z
       .object({
         ids: z.string().optional(),
+        scope: scopeSchema.optional(),
       })
       .safeParse(req.query);
     if (!parsed.success) {
@@ -3114,7 +3226,7 @@ adminFragebogenRouter.get("/question-map", async (req, res, next) => {
       res.status(200).json({ questions: [] });
       return;
     }
-    const questionMap = await fetchQuestionsByIds(db, ids);
+    const questionMap = await fetchQuestionsByIds(db, ids, parsed.data.scope);
     res.status(200).json({ questions: ids.map((id) => questionMap.get(id)).filter(Boolean) });
   } catch (error) {
     next(error);

@@ -57,7 +57,7 @@ type MarketDraft = Partial<
 >;
 type ImportDatasetType = "universum" | "kuehler" | "update";
 
-const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
+const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"] as const;
 
 function normalizeUnique(values: string[]): string[] {
   return Array.from(new Set(values.map((v) => v.trim()).filter((v) => v.length > 0)));
@@ -1059,13 +1059,13 @@ function mapKuehlerUnitRow(row: typeof marketKuehlerUnits.$inferSelect) {
 type ActiveNowCampaignSummary = {
   campaignId: string;
   campaignName: string;
-  section: "standard" | "flex" | "kuehler" | "mhd" | "billa";
+  section: "standard" | "flex" | "kuehler" | "mhd" | "billa" | "durcharbeit";
   targetVisitCount?: number;
   submittedVisitCount?: number;
   isComplete?: boolean;
 };
 
-type ProgressSectionKey = "kuehler" | "mhd";
+type ProgressSectionKey = "kuehler" | "mhd" | "durcharbeit";
 
 type ProgressMarketRow = {
   marketId: string;
@@ -1953,7 +1953,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
           eq(campaigns.isDeleted, false),
           eq(markets.isDeleted, false),
           campaignIsLiveNowCondition(),
-          inArray(campaigns.section, ["kuehler", "mhd"]),
+          inArray(campaigns.section, ["kuehler", "mhd", "durcharbeit"]),
         ),
       )
       .orderBy(asc(campaigns.section), asc(campaigns.name), asc(markets.name), asc(markets.address));
@@ -1974,6 +1974,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
     const dateRangeBySection = new Map<ProgressSectionKey, { startDate: string; endDate: string }>([
       ["kuehler", { startDate: redStartYmd, endDate: redEndYmd }],
       ["mhd", { startDate: redStartYmd, endDate: redEndYmd }],
+      ["durcharbeit", { startDate: redStartYmd, endDate: redEndYmd }],
     ]);
 
     for (const row of assignmentRows) {
@@ -2057,7 +2058,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
                 eq(visitSessions.status, "submitted"),
                 inArray(visitSessionSections.campaignId, assignedCampaignIds),
                 isNotNull(visitSessions.submittedAt),
-                inArray(visitSessionSections.section, ["kuehler", "mhd"]),
+                inArray(visitSessionSections.section, ["kuehler", "mhd", "durcharbeit"]),
               ),
             )
             .orderBy(desc(visitSessions.submittedAt));
@@ -2143,9 +2144,11 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
 
     const kuehler = buildSectionPayload("kuehler");
     const mhd = buildSectionPayload("mhd");
+    const durcharbeit = buildSectionPayload("durcharbeit");
     res.status(200).json({
       kuehler,
       mhd,
+      durcharbeit,
       generatedAt: new Date().toISOString(),
       timezone: "Europe/Vienna",
       periodFallback: {

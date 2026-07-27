@@ -17,7 +17,7 @@ import {
   questionScoring,
 } from "./schema.js";
 
-type PraemienSectionType = "standard" | "flex" | "billa" | "kuehler" | "mhd";
+type PraemienSectionType = "standard" | "flex" | "billa" | "kuehler" | "mhd" | "durcharbeit";
 
 type BonusSourceCatalogRow = {
   key: string;

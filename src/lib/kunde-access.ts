@@ -16,6 +16,7 @@ export const KUNDE_ADMIN_PAGE_KEYS = [
   "billa",
   "kuehlerinventur",
   "mhd",
+  "durcharbeit",
   "fbmanagement",
   "fotoarchiv",
   "zeiterfassung",
@@ -84,6 +85,7 @@ function resolveSharedQuestionnairePage(req: Request): KundeAdminPageKey | null 
     headerValue === "billa" ||
     headerValue === "kuehlerinventur" ||
     headerValue === "mhd" ||
+    headerValue === "durcharbeit" ||
     headerValue === "fbmanagement"
   ) {
     return headerValue;
@@ -92,6 +94,7 @@ function resolveSharedQuestionnairePage(req: Request): KundeAdminPageKey | null 
   const pathname = req.path;
   if (pathname.includes("/kuehler")) return "kuehlerinventur";
   if (pathname.includes("/mhd")) return "mhd";
+  if (pathname.includes("/durcharbeit")) return "durcharbeit";
   return null;
 }
 

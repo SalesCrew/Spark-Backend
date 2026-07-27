@@ -33,7 +33,7 @@ export type ZeitenaufstellungVisit = {
 export type ZeitenaufstellungVisitSection = {
   id: string;
   visitSessionId: string;
-  section: "standard" | "flex" | "billa" | "kuehler" | "mhd";
+  section: "standard" | "flex" | "billa" | "kuehler" | "mhd" | "durcharbeit";
   orderIndex: number;
   fragebogenName: string;
   campaignName: string;
@@ -104,6 +104,7 @@ const SECTION_RANK: Record<ZeitenaufstellungVisitSection["section"], number> = {
   billa: 3,
   mhd: 4,
   kuehler: 5,
+  durcharbeit: 6,
 };
 
 const EXTRA_LABELS: Record<string, string> = {

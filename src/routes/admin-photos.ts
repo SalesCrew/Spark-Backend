@@ -1,5 +1,7 @@
+import { ZipArchive, type Archiver, type ArchiverError } from "archiver";
 import { and, count, desc, eq, ilike, inArray, isNotNull, or, sql, type SQL } from "drizzle-orm";
 import { Router } from "express";
+import { Readable } from "node:stream";
 import { z } from "zod";
 import { db } from "../lib/db.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
@@ -23,7 +25,7 @@ const adminPhotosRouter = Router();
 adminPhotosRouter.use(requireAuth(["admin", "kunde"]));
 adminPhotosRouter.use(requireKundeAdminPermission);
 
-const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd"]);
+const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"]);
 const photoSignVariantSchema = z.enum(["preview", "original"]);
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SIGNED_URL_TTL_SECONDS = 15 * 60;
@@ -65,6 +67,12 @@ const photoSignedUrlsBodySchema = z.object({
   variant: photoSignVariantSchema,
 });
 
+const photoExportBodySchema = z.object({
+  filters: photoListQuerySchema
+    .omit({ page: true, pageSize: true })
+    .default({}),
+});
+
 const photoTagsUpdateBodySchema = z.object({
   photoTagIds: z.array(z.string().regex(uuidRegex)).max(80),
 });
@@ -90,7 +98,7 @@ type PhotoRow = {
   fragebogenName: string;
   campaignId: string;
   campaignName: string;
-  campaignType: "standard" | "flex" | "billa" | "kuehler" | "mhd";
+  campaignType: "standard" | "flex" | "billa" | "kuehler" | "mhd" | "durcharbeit";
   campaignStartDate: string | null;
   campaignEndDate: string | null;
   marketId: string;
@@ -204,6 +212,97 @@ function toIso(value: Date | string | null | undefined): string | null {
   if (value instanceof Date) return value.toISOString();
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function exportFilePart(value: string | null | undefined, fallback: string): string {
+  const normalized = (value ?? "").trim() || fallback;
+  return normalized
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 72) || fallback;
+}
+
+function photoFileExtension(row: PhotoRow): string {
+  const fromPath = row.storagePath.split(/[?#]/)[0]?.split(".").pop()?.trim().toLowerCase() ?? "";
+  if (/^[a-z0-9]{2,5}$/.test(fromPath)) return fromPath === "jpeg" ? "jpg" : fromPath;
+  const mime = (row.mimeType ?? "").toLowerCase();
+  if (mime.includes("png")) return "png";
+  if (mime.includes("webp")) return "webp";
+  if (mime.includes("heic")) return "heic";
+  if (mime.includes("heif")) return "heif";
+  return "jpg";
+}
+
+function campaignTypeLabel(value: PhotoRow["campaignType"]): string {
+  if (value === "standard") return "Standard";
+  if (value === "flex") return "Flex";
+  if (value === "billa") return "Billa";
+  if (value === "kuehler") return "Kuehler";
+  if (value === "mhd") return "MHD";
+  if (value === "durcharbeit") return "Durcharbeit";
+  return value;
+}
+
+function uniquePhotoExportName(row: PhotoRow, usedNames: Map<string, number>): string {
+  const stammnr = exportFilePart(
+    row.marketCokeMasterNumber || row.marketKuehlerStammnr || row.marketStandardMarketNumber,
+    "",
+  );
+  const market = exportFilePart(
+    row.marketName || `${row.marketAddress} ${row.marketPostalCode} ${row.marketCity}`,
+    "Markt",
+  );
+  const gmFirstName = exportFilePart(row.gmFirstName, "GM");
+  const campaign = exportFilePart(row.campaignName, "Kampagne");
+  const section = exportFilePart(campaignTypeLabel(row.campaignType), "Sektion");
+  const marketPart = `${stammnr}${market}`.slice(0, 90) || "Markt";
+  const baseName = `${marketPart}.${gmFirstName}-${campaign}.${section}`.slice(0, 180);
+  const extension = photoFileExtension(row);
+  const key = `${baseName}.${extension}`.toLowerCase();
+  const occurrence = (usedNames.get(key) ?? 0) + 1;
+  usedNames.set(key, occurrence);
+  return occurrence === 1
+    ? `${baseName}.${extension}`
+    : `${baseName}_${occurrence}.${extension}`;
+}
+
+function photoExportFolderName(): string {
+  return `CokeSpark_Fotoexport_${new Date().toISOString().slice(0, 10)}`;
+}
+
+async function appendRemotePhoto(
+  archive: Archiver,
+  row: PhotoRow,
+  archivePath: string,
+): Promise<string | null> {
+  const signed = await createSignedReadUrl({
+    photoId: row.id,
+    bucket: row.storageBucket,
+    storagePath: row.storagePath,
+    variant: "original",
+  });
+  if (!signed.signedUrl) return "Keine signierte Original-URL erhalten.";
+
+  const response = await fetch(signed.signedUrl, {
+    signal: AbortSignal.timeout(90_000),
+  });
+  if (!response.ok || !response.body) {
+    return `Download fehlgeschlagen (${response.status}).`;
+  }
+
+  const source = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+  archive.append(source, {
+    name: archivePath,
+    store: true,
+    date: row.uploadedAt,
+  });
+  await new Promise<void>((resolve, reject) => {
+    source.once("end", resolve);
+    source.once("error", reject);
+  });
+  return null;
 }
 
 function marketChainExpression() {
@@ -665,6 +764,124 @@ adminPhotosRouter.post("/photos/signed-urls", async (req: AuthedRequest, res, ne
 
     res.status(200).json({ urls });
   } catch (error) {
+    next(error);
+  }
+});
+
+adminPhotosRouter.post("/photos/export", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = photoExportBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "UngÃ¼ltige Fotoexport-Filter.",
+        code: "invalid_photo_export_filters",
+      });
+      return;
+    }
+
+    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
+    const filters: PhotoListQuery = {
+      ...parsed.data.filters,
+      page: 1,
+      pageSize: 1,
+    };
+    const rows = (await basePhotoSelect(buildPhotoWhere(filters, undefined, access))
+      .orderBy(
+        markets.name,
+        users.lastName,
+        users.firstName,
+        campaigns.name,
+        visitAnswerPhotos.id,
+      )) as PhotoRow[];
+
+    if (rows.length === 0) {
+      res.status(404).json({
+        error: "Keine Fotos im aktuellen Filter.",
+        code: "photo_export_empty",
+      });
+      return;
+    }
+
+    const folderName = photoExportFolderName();
+    const downloadName = `${folderName}.zip`;
+    res.status(200);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${downloadName}"; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
+    );
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Photo-Count", String(rows.length));
+
+    const archive = new ZipArchive({
+      forceZip64: true,
+      zlib: { level: 1 },
+    });
+    let clientDisconnected = false;
+    const completion = new Promise<void>((resolve, reject) => {
+      res.once("finish", resolve);
+      res.once("error", reject);
+      archive.once("error", reject);
+    });
+    void completion.catch(() => {});
+    res.once("close", () => {
+      if (!res.writableEnded) {
+        clientDisconnected = true;
+        archive.abort();
+      }
+    });
+    archive.on("warning", (warning: ArchiverError) => {
+      if ((warning as NodeJS.ErrnoException).code !== "ENOENT") {
+        archive.emit("error", warning);
+      }
+    });
+    archive.pipe(res);
+
+    const usedNames = new Map<string, number>();
+    const failures: string[] = [];
+    for (const row of rows) {
+      if (clientDisconnected) return;
+      const filename = uniquePhotoExportName(row, usedNames);
+      try {
+        const failure = await appendRemotePhoto(archive, row, `${folderName}/${filename}`);
+        if (failure) failures.push(`${filename}: ${failure} (${row.id})`);
+      } catch (error) {
+        failures.push(
+          `${filename}: ${error instanceof Error ? error.message : "Download fehlgeschlagen"} (${row.id})`,
+        );
+      }
+    }
+
+    if (clientDisconnected) return;
+    archive.append(
+      [
+        "Coke Spark Fotoarchiv Export",
+        `Erstellt am: ${new Date().toLocaleString("de-AT", { timeZone: "Europe/Vienna" })}`,
+        `Benutzer: ${req.authUser?.email ?? ""}`,
+        `Fotos im Filter: ${rows.length}`,
+        "Inhalt: Bilddateien direkt in diesem Export-Ordner",
+        "",
+        "Dateiname:",
+        "StammnrMarkt.VornameGM-Kampagne.Sektion.Dateiendung",
+        "",
+        failures.length ? `Fehlerhafte Fotos: ${failures.length}` : "Alle Fotos wurden exportiert.",
+      ].join("\r\n"),
+      { name: `${folderName}/_README.txt` },
+    );
+    if (failures.length > 0) {
+      archive.append(failures.join("\r\n"), {
+        name: `${folderName}/_Exportfehler.txt`,
+      });
+    }
+
+    await archive.finalize();
+    await completion;
+  } catch (error) {
+    if (res.headersSent) {
+      res.destroy(error instanceof Error ? error : new Error("Fotoexport fehlgeschlagen."));
+      return;
+    }
     next(error);
   }
 });

@@ -24,7 +24,7 @@ export type IppQuestionBreakdownRow = {
   sourceSections: string[];
   sourceFrageboegen: string[];
   deduped: boolean;
-  section: "standard" | "flex" | "billa" | "kuehler" | "mhd" | null;
+  section: "standard" | "flex" | "billa" | "kuehler" | "mhd" | "durcharbeit" | null;
   fragebogenName: string | null;
   submittedAt: string | null;
 };

@@ -20,6 +20,7 @@ import {
   campaignFragebogenHistory,
   campaignMarketAssignments,
   campaigns,
+  fragebogenDurcharbeit,
   fragebogenKuehler,
   fragebogenMain,
   fragebogenMhd,
@@ -41,7 +42,7 @@ import {
   users,
 } from "../lib/schema.js";
 
-const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd"]);
+const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"]);
 const campaignStatusSchema = z.enum(["active", "scheduled", "inactive"]);
 const scheduleTypeSchema = z.enum(["always", "scheduled"]);
 const CAMPAIGN_ASSIGNMENT_INSERT_BATCH_SIZE = 500;
@@ -994,6 +995,21 @@ async function resolveAuditUserId(rawUserId: string | undefined): Promise<string
 }
 
 async function ensureFragebogenMatchesSection(section: CampaignSection, fragebogenId: string) {
+  if (section === "durcharbeit") {
+    const [row] = await db
+      .select({ id: fragebogenDurcharbeit.id })
+      .from(fragebogenDurcharbeit)
+      .where(and(eq(fragebogenDurcharbeit.id, fragebogenId), eq(fragebogenDurcharbeit.isDeleted, false)))
+      .limit(1);
+    if (!row) {
+      throw new CampaignDomainError(
+        "fragebogen_mismatch",
+        400,
+        "Fragebogen passt nicht zur Sektion oder ist gelöscht.",
+      );
+    }
+    return;
+  }
   if (section === "kuehler") {
     const [row] = await db
       .select({ id: fragebogenKuehler.id })
@@ -1029,6 +1045,14 @@ async function ensureFragebogenMatchesSection(section: CampaignSection, fragebog
 
 async function getFragebogenNameBySection(section: CampaignSection, fragebogenId: string | null) {
   if (!fragebogenId) return null;
+  if (section === "durcharbeit") {
+    const [row] = await db
+      .select({ name: fragebogenDurcharbeit.name })
+      .from(fragebogenDurcharbeit)
+      .where(and(eq(fragebogenDurcharbeit.id, fragebogenId), eq(fragebogenDurcharbeit.isDeleted, false)))
+      .limit(1);
+    return row?.name ?? null;
+  }
   if (section === "kuehler") {
     const [row] = await db
       .select({ name: fragebogenKuehler.name })
@@ -1170,6 +1194,9 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
   const mhdIds = rows
     .filter((row) => row.section === "mhd" && row.currentFragebogenId)
     .map((row) => row.currentFragebogenId as string);
+  const durcharbeitIds = rows
+    .filter((row) => row.section === "durcharbeit" && row.currentFragebogenId)
+    .map((row) => row.currentFragebogenId as string);
   const standardIds = rows
     .filter((row) => row.section === "standard" && row.currentFragebogenId)
     .map((row) => row.currentFragebogenId as string);
@@ -1197,6 +1224,20 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
       .where(and(inArray(fragebogenMhd.id, Array.from(new Set(mhdIds))), eq(fragebogenMhd.isDeleted, false)));
     for (const row of mhdRows) {
       fbNameBySectionAndId.set(`mhd:${row.id}`, row.name);
+    }
+  }
+  if (durcharbeitIds.length > 0) {
+    const durcharbeitRows = await db
+      .select({ id: fragebogenDurcharbeit.id, name: fragebogenDurcharbeit.name })
+      .from(fragebogenDurcharbeit)
+      .where(
+        and(
+          inArray(fragebogenDurcharbeit.id, Array.from(new Set(durcharbeitIds))),
+          eq(fragebogenDurcharbeit.isDeleted, false),
+        ),
+      );
+    for (const row of durcharbeitRows) {
+      fbNameBySectionAndId.set(`durcharbeit:${row.id}`, row.name);
     }
   }
   const mainSections: Array<{ section: "standard" | "flex" | "billa"; ids: string[] }> = [
@@ -1605,7 +1646,7 @@ async function buildCampaignMarketVisitSummaries(
       gmName: string | null;
       sections: Array<{
         id: string;
-        section: "standard" | "flex" | "billa" | "kuehler" | "mhd";
+        section: "standard" | "flex" | "billa" | "kuehler" | "mhd" | "durcharbeit";
         campaignId: string;
         fragebogenId: string | null;
         fragebogenName: string;

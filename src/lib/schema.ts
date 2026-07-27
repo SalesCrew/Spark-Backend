@@ -18,9 +18,9 @@ import {
 } from "drizzle-orm/pg-core";
 
 export const userRoleEnum = pgEnum("user_role", ["admin", "gm", "sm", "kunde"]);
-export const fragebogenSectionEnum = pgEnum("fragebogen_section", ["standard", "flex", "billa", "kuehler", "mhd"]);
+export const fragebogenSectionEnum = pgEnum("fragebogen_section", ["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"]);
 export const fragebogenMainSectionEnum = pgEnum("fragebogen_main_section", ["standard", "flex", "billa"]);
-export const campaignSectionEnum = pgEnum("campaign_section", ["standard", "flex", "billa", "kuehler", "mhd"]);
+export const campaignSectionEnum = pgEnum("campaign_section", ["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"]);
 export const questionTypeEnum = pgEnum("fragebogen_question_type", [
   "single",
   "yesno",
@@ -36,7 +36,7 @@ export const questionTypeEnum = pgEnum("fragebogen_question_type", [
 export const fragebogenStatusEnum = pgEnum("fragebogen_status", ["active", "scheduled", "inactive"]);
 export const fragebogenScheduleTypeEnum = pgEnum("fragebogen_schedule_type", ["always", "scheduled"]);
 export const questionRuleActionEnum = pgEnum("fragebogen_rule_action", ["hide", "show"]);
-export const fragebogenScopeEnum = pgEnum("fragebogen_scope", ["main", "kuehler", "mhd"]);
+export const fragebogenScopeEnum = pgEnum("fragebogen_scope", ["main", "kuehler", "mhd", "durcharbeit"]);
 export const visitSessionStatusEnum = pgEnum("visit_session_status", ["draft", "submitted", "cancelled"]);
 export const visitSectionStatusEnum = pgEnum("visit_section_status", ["draft", "submitted"]);
 export const visitAnswerStatusEnum = pgEnum("visit_answer_status", ["unanswered", "answered", "hidden_by_rule", "skipped", "invalid"]);
@@ -894,6 +894,7 @@ export const questionBankShared = pgTable(
     rules: jsonb("rules").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
     scoring: jsonb("scoring").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
     isSpezial: boolean("is_spezial").notNull().default(false),
+    poolScope: fragebogenScopeEnum("pool_scope"),
     isDeleted: boolean("is_deleted").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
@@ -901,6 +902,7 @@ export const questionBankShared = pgTable(
   (table) => [
     index("question_bank_shared_type_idx").on(table.questionType),
     index("question_bank_shared_spezial_idx").on(table.isSpezial, table.isDeleted),
+    index("question_bank_shared_pool_scope_idx").on(table.poolScope, table.isSpezial, table.isDeleted),
     index("question_bank_shared_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -1826,6 +1828,109 @@ export const fragebogenMhdSpezialQuestion = pgTable(
       table.orderIndex,
     ),
     index("fragebogen_mhd_spezial_question_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const moduleDurcharbeit = pgTable("module_durcharbeit", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  isDeleted: boolean("is_deleted").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const moduleDurcharbeitQuestion = pgTable(
+  "module_durcharbeit_question",
+  {
+    moduleId: uuid("module_id")
+      .notNull()
+      .references(() => moduleDurcharbeit.id, { onDelete: "cascade" }),
+    questionId: uuid("question_id")
+      .notNull()
+      .references(() => questionBankShared.id, { onDelete: "cascade" }),
+    orderIndex: integer("order_index").notNull().default(0),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.moduleId, table.questionId] }),
+    index("module_durcharbeit_question_question_idx").on(table.questionId),
+    index("module_durcharbeit_question_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const fragebogenDurcharbeit = pgTable(
+  "fragebogen_durcharbeit",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    nurEinmalAusfuellbar: boolean("nur_einmal_ausfuellbar").notNull().default(false),
+    status: fragebogenStatusEnum("status").notNull().default("inactive"),
+    scheduleType: fragebogenScheduleTypeEnum("schedule_type").notNull().default("always"),
+    startDate: date("start_date"),
+    endDate: date("end_date"),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check(
+      "fragebogen_durcharbeit_schedule_dates_ck",
+      sql`(${table.scheduleType} = 'always') OR (${table.startDate} IS NOT NULL AND ${table.endDate} IS NOT NULL AND ${table.startDate} <= ${table.endDate})`,
+    ),
+  ],
+);
+
+export const fragebogenDurcharbeitModule = pgTable(
+  "fragebogen_durcharbeit_module",
+  {
+    fragebogenId: uuid("fragebogen_id")
+      .notNull()
+      .references(() => fragebogenDurcharbeit.id, { onDelete: "cascade" }),
+    moduleId: uuid("module_id")
+      .notNull()
+      .references(() => moduleDurcharbeit.id, { onDelete: "cascade" }),
+    orderIndex: integer("order_index").notNull().default(0),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.fragebogenId, table.moduleId] }),
+    index("fragebogen_durcharbeit_module_module_idx").on(table.moduleId),
+    index("fragebogen_durcharbeit_module_deleted_idx").on(table.isDeleted),
+  ],
+);
+
+export const fragebogenDurcharbeitSpezialQuestion = pgTable(
+  "fragebogen_durcharbeit_spezial_question",
+  {
+    fragebogenId: uuid("fragebogen_id")
+      .notNull()
+      .references(() => fragebogenDurcharbeit.id, { onDelete: "cascade" }),
+    questionId: uuid("question_id")
+      .notNull()
+      .references(() => questionBankShared.id, { onDelete: "cascade" }),
+    orderIndex: integer("order_index").notNull().default(0),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.fragebogenId, table.questionId] }),
+    index("fragebogen_durcharbeit_spezial_question_question_idx").on(table.questionId),
+    index("fragebogen_durcharbeit_spezial_question_active_order_idx").on(
+      table.fragebogenId,
+      table.isDeleted,
+      table.orderIndex,
+    ),
+    index("fragebogen_durcharbeit_spezial_question_deleted_idx").on(table.isDeleted),
   ],
 );
 

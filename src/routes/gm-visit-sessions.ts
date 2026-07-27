@@ -100,9 +100,9 @@ gmVisitSessionsRouter.use(async (req: AuthedRequest, res, next) => {
   }
 });
 
-const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
+const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"] as const;
 type VisitSectionName = (typeof SECTION_ORDER)[number];
-type FragebogenScope = "main" | "kuehler" | "mhd";
+type FragebogenScope = "main" | "kuehler" | "mhd" | "durcharbeit";
 const VISIT_PHOTOS_BUCKET = "visit-photos";
 const VISIT_PHOTO_READ_URL_TTL_SECONDS = 30 * 60;
 
@@ -113,6 +113,7 @@ function isBillaMarketRow(input: { name: string | null | undefined; dbName: stri
 function fragebogenScopeForVisitSection(section: VisitSectionName): FragebogenScope {
   if (section === "kuehler") return "kuehler";
   if (section === "mhd") return "mhd";
+  if (section === "durcharbeit") return "durcharbeit";
   return "main";
 }
 const VISIT_PHOTO_READ_URL_TIMEOUT_MS = 1800;
@@ -242,7 +243,7 @@ type ResolvedQuestion = {
 };
 
 type ResolvedSection = {
-  section: "standard" | "flex" | "billa" | "kuehler" | "mhd";
+  section: VisitSectionName;
   campaignId: string;
   campaignName: string;
   fragebogenId: string;
@@ -1214,35 +1215,42 @@ async function resolveVisitSectionsForSelection(input: {
     main: normalizedSelected.filter((row) => row.section === "standard" || row.section === "flex" || row.section === "billa"),
     kuehler: normalizedSelected.filter((row) => row.section === "kuehler"),
     mhd: normalizedSelected.filter((row) => row.section === "mhd"),
+    durcharbeit: normalizedSelected.filter((row) => row.section === "durcharbeit"),
   };
 
   const mainFbIds = Array.from(new Set(grouped.main.map((row) => row.currentFragebogenId)));
   const kuehlerFbIds = Array.from(new Set(grouped.kuehler.map((row) => row.currentFragebogenId)));
   const mhdFbIds = Array.from(new Set(grouped.mhd.map((row) => row.currentFragebogenId)));
+  const durcharbeitFbIds = Array.from(new Set(grouped.durcharbeit.map((row) => row.currentFragebogenId)));
 
-  const [mainFragebogen, kuehlerFragebogen, mhdFragebogen] = await Promise.all([
+  const [mainFragebogen, kuehlerFragebogen, mhdFragebogen, durcharbeitFragebogen] = await Promise.all([
     mainFbIds.length > 0 ? fetchFragebogenUi("main", mainFbIds) : Promise.resolve([]),
     kuehlerFbIds.length > 0 ? fetchFragebogenUi("kuehler", kuehlerFbIds) : Promise.resolve([]),
     mhdFbIds.length > 0 ? fetchFragebogenUi("mhd", mhdFbIds) : Promise.resolve([]),
+    durcharbeitFbIds.length > 0 ? fetchFragebogenUi("durcharbeit", durcharbeitFbIds) : Promise.resolve([]),
   ]);
 
   const mainFbById = new Map(mainFragebogen.map((entry) => [entry.id, entry]));
   const kuehlerFbById = new Map(kuehlerFragebogen.map((entry) => [entry.id, entry]));
   const mhdFbById = new Map(mhdFragebogen.map((entry) => [entry.id, entry]));
+  const durcharbeitFbById = new Map(durcharbeitFragebogen.map((entry) => [entry.id, entry]));
 
   const mainModuleIds = Array.from(new Set(mainFragebogen.flatMap((entry) => entry.moduleIds ?? [])));
   const kuehlerModuleIds = Array.from(new Set(kuehlerFragebogen.flatMap((entry) => entry.moduleIds ?? [])));
   const mhdModuleIds = Array.from(new Set(mhdFragebogen.flatMap((entry) => entry.moduleIds ?? [])));
+  const durcharbeitModuleIds = Array.from(new Set(durcharbeitFragebogen.flatMap((entry) => entry.moduleIds ?? [])));
 
-  const [mainModules, kuehlerModules, mhdModules] = await Promise.all([
+  const [mainModules, kuehlerModules, mhdModules, durcharbeitModules] = await Promise.all([
     mainModuleIds.length > 0 ? fetchModulesUi("main", mainModuleIds) : Promise.resolve([]),
     kuehlerModuleIds.length > 0 ? fetchModulesUi("kuehler", kuehlerModuleIds) : Promise.resolve([]),
     mhdModuleIds.length > 0 ? fetchModulesUi("mhd", mhdModuleIds) : Promise.resolve([]),
+    durcharbeitModuleIds.length > 0 ? fetchModulesUi("durcharbeit", durcharbeitModuleIds) : Promise.resolve([]),
   ]);
 
   const mainModuleById = new Map(mainModules.map((entry) => [entry.id, entry]));
   const kuehlerModuleById = new Map(kuehlerModules.map((entry) => [entry.id, entry]));
   const mhdModuleById = new Map(mhdModules.map((entry) => [entry.id, entry]));
+  const durcharbeitModuleById = new Map(durcharbeitModules.map((entry) => [entry.id, entry]));
 
   const sections = normalizedSelected
     .map((selected): ResolvedSection | null => {
@@ -1326,6 +1334,47 @@ async function resolveVisitSectionsForSelection(input: {
           questions,
         };
       }
+      if (selected.section === "durcharbeit") {
+        const fb = durcharbeitFbById.get(selected.currentFragebogenId);
+        if (!fb) return null;
+        const moduleQuestions = (fb.moduleIds ?? []).flatMap((moduleId) => {
+          const module = durcharbeitModuleById.get(moduleId);
+          if (!module) return [];
+          return (module.questions ?? [])
+            .map((question) =>
+              toResolvedQuestion(
+                {
+                  id: question.id ?? "",
+                  type: question.type,
+                  text: question.text,
+                  required: question.required,
+                  redSurvey: question.redSurvey ?? null,
+                  singleChoiceAvailability: question.singleChoiceAvailability ?? null,
+                  singleChoiceAvailabilityType:
+                    (question.singleChoiceAvailabilityType as SingleChoiceAvailabilityType | null) ?? null,
+                  config: question.config ?? {},
+                  rules: (question.rules ?? []) as Array<Record<string, unknown>>,
+                  scoring: question.scoring ?? {},
+                  chains: question.chains ?? [],
+                },
+                { id: module.id ?? "", name: module.name },
+              ),
+            )
+            .filter((question): question is ResolvedQuestion =>
+              Boolean(question && isQuestionApplicableToMarketChain(question.chains, marketChain)),
+            );
+        });
+        const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain);
+        if (!fb.id) return null;
+        return {
+          section: selected.section,
+          campaignId: selected.campaignId,
+          campaignName: selected.campaignName,
+          fragebogenId: fb.id,
+          fragebogenName: fb.name ?? "",
+          questions,
+        };
+      }
 
       const fb = mainFbById.get(selected.currentFragebogenId);
       if (!fb?.id) return null;
@@ -1380,7 +1429,7 @@ async function resolveVisitSectionsForSelection(input: {
 }
 
 async function loadStartSectionsFromSession(sessionId: string): Promise<Array<{
-  section: "standard" | "flex" | "billa" | "kuehler" | "mhd";
+  section: VisitSectionName;
   campaignId: string;
   campaignName: string;
   fragebogenId: string | null;
@@ -2264,7 +2313,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
 
       const createdSections: Array<{
         id: string;
-        section: "standard" | "flex" | "billa" | "kuehler" | "mhd";
+        section: VisitSectionName;
         campaignId: string;
         campaignName: string;
         fragebogenId: string;
@@ -2529,11 +2578,11 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/spezialfragen/sync", a
       return;
     }
 
-    const idsByScope: Record<FragebogenScope, string[]> = { main: [], kuehler: [], mhd: [] };
+    const idsByScope: Record<FragebogenScope, string[]> = { main: [], kuehler: [], mhd: [], durcharbeit: [] };
     for (const section of sectionRowsWithFragebogen) {
       idsByScope[fragebogenScopeForVisitSection(section.section)].push(section.fragebogenId);
     }
-    const [mainFragebogen, kuehlerFragebogen, mhdFragebogen] = await Promise.all([
+    const [mainFragebogen, kuehlerFragebogen, mhdFragebogen, durcharbeitFragebogen] = await Promise.all([
       idsByScope.main.length > 0
         ? fetchFragebogenUi("main", Array.from(new Set(idsByScope.main)))
         : Promise.resolve([]),
@@ -2543,11 +2592,15 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/spezialfragen/sync", a
       idsByScope.mhd.length > 0
         ? fetchFragebogenUi("mhd", Array.from(new Set(idsByScope.mhd)))
         : Promise.resolve([]),
+      idsByScope.durcharbeit.length > 0
+        ? fetchFragebogenUi("durcharbeit", Array.from(new Set(idsByScope.durcharbeit)))
+        : Promise.resolve([]),
     ]);
     const fragebogenByScope = {
       main: new Map(mainFragebogen.map((entry) => [entry.id, entry])),
       kuehler: new Map(kuehlerFragebogen.map((entry) => [entry.id, entry])),
       mhd: new Map(mhdFragebogen.map((entry) => [entry.id, entry])),
+      durcharbeit: new Map(durcharbeitFragebogen.map((entry) => [entry.id, entry])),
     };
     const marketChain = normalizeMarketChain(session.marketDbName);
     const candidatesBySectionId = new Map<string, ResolvedQuestion[]>();

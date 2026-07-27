@@ -64,7 +64,7 @@ const pillarMetricValueSourceSchema = z.enum([
   "flex_component",
 ]);
 const pillarConditionOperatorSchema = z.enum(["gte", "lte", "eq"]);
-const sectionTypeSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd"]) satisfies z.ZodType<PraemienSectionType>;
+const sectionTypeSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"]) satisfies z.ZodType<PraemienSectionType>;
 const distributionFreqRuleSchema = z.enum(["lt8", "gt8"]);
 const dateYmdSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const isoDatetimeSchema = z.string().datetime({ offset: true });

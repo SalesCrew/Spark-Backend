@@ -139,8 +139,8 @@ function shouldSuppressRequestCompletionLog(path: string, method: string, status
   if (normalizedPath === "/markets") return true;
   if (normalizedPath === "/admin/campaigns") return true;
   if (normalizedPath === "/admin/users") return true;
-  if (/^\/admin\/modules\/(main|kuehler|mhd)$/i.test(normalizedPath)) return true;
-  if (/^\/admin\/fragebogen\/(main|kuehler|mhd)$/i.test(normalizedPath)) return true;
+  if (/^\/admin\/modules\/(main|kuehler|mhd|durcharbeit)$/i.test(normalizedPath)) return true;
+  if (/^\/admin\/fragebogen\/(main|kuehler|mhd|durcharbeit)$/i.test(normalizedPath)) return true;
   if (normalizedPath === "/markets/gm/assigned-active") return true;
   if (normalizedPath === "/markets/gm/kuehler-mhd-progress") return true;
   if (normalizedPath === "/markets/gm/visit-start") return true;
