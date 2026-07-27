@@ -1,6 +1,7 @@
 import { and, eq, isNotNull, or } from "drizzle-orm";
 import { db } from "./db.js";
 import {
+  campaigns,
   fragebogenKuehler,
   fragebogenKuehlerModule,
   fragebogenMain,
@@ -18,6 +19,7 @@ import {
 } from "./schema.js";
 
 type PraemienSectionType = "standard" | "flex" | "billa" | "kuehler" | "mhd" | "durcharbeit";
+type PraemienMainSectionType = Extract<PraemienSectionType, "standard" | "flex" | "billa">;
 
 type BonusSourceCatalogRow = {
   key: string;
@@ -53,6 +55,34 @@ function sourceCatalogKey(input: {
   return [input.sectionType, input.fragebogenId ?? "", input.moduleId ?? "", input.questionId, input.scoringKey].join("__");
 }
 
+function resolveMainSourceSections(input: {
+  fragebogenSections: unknown[] | null;
+  fragebogenStatus: string;
+  campaignSection: string | null;
+}): PraemienMainSectionType[] {
+  const configuredSections = new Set(
+    (input.fragebogenSections ?? ["standard"])
+      .map((entry) => String(entry))
+      .filter((entry): entry is PraemienMainSectionType =>
+        entry === "standard" || entry === "flex" || entry === "billa",
+      ),
+  );
+
+  if (input.fragebogenStatus === "active" || input.fragebogenStatus === "scheduled") {
+    return Array.from(configuredSections);
+  }
+
+  const campaignSection = input.campaignSection;
+  if (
+    (campaignSection === "standard" || campaignSection === "flex" || campaignSection === "billa") &&
+    configuredSections.has(campaignSection)
+  ) {
+    return [campaignSection];
+  }
+
+  return [];
+}
+
 async function buildSourceCatalog(): Promise<BonusSourceCatalogRow[]> {
   const map = new Map<string, BonusSourceCatalogRow>();
 
@@ -60,7 +90,9 @@ async function buildSourceCatalog(): Promise<BonusSourceCatalogRow[]> {
     .select({
       fragebogenId: fragebogenMain.id,
       fragebogenName: fragebogenMain.name,
+      fragebogenStatus: fragebogenMain.status,
       sectionKeywords: fragebogenMain.sectionKeywords,
+      campaignSection: campaigns.section,
       moduleId: moduleMain.id,
       moduleName: moduleMain.name,
       questionId: questionBankShared.id,
@@ -74,6 +106,14 @@ async function buildSourceCatalog(): Promise<BonusSourceCatalogRow[]> {
     .innerJoin(moduleMain, eq(moduleMain.id, moduleMainQuestion.moduleId))
     .innerJoin(fragebogenMainModule, eq(fragebogenMainModule.moduleId, moduleMain.id))
     .innerJoin(fragebogenMain, eq(fragebogenMain.id, fragebogenMainModule.fragebogenId))
+    .leftJoin(
+      campaigns,
+      and(
+        eq(campaigns.currentFragebogenId, fragebogenMain.id),
+        eq(campaigns.isDeleted, false),
+        or(eq(campaigns.status, "active"), eq(campaigns.status, "scheduled")),
+      ),
+    )
     .where(
       and(
         eq(questionScoring.isDeleted, false),
@@ -83,16 +123,23 @@ async function buildSourceCatalog(): Promise<BonusSourceCatalogRow[]> {
         eq(fragebogenMainModule.isDeleted, false),
         eq(fragebogenMain.isDeleted, false),
         isNotNull(questionScoring.boni),
-        or(eq(fragebogenMain.status, "active"), eq(fragebogenMain.status, "scheduled")),
+        or(
+          eq(fragebogenMain.status, "active"),
+          eq(fragebogenMain.status, "scheduled"),
+          isNotNull(campaigns.id),
+        ),
       ),
     );
 
   for (const row of mainRows) {
     const boniValue = normalizeMoney(row.boni);
     if (!Number.isFinite(boniValue) || boniValue === 0) continue;
-    const sections = new Set((row.sectionKeywords ?? ["standard"]).map((entry) => String(entry)));
-    for (const sectionType of ["standard", "flex", "billa"] as const) {
-      if (!sections.has(sectionType)) continue;
+    const sections = resolveMainSourceSections({
+      fragebogenSections: row.sectionKeywords,
+      fragebogenStatus: row.fragebogenStatus,
+      campaignSection: row.campaignSection,
+    });
+    for (const sectionType of sections) {
       const key = sourceCatalogKey({
         sectionType,
         fragebogenId: row.fragebogenId,
@@ -245,5 +292,5 @@ async function buildSourceCatalog(): Promise<BonusSourceCatalogRow[]> {
   );
 }
 
-export { buildSourceCatalog, normalizeMoney, sourceCatalogKey };
+export { buildSourceCatalog, normalizeMoney, resolveMainSourceSections, sourceCatalogKey };
 export type { BonusSourceCatalogRow, PraemienSectionType };
