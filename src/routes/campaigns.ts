@@ -11,6 +11,7 @@ import { db } from "../lib/db.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { buildVisitAnswerValidationResult, computeMissingRequiredQuestions } from "../lib/visit-session-answer-validation.js";
+import { readRequestedCommentChange } from "../lib/answer-change-request.js";
 import {
   reconcileCampaignVisitExportDetails,
   uniqueCampaignVisitExportRequests,
@@ -2409,10 +2410,16 @@ adminCampaignsRouter.get("/campaigns/answer-change-requests", async (req: Authed
       .limit(250);
 
     const requests = rows.map((row) => {
-      const applicability = normalizeChangeRequestAnswerPayload({
-        questionType: row.questionType,
-        payload: asPlainRecord(row.requestedAnswerPayload),
-      });
+      const requestedPayload = asPlainRecord(row.requestedAnswerPayload);
+      const commentChange = readRequestedCommentChange(requestedPayload);
+      const applicability = commentChange.kind === "comment"
+        ? { ok: true as const, answer: null }
+        : commentChange.kind === "invalid"
+          ? { ok: false as const, error: commentChange.error, code: "invalid_comment_change_request" }
+          : normalizeChangeRequestAnswerPayload({
+              questionType: row.questionType,
+              payload: requestedPayload,
+            });
       return {
         id: row.id,
         status: row.status,
@@ -2587,9 +2594,138 @@ adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve
         throw error;
       }
 
+      const requestedPayload = asPlainRecord(requestRow.requestedAnswerPayload);
+      const requestedCommentChange = readRequestedCommentChange(requestedPayload);
+      if (requestedCommentChange.kind === "invalid") {
+        const error = new Error(requestedCommentChange.error) as Error & { status?: number; code?: string };
+        error.status = 400;
+        error.code = "invalid_comment_change_request";
+        throw error;
+      }
+
+      if (requestedCommentChange.kind === "comment") {
+        const siblingQuestions = await tx
+          .select({
+            visitQuestionId: visitSessionQuestions.id,
+          })
+          .from(visitSessionQuestions)
+          .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+          .where(
+            and(
+              eq(visitSessionSections.visitSessionId, session.id),
+              eq(visitSessionSections.isDeleted, false),
+              eq(visitSessionQuestions.questionId, visitQuestion.questionId),
+              eq(visitSessionQuestions.isDeleted, false),
+            ),
+          );
+        const siblingQuestionIds = siblingQuestions.map((row) => row.visitQuestionId);
+        if (siblingQuestionIds.length === 0) {
+          throw new Error("Keine zugehörigen Fragen in der Session gefunden.");
+        }
+
+        await tx.execute(
+          sql`SELECT id FROM ${visitSessionQuestions} WHERE ${inArray(visitSessionQuestions.id, siblingQuestionIds)} FOR UPDATE`,
+        );
+        const existingComments = await tx
+          .select()
+          .from(visitQuestionComments)
+          .where(
+            and(
+              inArray(visitQuestionComments.visitSessionQuestionId, siblingQuestionIds),
+              eq(visitQuestionComments.isDeleted, false),
+            ),
+          );
+        const existingAnswers = await tx
+          .select({ id: visitAnswers.id, visitSessionQuestionId: visitAnswers.visitSessionQuestionId })
+          .from(visitAnswers)
+          .where(
+            and(
+              inArray(visitAnswers.visitSessionQuestionId, siblingQuestionIds),
+              eq(visitAnswers.isDeleted, false),
+            ),
+          );
+        const commentByQuestionId = new Map(existingComments.map((row) => [row.visitSessionQuestionId, row]));
+        const answerByQuestionId = new Map(existingAnswers.map((row) => [row.visitSessionQuestionId, row]));
+        const commentAuditEvents: Array<typeof visitAnswerEvents.$inferInsert> = [];
+
+        for (const sibling of siblingQuestions) {
+          const existingComment = commentByQuestionId.get(sibling.visitQuestionId);
+          const beforeComment = existingComment?.commentText ?? null;
+          if (!requestedCommentChange.comment) {
+            if (existingComment) {
+              await tx
+                .update(visitQuestionComments)
+                .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+                .where(eq(visitQuestionComments.id, existingComment.id));
+            }
+          } else if (existingComment) {
+            await tx
+              .update(visitQuestionComments)
+              .set({ commentText: requestedCommentChange.comment, commentedAt: now, updatedAt: now })
+              .where(eq(visitQuestionComments.id, existingComment.id));
+          } else {
+            await tx.insert(visitQuestionComments).values({
+              visitSessionQuestionId: sibling.visitQuestionId,
+              commentText: requestedCommentChange.comment,
+              commentedAt: now,
+              isDeleted: false,
+              deletedAt: null,
+              createdAt: now,
+              updatedAt: now,
+            });
+          }
+
+          const siblingAnswer = answerByQuestionId.get(sibling.visitQuestionId);
+          if (siblingAnswer) {
+            commentAuditEvents.push({
+              visitAnswerId: siblingAnswer.id,
+              eventType: "set",
+              payload: {
+                source: "admin_comment_change_request_approved",
+                requestId: requestRow.id,
+                sessionId: session.id,
+                visitQuestionId: sibling.visitQuestionId,
+                beforeComment,
+                afterComment: requestedCommentChange.comment || null,
+              },
+              actorUserId,
+              createdAt: now,
+            });
+          }
+        }
+        if (commentAuditEvents.length > 0) {
+          await tx.insert(visitAnswerEvents).values(commentAuditEvents);
+        }
+
+        await tx
+          .update(visitAnswerChangeRequests)
+          .set({
+            status: "approved",
+            reviewedByUserId: actorUserId,
+            reviewedAt: now,
+            adminNote: parsed.data.adminNote || null,
+            updatedAt: now,
+          })
+          .where(eq(visitAnswerChangeRequests.id, requestRow.id));
+        await tx
+          .update(visitSessions)
+          .set({ lastSavedAt: now, updatedAt: now })
+          .where(eq(visitSessions.id, session.id));
+
+        return {
+          requestId: requestRow.id,
+          answerId: requestRow.visitAnswerId,
+          sessionId: session.id,
+          gmUserId: session.gmUserId,
+          marketId: session.marketId,
+          submittedAt: session.submittedAt ?? now,
+          affectsAnswer: false,
+        };
+      }
+
       const rawAnswer = normalizeChangeRequestAnswerPayload({
         questionType: visitQuestion.questionType,
-        payload: asPlainRecord(requestRow.requestedAnswerPayload),
+        payload: requestedPayload,
       });
       if (!rawAnswer.ok) {
         const error = new Error(rawAnswer.error) as Error & { status?: number; code?: string };
@@ -2777,35 +2913,42 @@ adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve
         gmUserId: session.gmUserId,
         marketId: session.marketId,
         submittedAt: session.submittedAt ?? now,
+        affectsAnswer: true,
       };
     });
 
-    try {
-      await enqueueIppRecalcForDate(result.marketId, result.submittedAt, "visit_answer_change_request_approved");
-    } catch (enqueueError) {
-      logger.error("answer_change_request_ipp_enqueue_failed", {
-        action: "answer_change_request_approved",
-        result: "failure",
-        requestId: result.requestId,
-        sessionId: result.sessionId,
-        marketId: result.marketId,
-        error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
-      });
-    }
-    try {
-      await recomputeGmKpiCache(result.gmUserId);
-    } catch (kpiError) {
-      logger.error("answer_change_request_kpi_recompute_failed", {
-        action: "answer_change_request_approved",
-        result: "failure",
-        requestId: result.requestId,
-        sessionId: result.sessionId,
-        gmUserId: result.gmUserId,
-        error: kpiError instanceof Error ? kpiError.message : String(kpiError),
-      });
+    if (result.affectsAnswer) {
+      try {
+        await enqueueIppRecalcForDate(result.marketId, result.submittedAt, "visit_answer_change_request_approved");
+      } catch (enqueueError) {
+        logger.error("answer_change_request_ipp_enqueue_failed", {
+          action: "answer_change_request_approved",
+          result: "failure",
+          requestId: result.requestId,
+          sessionId: result.sessionId,
+          marketId: result.marketId,
+          error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
+        });
+      }
+      try {
+        await recomputeGmKpiCache(result.gmUserId);
+      } catch (kpiError) {
+        logger.error("answer_change_request_kpi_recompute_failed", {
+          action: "answer_change_request_approved",
+          result: "failure",
+          requestId: result.requestId,
+          sessionId: result.sessionId,
+          gmUserId: result.gmUserId,
+          error: kpiError instanceof Error ? kpiError.message : String(kpiError),
+        });
+      }
     }
 
-    res.status(200).json({ ok: true, request: { id: result.requestId, status: "approved" }, answerId: result.answerId });
+    res.status(200).json({
+      ok: true,
+      request: { id: result.requestId, status: "approved" },
+      ...(result.answerId ? { answerId: result.answerId } : {}),
+    });
   } catch (error) {
     const err = error as Error & { status?: number; code?: string };
     if (err.status) {

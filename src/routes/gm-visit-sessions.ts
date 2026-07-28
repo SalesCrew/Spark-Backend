@@ -15,6 +15,7 @@ import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import { addDays, startOfDay } from "../lib/red-monat.js";
 import { resolveCurrentRedPeriod, resolveRedPeriodForDate } from "../lib/red-month-periods.js";
 import { selectMissingSpezialfragenForSession } from "../lib/spezialfragen-session-sync.js";
+import { readRequestedCommentChange, requestedCommentSummary } from "../lib/answer-change-request.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import {
@@ -2895,6 +2896,11 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/change-requests", asyn
       res.status(400).json({ error: "Änderungsanfrage ist ungültig.", code: "invalid_change_request" });
       return;
     }
+    const requestedCommentChange = readRequestedCommentChange(parsed.data.requestedAnswerPayload);
+    if (requestedCommentChange.kind === "invalid") {
+      res.status(400).json({ error: requestedCommentChange.error, code: "invalid_comment_change_request" });
+      return;
+    }
     const now = new Date();
 
     const [target] = await db
@@ -2934,6 +2940,24 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/change-requests", asyn
       .from(visitAnswers)
       .where(and(eq(visitAnswers.visitSessionQuestionId, target.visitSessionQuestionId), eq(visitAnswers.isDeleted, false)))
       .limit(1);
+    const [currentComment] = await db
+      .select({ commentText: visitQuestionComments.commentText })
+      .from(visitQuestionComments)
+      .where(
+        and(
+          eq(visitQuestionComments.visitSessionQuestionId, target.visitSessionQuestionId),
+          eq(visitQuestionComments.isDeleted, false),
+        ),
+      )
+      .limit(1);
+
+    if (
+      requestedCommentChange.kind === "comment"
+      && requestedCommentChange.comment === (currentComment?.commentText ?? "").trim()
+    ) {
+      res.status(409).json({ error: "Der gewünschte Kommentar ist bereits gespeichert.", code: "comment_unchanged" });
+      return;
+    }
 
     let answerOptions: Array<typeof visitAnswerOptions.$inferSelect> = [];
     let answerMatrixCells: Array<typeof visitAnswerMatrixCells.$inferSelect> = [];
@@ -2958,12 +2982,23 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/change-requests", asyn
       ]);
     }
 
-    const currentAnswerSnapshot = buildAnswerChangeRequestSnapshot({
-      ...(answer ? { answer } : {}),
-      options: answerOptions,
-      matrixCells: answerMatrixCells,
-      photos: answerPhotos,
-    });
+    const currentAnswerSnapshot = {
+      ...buildAnswerChangeRequestSnapshot({
+        ...(answer ? { answer } : {}),
+        options: answerOptions,
+        matrixCells: answerMatrixCells,
+        photos: answerPhotos,
+      }),
+      ...(requestedCommentChange.kind === "comment"
+        ? {
+            changeKind: "comment",
+            comment: currentComment?.commentText ?? null,
+          }
+        : {}),
+    };
+    const requestedAnswerSummary = requestedCommentChange.kind === "comment"
+      ? requestedCommentSummary(requestedCommentChange.comment)
+      : parsed.data.requestedAnswerSummary;
 
     const [saved] = await db.transaction(async (tx) => {
       const [existing] = await tx
@@ -2980,6 +3015,19 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/change-requests", asyn
         .limit(1);
 
       if (existing) {
+        const existingCommentChange = readRequestedCommentChange(
+          (existing.requestedAnswerPayload ?? {}) as Record<string, unknown>,
+        );
+        const existingIsCommentChange = existingCommentChange.kind === "comment";
+        const nextIsCommentChange = requestedCommentChange.kind === "comment";
+        if (existingIsCommentChange !== nextIsCommentChange) {
+          const error = new Error(
+            "Für diese Frage gibt es bereits eine andere offene Änderungsanfrage. Bitte warte auf die Admin-Prüfung.",
+          ) as Error & { status?: number; code?: string };
+          error.status = 409;
+          error.code = "different_pending_change_request";
+          throw error;
+        }
         return tx
           .update(visitAnswerChangeRequests)
           .set({
@@ -2988,7 +3036,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/change-requests", asyn
             questionTextSnapshot: target.questionTextSnapshot,
             currentAnswerSnapshot,
             requestedAnswerPayload: parsed.data.requestedAnswerPayload,
-            requestedAnswerSummary: parsed.data.requestedAnswerSummary,
+            requestedAnswerSummary,
             requestNote: parsed.data.requestNote || null,
             updatedAt: now,
           })
@@ -3015,7 +3063,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/change-requests", asyn
           questionTextSnapshot: target.questionTextSnapshot,
           currentAnswerSnapshot,
           requestedAnswerPayload: parsed.data.requestedAnswerPayload,
-          requestedAnswerSummary: parsed.data.requestedAnswerSummary,
+          requestedAnswerSummary,
           requestNote: parsed.data.requestNote || null,
           status: "pending",
           createdAt: now,
@@ -3041,6 +3089,11 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/change-requests", asyn
         : null,
     });
   } catch (error) {
+    const err = error as Error & { status?: number; code?: string };
+    if (err.status) {
+      res.status(err.status).json({ error: err.message, code: err.code });
+      return;
+    }
     next(error);
   }
 });
