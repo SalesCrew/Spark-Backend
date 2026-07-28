@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { type NextFunction, type Request, type Response, Router } from "express";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { db, sql as pgSql } from "../lib/db.js";
 import {
@@ -14,6 +15,10 @@ import {
 import { enqueueIppRecalcForQuestionScoringChanges } from "../lib/ipp-finalizer.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { canonicalizeSpezialfragenIds } from "../lib/spezialfragen-persistence.js";
+import {
+  createQuestionCopyIdMap,
+  remapQuestionForDeepCopy,
+} from "../lib/fragebogen-deep-copy.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
   fragebogenDurcharbeit,
@@ -1344,6 +1349,7 @@ async function upsertQuestionGraphTx(
   tx: DbTx,
   input: UiQuestion,
   scope: Scope = "main",
+  options: { recordAnswerHistory?: boolean } = {},
 ): Promise<UiQuestion> {
   const parsed = questionSchema.parse(input);
   validateQuestionDomain(parsed);
@@ -1450,7 +1456,7 @@ async function upsertQuestionGraphTx(
   }
 
   const cleanConfig = sanitizeQuestionConfig(config);
-  if (previousQuestion && questionId) {
+  if (previousQuestion && questionId && options.recordAnswerHistory !== false) {
     const previous = extractAnswerState(previousQuestion.type, previousQuestion.config ?? {}, previousQuestion.scoring ?? {});
     const next = extractAnswerState(parsed.type, cleanConfig, parsed.scoring ?? {});
     if (hasAnswerStateChanged(previous, next)) {
@@ -2768,6 +2774,232 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id/delete", async (req, res, ne
   }
 });
 
+async function deepCopyFragebogenToDurcharbeitTx(input: {
+  tx: DbTx;
+  source: UiFragebogen;
+  sourceModules: UiModule[];
+  now: Date;
+}): Promise<{ fragebogenId: string; moduleCount: number; questionCount: number; spezialfragenCount: number }> {
+  const { tx, source, sourceModules, now } = input;
+  const sourceModuleById = new Map(sourceModules.map((moduleRow) => [moduleRow.id, moduleRow]));
+  const orderedSourceModules = source.moduleIds.map((moduleId) => {
+    const moduleRow = sourceModuleById.get(moduleId);
+    if (!moduleRow) {
+      throw new DomainValidationError("Mindestens ein verknüpftes Modul der Quelle konnte nicht geladen werden.");
+    }
+    return moduleRow;
+  });
+
+  const sourceSpezialfragen = source.spezialfragen ?? [];
+  const spezialfrageIds = new Set(
+    sourceSpezialfragen
+      .map((question) => question.id)
+      .filter((questionId): questionId is string => Boolean(questionId)),
+  );
+  const sourceQuestionById = new Map<string, UiQuestion>();
+  for (const moduleRow of orderedSourceModules) {
+    for (const question of moduleRow.questions) {
+      if (!question.id) {
+        throw new DomainValidationError("Mindestens eine Modulfrage besitzt keine stabile ID.");
+      }
+      if (!sourceQuestionById.has(question.id)) {
+        sourceQuestionById.set(question.id, question);
+      }
+    }
+  }
+  for (const question of sourceSpezialfragen) {
+    if (!question.id) {
+      throw new DomainValidationError("Mindestens eine Spezialfrage besitzt keine stabile ID.");
+    }
+    sourceQuestionById.set(question.id, question);
+  }
+
+  const questionIdMap = createQuestionCopyIdMap(
+    Array.from(sourceQuestionById.keys()),
+    randomUUID,
+  );
+  const copiedQuestions: Array<{
+    sourceQuestionId: string;
+    targetQuestionId: string;
+    isSpezial: boolean;
+    question: UiQuestion;
+  }> = [];
+  for (const [sourceQuestionId, sourceQuestion] of sourceQuestionById.entries()) {
+    try {
+      const question = remapQuestionForDeepCopy(sourceQuestion, questionIdMap) as UiQuestion;
+      copiedQuestions.push({
+        sourceQuestionId,
+        targetQuestionId: question.id!,
+        isSpezial: spezialfrageIds.has(sourceQuestionId),
+        question,
+      });
+    } catch (error) {
+      throw new DomainValidationError(
+        error instanceof Error ? error.message : "Bedingte Logik konnte nicht in den Durcharbeit-Fragenpool kopiert werden.",
+      );
+    }
+  }
+
+  if (copiedQuestions.length > 0) {
+    await tx.insert(questionBankShared).values(
+      copiedQuestions.map(({ question, targetQuestionId, isSpezial }) => ({
+        id: targetQuestionId,
+        questionType: question.type,
+        text: question.text,
+        required: question.required,
+        redSurvey: question.redSurvey ?? null,
+        singleChoiceAvailability: question.singleChoiceAvailability ?? null,
+        singleChoiceAvailabilityType: question.singleChoiceAvailabilityType ?? null,
+        chains: isSpezial && question.chains?.length ? normalizeChainDbNames(question.chains) : null,
+        config: {},
+        rules: [],
+        scoring: {},
+        isSpezial,
+        poolScope: "durcharbeit" as const,
+        isDeleted: false,
+        createdAt: now,
+        updatedAt: now,
+      })),
+    );
+  }
+
+  for (const copiedQuestion of copiedQuestions) {
+    await upsertQuestionGraphTx(
+      tx,
+      copiedQuestion.question,
+      "durcharbeit",
+      { recordAnswerHistory: false },
+    );
+  }
+
+  const targetModuleIdBySourceId = new Map<string, string>();
+  for (const sourceModule of orderedSourceModules) {
+    if (!sourceModule.id) {
+      throw new DomainValidationError("Mindestens ein Quellmodul besitzt keine stabile ID.");
+    }
+    const [createdModule] = await tx
+      .insert(moduleDurcharbeit)
+      .values({
+        name: `Kopie von ${sourceModule.name}`,
+        description: sourceModule.description ?? "",
+        isDeleted: false,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning({ id: moduleDurcharbeit.id });
+    if (!createdModule) {
+      throw new Error("Durcharbeit-Modul konnte nicht erstellt werden.");
+    }
+    targetModuleIdBySourceId.set(sourceModule.id, createdModule.id);
+
+    const targetQuestionIds = sourceModule.questions.map((question) => {
+      if (!question.id) {
+        throw new DomainValidationError("Mindestens eine Modulfrage besitzt keine stabile ID.");
+      }
+      const targetQuestionId = questionIdMap.get(question.id);
+      if (!targetQuestionId) {
+        throw new DomainValidationError("Mindestens eine Modulfrage konnte nicht kopiert werden.");
+      }
+      return targetQuestionId;
+    });
+    if (targetQuestionIds.length > 0) {
+      await tx.insert(moduleDurcharbeitQuestion).values(
+        targetQuestionIds.map((questionId, orderIndex) => ({
+          moduleId: createdModule.id,
+          questionId,
+          orderIndex,
+          isDeleted: false,
+          deletedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        })),
+      );
+    }
+    await upsertModuleQuestionChainsTx(tx, {
+      scope: "durcharbeit",
+      moduleId: createdModule.id,
+      questionChainInputs: sourceModule.questions.map((question) => {
+        const targetQuestionId = question.id ? questionIdMap.get(question.id) : null;
+        if (!targetQuestionId) {
+          throw new DomainValidationError("Handelsketten-Zuordnungen konnten nicht kopiert werden.");
+        }
+        return question.chains
+          ? { questionId: targetQuestionId, chains: question.chains }
+          : { questionId: targetQuestionId };
+      }),
+    });
+  }
+
+  const [createdFragebogen] = await tx
+    .insert(fragebogenDurcharbeit)
+    .values({
+      name: `Kopie von ${source.name}`,
+      description: source.description ?? "",
+      nurEinmalAusfuellbar: source.nurEinmalAusfuellbar ?? false,
+      status: "inactive",
+      scheduleType: "always",
+      startDate: null,
+      endDate: null,
+      isDeleted: false,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .returning({ id: fragebogenDurcharbeit.id });
+  if (!createdFragebogen) {
+    throw new Error("Durcharbeit-Fragebogen konnte nicht erstellt werden.");
+  }
+
+  if (orderedSourceModules.length > 0) {
+    await tx.insert(fragebogenDurcharbeitModule).values(
+      orderedSourceModules.map((sourceModule, orderIndex) => {
+        if (!sourceModule.id) {
+          throw new DomainValidationError("Mindestens ein Quellmodul besitzt keine stabile ID.");
+        }
+        const moduleId = targetModuleIdBySourceId.get(sourceModule.id);
+        if (!moduleId) {
+          throw new Error("Durcharbeit-Modul-Verknüpfung konnte nicht erstellt werden.");
+        }
+        return {
+          fragebogenId: createdFragebogen.id,
+          moduleId,
+          orderIndex,
+          isDeleted: false,
+          deletedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+      }),
+    );
+  }
+
+  if (sourceSpezialfragen.length > 0) {
+    await tx.insert(fragebogenDurcharbeitSpezialQuestion).values(
+      sourceSpezialfragen.map((sourceQuestion, orderIndex) => {
+        const questionId = sourceQuestion.id ? questionIdMap.get(sourceQuestion.id) : null;
+        if (!questionId) {
+          throw new DomainValidationError("Mindestens eine Spezialfrage konnte nicht kopiert werden.");
+        }
+        return {
+          fragebogenId: createdFragebogen.id,
+          questionId,
+          orderIndex,
+          isDeleted: false,
+          deletedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+      }),
+    );
+  }
+
+  return {
+    fragebogenId: createdFragebogen.id,
+    moduleCount: orderedSourceModules.length,
+    questionCount: copiedQuestions.length,
+    spezialfragenCount: sourceSpezialfragen.length,
+  };
+}
+
 adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, next) => {
   const startedAtNs = startActionTimer();
   try {
@@ -2805,7 +3037,8 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
       return;
     }
     const targetScope = body.data.targetScope ?? sourceScope;
-    if (questionPoolScope(sourceScope) !== questionPoolScope(targetScope)) {
+    const shouldDeepCopyToDurcharbeit = targetScope === "durcharbeit";
+    if (sourceScope === "durcharbeit" && targetScope !== "durcharbeit") {
       res.status(400).json({
         error: "Durcharbeit-Fragebögen können wegen des isolierten Fragenpools nur innerhalb von Durcharbeit dupliziert werden.",
       });
@@ -2850,11 +3083,11 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
     }
 
     const sourceModulesForDuplication =
-      shouldDuplicateLinkedModules
+      shouldDeepCopyToDurcharbeit || shouldDuplicateLinkedModules
         ? await fetchModulesUi(sourceScope, source.moduleIds)
         : [];
 
-    if (shouldDuplicateLinkedModules) {
+    if (shouldDeepCopyToDurcharbeit || shouldDuplicateLinkedModules) {
       const sourceModuleById = new Map(sourceModulesForDuplication.map((moduleRow) => [moduleRow.id, moduleRow]));
       const missingSourceModuleId = source.moduleIds.find((moduleId) => !sourceModuleById.has(moduleId));
       if (missingSourceModuleId) {
@@ -2873,7 +3106,16 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
     }
 
     const now = new Date();
-    const createdId = await db.transaction(async (tx) => {
+    const creationResult = await db.transaction(async (tx) => {
+      if (shouldDeepCopyToDurcharbeit) {
+        return deepCopyFragebogenToDurcharbeitTx({
+          tx,
+          source,
+          sourceModules: sourceModulesForDuplication,
+          now,
+        });
+      }
+
       const targetCfg = pickScopeConfig(targetScope);
 
       const targetModuleIds = shouldDuplicateLinkedModules
@@ -3002,11 +3244,26 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
         );
       }
       await saveSharedSpezialfragenTx(tx, targetScope, created.id, source.spezialfragen ?? []);
-      return created.id;
+      return {
+        fragebogenId: created.id,
+        moduleCount: moduleIds.length,
+        questionCount: 0,
+        spezialfragenCount: source.spezialfragen?.length ?? 0,
+      };
     });
 
+    const createdId = creationResult.fragebogenId;
     const [fragebogen] = await fetchFragebogenUi(targetScope, [createdId]);
-    res.status(201).json({ fragebogen });
+    if (!fragebogen) {
+      throw new Error("Das erstellte Fragebogen-Duplikat konnte nicht geladen werden.");
+    }
+    const copiedModules = shouldDeepCopyToDurcharbeit
+      ? await fetchModulesUi("durcharbeit", fragebogen.moduleIds)
+      : undefined;
+    res.status(201).json({
+      fragebogen,
+      ...(copiedModules ? { modules: copiedModules } : {}),
+    });
     logAction("info", "fragebogen_duplicate_success", {
       req,
       action: "fragebogen_duplicate",
@@ -3019,12 +3276,18 @@ adminFragebogenRouter.post("/fragebogen/:scope/:id/duplicate", async (req, res, 
         targetScope,
         sourceFragebogenId: req.params.id,
         targetFragebogenId: createdId,
+        deepCopiedToDurcharbeit: shouldDeepCopyToDurcharbeit,
         duplicatedModulesToTargetSection: shouldDuplicateLinkedModules,
-        moduleCount: source.moduleIds.length,
+        moduleCount: creationResult.moduleCount,
+        questionCount: creationResult.questionCount,
+        spezialfragenCount: creationResult.spezialfragenCount,
       },
     });
   } catch (error) {
-    if (error instanceof Error && error.message.includes("Modul")) {
+    if (
+      error instanceof DomainValidationError
+      || (error instanceof Error && error.message.includes("Modul"))
+    ) {
       logAction("warn", "fragebogen_duplicate_module_error", {
         req,
         action: "fragebogen_duplicate",
