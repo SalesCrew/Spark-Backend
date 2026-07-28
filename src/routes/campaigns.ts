@@ -47,6 +47,7 @@ const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "m
 const campaignStatusSchema = z.enum(["active", "scheduled", "inactive"]);
 const scheduleTypeSchema = z.enum(["always", "scheduled"]);
 const CAMPAIGN_ASSIGNMENT_INSERT_BATCH_SIZE = 500;
+const DYNAMIC_FLEX_ASSIGNMENT_LOCK_KEY = "coke_spark_dynamic_flex_assignments";
 const VISIT_PHOTOS_BUCKET = "visit-photos";
 const VISIT_PHOTO_READ_URL_TTL_SECONDS = 30 * 60;
 const VISIT_PHOTO_READ_URL_TIMEOUT_MS = 1800;
@@ -736,20 +737,6 @@ async function ensureMarketsExist(marketIds: string[]) {
   if (missing.length > 0) {
     throw new CampaignDomainError("market_missing", 400, "Mindestens ein Markt existiert nicht oder ist gelöscht.");
   }
-}
-
-async function loadActiveUniversumMarketIds(): Promise<string[]> {
-  const rows = await db
-    .select({ id: markets.id })
-    .from(markets)
-    .where(
-      and(
-        eq(markets.isDeleted, false),
-        eq(markets.isActive, true),
-        inArray(markets.marketType, ["universum", "both"]),
-      ),
-    );
-  return rows.map((row) => row.id);
 }
 
 type CampaignAssignmentInput = {
@@ -3779,38 +3766,63 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
     const now = new Date();
     const auditUserId = await resolveAuditUserId(req.authUser?.appUserId);
     const schedule = normalizeSchedule(parsed.data);
-    const autoFlexMarketIds = parsed.data.section === "flex"
-      ? await loadActiveUniversumMarketIds()
-      : null;
-    const assignments = normalizeAssignments({
+    const isFlexCampaign = parsed.data.section === "flex";
+    const requestedAssignments = normalizeAssignments({
       section: parsed.data.section,
-      marketIds: autoFlexMarketIds ?? parsed.data.marketIds,
-      ...(parsed.data.section !== "flex" && parsed.data.assignments ? { assignments: parsed.data.assignments } : {}),
+      marketIds: isFlexCampaign ? [] : parsed.data.marketIds,
+      ...(!isFlexCampaign && parsed.data.assignments ? { assignments: parsed.data.assignments } : {}),
     });
-    const marketIds = assignments.map((assignment) => assignment.marketId);
-    if (parsed.data.section === "flex" && marketIds.length === 0) {
-      throw new CampaignDomainError("invalid_payload", 400, "Keine aktiven Universumsmärkte für Flexkampagne gefunden.");
-    }
     if (parsed.data.currentFragebogenId) {
       await ensureFragebogenMatchesSection(parsed.data.section, parsed.data.currentFragebogenId);
     }
-    await ensureMarketsExist(marketIds);
-    await ensureGmUsersExist(assignments.map((assignment) => assignment.gmUserId));
-    const conflicts = await findCampaignAssignmentConflicts({
-      section: parsed.data.section,
-      targetStatus: parsed.data.status,
-      targetWindow: {
-        scheduleType: schedule.scheduleType,
-        startDate: schedule.startDate,
-        endDate: schedule.endDate,
-      },
-      assignments,
-    });
-    if (conflicts.length > 0) {
-      throw new CampaignOverlapConflictError(conflicts);
+    if (!isFlexCampaign) {
+      const marketIds = requestedAssignments.map((assignment) => assignment.marketId);
+      await ensureMarketsExist(marketIds);
+      await ensureGmUsersExist(requestedAssignments.map((assignment) => assignment.gmUserId));
+      const conflicts = await findCampaignAssignmentConflicts({
+        section: parsed.data.section,
+        targetStatus: parsed.data.status,
+        targetWindow: {
+          scheduleType: schedule.scheduleType,
+          startDate: schedule.startDate,
+          endDate: schedule.endDate,
+        },
+        assignments: requestedAssignments,
+      });
+      if (conflicts.length > 0) {
+        throw new CampaignOverlapConflictError(conflicts);
+      }
     }
 
     const createResult = await db.transaction(async (tx) => {
+      let assignments = requestedAssignments;
+      if (isFlexCampaign) {
+        await tx.execute(
+          sql`SELECT pg_advisory_xact_lock(hashtext(${DYNAMIC_FLEX_ASSIGNMENT_LOCK_KEY}))`,
+        );
+        const autoFlexMarkets = await tx
+          .select({ id: markets.id })
+          .from(markets)
+          .where(
+            and(
+              eq(markets.isDeleted, false),
+              eq(markets.isActive, true),
+              inArray(markets.marketType, ["universum", "both"]),
+            ),
+          );
+        assignments = normalizeAssignments({
+          section: "flex",
+          marketIds: autoFlexMarkets.map((market) => market.id),
+        });
+        if (assignments.length === 0) {
+          throw new CampaignDomainError(
+            "invalid_payload",
+            400,
+            "Keine aktiven Universumsmärkte für Flexkampagne gefunden.",
+          );
+        }
+      }
+
       const [created] = await tx
         .insert(campaigns)
         .values({
@@ -3869,7 +3881,7 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
           .returning();
         historyRow = createdHistory ?? null;
       }
-      return { campaign: created, historyRow };
+      return { campaign: created, historyRow, assignments };
     });
 
     const campaign = {
@@ -3887,8 +3899,8 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
       scheduleType: createResult.campaign.scheduleType,
       startDate: createResult.campaign.startDate ? String(createResult.campaign.startDate) : null,
       endDate: createResult.campaign.endDate ? String(createResult.campaign.endDate) : null,
-      marketIds: normalizeUnique(assignments.map((assignment) => assignment.marketId)),
-      assignments: assignments.map((assignment) => ({
+      marketIds: normalizeUnique(createResult.assignments.map((assignment) => assignment.marketId)),
+      assignments: createResult.assignments.map((assignment) => ({
         marketId: assignment.marketId,
         gmUserId: assignment.gmUserId,
         gmName: null,
@@ -3920,7 +3932,7 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
       details: {
         campaignId: createResult.campaign.id,
         section: parsed.data.section,
-        assignmentsCount: assignments.length,
+        assignmentsCount: createResult.assignments.length,
       },
     });
   } catch (error) {

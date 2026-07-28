@@ -404,6 +404,11 @@ export const markets = pgTable(
     index("markets_current_gm_name_idx").on(table.currentGmName),
     index("markets_active_idx").on(table.isActive),
     index("markets_deleted_idx").on(table.isDeleted),
+    index("markets_flex_eligible_sync_idx")
+      .on(table.marketType, table.id)
+      .where(
+        sql`${table.isDeleted} = false AND ${table.isActive} = true AND ${table.marketType} IN ('universum', 'both')`,
+      ),
   ],
 );
 
@@ -524,6 +529,9 @@ export const campaigns = pgTable("campaigns", {
   index("campaigns_assigned_gm_active_idx")
     .on(table.assignedGmUserId, table.section, table.status)
     .where(sql`${table.isDeleted} = false AND ${table.assignedGmUserId} IS NOT NULL`),
+  index("campaigns_flex_open_sync_idx")
+    .on(table.status, table.scheduleType, table.endDate)
+    .where(sql`${table.isDeleted} = false AND ${table.section} = 'flex'`),
 ]);
 
 export const campaignMarketAssignments = pgTable(
