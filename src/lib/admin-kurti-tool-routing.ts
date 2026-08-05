@@ -17,6 +17,7 @@ export const ADMIN_KURTI_TOOL_GROUP_NAMES = [
   "questionnaires",
   "photos",
   "reviews_audit",
+  "exports",
   "visualizations",
 ] as const;
 
@@ -33,6 +34,7 @@ export const ADMIN_KURTI_TOOL_GROUPS: Record<AdminKurtiToolGroup, readonly strin
   questionnaires: ["get_questionnaire_context", "get_module_context", "get_question_context", "get_evaluation_context", "get_answer_distribution_analytics", "get_filter_context"],
   photos: ["search_photo_archive", "get_photo_analytics"],
   reviews_audit: ["get_pending_requests", "get_audit_history_context"],
+  exports: ["prepare_admin_excel_export"],
   visualizations: [
     "load_admin_visualization_skill",
     "render_series_visualization",
@@ -56,6 +58,7 @@ const loaderArgumentsSchema = z.object({
 const TOOL_BY_NAME = new Map(ADMIN_KURTI_TOOLS.map((tool) => [tool.name, tool]));
 
 const GROUP_KEYWORDS: Array<{ group: AdminKurtiToolGroup; pattern: RegExp }> = [
+  { group: "exports", pattern: /\b(export|exportieren|excel|xlsx|download|herunterladen)\b/i },
   { group: "people", pattern: /\b(gm|gebietsmanager|mitarbeiter|person|personen|user|nutzer|konto|account|rolle|zugriff|berechtigung|chatverlauf)\b/i },
   { group: "markets_inventory", pattern: /\b(markt|märkte|market|stammnummer|stammnr|flexnummer|kette|handelskette|universum|kühler|kuehler|lager|inventar|seriennummer)\b/i },
   { group: "visits_campaigns", pattern: /\b(besuch|besuche|visit|visits|kampagne|campaign|zuweisung|zielbesuch|submitted|einreichung|abgeschlossen)\b/i },
@@ -79,7 +82,7 @@ export function getAdminKurtiToolsForGroups(groups: Iterable<AdminKurtiToolGroup
   // Keep the legacy chart renderer available for every turn. Follow-up messages
   // such as "yes, do that" do not repeat chart keywords, but still belong to the
   // same visualization request and must be able to complete it.
-  const names = new Set<string>(["load_admin_tool_group", "load_admin_visualization_skill", "render_admin_chart"]);
+  const names = new Set<string>(["load_admin_tool_group", "load_admin_visualization_skill", "render_admin_chart", "prepare_admin_excel_export"]);
   for (const group of groups) {
     for (const name of ADMIN_KURTI_TOOL_GROUPS[group]) names.add(name);
   }
@@ -113,6 +116,7 @@ export function addAdminKurtiToolGroups(
   const names = new Set(currentTools.map((tool) => tool.name));
   names.add("load_admin_tool_group");
   names.add("load_admin_visualization_skill");
+  names.add("prepare_admin_excel_export");
   for (const group of groups) {
     for (const name of ADMIN_KURTI_TOOL_GROUPS[group]) names.add(name);
   }

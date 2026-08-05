@@ -10,6 +10,11 @@ import {
   type AdminKurtiChartSpec,
 } from "../lib/admin-kurti-charts.js";
 import {
+  appendAdminKurtiExcelExports,
+  parseAdminKurtiExcelExportArguments,
+  type AdminKurtiExcelExport,
+} from "../lib/admin-kurti-exports.js";
+import {
   appendAdminKurtiVisualizations,
   type AdminKurtiVisualization,
 } from "../lib/admin-kurti-visualizations.js";
@@ -295,6 +300,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     ];
     const renderedCharts: AdminKurtiChartSpec[] = [];
     const renderedVisualizations: AdminKurtiVisualization[] = [];
+    const preparedExports: AdminKurtiExcelExport[] = [];
     let activeTools = selectAdminKurtiTools(routingText);
 
     let response = await createAdminKurtiResponse(openai, {
@@ -333,6 +339,32 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
                 tool: toolCall.name,
                 error: "invalid_tool_group_request",
                 message: error instanceof Error ? error.message : "The requested tool group is invalid.",
+              });
+            }
+          } else if (toolCall.name === "prepare_admin_excel_export") {
+            try {
+              if (preparedExports.length >= 3) {
+                output = JSON.stringify({
+                  tool: toolCall.name,
+                  error: "export_limit_reached",
+                  message: "At most three Excel exports can be prepared in one answer.",
+                });
+              } else {
+                const preparedExport = parseAdminKurtiExcelExportArguments(toolCall.arguments);
+                preparedExports.push(preparedExport);
+                output = JSON.stringify({
+                  tool: toolCall.name,
+                  accepted: true,
+                  exportIndex: preparedExports.length - 1,
+                  kind: preparedExport.kind,
+                  title: preparedExport.title,
+                });
+              }
+            } catch (error) {
+              output = JSON.stringify({
+                tool: toolCall.name,
+                error: "invalid_export_spec",
+                message: error instanceof Error ? error.message : "The export specification is invalid.",
               });
             }
           } else if (ADMIN_KURTI_VISUALIZATION_TOOL_NAMES.has(toolCall.name)) {
@@ -413,7 +445,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     }
 
     const assistantText = response.output_text.trim();
-    if (!assistantText && renderedCharts.length === 0 && renderedVisualizations.length === 0) {
+    if (!assistantText && renderedCharts.length === 0 && renderedVisualizations.length === 0 && preparedExports.length === 0) {
       logger.warn("admin_kurti_empty_response", {
         ...getRequestLogMeta(req),
         action: "admin_kurti_chat",
@@ -430,7 +462,8 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       assistantText || "Hier ist die gewünschte Auswertung.",
       renderedCharts,
     );
-    const assistantContent = appendAdminKurtiVisualizations(contentWithLegacyCharts, renderedVisualizations);
+    const contentWithVisualizations = appendAdminKurtiVisualizations(contentWithLegacyCharts, renderedVisualizations);
+    const assistantContent = appendAdminKurtiExcelExports(contentWithVisualizations, preparedExports);
 
     const messages = await saveAdminKurtiExchange({
       adminUserId,

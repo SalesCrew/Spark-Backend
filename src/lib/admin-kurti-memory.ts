@@ -1,5 +1,6 @@
 import { and, desc, eq, gt, lte } from "drizzle-orm";
 import { parseAdminKurtiStoredContent, type AdminKurtiChartSpec } from "./admin-kurti-charts.js";
+import { parseAdminKurtiStoredExports, type AdminKurtiExcelExport } from "./admin-kurti-exports.js";
 import { parseAdminKurtiStoredVisualizations, type AdminKurtiVisualization } from "./admin-kurti-visualizations.js";
 import { db } from "./db.js";
 import { logger, serializeError } from "./logger.js";
@@ -14,12 +15,14 @@ export type AdminKurtiMemoryMessage = {
   content: string;
   charts: AdminKurtiChartSpec[];
   visualizations: AdminKurtiVisualization[];
+  exports: AdminKurtiExcelExport[];
   createdAt: string;
   expiresAt: string;
 };
 
 function toPayload(row: typeof adminKurtiMessages.$inferSelect): AdminKurtiMemoryMessage {
-  const parsedVisualizations = parseAdminKurtiStoredVisualizations(row.content);
+  const parsedExports = parseAdminKurtiStoredExports(row.content);
+  const parsedVisualizations = parseAdminKurtiStoredVisualizations(parsedExports.content);
   const parsedContent = parseAdminKurtiStoredContent(parsedVisualizations.content);
   return {
     id: row.id,
@@ -27,6 +30,7 @@ function toPayload(row: typeof adminKurtiMessages.$inferSelect): AdminKurtiMemor
     content: parsedContent.content,
     charts: parsedContent.charts,
     visualizations: parsedVisualizations.visualizations,
+    exports: parsedExports.exports,
     createdAt: row.createdAt.toISOString(),
     expiresAt: row.expiresAt.toISOString(),
   };
