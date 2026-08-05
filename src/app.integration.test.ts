@@ -2790,6 +2790,81 @@ test("module question chains stay module-scoped and duplicate with module", asyn
   await request(app).patch(`/admin/modules/main/${duplicatedModuleId}/delete`).send({});
 });
 
+test("module patch persists attachment-only question edits", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForFragebogenTests())) {
+    t.skip("Fragebogen tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const app = createApp();
+  const uniq = `it-module-attachment-${Date.now()}`;
+  const attachmentPayload = `data:image/png;base64,${Buffer.from(uniq).toString("base64")}`;
+
+  const questionRes = await request(app).post("/admin/questions").send({
+    type: "text",
+    text: `Q ${uniq}`,
+    required: true,
+    config: { images: [attachmentPayload] },
+    rules: [],
+    scoring: {},
+  });
+  assert.equal(questionRes.status, 201);
+  const questionId = questionRes.body.question?.id as string;
+  assert.ok(questionId);
+
+  const moduleRes = await request(app).post("/admin/modules/main").send({
+    name: `Module ${uniq}`,
+    description: "",
+    sectionKeywords: ["standard"],
+    questions: [
+      {
+        id: questionId,
+        type: "text",
+        text: `Q ${uniq}`,
+        required: true,
+        config: { images: [attachmentPayload] },
+        rules: [],
+        scoring: {},
+      },
+    ],
+  });
+  assert.equal(moduleRes.status, 201);
+  const moduleId = moduleRes.body.module?.id as string;
+  assert.ok(moduleId);
+
+  const patchRes = await request(app).patch(`/admin/modules/main/${moduleId}`).send({
+    id: moduleId,
+    name: `Module ${uniq}`,
+    description: "",
+    sectionKeywords: ["standard"],
+    questions: [
+      {
+        id: questionId,
+        type: "text",
+        text: `Q ${uniq}`,
+        required: true,
+        config: {},
+        rules: [],
+        scoring: {},
+      },
+    ],
+  });
+  assert.equal(patchRes.status, 200);
+  assert.deepEqual(patchRes.body.module?.questions?.[0]?.config?.images ?? [], []);
+
+  const attachmentRows = await db
+    .select()
+    .from(questionAttachments)
+    .where(eq(questionAttachments.questionId, questionId));
+  assert.equal(
+    attachmentRows.some((row) => row.payload === attachmentPayload && row.isDeleted),
+    true,
+  );
+  assert.equal(attachmentRows.some((row) => !row.isDeleted), false);
+
+  await request(app).patch(`/admin/modules/main/${moduleId}/delete`).send({});
+});
+
 test("question patch soft-deletes prior children and keeps only active graph", async (t) => {
   enableTestAuthBypass();
   if (!(await ensureDbReadyForFragebogenTests())) {
