@@ -33,7 +33,9 @@ type ImportFieldKey =
   | "kuehlerAnzahlKsAmStandort"
   | "kuehlerInternalId"
   | "kuehlerSerialNumber"
+  | "kuehlerTechnicalIdentNo"
   | "kuehlerModel"
+  | "kuehlerMatchValue"
   | "name"
   | "address"
   | "postalCode"
@@ -55,7 +57,11 @@ type MarketDraft = Partial<
     string | number | boolean
   >
 >;
-type ImportDatasetType = "universum" | "kuehler" | "update";
+type ImportDatasetType = "universum" | "kuehler" | "kuehler_update" | "update";
+type KuehlerUpdateIdentifier =
+  | "kuehlerInternalId"
+  | "kuehlerSerialNumber"
+  | "kuehlerTechnicalIdentNo";
 
 const SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"] as const;
 
@@ -228,12 +234,25 @@ const kuehlerImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; requi
   { key: "kuehlerBd", label: "BD", required: false, isIdentity: false },
   { key: "kuehlerAnzahlKsAmStandort", label: "Anzahl KS am Standort", required: false, isIdentity: false },
   { key: "kuehlerSerialNumber", label: "Serial Number", required: false, isIdentity: false },
+  { key: "kuehlerTechnicalIdentNo", label: "Tech. Ident. No.", required: false, isIdentity: false },
   { key: "name", label: "Name", required: true, isIdentity: false },
   { key: "address", label: "Street name", required: true, isIdentity: false },
   { key: "postalCode", label: "PLZ", required: true, isIdentity: false },
   { key: "city", label: "Ort", required: true, isIdentity: false },
   { key: "region", label: "Region", required: true, isIdentity: false },
   { key: "kuehlerModel", label: "Model", required: false, isIdentity: false },
+  { key: "employee", label: "Mitarbeiter", required: false, isIdentity: false },
+];
+
+const kuehlerUpdateImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; required: boolean; isIdentity: boolean }> = [
+  { key: "kuehlerMatchValue", label: "Identifikationswert", required: true, isIdentity: true },
+  { key: "kuehlerInternalId", label: "internal_id", required: false, isIdentity: false },
+  { key: "kuehlerTechnicalIdentNo", label: "Tech. Ident. No.", required: false, isIdentity: false },
+  { key: "kuehlerSerialNumber", label: "Serial Number", required: false, isIdentity: false },
+  { key: "kuehlerBd", label: "BD", required: false, isIdentity: false },
+  { key: "kuehlerAnzahlKsAmStandort", label: "Anzahl KS am Standort", required: false, isIdentity: false },
+  { key: "kuehlerModel", label: "Model", required: false, isIdentity: false },
+  { key: "name", label: "Name", required: false, isIdentity: false },
   { key: "employee", label: "Mitarbeiter", required: false, isIdentity: false },
 ];
 
@@ -259,6 +278,7 @@ const updateImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; requir
 
 function getImportFieldSpecs(importType: ImportDatasetType) {
   if (importType === "kuehler") return kuehlerImportFieldSpecs;
+  if (importType === "kuehler_update") return kuehlerUpdateImportFieldSpecs;
   if (importType === "update") return updateImportFieldSpecs;
   return universumImportFieldSpecs;
 }
@@ -273,7 +293,9 @@ const mappingSchema = z
     kuehlerAnzahlKsAmStandort: z.string().optional(),
     kuehlerInternalId: z.string().optional(),
     kuehlerSerialNumber: z.string().optional(),
+    kuehlerTechnicalIdentNo: z.string().optional(),
     kuehlerModel: z.string().optional(),
+    kuehlerMatchValue: z.string().optional(),
     name: z.string().optional(),
     address: z.string().optional(),
     postalCode: z.string().optional(),
@@ -293,7 +315,10 @@ const mappingSchema = z
 
 const importMarketsSchema = z
   .object({
-    importType: z.enum(["universum", "kuehler", "update"]).optional().default("universum"),
+    importType: z.enum(["universum", "kuehler", "kuehler_update", "update"]).optional().default("universum"),
+    kuehlerUpdateIdentifier: z
+      .enum(["kuehlerInternalId", "kuehlerSerialNumber", "kuehlerTechnicalIdentNo"])
+      .optional(),
     allowMissingCokeMasterNumber: z.boolean().optional().default(false),
     fileName: z.string().min(1),
     sheetName: z.string().min(1),
@@ -373,6 +398,7 @@ const createKuehlerUnitSchema = z
     kuehlerBd: z.string().optional().default(""),
     kuehlerAnzahlKsAmStandort: z.number().int().min(0).nullable().optional(),
     kuehlerSerialNumber: z.string().optional().default(""),
+    kuehlerTechnicalIdentNo: z.string().optional().default(""),
     kuehlerModel: z.string().optional().default(""),
     importSourceFileName: z.string().optional().default(""),
     importedAt: z.string().datetime().optional(),
@@ -387,6 +413,7 @@ const updateKuehlerUnitSchema = z
     kuehlerBd: z.string().optional(),
     kuehlerAnzahlKsAmStandort: z.number().int().min(0).nullable().optional(),
     kuehlerSerialNumber: z.string().optional(),
+    kuehlerTechnicalIdentNo: z.string().optional(),
     kuehlerModel: z.string().optional(),
     importSourceFileName: z.string().optional(),
     importedAt: z.string().datetime().optional(),
@@ -986,6 +1013,82 @@ function marketPatchHasChanges(
   });
 }
 
+const kuehlerUpdatePatchKeys: ImportFieldKey[] = [
+  "kuehlerInternalId",
+  "kuehlerTechnicalIdentNo",
+  "kuehlerSerialNumber",
+  "kuehlerBd",
+  "kuehlerAnzahlKsAmStandort",
+  "kuehlerModel",
+  "name",
+  "employee",
+];
+
+function getMappedKuehlerUpdateFields(mapping: z.infer<typeof mappingSchema>): ImportFieldKey[] {
+  return kuehlerUpdatePatchKeys.filter((key) => isValidColLetter(mapping[key] ?? ""));
+}
+
+export function buildKuehlerUpdatePatch(
+  draft: MarketDraft,
+  mappedFields: ImportFieldKey[],
+): Partial<typeof marketKuehlerUnits.$inferInsert> {
+  const mapped = new Set(mappedFields);
+  const patch: Partial<typeof marketKuehlerUnits.$inferInsert> = {};
+
+  if (mapped.has("kuehlerInternalId") && draft.kuehlerInternalId != null) {
+    patch.kuehlerInternalId = normalizeIdentity(draft.kuehlerInternalId);
+  }
+  if (mapped.has("kuehlerTechnicalIdentNo") && draft.kuehlerTechnicalIdentNo != null) {
+    patch.kuehlerTechnicalIdentNo = normalizeIdentity(draft.kuehlerTechnicalIdentNo);
+  }
+  if (mapped.has("kuehlerSerialNumber") && draft.kuehlerSerialNumber != null) {
+    patch.kuehlerSerialNumber = normalizeOptionalText(draft.kuehlerSerialNumber);
+  }
+  if (mapped.has("kuehlerBd") && draft.kuehlerBd != null) {
+    patch.kuehlerBd = normalizeOptionalText(draft.kuehlerBd);
+  }
+  if (mapped.has("kuehlerAnzahlKsAmStandort") && draft.kuehlerAnzahlKsAmStandort != null) {
+    patch.kuehlerAnzahlKsAmStandort = Number(draft.kuehlerAnzahlKsAmStandort);
+  }
+  if (mapped.has("kuehlerModel") && draft.kuehlerModel != null) {
+    patch.kuehlerModel = normalizeOptionalText(draft.kuehlerModel);
+  }
+  if (mapped.has("name") && draft.name != null) {
+    patch.name = normalizeOptionalText(draft.name) ?? "";
+  }
+  if (mapped.has("employee") && draft.employee != null) {
+    patch.employee = normalizeOptionalText(draft.employee) ?? "";
+  }
+
+  return patch;
+}
+
+function kuehlerUnitPatchHasChanges(
+  unit: typeof marketKuehlerUnits.$inferSelect,
+  patch: Partial<typeof marketKuehlerUnits.$inferInsert>,
+): boolean {
+  return Object.entries(patch).some(([key, value]) => {
+    const current = unit[key as keyof typeof unit];
+    if (typeof value === "number") return current !== value;
+    const nextText = value == null ? "" : String(value);
+    const currentText = current == null ? "" : String(current);
+    return currentText !== nextText;
+  });
+}
+
+function getKuehlerUpdateIdentifierValue(
+  unit: typeof marketKuehlerUnits.$inferSelect,
+  identifier: KuehlerUpdateIdentifier,
+): string | null {
+  return normalizeIdentity(unit[identifier]);
+}
+
+function getKuehlerUpdateIdentifierLabel(identifier: KuehlerUpdateIdentifier): string {
+  if (identifier === "kuehlerInternalId") return "internal_id";
+  if (identifier === "kuehlerTechnicalIdentNo") return "Tech. Ident. No.";
+  return "Serial Number";
+}
+
 async function updateMarketIdsInChunks(
   tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
   ids: string[],
@@ -1047,6 +1150,7 @@ function mapKuehlerUnitRow(row: typeof marketKuehlerUnits.$inferSelect) {
     kuehlerBd: row.kuehlerBd,
     kuehlerAnzahlKsAmStandort: row.kuehlerAnzahlKsAmStandort,
     kuehlerSerialNumber: row.kuehlerSerialNumber,
+    kuehlerTechnicalIdentNo: row.kuehlerTechnicalIdentNo,
     kuehlerModel: row.kuehlerModel,
     importSourceFileName: row.importSourceFileName,
     importedAt: importedAtIso,
@@ -2516,6 +2620,20 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       res.status(400).json({ error: "Für Kühlermärkte muss 'Stammnr' oder 'Flex-Nummer' gemappt sein." });
       return;
     }
+    if (importType === "kuehler_update") {
+      if (!payload.kuehlerUpdateIdentifier) {
+        res.status(400).json({ error: "Bitte auswählen, über welche Kühlernummer die Zeilen erkannt werden." });
+        return;
+      }
+      if (!isValidColLetter(payload.mapping.kuehlerMatchValue ?? "")) {
+        res.status(400).json({ error: "Für Kühler-Updates muss die Identifikationsspalte gemappt sein." });
+        return;
+      }
+      if (getMappedKuehlerUpdateFields(payload.mapping).length === 0) {
+        res.status(400).json({ error: "Bitte mindestens ein Kühlerfeld zum Aktualisieren mappen." });
+        return;
+      }
+    }
     if (importType === "update") {
       if (!isValidColLetter(payload.mapping.flexNumber ?? "")) {
         res.status(400).json({ error: "Für Markt-Updates muss 'Flex-Nummer' gemappt sein." });
@@ -2531,6 +2649,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       fileName: string;
       sheetName: string;
       importType: ImportDatasetType;
+      kuehlerUpdateIdentifier: KuehlerUpdateIdentifier | null;
       totalParsedRows: number;
       created: number;
       updated: number;
@@ -2554,6 +2673,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       fileName: payload.fileName,
       sheetName: payload.sheetName,
       importType,
+      kuehlerUpdateIdentifier: payload.kuehlerUpdateIdentifier ?? null,
       totalParsedRows: Math.max(rowsAsStrings.length - 1, 0),
       created: 0,
       updated: 0,
@@ -2900,6 +3020,212 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       return;
     }
 
+    if (importType === "kuehler_update") {
+      const identifier = payload.kuehlerUpdateIdentifier as KuehlerUpdateIdentifier;
+      const identifierLabel = getKuehlerUpdateIdentifierLabel(identifier);
+      const mappedUpdateFields = getMappedKuehlerUpdateFields(payload.mapping);
+
+      await db.transaction(async (tx) => {
+        await tx.execute(sql`set local lock_timeout = '5s'`);
+        await tx.execute(sql`set local statement_timeout = '90s'`);
+        const importLock = await tx.execute<{ locked: boolean }>(
+          sql`select pg_try_advisory_xact_lock(47110333) as locked`,
+        );
+        if (!importLock[0]?.locked) {
+          throw new Error("IMPORT_IN_PROGRESS");
+        }
+
+        const existingUnits = await tx
+          .select()
+          .from(marketKuehlerUnits)
+          .where(eq(marketKuehlerUnits.isDeleted, false));
+        const unitsByIdentifier = new Map<string, Array<typeof marketKuehlerUnits.$inferSelect>>();
+        const internalIdOwners = new Map<string, typeof marketKuehlerUnits.$inferSelect>();
+        const technicalIdentNoOwners = new Map<string, typeof marketKuehlerUnits.$inferSelect>();
+
+        for (const unit of existingUnits) {
+          const identifierKey = normStr(getKuehlerUpdateIdentifierValue(unit, identifier) ?? "");
+          if (identifierKey) {
+            const bucket = unitsByIdentifier.get(identifierKey) ?? [];
+            bucket.push(unit);
+            unitsByIdentifier.set(identifierKey, bucket);
+          }
+          const internalIdKey = normStr(unit.kuehlerInternalId ?? "");
+          if (internalIdKey) internalIdOwners.set(internalIdKey, unit);
+          const technicalIdentNoKey = normStr(unit.kuehlerTechnicalIdentNo ?? "");
+          if (technicalIdentNoKey) technicalIdentNoOwners.set(technicalIdentNoKey, unit);
+        }
+
+        const updatedUnitIds = new Set<string>();
+        for (let i = 0; i < dataRows.length; i += 1) {
+          const row = dataRows[i];
+          if (!row) continue;
+          const rowNum = i + 2;
+          if (row.every((cell) => !cell || !cell.trim())) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            continue;
+          }
+
+          const draft = mapRowToDraft(row, payload.mapping, importType);
+          const sampleText = String(draft.kuehlerMatchValue ?? row.find((cell) => cell?.trim()) ?? "");
+          const matchValue = normalizeIdentity(draft.kuehlerMatchValue);
+          const matchKey = normStr(matchValue ?? "");
+          if (!matchKey) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `${identifierLabel} fehlt oder ist leer`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+
+          const candidates = unitsByIdentifier.get(matchKey) ?? [];
+          if (candidates.length === 0) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `Kein aktiver Kühler mit ${identifierLabel} ${matchValue} gefunden`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+          if (candidates.length > 1) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `${identifierLabel} ${matchValue} ist nicht eindeutig (${candidates.length} Kühler)`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+
+          const existingUnit = candidates[0];
+          if (!existingUnit) continue;
+          if (updatedUnitIds.has(existingUnit.id)) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `Doppelter Kühler in der Datei (${identifierLabel} ${matchValue})`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+
+          const unitPatch = buildKuehlerUpdatePatch(draft, mappedUpdateFields);
+          const nextInternalId = Object.prototype.hasOwnProperty.call(unitPatch, "kuehlerInternalId")
+            ? normalizeIdentity(unitPatch.kuehlerInternalId)
+            : null;
+          const nextTechnicalIdentNo = Object.prototype.hasOwnProperty.call(unitPatch, "kuehlerTechnicalIdentNo")
+            ? normalizeIdentity(unitPatch.kuehlerTechnicalIdentNo)
+            : null;
+          const conflictingInternalIdOwner = nextInternalId
+            ? internalIdOwners.get(normStr(nextInternalId))
+            : undefined;
+          const conflictingTechnicalIdentNoOwner = nextTechnicalIdentNo
+            ? technicalIdentNoOwners.get(normStr(nextTechnicalIdentNo))
+            : undefined;
+          if (
+            (conflictingInternalIdOwner && conflictingInternalIdOwner.id !== existingUnit.id) ||
+            (conflictingTechnicalIdentNoOwner && conflictingTechnicalIdentNoOwner.id !== existingUnit.id)
+          ) {
+            const conflictLabel = conflictingInternalIdOwner ? "internal_id" : "Tech. Ident. No.";
+            const conflictValue = conflictingInternalIdOwner ? nextInternalId : nextTechnicalIdentNo;
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: `${conflictLabel} ${conflictValue} gehört bereits zu einem anderen Kühler`,
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+
+          if (!kuehlerUnitPatchHasChanges(existingUnit, unitPatch)) {
+            summary.unchanged += 1;
+            continue;
+          }
+
+          const [updatedUnit] = await tx
+            .update(marketKuehlerUnits)
+            .set({
+              ...unitPatch,
+              updatedAt: new Date(),
+            })
+            .where(and(eq(marketKuehlerUnits.id, existingUnit.id), eq(marketKuehlerUnits.isDeleted, false)))
+            .returning();
+          if (!updatedUnit) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            continue;
+          }
+
+          updatedUnitIds.add(existingUnit.id);
+          summary.updated += 1;
+          summary.kuehlerUnitsUpdated += 1;
+
+          const previousInternalIdKey = normStr(existingUnit.kuehlerInternalId ?? "");
+          const updatedInternalIdKey = normStr(updatedUnit.kuehlerInternalId ?? "");
+          if (previousInternalIdKey && previousInternalIdKey !== updatedInternalIdKey) {
+            internalIdOwners.delete(previousInternalIdKey);
+          }
+          if (updatedInternalIdKey) internalIdOwners.set(updatedInternalIdKey, updatedUnit);
+
+          const previousTechnicalIdentNoKey = normStr(existingUnit.kuehlerTechnicalIdentNo ?? "");
+          const updatedTechnicalIdentNoKey = normStr(updatedUnit.kuehlerTechnicalIdentNo ?? "");
+          if (previousTechnicalIdentNoKey && previousTechnicalIdentNoKey !== updatedTechnicalIdentNoKey) {
+            technicalIdentNoOwners.delete(previousTechnicalIdentNoKey);
+          }
+          if (updatedTechnicalIdentNoKey) {
+            technicalIdentNoOwners.set(updatedTechnicalIdentNoKey, updatedUnit);
+          }
+        }
+      });
+
+      const fresh = await db
+        .select()
+        .from(markets)
+        .where(eq(markets.isDeleted, false))
+        .orderBy(desc(markets.createdAt));
+      logAction("info", "market_kuehler_update_import_completed", {
+        req,
+        action: "market_import",
+        result: "success",
+        statusCode: 200,
+        requestClass: "success",
+        startedAtNs,
+        details: {
+          importType,
+          identifier,
+          updated: summary.updated,
+          unchanged: summary.unchanged,
+          skipped: summary.skipped,
+        },
+      });
+      res.status(200).json({ markets: fresh.map(mapMarketRow), summary });
+      return;
+    }
+
     if (importType === "kuehler") {
       await db.transaction(async (tx) => {
         await tx.execute(sql`set local lock_timeout = '5s'`);
@@ -2915,7 +3241,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         const existingUnits = await tx
           .select()
           .from(marketKuehlerUnits)
-          .where(and(eq(marketKuehlerUnits.isDeleted, false), isNotNull(marketKuehlerUnits.kuehlerInternalId)));
+          .where(eq(marketKuehlerUnits.isDeleted, false));
 
         const marketByCanonicalStammnr = new Map<string, typeof markets.$inferSelect>();
         const marketsByCanonicalFlex = new Map<string, Array<typeof markets.$inferSelect>>();
@@ -2944,10 +3270,12 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         }
 
         const unitByCanonicalInternalId = new Map<string, typeof marketKuehlerUnits.$inferSelect>();
+        const unitByCanonicalTechnicalIdentNo = new Map<string, typeof marketKuehlerUnits.$inferSelect>();
         for (const unit of existingUnits) {
-          const key = normStr(unit.kuehlerInternalId ?? "");
-          if (!key) continue;
-          unitByCanonicalInternalId.set(key, unit);
+          const internalIdKey = normStr(unit.kuehlerInternalId ?? "");
+          if (internalIdKey) unitByCanonicalInternalId.set(internalIdKey, unit);
+          const technicalIdentNoKey = normStr(unit.kuehlerTechnicalIdentNo ?? "");
+          if (technicalIdentNoKey) unitByCanonicalTechnicalIdentNo.set(technicalIdentNoKey, unit);
         }
 
         const seedByCanonicalStammnr = new Map<
@@ -3193,6 +3521,8 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
           const normalizedInternalId = normalizeIdentity(draft.kuehlerInternalId);
           const canonicalInternalId = normStr(normalizedInternalId ?? "");
+          const normalizedTechnicalIdentNo = normalizeIdentity(draft.kuehlerTechnicalIdentNo);
+          const canonicalTechnicalIdentNo = normStr(normalizedTechnicalIdentNo ?? "");
           const unitName = normalizeOptionalText(String(draft.name ?? "")) ?? "";
           const unitEmployee = normalizeOptionalText(String(draft.employee ?? "")) ?? "";
           const unitBd = normalizeOptionalText(String(draft.kuehlerBd ?? ""));
@@ -3203,9 +3533,31 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
               ? Number(draft.kuehlerAnzahlKsAmStandort)
               : null;
 
-          if (canonicalInternalId) {
-            const existingUnit = unitByCanonicalInternalId.get(canonicalInternalId);
-            if (existingUnit) {
+          const existingUnitByInternalId = canonicalInternalId
+            ? unitByCanonicalInternalId.get(canonicalInternalId)
+            : undefined;
+          const existingUnitByTechnicalIdentNo = canonicalTechnicalIdentNo
+            ? unitByCanonicalTechnicalIdentNo.get(canonicalTechnicalIdentNo)
+            : undefined;
+          if (
+            existingUnitByInternalId &&
+            existingUnitByTechnicalIdentNo &&
+            existingUnitByInternalId.id !== existingUnitByTechnicalIdentNo.id
+          ) {
+            summary.skipped += 1;
+            summary.kuehlerUnitsSkipped += 1;
+            if (summary.skippedReasons.length < 50) {
+              summary.skippedReasons.push({
+                row: rowNum,
+                reason: "internal_id und Tech. Ident. No. gehören zu unterschiedlichen Kühlern",
+                sample: sampleText,
+                draft,
+              });
+            }
+            continue;
+          }
+          const existingUnit = existingUnitByInternalId ?? existingUnitByTechnicalIdentNo;
+          if (existingUnit) {
               const [updatedUnit] = await tx
                 .update(marketKuehlerUnits)
                 .set({
@@ -3216,6 +3568,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
                   kuehlerBd: unitBd,
                   kuehlerAnzahlKsAmStandort: unitCount,
                   kuehlerSerialNumber: unitSerial,
+                  kuehlerTechnicalIdentNo: normalizedTechnicalIdentNo,
                   kuehlerModel: unitModel,
                   importSourceFileName: payload.fileName,
                   importedAt,
@@ -3226,12 +3579,14 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
                 .returning();
               if (updatedUnit) {
                 summary.kuehlerUnitsUpdated += 1;
-                unitByCanonicalInternalId.set(canonicalInternalId, updatedUnit);
+                if (canonicalInternalId) unitByCanonicalInternalId.set(canonicalInternalId, updatedUnit);
+                if (canonicalTechnicalIdentNo) {
+                  unitByCanonicalTechnicalIdentNo.set(canonicalTechnicalIdentNo, updatedUnit);
+                }
               } else {
                 summary.kuehlerUnitsSkipped += 1;
               }
               continue;
-            }
           }
 
           const [createdUnit] = await tx
@@ -3244,6 +3599,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
               kuehlerBd: unitBd,
               kuehlerAnzahlKsAmStandort: unitCount,
               kuehlerSerialNumber: unitSerial,
+              kuehlerTechnicalIdentNo: normalizedTechnicalIdentNo,
               kuehlerModel: unitModel,
               importSourceFileName: payload.fileName,
               importedAt,
@@ -3254,6 +3610,9 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             summary.kuehlerUnitsCreated += 1;
             if (canonicalInternalId) {
               unitByCanonicalInternalId.set(canonicalInternalId, createdUnit);
+            }
+            if (canonicalTechnicalIdentNo) {
+              unitByCanonicalTechnicalIdentNo.set(canonicalTechnicalIdentNo, createdUnit);
             }
           } else {
             summary.kuehlerUnitsSkipped += 1;
@@ -3761,6 +4120,31 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       });
       return;
     }
+    const kuehlerUnitUniqueViolation = getPgUniqueViolation(err);
+    if (
+      kuehlerUnitUniqueViolation?.constraint === "market_kuehler_units_internal_id_active_unique" ||
+      kuehlerUnitUniqueViolation?.constraint === "market_kuehler_units_technical_ident_no_active_unique"
+    ) {
+      const label = kuehlerUnitUniqueViolation.constraint === "market_kuehler_units_internal_id_active_unique"
+        ? "internal_id"
+        : "Tech. Ident. No.";
+      logAction("warn", "market_import_kuehler_identity_conflict", {
+        req,
+        action: "market_import",
+        result: "failure",
+        statusCode: 409,
+        requestClass: "client_error",
+        startedAtNs,
+        error: err,
+        details: { constraint: kuehlerUnitUniqueViolation.constraint },
+      });
+      markErrorAsLogged(err);
+      res.status(409).json({
+        error: `${label} ist bereits einem anderen aktiven Kühler zugeordnet. Es wurde nichts aus dieser Datei gespeichert.`,
+        code: "market_import_kuehler_identity_conflict",
+      });
+      return;
+    }
     if (isPgLockTimeout(err)) {
       logAction("warn", "market_import_lock_timeout", {
         req,
@@ -3881,6 +4265,7 @@ adminMarketsRouter.post("/:id/kuehler-units", async (req: AuthedRequest, res, ne
           kuehlerBd: normalizeOptionalText(payload.kuehlerBd),
           kuehlerAnzahlKsAmStandort: payload.kuehlerAnzahlKsAmStandort ?? null,
           kuehlerSerialNumber: normalizeOptionalText(payload.kuehlerSerialNumber),
+          kuehlerTechnicalIdentNo: normalizeIdentity(payload.kuehlerTechnicalIdentNo),
           kuehlerModel: normalizeOptionalText(payload.kuehlerModel),
           importSourceFileName: payload.importSourceFileName,
           importedAt: payload.importedAt ? new Date(payload.importedAt) : new Date(),
@@ -3928,8 +4313,14 @@ adminMarketsRouter.post("/:id/kuehler-units", async (req: AuthedRequest, res, ne
     res.status(201).json({ unit: mapKuehlerUnitRow(txResult.unit) });
   } catch (err) {
     const uniqueViolation = getPgUniqueViolation(err);
-    if (uniqueViolation?.constraint === "market_kuehler_units_internal_id_active_unique") {
-      res.status(409).json({ error: "Kühler konnte nicht angelegt werden: internal_id bereits vorhanden." });
+    if (
+      uniqueViolation?.constraint === "market_kuehler_units_internal_id_active_unique" ||
+      uniqueViolation?.constraint === "market_kuehler_units_technical_ident_no_active_unique"
+    ) {
+      const label = uniqueViolation.constraint === "market_kuehler_units_internal_id_active_unique"
+        ? "internal_id"
+        : "Tech. Ident. No.";
+      res.status(409).json({ error: `Kühler konnte nicht angelegt werden: ${label} bereits vorhanden.` });
       return;
     }
     next(err);
@@ -3979,6 +4370,8 @@ adminMarketsRouter.patch("/:marketId/kuehler-units/:unitId", async (req: AuthedR
           payload.kuehlerAnzahlKsAmStandort != null ? payload.kuehlerAnzahlKsAmStandort : undefined,
         kuehlerSerialNumber:
           payload.kuehlerSerialNumber != null ? normalizeOptionalText(payload.kuehlerSerialNumber) : undefined,
+        kuehlerTechnicalIdentNo:
+          payload.kuehlerTechnicalIdentNo != null ? normalizeIdentity(payload.kuehlerTechnicalIdentNo) : undefined,
         kuehlerModel: payload.kuehlerModel != null ? normalizeOptionalText(payload.kuehlerModel) : undefined,
         importSourceFileName:
           payload.importSourceFileName != null ? payload.importSourceFileName : undefined,
@@ -3995,8 +4388,14 @@ adminMarketsRouter.patch("/:marketId/kuehler-units/:unitId", async (req: AuthedR
     res.status(200).json({ unit: mapKuehlerUnitRow(updatedUnit) });
   } catch (err) {
     const uniqueViolation = getPgUniqueViolation(err);
-    if (uniqueViolation?.constraint === "market_kuehler_units_internal_id_active_unique") {
-      res.status(409).json({ error: "Kühler konnte nicht aktualisiert werden: internal_id bereits vorhanden." });
+    if (
+      uniqueViolation?.constraint === "market_kuehler_units_internal_id_active_unique" ||
+      uniqueViolation?.constraint === "market_kuehler_units_technical_ident_no_active_unique"
+    ) {
+      const label = uniqueViolation.constraint === "market_kuehler_units_internal_id_active_unique"
+        ? "internal_id"
+        : "Tech. Ident. No.";
+      res.status(409).json({ error: `Kühler konnte nicht aktualisiert werden: ${label} bereits vorhanden.` });
       return;
     }
     next(err);

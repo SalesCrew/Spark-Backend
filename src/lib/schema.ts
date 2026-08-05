@@ -425,6 +425,7 @@ export const marketKuehlerUnits = pgTable(
     kuehlerBd: text("kuehler_bd"),
     kuehlerAnzahlKsAmStandort: integer("kuehler_anzahl_ks_am_standort"),
     kuehlerSerialNumber: text("kuehler_serial_number"),
+    kuehlerTechnicalIdentNo: text("kuehler_technical_ident_no"),
     kuehlerModel: text("kuehler_model"),
     importSourceFileName: text("import_source_file_name").notNull().default(""),
     importedAt: timestamp("imported_at", { withTimezone: true }).defaultNow().notNull(),
@@ -438,6 +439,9 @@ export const marketKuehlerUnits = pgTable(
     uniqueIndex("market_kuehler_units_internal_id_active_unique")
       .on(table.kuehlerInternalId)
       .where(sql`${table.isDeleted} = false AND ${table.kuehlerInternalId} IS NOT NULL`),
+    uniqueIndex("market_kuehler_units_technical_ident_no_active_unique")
+      .on(table.kuehlerTechnicalIdentNo)
+      .where(sql`${table.isDeleted} = false AND ${table.kuehlerTechnicalIdentNo} IS NOT NULL`),
     index("market_kuehler_units_deleted_idx").on(table.isDeleted),
   ],
 );
