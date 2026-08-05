@@ -1,6 +1,7 @@
 import type { Responses } from "openai/resources/responses/responses";
 import { z } from "zod";
 import { adminKurtiChartSpecSchema } from "./admin-kurti-charts.js";
+import { ADMIN_KURTI_EXPORT_TOOL } from "./admin-kurti-exports.js";
 import {
   ADMIN_KURTI_VISUALIZATION_SKILL_IDS,
   buildAdminKurtiVisualizationSkillContext,
@@ -65,7 +66,7 @@ function functionTool(
 export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
   functionTool(
     "load_admin_tool_group",
-    "Loads additional read-only Admin Kurti research or visualization tools only when the currently available tools do not cover the question. Available groups: overview, people, markets_inventory, visits_campaigns, time, ipp, bonus, questionnaires, photos, reviews_audit, visualizations. Call this instead of claiming that data or a display type is unavailable.",
+    "Loads additional read-only Admin Kurti research, export, or visualization tools only when the currently available tools do not cover the question. Available groups: overview, people, markets_inventory, visits_campaigns, time, ipp, bonus, questionnaires, photos, reviews_audit, exports, visualizations. Call this instead of claiming that data or a display type is unavailable.",
     {
       groups: {
         type: "array",
@@ -73,12 +74,13 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
         maxItems: 5,
         items: {
           type: "string",
-          enum: ["overview", "people", "markets_inventory", "visits_campaigns", "time", "ipp", "bonus", "questionnaires", "photos", "reviews_audit", "visualizations"],
+          enum: ["overview", "people", "markets_inventory", "visits_campaigns", "time", "ipp", "bonus", "questionnaires", "photos", "reviews_audit", "exports", "visualizations"],
         },
       },
     },
     ["groups"],
   ),
+  ADMIN_KURTI_EXPORT_TOOL,
   functionTool(
     "load_admin_visualization_skill",
     "Loads one to three trusted Admin Kurti SKILL.md guides before choosing or calling a visualization renderer. Call this when the needed specific visualization skill was not already included in the active developer context. Read every returned guide fully and obey its selection, integrity, and rendering rules.",
