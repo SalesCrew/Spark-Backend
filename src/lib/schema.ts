@@ -404,6 +404,11 @@ export const markets = pgTable(
     index("markets_current_gm_name_idx").on(table.currentGmName),
     index("markets_active_idx").on(table.isActive),
     index("markets_deleted_idx").on(table.isDeleted),
+    index("markets_flex_eligible_sync_idx")
+      .on(table.marketType, table.id)
+      .where(
+        sql`${table.isDeleted} = false AND ${table.isActive} = true AND ${table.marketType} IN ('universum', 'both')`,
+      ),
   ],
 );
 
@@ -524,6 +529,9 @@ export const campaigns = pgTable("campaigns", {
   index("campaigns_assigned_gm_active_idx")
     .on(table.assignedGmUserId, table.section, table.status)
     .where(sql`${table.isDeleted} = false AND ${table.assignedGmUserId} IS NOT NULL`),
+  index("campaigns_flex_open_sync_idx")
+    .on(table.status, table.scheduleType, table.endDate)
+    .where(sql`${table.isDeleted} = false AND ${table.section} = 'flex'`),
 ]);
 
 export const campaignMarketAssignments = pgTable(
@@ -1284,6 +1292,37 @@ export const praemienWaveFlexScores = pgTable(
       .on(table.waveId, table.gmUserId)
       .where(sql`${table.isDeleted} = false`),
     index("praemien_wave_flex_scores_wave_idx").on(table.waveId, table.isDeleted),
+  ],
+);
+
+export const praemienWavePillarOverrides = pgTable(
+  "praemien_wave_pillar_overrides",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    waveId: uuid("wave_id")
+      .notNull()
+      .references(() => praemienWaves.id, { onDelete: "cascade" }),
+    pillarId: uuid("pillar_id")
+      .notNull()
+      .references(() => praemienWavePillars.id, { onDelete: "cascade" }),
+    gmUserId: uuid("gm_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    points: numeric("points", { precision: 14, scale: 4 }).notNull(),
+    note: text("note"),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("praemien_wave_pillar_overrides_points_ck", sql`${table.points} >= 0`),
+    uniqueIndex("praemien_wave_pillar_overrides_wave_pillar_gm_active_unique")
+      .on(table.waveId, table.pillarId, table.gmUserId)
+      .where(sql`${table.isDeleted} = false`),
+    index("praemien_wave_pillar_overrides_wave_idx").on(table.waveId, table.isDeleted),
+    index("praemien_wave_pillar_overrides_gm_wave_idx").on(table.gmUserId, table.waveId),
+    index("praemien_wave_pillar_overrides_pillar_gm_idx").on(table.pillarId, table.gmUserId),
   ],
 );
 

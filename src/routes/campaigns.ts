@@ -11,6 +11,7 @@ import { db } from "../lib/db.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { buildVisitAnswerValidationResult, computeMissingRequiredQuestions } from "../lib/visit-session-answer-validation.js";
+import { readRequestedCommentChange } from "../lib/answer-change-request.js";
 import {
   reconcileCampaignVisitExportDetails,
   uniqueCampaignVisitExportRequests,
@@ -46,6 +47,7 @@ const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "m
 const campaignStatusSchema = z.enum(["active", "scheduled", "inactive"]);
 const scheduleTypeSchema = z.enum(["always", "scheduled"]);
 const CAMPAIGN_ASSIGNMENT_INSERT_BATCH_SIZE = 500;
+const DYNAMIC_FLEX_ASSIGNMENT_LOCK_KEY = "coke_spark_dynamic_flex_assignments";
 const VISIT_PHOTOS_BUCKET = "visit-photos";
 const VISIT_PHOTO_READ_URL_TTL_SECONDS = 30 * 60;
 const VISIT_PHOTO_READ_URL_TIMEOUT_MS = 1800;
@@ -735,20 +737,6 @@ async function ensureMarketsExist(marketIds: string[]) {
   if (missing.length > 0) {
     throw new CampaignDomainError("market_missing", 400, "Mindestens ein Markt existiert nicht oder ist gelöscht.");
   }
-}
-
-async function loadActiveUniversumMarketIds(): Promise<string[]> {
-  const rows = await db
-    .select({ id: markets.id })
-    .from(markets)
-    .where(
-      and(
-        eq(markets.isDeleted, false),
-        eq(markets.isActive, true),
-        inArray(markets.marketType, ["universum", "both"]),
-      ),
-    );
-  return rows.map((row) => row.id);
 }
 
 type CampaignAssignmentInput = {
@@ -2409,10 +2397,16 @@ adminCampaignsRouter.get("/campaigns/answer-change-requests", async (req: Authed
       .limit(250);
 
     const requests = rows.map((row) => {
-      const applicability = normalizeChangeRequestAnswerPayload({
-        questionType: row.questionType,
-        payload: asPlainRecord(row.requestedAnswerPayload),
-      });
+      const requestedPayload = asPlainRecord(row.requestedAnswerPayload);
+      const commentChange = readRequestedCommentChange(requestedPayload);
+      const applicability = commentChange.kind === "comment"
+        ? { ok: true as const, answer: null }
+        : commentChange.kind === "invalid"
+          ? { ok: false as const, error: commentChange.error, code: "invalid_comment_change_request" }
+          : normalizeChangeRequestAnswerPayload({
+              questionType: row.questionType,
+              payload: requestedPayload,
+            });
       return {
         id: row.id,
         status: row.status,
@@ -2587,9 +2581,138 @@ adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve
         throw error;
       }
 
+      const requestedPayload = asPlainRecord(requestRow.requestedAnswerPayload);
+      const requestedCommentChange = readRequestedCommentChange(requestedPayload);
+      if (requestedCommentChange.kind === "invalid") {
+        const error = new Error(requestedCommentChange.error) as Error & { status?: number; code?: string };
+        error.status = 400;
+        error.code = "invalid_comment_change_request";
+        throw error;
+      }
+
+      if (requestedCommentChange.kind === "comment") {
+        const siblingQuestions = await tx
+          .select({
+            visitQuestionId: visitSessionQuestions.id,
+          })
+          .from(visitSessionQuestions)
+          .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitSessionQuestions.visitSessionSectionId))
+          .where(
+            and(
+              eq(visitSessionSections.visitSessionId, session.id),
+              eq(visitSessionSections.isDeleted, false),
+              eq(visitSessionQuestions.questionId, visitQuestion.questionId),
+              eq(visitSessionQuestions.isDeleted, false),
+            ),
+          );
+        const siblingQuestionIds = siblingQuestions.map((row) => row.visitQuestionId);
+        if (siblingQuestionIds.length === 0) {
+          throw new Error("Keine zugehörigen Fragen in der Session gefunden.");
+        }
+
+        await tx.execute(
+          sql`SELECT id FROM ${visitSessionQuestions} WHERE ${inArray(visitSessionQuestions.id, siblingQuestionIds)} FOR UPDATE`,
+        );
+        const existingComments = await tx
+          .select()
+          .from(visitQuestionComments)
+          .where(
+            and(
+              inArray(visitQuestionComments.visitSessionQuestionId, siblingQuestionIds),
+              eq(visitQuestionComments.isDeleted, false),
+            ),
+          );
+        const existingAnswers = await tx
+          .select({ id: visitAnswers.id, visitSessionQuestionId: visitAnswers.visitSessionQuestionId })
+          .from(visitAnswers)
+          .where(
+            and(
+              inArray(visitAnswers.visitSessionQuestionId, siblingQuestionIds),
+              eq(visitAnswers.isDeleted, false),
+            ),
+          );
+        const commentByQuestionId = new Map(existingComments.map((row) => [row.visitSessionQuestionId, row]));
+        const answerByQuestionId = new Map(existingAnswers.map((row) => [row.visitSessionQuestionId, row]));
+        const commentAuditEvents: Array<typeof visitAnswerEvents.$inferInsert> = [];
+
+        for (const sibling of siblingQuestions) {
+          const existingComment = commentByQuestionId.get(sibling.visitQuestionId);
+          const beforeComment = existingComment?.commentText ?? null;
+          if (!requestedCommentChange.comment) {
+            if (existingComment) {
+              await tx
+                .update(visitQuestionComments)
+                .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+                .where(eq(visitQuestionComments.id, existingComment.id));
+            }
+          } else if (existingComment) {
+            await tx
+              .update(visitQuestionComments)
+              .set({ commentText: requestedCommentChange.comment, commentedAt: now, updatedAt: now })
+              .where(eq(visitQuestionComments.id, existingComment.id));
+          } else {
+            await tx.insert(visitQuestionComments).values({
+              visitSessionQuestionId: sibling.visitQuestionId,
+              commentText: requestedCommentChange.comment,
+              commentedAt: now,
+              isDeleted: false,
+              deletedAt: null,
+              createdAt: now,
+              updatedAt: now,
+            });
+          }
+
+          const siblingAnswer = answerByQuestionId.get(sibling.visitQuestionId);
+          if (siblingAnswer) {
+            commentAuditEvents.push({
+              visitAnswerId: siblingAnswer.id,
+              eventType: "set",
+              payload: {
+                source: "admin_comment_change_request_approved",
+                requestId: requestRow.id,
+                sessionId: session.id,
+                visitQuestionId: sibling.visitQuestionId,
+                beforeComment,
+                afterComment: requestedCommentChange.comment || null,
+              },
+              actorUserId,
+              createdAt: now,
+            });
+          }
+        }
+        if (commentAuditEvents.length > 0) {
+          await tx.insert(visitAnswerEvents).values(commentAuditEvents);
+        }
+
+        await tx
+          .update(visitAnswerChangeRequests)
+          .set({
+            status: "approved",
+            reviewedByUserId: actorUserId,
+            reviewedAt: now,
+            adminNote: parsed.data.adminNote || null,
+            updatedAt: now,
+          })
+          .where(eq(visitAnswerChangeRequests.id, requestRow.id));
+        await tx
+          .update(visitSessions)
+          .set({ lastSavedAt: now, updatedAt: now })
+          .where(eq(visitSessions.id, session.id));
+
+        return {
+          requestId: requestRow.id,
+          answerId: requestRow.visitAnswerId,
+          sessionId: session.id,
+          gmUserId: session.gmUserId,
+          marketId: session.marketId,
+          submittedAt: session.submittedAt ?? now,
+          affectsAnswer: false,
+        };
+      }
+
       const rawAnswer = normalizeChangeRequestAnswerPayload({
         questionType: visitQuestion.questionType,
-        payload: asPlainRecord(requestRow.requestedAnswerPayload),
+        payload: requestedPayload,
       });
       if (!rawAnswer.ok) {
         const error = new Error(rawAnswer.error) as Error & { status?: number; code?: string };
@@ -2777,35 +2900,42 @@ adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve
         gmUserId: session.gmUserId,
         marketId: session.marketId,
         submittedAt: session.submittedAt ?? now,
+        affectsAnswer: true,
       };
     });
 
-    try {
-      await enqueueIppRecalcForDate(result.marketId, result.submittedAt, "visit_answer_change_request_approved");
-    } catch (enqueueError) {
-      logger.error("answer_change_request_ipp_enqueue_failed", {
-        action: "answer_change_request_approved",
-        result: "failure",
-        requestId: result.requestId,
-        sessionId: result.sessionId,
-        marketId: result.marketId,
-        error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
-      });
-    }
-    try {
-      await recomputeGmKpiCache(result.gmUserId);
-    } catch (kpiError) {
-      logger.error("answer_change_request_kpi_recompute_failed", {
-        action: "answer_change_request_approved",
-        result: "failure",
-        requestId: result.requestId,
-        sessionId: result.sessionId,
-        gmUserId: result.gmUserId,
-        error: kpiError instanceof Error ? kpiError.message : String(kpiError),
-      });
+    if (result.affectsAnswer) {
+      try {
+        await enqueueIppRecalcForDate(result.marketId, result.submittedAt, "visit_answer_change_request_approved");
+      } catch (enqueueError) {
+        logger.error("answer_change_request_ipp_enqueue_failed", {
+          action: "answer_change_request_approved",
+          result: "failure",
+          requestId: result.requestId,
+          sessionId: result.sessionId,
+          marketId: result.marketId,
+          error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
+        });
+      }
+      try {
+        await recomputeGmKpiCache(result.gmUserId);
+      } catch (kpiError) {
+        logger.error("answer_change_request_kpi_recompute_failed", {
+          action: "answer_change_request_approved",
+          result: "failure",
+          requestId: result.requestId,
+          sessionId: result.sessionId,
+          gmUserId: result.gmUserId,
+          error: kpiError instanceof Error ? kpiError.message : String(kpiError),
+        });
+      }
     }
 
-    res.status(200).json({ ok: true, request: { id: result.requestId, status: "approved" }, answerId: result.answerId });
+    res.status(200).json({
+      ok: true,
+      request: { id: result.requestId, status: "approved" },
+      ...(result.answerId ? { answerId: result.answerId } : {}),
+    });
   } catch (error) {
     const err = error as Error & { status?: number; code?: string };
     if (err.status) {
@@ -3636,38 +3766,63 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
     const now = new Date();
     const auditUserId = await resolveAuditUserId(req.authUser?.appUserId);
     const schedule = normalizeSchedule(parsed.data);
-    const autoFlexMarketIds = parsed.data.section === "flex"
-      ? await loadActiveUniversumMarketIds()
-      : null;
-    const assignments = normalizeAssignments({
+    const isFlexCampaign = parsed.data.section === "flex";
+    const requestedAssignments = normalizeAssignments({
       section: parsed.data.section,
-      marketIds: autoFlexMarketIds ?? parsed.data.marketIds,
-      ...(parsed.data.section !== "flex" && parsed.data.assignments ? { assignments: parsed.data.assignments } : {}),
+      marketIds: isFlexCampaign ? [] : parsed.data.marketIds,
+      ...(!isFlexCampaign && parsed.data.assignments ? { assignments: parsed.data.assignments } : {}),
     });
-    const marketIds = assignments.map((assignment) => assignment.marketId);
-    if (parsed.data.section === "flex" && marketIds.length === 0) {
-      throw new CampaignDomainError("invalid_payload", 400, "Keine aktiven Universumsmärkte für Flexkampagne gefunden.");
-    }
     if (parsed.data.currentFragebogenId) {
       await ensureFragebogenMatchesSection(parsed.data.section, parsed.data.currentFragebogenId);
     }
-    await ensureMarketsExist(marketIds);
-    await ensureGmUsersExist(assignments.map((assignment) => assignment.gmUserId));
-    const conflicts = await findCampaignAssignmentConflicts({
-      section: parsed.data.section,
-      targetStatus: parsed.data.status,
-      targetWindow: {
-        scheduleType: schedule.scheduleType,
-        startDate: schedule.startDate,
-        endDate: schedule.endDate,
-      },
-      assignments,
-    });
-    if (conflicts.length > 0) {
-      throw new CampaignOverlapConflictError(conflicts);
+    if (!isFlexCampaign) {
+      const marketIds = requestedAssignments.map((assignment) => assignment.marketId);
+      await ensureMarketsExist(marketIds);
+      await ensureGmUsersExist(requestedAssignments.map((assignment) => assignment.gmUserId));
+      const conflicts = await findCampaignAssignmentConflicts({
+        section: parsed.data.section,
+        targetStatus: parsed.data.status,
+        targetWindow: {
+          scheduleType: schedule.scheduleType,
+          startDate: schedule.startDate,
+          endDate: schedule.endDate,
+        },
+        assignments: requestedAssignments,
+      });
+      if (conflicts.length > 0) {
+        throw new CampaignOverlapConflictError(conflicts);
+      }
     }
 
     const createResult = await db.transaction(async (tx) => {
+      let assignments = requestedAssignments;
+      if (isFlexCampaign) {
+        await tx.execute(
+          sql`SELECT pg_advisory_xact_lock(hashtext(${DYNAMIC_FLEX_ASSIGNMENT_LOCK_KEY}))`,
+        );
+        const autoFlexMarkets = await tx
+          .select({ id: markets.id })
+          .from(markets)
+          .where(
+            and(
+              eq(markets.isDeleted, false),
+              eq(markets.isActive, true),
+              inArray(markets.marketType, ["universum", "both"]),
+            ),
+          );
+        assignments = normalizeAssignments({
+          section: "flex",
+          marketIds: autoFlexMarkets.map((market) => market.id),
+        });
+        if (assignments.length === 0) {
+          throw new CampaignDomainError(
+            "invalid_payload",
+            400,
+            "Keine aktiven Universumsmärkte für Flexkampagne gefunden.",
+          );
+        }
+      }
+
       const [created] = await tx
         .insert(campaigns)
         .values({
@@ -3726,7 +3881,7 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
           .returning();
         historyRow = createdHistory ?? null;
       }
-      return { campaign: created, historyRow };
+      return { campaign: created, historyRow, assignments };
     });
 
     const campaign = {
@@ -3744,8 +3899,8 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
       scheduleType: createResult.campaign.scheduleType,
       startDate: createResult.campaign.startDate ? String(createResult.campaign.startDate) : null,
       endDate: createResult.campaign.endDate ? String(createResult.campaign.endDate) : null,
-      marketIds: normalizeUnique(assignments.map((assignment) => assignment.marketId)),
-      assignments: assignments.map((assignment) => ({
+      marketIds: normalizeUnique(createResult.assignments.map((assignment) => assignment.marketId)),
+      assignments: createResult.assignments.map((assignment) => ({
         marketId: assignment.marketId,
         gmUserId: assignment.gmUserId,
         gmName: null,
@@ -3777,7 +3932,7 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
       details: {
         campaignId: createResult.campaign.id,
         section: parsed.data.section,
-        assignmentsCount: assignments.length,
+        assignmentsCount: createResult.assignments.length,
       },
     });
   } catch (error) {
