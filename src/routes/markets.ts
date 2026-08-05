@@ -1177,6 +1177,7 @@ type ProgressMarketRow = {
   campaignName: string;
   kuehlerUnitId: string | null;
   kuehlerNumber: string | null;
+  kuehlerTechnicalIdentNo: string | null;
   chain: string;
   address: string;
   stammnr: string | null;
@@ -2127,6 +2128,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
               id: marketKuehlerUnits.id,
               marketId: marketKuehlerUnits.marketId,
               kuehlerInternalId: marketKuehlerUnits.kuehlerInternalId,
+              kuehlerTechnicalIdentNo: marketKuehlerUnits.kuehlerTechnicalIdentNo,
               kuehlerSerialNumber: marketKuehlerUnits.kuehlerSerialNumber,
               kuehlerModel: marketKuehlerUnits.kuehlerModel,
               createdAt: marketKuehlerUnits.createdAt,
@@ -2210,6 +2212,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
               campaignName: row.campaignName,
               kuehlerUnitId: unit?.id ?? null,
               kuehlerNumber: unit?.kuehlerInternalId ?? (desiredCount > 1 ? `Kühler ${index + 1}` : null),
+              kuehlerTechnicalIdentNo: unit?.kuehlerTechnicalIdentNo ?? null,
               chain: row.chain,
               address: row.address,
               stammnr: row.stammnr,
@@ -2225,6 +2228,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
           campaignName: row.campaignName,
           kuehlerUnitId: null,
           kuehlerNumber: null,
+          kuehlerTechnicalIdentNo: null,
           chain: row.chain,
           address: row.address,
           stammnr: row.stammnr,

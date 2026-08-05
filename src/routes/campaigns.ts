@@ -478,6 +478,7 @@ type CampaignMarketVisitStatusRow = {
   marketId: string;
   kuehlerUnitId: string | null;
   kuehlerNumber: string | null;
+  kuehlerTechnicalIdentNo: string | null;
   targetVisitCount: number;
   submittedVisitCount: number;
   isComplete: boolean;
@@ -655,6 +656,7 @@ async function buildCampaignMarketVisitStatusBatch(
               marketId,
               kuehlerUnitId: unit?.id ?? null,
               kuehlerNumber: unit?.kuehlerInternalId ?? (rowCount > 1 ? `Kühler ${index + 1}` : null),
+              kuehlerTechnicalIdentNo: unit?.kuehlerTechnicalIdentNo ?? null,
               targetVisitCount: 1,
               submittedVisitCount,
               isComplete: submittedVisitCount >= 1,
@@ -675,6 +677,7 @@ async function buildCampaignMarketVisitStatusBatch(
           marketId,
           kuehlerUnitId: null,
           kuehlerNumber: null,
+          kuehlerTechnicalIdentNo: null,
           targetVisitCount,
           submittedVisitCount,
           isComplete: targetVisitCount > 0 && submittedVisitCount >= targetVisitCount,
@@ -1392,6 +1395,7 @@ async function buildCampaignMarketVisitSummaries(
       sessionId: visitSessions.id,
       kuehlerUnitId: visitSessions.kuehlerUnitId,
       kuehlerInternalId: marketKuehlerUnits.kuehlerInternalId,
+      kuehlerTechnicalIdentNo: marketKuehlerUnits.kuehlerTechnicalIdentNo,
       gmUserId: visitSessions.gmUserId,
       startedAt: visitSessions.startedAt,
       submittedAt: visitSessions.submittedAt,
@@ -1427,6 +1431,7 @@ async function buildCampaignMarketVisitSummaries(
       sessionId: null,
       kuehlerUnitId: null,
       kuehlerInternalId: null,
+      kuehlerTechnicalIdentNo: null,
       startedAt: null,
       submittedAt: null,
       durationMinutes: null,
@@ -1627,6 +1632,7 @@ async function buildCampaignMarketVisitSummaries(
       sessionId: string | null;
       kuehlerUnitId: string | null;
       kuehlerInternalId: string | null;
+      kuehlerTechnicalIdentNo: string | null;
       startedAt: string | null;
       submittedAt: string | null;
       durationMinutes: number | null;
@@ -1719,6 +1725,7 @@ async function buildCampaignMarketVisitSummaries(
         sessionId: null,
         kuehlerUnitId: null,
         kuehlerInternalId: null,
+        kuehlerTechnicalIdentNo: null,
         startedAt: null,
         submittedAt: null,
         durationMinutes: null,
@@ -1830,6 +1837,7 @@ async function buildCampaignMarketVisitSummaries(
       sessionId: selectedSession.sessionId,
       kuehlerUnitId: selectedSession.kuehlerUnitId ?? null,
       kuehlerInternalId: selectedSession.kuehlerInternalId ?? null,
+      kuehlerTechnicalIdentNo: selectedSession.kuehlerTechnicalIdentNo ?? null,
       startedAt: selectedSession.startedAt?.toISOString() ?? null,
       submittedAt: selectedSession.submittedAt?.toISOString() ?? null,
       durationMinutes: calculateDurationMinutes(selectedSession.startedAt, selectedSession.submittedAt),
@@ -1848,6 +1856,7 @@ async function buildCampaignMarketVisitSummaries(
       sessionId: null,
       kuehlerUnitId: null,
       kuehlerInternalId: null,
+      kuehlerTechnicalIdentNo: null,
       startedAt: null,
       submittedAt: null,
       durationMinutes: null,
