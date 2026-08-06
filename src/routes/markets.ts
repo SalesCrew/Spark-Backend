@@ -1991,7 +1991,27 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
       }
     }
 
-    const gmNamesByMarketId = await resolveActiveStandardGmNamesByMarketIds([marketId]);
+    const [gmNamesByMarketId, kuehlerTechnicalIdentRows] = await Promise.all([
+      resolveActiveStandardGmNamesByMarketIds([marketId]),
+      db
+        .select({ value: marketKuehlerUnits.kuehlerTechnicalIdentNo })
+        .from(marketKuehlerUnits)
+        .where(
+          and(
+            eq(marketKuehlerUnits.marketId, marketId),
+            eq(marketKuehlerUnits.isDeleted, false),
+            isNotNull(marketKuehlerUnits.kuehlerTechnicalIdentNo),
+          ),
+        )
+        .orderBy(asc(marketKuehlerUnits.kuehlerTechnicalIdentNo)),
+    ]);
+    const kuehlerTechnicalIdentNos = Array.from(
+      new Set(
+        kuehlerTechnicalIdentRows
+          .map((row) => row.value?.trim() ?? "")
+          .filter(Boolean),
+      ),
+    );
     res.status(200).json({
       period: {
         startDate: toYmd(redPeriod.start),
@@ -2002,6 +2022,7 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
         plannedByActiveStandardGmName: gmNamesByMarketId.get(marketId) ?? null,
       },
       activeCampaigns,
+      kuehlerTechnicalIdentNos,
       drafts,
       pastVisits: pastSessionRows.map((row) => ({
         sessionId: row.sessionId,
