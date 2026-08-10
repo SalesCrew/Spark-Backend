@@ -1,7 +1,10 @@
-import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
-import { logAction, startActionTimer } from "../lib/logger.js";
+import { recomputeBonusWaveTx } from "../lib/bonus-finalizer.js";
+import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
+import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
+import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import {
   buildDaySessionPayload,
   buildGmAggregates,
@@ -20,11 +23,18 @@ import {
   lager,
   lagerGmAssignments,
   markets,
+  praemienGmWaveContributions,
+  timeEntryChangeRequests,
   timeTrackingEntries,
   users,
+  visitAnswerChangeRequests,
+  visitAnswerMatrixCells,
+  visitAnswerOptions,
+  visitAnswerPhotoTags,
   visitAnswerPhotos,
   visitAnswers,
   visitQuestionComments,
+  visitSessionDeleteRequests,
   visitSessionQuestions,
   visitSessionSections,
   visitSessions,
@@ -109,6 +119,11 @@ const daySessionPatchSchema = z
     endTime: z.string().regex(hhmmRegex).optional(),
     startKm: z.number().int().min(0).max(10_000_000).optional(),
     endKm: z.number().int().min(0).max(10_000_000).optional(),
+  })
+  .strict();
+const daySessionDeleteSchema = z
+  .object({
+    confirmation: z.literal("SOFT_DELETE_DAY"),
   })
   .strict();
 
@@ -1730,6 +1745,359 @@ adminZeiterfassungRouter.patch("/day-sessions/:sessionId", async (req: AuthedReq
 
     res.status(200).json({ ok: true });
   } catch (error) {
+    next(error);
+  }
+});
+
+adminZeiterfassungRouter.delete("/day-sessions/:sessionId", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    if (req.authUser?.role !== "admin") {
+      res.status(403).json({ error: "Nur Admins koennen komplette Arbeitstage loeschen.", code: "admin_required" });
+      return;
+    }
+
+    const sessionId = String(req.params.sessionId ?? "").trim();
+    if (!isUuid(sessionId)) {
+      res.status(400).json({ error: "Ungueltige Arbeitstag-ID.", code: "invalid_session_id" });
+      return;
+    }
+    const parsed = daySessionDeleteSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Die Loeschung muss ausdruecklich bestaetigt werden.", code: "confirmation_required" });
+      return;
+    }
+
+    const now = new Date();
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select ${gmDaySessions.id} from ${gmDaySessions} where ${gmDaySessions.id} = ${sessionId} for update`,
+      );
+
+      const [session] = await tx
+        .select({
+          id: gmDaySessions.id,
+          gmUserId: gmDaySessions.gmUserId,
+          workDate: gmDaySessions.workDate,
+          timezone: gmDaySessions.timezone,
+        })
+        .from(gmDaySessions)
+        .where(and(eq(gmDaySessions.id, sessionId), eq(gmDaySessions.isDeleted, false)))
+        .limit(1);
+      if (!session) {
+        const error = new Error("Arbeitstag wurde nicht gefunden oder bereits geloescht.") as Error & {
+          status?: number;
+          code?: string;
+        };
+        error.status = 404;
+        error.code = "day_session_not_found";
+        throw error;
+      }
+
+      const timezone = session.timezone?.trim() || "Europe/Vienna";
+      const dayStartExpr = sql`(${session.workDate}::date::timestamp at time zone ${timezone})`;
+      const dayEndExpr = sql`((${session.workDate}::date + 1)::timestamp at time zone ${timezone})`;
+
+      const visitRows = await tx
+        .select({
+          id: visitSessions.id,
+          marketId: visitSessions.marketId,
+          submittedAt: visitSessions.submittedAt,
+        })
+        .from(visitSessions)
+        .where(
+          and(
+            eq(visitSessions.gmUserId, session.gmUserId),
+            eq(visitSessions.isDeleted, false),
+            sql`${visitSessions.startedAt} >= ${dayStartExpr}`,
+            sql`${visitSessions.startedAt} < ${dayEndExpr}`,
+          ),
+        );
+      const visitIds = visitRows.map((row) => row.id);
+
+      const waveRows = visitIds.length === 0
+        ? []
+        : await tx
+            .select({ waveId: praemienGmWaveContributions.waveId })
+            .from(praemienGmWaveContributions)
+            .where(inArray(praemienGmWaveContributions.visitSessionId, visitIds));
+      const affectedWaveIds = Array.from(new Set(waveRows.map((row) => row.waveId)));
+
+      const sectionRows = visitIds.length === 0
+        ? []
+        : await tx
+            .select({ id: visitSessionSections.id })
+            .from(visitSessionSections)
+            .where(
+              and(
+                inArray(visitSessionSections.visitSessionId, visitIds),
+                eq(visitSessionSections.isDeleted, false),
+              ),
+            );
+      const sectionIds = sectionRows.map((row) => row.id);
+
+      const questionRows = sectionIds.length === 0
+        ? []
+        : await tx
+            .select({ id: visitSessionQuestions.id })
+            .from(visitSessionQuestions)
+            .where(
+              and(
+                inArray(visitSessionQuestions.visitSessionSectionId, sectionIds),
+                eq(visitSessionQuestions.isDeleted, false),
+              ),
+            );
+      const questionIds = questionRows.map((row) => row.id);
+
+      const answerRows = visitIds.length === 0
+        ? []
+        : await tx
+            .select({ id: visitAnswers.id })
+            .from(visitAnswers)
+            .where(and(inArray(visitAnswers.visitSessionId, visitIds), eq(visitAnswers.isDeleted, false)));
+      const answerIds = answerRows.map((row) => row.id);
+
+      const photoRows = answerIds.length === 0
+        ? []
+        : await tx
+            .select({ id: visitAnswerPhotos.id })
+            .from(visitAnswerPhotos)
+            .where(and(inArray(visitAnswerPhotos.visitAnswerId, answerIds), eq(visitAnswerPhotos.isDeleted, false)));
+      const photoIds = photoRows.map((row) => row.id);
+
+      if (photoIds.length > 0) {
+        await tx
+          .update(visitAnswerPhotoTags)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(
+            and(
+              inArray(visitAnswerPhotoTags.visitAnswerPhotoId, photoIds),
+              eq(visitAnswerPhotoTags.isDeleted, false),
+            ),
+          );
+      }
+      if (answerIds.length > 0) {
+        await tx
+          .update(visitAnswerPhotos)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitAnswerPhotos.visitAnswerId, answerIds), eq(visitAnswerPhotos.isDeleted, false)));
+        await tx
+          .update(visitAnswerOptions)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitAnswerOptions.visitAnswerId, answerIds), eq(visitAnswerOptions.isDeleted, false)));
+        await tx
+          .update(visitAnswerMatrixCells)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitAnswerMatrixCells.visitAnswerId, answerIds), eq(visitAnswerMatrixCells.isDeleted, false)));
+      }
+      if (questionIds.length > 0) {
+        await tx
+          .update(visitQuestionComments)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(
+            and(
+              inArray(visitQuestionComments.visitSessionQuestionId, questionIds),
+              eq(visitQuestionComments.isDeleted, false),
+            ),
+          );
+        await tx
+          .update(visitSessionQuestions)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitSessionQuestions.id, questionIds), eq(visitSessionQuestions.isDeleted, false)));
+      }
+      if (sectionIds.length > 0) {
+        await tx
+          .update(visitSessionSections)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitSessionSections.id, sectionIds), eq(visitSessionSections.isDeleted, false)));
+      }
+      if (visitIds.length > 0) {
+        await tx
+          .update(visitAnswers)
+          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(and(inArray(visitAnswers.visitSessionId, visitIds), eq(visitAnswers.isDeleted, false)));
+        await tx
+          .update(visitAnswerChangeRequests)
+          .set({ status: "cancelled", isDeleted: true, deletedAt: now, updatedAt: now })
+          .where(
+            and(
+              inArray(visitAnswerChangeRequests.visitSessionId, visitIds),
+              eq(visitAnswerChangeRequests.isDeleted, false),
+            ),
+          );
+        await tx
+          .update(visitSessionDeleteRequests)
+          .set({
+            status: "cancelled",
+            reviewedByUserId: req.authUser?.appUserId ?? null,
+            reviewedAt: now,
+            adminNote: "Arbeitstag durch Admin soft-deleted.",
+            isDeleted: true,
+            deletedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              inArray(visitSessionDeleteRequests.visitSessionId, visitIds),
+              eq(visitSessionDeleteRequests.isDeleted, false),
+            ),
+          );
+        await tx
+          .update(visitSessions)
+          .set({
+            status: "cancelled",
+            cancelledAt: now,
+            lastSavedAt: now,
+            isDeleted: true,
+            deletedAt: now,
+            updatedAt: now,
+          })
+          .where(and(inArray(visitSessions.id, visitIds), eq(visitSessions.isDeleted, false)));
+      }
+
+      const deletedPauses = await tx
+        .update(gmDaySessionPauses)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(gmDaySessionPauses.daySessionId, session.id),
+            eq(gmDaySessionPauses.isDeleted, false),
+          ),
+        )
+        .returning({ id: gmDaySessionPauses.id });
+
+      const deletedEntries = await tx
+        .update(timeTrackingEntries)
+        .set({ status: "cancelled", cancelledAt: now, isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(timeTrackingEntries.gmUserId, session.gmUserId),
+            eq(timeTrackingEntries.isDeleted, false),
+            or(
+              and(
+                isNotNull(timeTrackingEntries.startAt),
+                sql`${timeTrackingEntries.startAt} >= ${dayStartExpr}`,
+                sql`${timeTrackingEntries.startAt} < ${dayEndExpr}`,
+              ),
+              and(
+                isNull(timeTrackingEntries.startAt),
+                sql`${timeTrackingEntries.createdAt} >= ${dayStartExpr}`,
+                sql`${timeTrackingEntries.createdAt} < ${dayEndExpr}`,
+              ),
+            ),
+          ),
+        )
+        .returning({ id: timeTrackingEntries.id });
+
+      const deletedChangeRequests = await tx
+        .update(timeEntryChangeRequests)
+        .set({
+          status: "cancelled",
+          reviewedByUserId: req.authUser?.appUserId ?? null,
+          reviewedAt: now,
+          adminNote: "Arbeitstag durch Admin soft-deleted.",
+          isDeleted: true,
+          deletedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(timeEntryChangeRequests.daySessionId, session.id),
+            eq(timeEntryChangeRequests.isDeleted, false),
+          ),
+        )
+        .returning({ id: timeEntryChangeRequests.id });
+
+      await tx
+        .update(gmDaySessions)
+        .set({
+          status: "cancelled",
+          cancelledAt: now,
+          isDeleted: true,
+          deletedAt: now,
+          updatedAt: now,
+        })
+        .where(and(eq(gmDaySessions.id, session.id), eq(gmDaySessions.isDeleted, false)));
+
+      return {
+        sessionId: session.id,
+        gmUserId: session.gmUserId,
+        workDate: session.workDate,
+        affectedWaveIds,
+        affectedVisits: visitRows,
+        counts: {
+          visits: visitRows.length,
+          pauses: deletedPauses.length,
+          entries: deletedEntries.length,
+          changeRequests: deletedChangeRequests.length,
+        },
+      };
+    });
+
+    const affectedGmUserIds = new Set<string>([result.gmUserId]);
+    for (const waveId of result.affectedWaveIds) {
+      try {
+        const recomputeResult = await db.transaction((tx) => recomputeBonusWaveTx(tx, waveId));
+        for (const gmUserId of recomputeResult.affectedGmUserIds) affectedGmUserIds.add(gmUserId);
+      } catch (error) {
+        logger.error("admin_zeiterfassung_day_delete_bonus_recompute_failed", {
+          action: "admin_zeiterfassung_day_soft_delete",
+          result: "failure",
+          sessionId: result.sessionId,
+          waveId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    for (const visit of result.affectedVisits) {
+      if (!visit.submittedAt) continue;
+      try {
+        await enqueueIppRecalcForDate(visit.marketId, visit.submittedAt, "admin_zeiterfassung_day_soft_deleted");
+      } catch (error) {
+        logger.error("admin_zeiterfassung_day_delete_ipp_enqueue_failed", {
+          action: "admin_zeiterfassung_day_soft_delete",
+          result: "failure",
+          sessionId: result.sessionId,
+          marketId: visit.marketId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    for (const gmUserId of affectedGmUserIds) {
+      try {
+        await recomputeGmKpiCache(gmUserId);
+      } catch (error) {
+        logger.error("admin_zeiterfassung_day_delete_kpi_recompute_failed", {
+          action: "admin_zeiterfassung_day_soft_delete",
+          result: "failure",
+          sessionId: result.sessionId,
+          gmUserId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    logAction("info", "admin_zeiterfassung_day_soft_delete_completed", {
+      req,
+      action: "admin_zeiterfassung_day_soft_delete",
+      result: "success",
+      startedAtNs,
+      details: {
+        sessionId: result.sessionId,
+        gmUserId: result.gmUserId,
+        workDate: result.workDate,
+        ...result.counts,
+      },
+    });
+    res.status(200).json({ ok: true, sessionId: result.sessionId, counts: result.counts });
+  } catch (error) {
+    const err = error as Error & { status?: number; code?: string };
+    if (err.status) {
+      res.status(err.status).json({ error: err.message, code: err.code });
+      return;
+    }
     next(error);
   }
 });
