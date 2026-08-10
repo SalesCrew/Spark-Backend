@@ -113,6 +113,12 @@ const segmentPatchSchema = z
     comment: z.string().trim().max(2_000).nullable().optional(),
   })
   .strict();
+const pauseDeleteSchema = z
+  .object({
+    sessionId: z.string().uuid(),
+    confirmation: z.literal("SOFT_DELETE_PAUSE"),
+  })
+  .strict();
 const daySessionPatchSchema = z
   .object({
     startTime: z.string().regex(hhmmRegex).optional(),
@@ -1634,6 +1640,58 @@ adminZeiterfassungRouter.patch("/segments/:kind/:segmentId", async (req: AuthedR
     }
 
     res.status(200).json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminZeiterfassungRouter.delete("/pauses/:pauseId", async (req: AuthedRequest, res, next) => {
+  try {
+    const pauseId = String(req.params.pauseId ?? "").trim();
+    if (!isUuid(pauseId)) {
+      res.status(400).json({ error: "Ungültige Pausen-ID." });
+      return;
+    }
+    const parsed = pauseDeleteSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige Löschbestätigung." });
+      return;
+    }
+
+    const [session] = await db
+      .select({ id: gmDaySessions.id })
+      .from(gmDaySessions)
+      .where(
+        and(
+          eq(gmDaySessions.id, parsed.data.sessionId),
+          eq(gmDaySessions.isDeleted, false),
+        ),
+      )
+      .limit(1);
+    if (!session) {
+      res.status(404).json({ error: "Arbeitstag nicht gefunden." });
+      return;
+    }
+
+    const now = new Date();
+    const [deletedPause] = await db
+      .update(gmDaySessionPauses)
+      .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+      .where(
+        and(
+          eq(gmDaySessionPauses.id, pauseId),
+          eq(gmDaySessionPauses.daySessionId, session.id),
+          eq(gmDaySessionPauses.isDeleted, false),
+          isNotNull(gmDaySessionPauses.pauseEndedAt),
+        ),
+      )
+      .returning({ id: gmDaySessionPauses.id });
+    if (!deletedPause) {
+      res.status(404).json({ error: "Beendete Pause nicht gefunden." });
+      return;
+    }
+
+    res.status(200).json({ ok: true, pauseId: deletedPause.id });
   } catch (error) {
     next(error);
   }
