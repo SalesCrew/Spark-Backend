@@ -53,6 +53,7 @@ import {
   questionRuleTargets,
   questionScoring,
 } from "../lib/schema.js";
+import { filterFragebogenModuleLinksByActiveModuleIds } from "../lib/fragebogen-module-links.js";
 
 const adminFragebogenRouter = Router();
 adminFragebogenRouter.use(requireAuth(["admin", "kunde"]));
@@ -1826,8 +1827,12 @@ export async function fetchFragebogenUi(scope: Scope, ids?: string[]): Promise<U
   if (fbRows.length === 0) return [];
 
   const fragebogenIds = fbRows.map((row) => row.id);
-  const moduleLinks = await db
-    .select()
+  const storedModuleLinks = await db
+    .select({
+      fragebogenId: (cfg.fbModuleLink as AnyTable).fragebogenId,
+      moduleId: (cfg.fbModuleLink as AnyTable).moduleId,
+      orderIndex: (cfg.fbModuleLink as AnyTable).orderIndex,
+    })
     .from(cfg.fbModuleLink as AnyTable)
     .where(
       and(
@@ -1839,6 +1844,22 @@ export async function fetchFragebogenUi(scope: Scope, ids?: string[]): Promise<U
       asc((cfg.fbModuleLink as AnyTable).fragebogenId),
       asc((cfg.fbModuleLink as AnyTable).orderIndex),
     );
+  const linkedModuleIds = Array.from(new Set(storedModuleLinks.map((link) => link.moduleId)));
+  const activeModuleRows = linkedModuleIds.length === 0
+    ? []
+    : await db
+        .select({ id: (cfg.moduleTable as AnyTable).id })
+        .from(cfg.moduleTable as AnyTable)
+        .where(
+          and(
+            inArray((cfg.moduleTable as AnyTable).id, linkedModuleIds),
+            eq((cfg.moduleTable as AnyTable).isDeleted, false),
+          ),
+        );
+  const moduleLinks = filterFragebogenModuleLinksByActiveModuleIds(
+    storedModuleLinks,
+    activeModuleRows.map((row) => row.id),
+  );
   const moduleIdsByFragebogen = new Map<string, string[]>();
   for (const link of moduleLinks) {
     const current = moduleIdsByFragebogen.get(link.fragebogenId) ?? [];
@@ -2527,10 +2548,22 @@ adminFragebogenRouter.patch("/modules/:scope/:id/delete", async (req, res, next)
       return;
     }
     const cfg = pickScopeConfig(scope);
-    await db
-      .update(cfg.moduleTable as typeof moduleMain)
-      .set({ isDeleted: true, updatedAt: new Date() })
-      .where(eq((cfg.moduleTable as typeof moduleMain).id, req.params.id));
+    const now = new Date();
+    await db.transaction(async (tx) => {
+      await tx
+        .update(cfg.moduleTable as typeof moduleMain)
+        .set({ isDeleted: true, updatedAt: now })
+        .where(eq((cfg.moduleTable as typeof moduleMain).id, req.params.id));
+      await tx
+        .update(cfg.fbModuleLink as typeof fragebogenMainModule)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq((cfg.fbModuleLink as typeof fragebogenMainModule).moduleId, req.params.id),
+            eq((cfg.fbModuleLink as typeof fragebogenMainModule).isDeleted, false),
+          ),
+        );
+    });
     res.status(200).json({ ok: true });
   } catch (error) {
     next(error);
