@@ -4,7 +4,11 @@ import { Router } from "express";
 import { z } from "zod";
 import { formatExtraLabel } from "../lib/admin-zeiterfassung.js";
 import { db } from "../lib/db.js";
-import { validateGmTimelineInterval, validateGmTimelineIntervalStrict } from "../lib/zeiterfassung-validation.js";
+import {
+  formatTimelineConflictMessage,
+  validateGmTimelineInterval,
+  validateGmTimelineIntervalStrict,
+} from "../lib/zeiterfassung-validation.js";
 import {
   gmDaySessionPauses,
   gmDaySessions,
@@ -875,7 +879,12 @@ gmTimeEntryChangeRequestsRouter.post("/zusatzzeit", async (req: AuthedRequest, r
       return;
     }
     const [overlappingRequest] = await db
-      .select({ id: timeEntryChangeRequests.id })
+      .select({
+        id: timeEntryChangeRequests.id,
+        activityType: timeEntryChangeRequests.requestedActivityType,
+        startAt: timeEntryChangeRequests.requestedStartAt,
+        endAt: timeEntryChangeRequests.requestedEndAt,
+      })
       .from(timeEntryChangeRequests)
       .where(
         and(
@@ -890,7 +899,22 @@ gmTimeEntryChangeRequestsRouter.post("/zusatzzeit", async (req: AuthedRequest, r
       )
       .limit(1);
     if (overlappingRequest) {
-      res.status(409).json({ error: "Für diesen Zeitraum ist bereits eine Zusatzzeit angefragt.", code: "pending_request_overlap" });
+      const activityLabel = overlappingRequest.activityType
+        ? formatExtraLabel(overlappingRequest.activityType)
+        : "Zusatzzeit";
+      res.status(409).json({
+        error: formatTimelineConflictMessage({
+          requestedKind: "zusatzzeit",
+          requestedStartAt,
+          requestedEndAt,
+          conflictKind: "zusatzzeit",
+          conflictStartAt: overlappingRequest.startAt,
+          conflictEndAt: overlappingRequest.endAt,
+          timezone,
+          conflictLabel: `der offenen Anfrage „${activityLabel}“`,
+        }),
+        code: "pending_request_overlap",
+      });
       return;
     }
     const now = new Date();

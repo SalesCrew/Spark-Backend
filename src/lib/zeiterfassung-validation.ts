@@ -21,6 +21,42 @@ type DbLike = typeof db | DbTransaction;
 const TIMELINE_DAY_NOT_STARTED_MESSAGE = "Bitte zuerst den Arbeitstag starten.";
 const TIMELINE_OUTSIDE_DAY_MESSAGE = "Zeit liegt ausserhalb des Arbeitstags.";
 
+const TIMELINE_KIND_LABELS: Record<TimelineIntervalKind, string> = {
+  marktbesuch: "Marktbesuch",
+  pause: "Pause",
+  zusatzzeit: "Zusatzzeit",
+};
+
+const TIMELINE_REQUEST_LABELS: Record<TimelineIntervalKind, string> = {
+  marktbesuch: "Der angefragte Marktbesuch",
+  pause: "Die angefragte Pause",
+  zusatzzeit: "Die angefragte Zusatzzeit",
+};
+
+function formatTimelineHm(value: Date, timezone: string): string {
+  return new Intl.DateTimeFormat("de-AT", {
+    timeZone: timezone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(value);
+}
+
+function formatTimelineConflictMessage(input: {
+  requestedKind: TimelineIntervalKind;
+  requestedStartAt: Date;
+  requestedEndAt: Date;
+  conflictKind: TimelineIntervalKind;
+  conflictStartAt: Date;
+  conflictEndAt: Date;
+  timezone: string;
+  conflictLabel?: string;
+}): string {
+  const requestedLabel = TIMELINE_REQUEST_LABELS[input.requestedKind];
+  const conflictLabel = input.conflictLabel ?? TIMELINE_KIND_LABELS[input.conflictKind];
+  return `${requestedLabel} ${formatTimelineHm(input.requestedStartAt, input.timezone)}-${formatTimelineHm(input.requestedEndAt, input.timezone)} überschneidet sich mit ${conflictLabel} ${formatTimelineHm(input.conflictStartAt, input.timezone)}-${formatTimelineHm(input.conflictEndAt, input.timezone)}. Bitte wähle eine freie Lücke; direkt angrenzende Zeiten sind erlaubt.`;
+}
+
 type DaySessionForValidation = {
   id: string;
   gmUserId: string;
@@ -284,13 +320,21 @@ async function validateGmTimelineIntervalStrict(input: {
     now: context.now,
     database: input.database ?? db,
   });
-  const overlaps = intervals.some((interval) => {
+  const conflict = intervals.find((interval) => {
     if (interval.kind === input.kind && interval.id === input.id) return false;
     return input.startAt.getTime() < interval.endAt.getTime()
       && input.endAt.getTime() > interval.startAt.getTime();
   });
-  if (overlaps) {
-    throw new TimelineValidationError(409, "overlap", TIMELINE_OVERLAP_ERROR_MESSAGE);
+  if (conflict) {
+    throw new TimelineValidationError(409, "overlap", formatTimelineConflictMessage({
+      requestedKind: input.kind,
+      requestedStartAt: input.startAt,
+      requestedEndAt: input.endAt,
+      conflictKind: conflict.kind,
+      conflictStartAt: conflict.startAt,
+      conflictEndAt: conflict.endAt,
+      timezone: context.session.timezone || "Europe/Vienna",
+    }));
   }
   return { session: context.session };
 }
@@ -331,6 +375,7 @@ async function validateGmTimelineStartPoint(input: {
 }
 
 export {
+  formatTimelineConflictMessage,
   TIMELINE_DAY_NOT_STARTED_MESSAGE,
   TIMELINE_OUTSIDE_DAY_MESSAGE,
   TimelineValidationError,
