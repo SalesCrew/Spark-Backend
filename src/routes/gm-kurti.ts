@@ -27,7 +27,7 @@ const openai = env.OPENAI_API_KEY
     })
   : null;
 
-gmKurtiRouter.use(requireAuth(["gm"]));
+gmKurtiRouter.use(requireAuth(["gm", "sm"]));
 gmKurtiRouter.use(async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;

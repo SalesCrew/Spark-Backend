@@ -10,6 +10,7 @@ import { enqueueIppRecalcForQuestionScoringChanges, runIppFinalizerOnce } from "
 import { computeMarketIppForPeriod } from "./lib/ipp.js";
 import { addDays, getCurrentRedPeriod, getRedPeriodForDate, startOfDay } from "./lib/red-monat.js";
 import { loadRedSurveySessionStatsBySessionIds } from "./lib/red-survey-stats.js";
+import { assertSafeMutatingIntegrationTestEnvironment } from "./lib/integration-test-database-guard.js";
 import {
   campaignMarketAssignmentHistory,
   campaignFragebogenHistory,
@@ -52,6 +53,8 @@ import {
   visitAnswerPhotos,
   visitAnswerPhotoTags,
 } from "./lib/schema.js";
+
+assertSafeMutatingIntegrationTestEnvironment();
 
 function enableTestAuthBypass() {
   process.env.NODE_ENV = "test";
