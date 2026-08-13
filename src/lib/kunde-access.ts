@@ -106,16 +106,22 @@ function resolveKundePageKeyHeader(req: Request): KundeAdminPageKey | null {
 export function resolveKundeAdminRequirement(req: Request): {
   pageKey: KundeAdminPageKey;
   action: KundePermissionAction;
+  allowAnyPagePermission?: boolean;
 } | null {
   const pathname = req.path;
   const originalUrl = req.originalUrl || req.url;
   const originalPath = originalUrl.split("?")[0] ?? originalUrl;
   const action = methodToDefaultAction(req.method);
+  const isExportRequest = /(?:^|[\/-])export(?:[\/-]|$)/i.test(originalPath);
 
   if (routeStartsWith(pathname, "/kunden-users") || routeStartsWith(originalPath, "/admin/kunden-users")) return null;
   if (routeStartsWith(pathname, "/users") || routeStartsWith(originalPath, "/admin/users")) return null;
   if (routeStartsWith(pathname, "/photos") || routeStartsWith(originalPath, "/admin/photos")) {
-    return { pageKey: "fotoarchiv", action: originalUrl.includes("/signed-urls") ? "read" : action };
+    return {
+      pageKey: "fotoarchiv",
+      action: originalUrl.includes("/signed-urls") ? "read" : action,
+      allowAnyPagePermission: isExportRequest,
+    };
   }
   if (routeStartsWith(pathname, "/photo-tags") || routeStartsWith(originalPath, "/admin/photo-tags")) {
     const sharedPage = resolveSharedQuestionnairePage(req);
@@ -123,7 +129,7 @@ export function resolveKundeAdminRequirement(req: Request): {
   }
   if (routeStartsWith(pathname, "/ipp") || routeStartsWith(originalPath, "/admin/ipp")) return { pageKey: "ipp_berechnung", action };
   if (routeStartsWith(pathname, "/praemien") || routeStartsWith(originalPath, "/admin/praemien")) return { pageKey: "praemien", action };
-  if (routeStartsWith(pathname, "/zeiterfassung") || routeStartsWith(originalPath, "/admin/zeiterfassung")) return { pageKey: "zeiterfassung", action };
+  if (routeStartsWith(pathname, "/zeiterfassung") || routeStartsWith(originalPath, "/admin/zeiterfassung")) return { pageKey: "zeiterfassung", action, allowAnyPagePermission: isExportRequest };
   if (routeStartsWith(pathname, "/markets") || originalUrl === "/markets" || originalUrl.startsWith("/markets?")) {
     const requestedPageKey = resolveKundePageKeyHeader(req);
     if (
@@ -136,7 +142,7 @@ export function resolveKundeAdminRequirement(req: Request): {
   }
   if (routeStartsWith(originalPath, "/admin/markets")) return { pageKey: "maerkte", action };
   if (routeStartsWith(pathname, "/lager") || routeStartsWith(originalPath, "/admin/lager")) return { pageKey: "lager", action };
-  if (routeStartsWith(pathname, "/campaigns") || routeStartsWith(originalPath, "/admin/campaigns")) return { pageKey: "fbmanagement", action };
+  if (routeStartsWith(pathname, "/campaigns") || routeStartsWith(originalPath, "/admin/campaigns")) return { pageKey: "fbmanagement", action, allowAnyPagePermission: isExportRequest };
   if (routeStartsWith(pathname, "/red-month") || routeStartsWith(originalPath, "/admin/red-month")) return { pageKey: "gm_dashboard", action };
   if (
     routeStartsWith(pathname, "/modules") ||
@@ -172,7 +178,13 @@ export function requireKundeAdminPermission(req: AuthedRequest, res: Response, n
 
   getKundePermissionsForUser(req.authUser.appUserId)
     .then((permissions) => {
-      if (hasKundePermission(permissions, requirement.pageKey, requirement.action)) {
+      const pageActions = permissions[requirement.pageKey] ?? [];
+      const requestPath = (req.originalUrl || req.url).split("?")[0] ?? "";
+      const isExportRequest = /(?:^|[\/-])export(?:[\/-]|$)/i.test(requestPath);
+      if (
+        hasKundePermission(permissions, requirement.pageKey, requirement.action) ||
+        ((requirement.allowAnyPagePermission === true || isExportRequest) && pageActions.length > 0)
+      ) {
         next();
         return;
       }

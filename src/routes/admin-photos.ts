@@ -59,6 +59,10 @@ const photoListQuerySchema = z.object({
 });
 
 type PhotoListQuery = z.infer<typeof photoListQuerySchema>;
+type PhotoFilterQuery = PhotoListQuery & {
+  tagIds?: string[] | undefined;
+  tagLabels?: string[] | undefined;
+};
 type PhotoSignVariant = z.infer<typeof photoSignVariantSchema>;
 type PhotoAccessScope = { excludeMhd: boolean };
 
@@ -70,6 +74,10 @@ const photoSignedUrlsBodySchema = z.object({
 const photoExportBodySchema = z.object({
   filters: photoListQuerySchema
     .omit({ page: true, pageSize: true })
+    .extend({
+      tagIds: z.array(z.string().regex(uuidRegex)).max(80).optional(),
+      tagLabels: z.array(z.string().trim().min(1).max(120)).max(80).optional(),
+    })
     .default({}),
 });
 
@@ -332,7 +340,7 @@ function marketChainExpression() {
 }
 
 function buildPhotoWhere(
-  input: PhotoListQuery,
+  input: PhotoFilterQuery,
   photoId?: string,
   access: PhotoAccessScope = { excludeMhd: false },
 ): SQL {
@@ -387,6 +395,21 @@ function buildPhotoWhere(
       where vapt_label_filter.visit_answer_photo_id = ${visitAnswerPhotos.id}
         and vapt_label_filter.is_deleted = false
         and vapt_label_filter.photo_tag_label_snapshot ilike ${`%${input.tagLabel}%`}
+    )`);
+  }
+  if ((input.tagIds?.length ?? 0) > 0 || (input.tagLabels?.length ?? 0) > 0) {
+    const idMatch = input.tagIds?.length
+      ? sql`vapt_multi_filter.photo_tag_id in (${sql.join(input.tagIds.map((id) => sql`${id}`), sql`, `)})`
+      : sql`false`;
+    const labelMatch = input.tagLabels?.length
+      ? sql`lower(vapt_multi_filter.photo_tag_label_snapshot) in (${sql.join(input.tagLabels.map((label) => sql`lower(${label})`), sql`, `)})`
+      : sql`false`;
+    conditions.push(sql`exists (
+      select 1
+      from visit_answer_photo_tags vapt_multi_filter
+      where vapt_multi_filter.visit_answer_photo_id = ${visitAnswerPhotos.id}
+        and vapt_multi_filter.is_deleted = false
+        and (${idMatch} or ${labelMatch})
     )`);
   }
   if (input.search) {
@@ -780,7 +803,7 @@ adminPhotosRouter.post("/photos/export", async (req: AuthedRequest, res, next) =
     }
 
     const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
-    const filters: PhotoListQuery = {
+    const filters: PhotoFilterQuery = {
       ...parsed.data.filters,
       page: 1,
       pageSize: 1,
