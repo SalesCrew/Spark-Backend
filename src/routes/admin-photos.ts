@@ -60,6 +60,7 @@ const photoListQuerySchema = z.object({
 
 type PhotoListQuery = z.infer<typeof photoListQuerySchema>;
 type PhotoFilterQuery = PhotoListQuery & {
+  chains?: string[] | undefined;
   tagIds?: string[] | undefined;
   tagLabels?: string[] | undefined;
 };
@@ -75,6 +76,7 @@ const photoExportBodySchema = z.object({
   filters: photoListQuerySchema
     .omit({ page: true, pageSize: true })
     .extend({
+      chains: z.array(z.string().trim().min(1).max(80)).max(80).optional(),
       tagIds: z.array(z.string().regex(uuidRegex)).max(80).optional(),
       tagLabels: z.array(z.string().trim().min(1).max(120)).max(80).optional(),
     })
@@ -370,6 +372,9 @@ function buildPhotoWhere(
   if (input.city) conditions.push(ilike(markets.city, input.city));
   if (input.postalCode) conditions.push(ilike(markets.postalCode, input.postalCode));
   if (input.chain) conditions.push(sql`${marketChainExpression()} ILIKE ${input.chain}`);
+  if (input.chains?.length) {
+    conditions.push(sql`lower(${marketChainExpression()}) in (${sql.join(input.chains.map((chain) => sql`lower(${chain})`), sql`, `)})`);
+  }
   if (input.dateFrom) {
     conditions.push(sql`${visitSessions.submittedAt} >= (${input.dateFrom}::date::timestamp at time zone 'Europe/Vienna')`);
   }
