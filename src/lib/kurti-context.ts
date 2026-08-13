@@ -169,7 +169,14 @@ export async function buildKurtiGmContext(gmUserId: string, now = new Date()): P
         isBillaGm: users.isBillaGm,
       })
       .from(users)
-      .where(and(eq(users.id, gmUserId), eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+      .where(
+        and(
+          eq(users.id, gmUserId),
+          or(eq(users.role, "gm"), eq(users.role, "sm")),
+          eq(users.isActive, true),
+          isNull(users.deletedAt),
+        ),
+      )
       .limit(1),
     loadZeiterfassungDaySessions({
       from: weekStartYmd,
