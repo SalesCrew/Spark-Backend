@@ -213,16 +213,16 @@ export function buildVisitAnswerValidationResult(
     if (typeof rawAnswer !== "string") return { ...empty, answerStatus: "invalid", isValid: false, validationError: "Ja/Nein-Multi erwartet JSON-String." };
     try {
       const parsed = JSON.parse(rawAnswer) as { sel?: unknown; subs?: unknown };
-      const top = typeof parsed?.sel === "string" ? parsed.sel : "";
+      const top = typeof parsed?.sel === "string" ? parsed.sel.trim() : "";
       const subs = normalizeUnique(Array.isArray(parsed?.subs) ? parsed.subs.filter((v): v is string => typeof v === "string") : []);
-      const configAnswers = asStringArray(config.answers);
+      const configAnswers = normalizeUnique(asStringArray(config.answers));
       const configBranches = Array.isArray(config.branches) ? (config.branches as Array<Record<string, unknown>>) : [];
       if (configAnswers.length > 0 && top.length > 0 && !configAnswers.includes(top)) {
         return { ...empty, answerStatus: "invalid", isValid: false, validationError: "Ja/Nein-Multi Top-Antwort ist nicht erlaubt." };
       }
       if (top.length > 0 && configBranches.length > 0) {
-        const branch = configBranches.find((entry) => entry.answer === top);
-        const branchOptions = branch ? asStringArray((branch as Record<string, unknown>).options) : [];
+        const branch = configBranches.find((entry) => typeof entry.answer === "string" && entry.answer.trim() === top);
+        const branchOptions = branch ? normalizeUnique(asStringArray((branch as Record<string, unknown>).options)) : [];
         if (branchOptions.length > 0 && subs.some((v) => !branchOptions.includes(v))) {
           return { ...empty, answerStatus: "invalid", isValid: false, validationError: "Ja/Nein-Multi Unteroption ist nicht erlaubt." };
         }
@@ -235,7 +235,7 @@ export function buildVisitAnswerValidationResult(
         ...empty,
         answerStatus: top ? "answered" : "unanswered",
         valueText: top || null,
-        valueJson: { raw: parsed },
+        valueJson: { raw: { sel: top || null, subs } },
         options,
       };
     } catch {
