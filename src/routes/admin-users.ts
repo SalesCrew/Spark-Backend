@@ -21,6 +21,7 @@ const createUserSchema = z.object({
   city: z.string().optional(),
   postalCode: z.string().optional(),
   region: z.string().optional(),
+  travelTimeEnabled: z.boolean().optional(),
   ipp: z.number().min(0).max(99.9).optional(),
   isBillaGm: z.boolean().optional(),
 });
@@ -34,6 +35,7 @@ const updateUserSchema = z.object({
   city: z.string().optional(),
   postalCode: z.string().optional(),
   region: z.string().optional(),
+  travelTimeEnabled: z.boolean().optional(),
   ipp: z.number().min(0).max(99.9).optional(),
   isBillaGm: z.boolean().optional(),
 });
@@ -61,8 +63,12 @@ function normalizeSpecialArthurMatchValue(input: unknown): string | null {
 }
 
 function mapUserResponse(row: typeof users.$inferSelect, gmKpi?: { ipp: number; ippSampleCount: number } | null) {
+  const { phone, address, city, postalCode, region, travelTimeEnabled, ...base } = row;
   return {
-    ...row,
+    ...base,
+    ...(row.role === "sm"
+      ? { travelTimeEnabled }
+      : { phone, address, city, postalCode, region }),
     isBillaGm: row.role === "gm" ? row.isBillaGm : false,
     ipp: row.role === "gm" ? gmKpi?.ipp ?? 0 : row.ipp == null ? null : Number(row.ipp),
     ippSampleCount: row.role === "gm" ? gmKpi?.ippSampleCount ?? 0 : null,
@@ -173,11 +179,15 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
         email: row.email,
         firstName: row.firstName,
         lastName: row.lastName,
-        phone: row.phone,
-        address: row.address,
-        city: row.city,
-        postalCode: row.postalCode,
-        region: row.region,
+        ...(row.role === "sm"
+          ? { travelTimeEnabled: row.travelTimeEnabled }
+          : {
+              phone: row.phone,
+              address: row.address,
+              city: row.city,
+              postalCode: row.postalCode,
+              region: row.region,
+            }),
         isBillaGm: row.role === "gm" ? row.isBillaGm : false,
         ...(row.role !== "gm" ? { ipp: row.ipp == null ? null : Number(row.ipp), ippSampleCount: null } : {}),
         isActive: row.isActive,
@@ -383,11 +393,12 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
           email: payload.email,
           firstName: payload.firstName,
           lastName: payload.lastName,
-          phone: payload.phone,
-          address: payload.address,
-          city: payload.city,
-          postalCode: payload.postalCode,
-          region: payload.region,
+          phone: payload.role === "sm" ? undefined : payload.phone,
+          address: payload.role === "sm" ? undefined : payload.address,
+          city: payload.role === "sm" ? undefined : payload.city,
+          postalCode: payload.role === "sm" ? undefined : payload.postalCode,
+          region: payload.role === "sm" ? undefined : payload.region,
+          travelTimeEnabled: payload.role === "sm" ? Boolean(payload.travelTimeEnabled) : false,
           ipp: payload.ipp != null ? payload.ipp.toFixed(1) : null,
           isBillaGm: payload.role === "gm" ? Boolean(payload.isBillaGm ?? false) : false,
         })
@@ -414,25 +425,7 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
           : null;
 
       res.status(201).json({
-        user: {
-          id: created.id,
-          role: created.role,
-          email: created.email,
-          firstName: created.firstName,
-          lastName: created.lastName,
-          phone: created.phone,
-          address: created.address,
-          city: created.city,
-          postalCode: created.postalCode,
-          region: created.region,
-          isBillaGm: created.role === "gm" ? created.isBillaGm : false,
-          ipp: created.role === "gm" ? gmKpi?.ipp ?? 0 : created.ipp == null ? null : Number(created.ipp),
-          ippSampleCount: created.role === "gm" ? gmKpi?.ippSampleCount ?? 0 : null,
-          isActive: created.isActive,
-          deletedAt: created.deletedAt,
-          createdAt: created.createdAt,
-          updatedAt: created.updatedAt,
-        },
+        user: mapUserResponse(created, gmKpi),
         oneTimePassword: password,
       });
       logAction("info", "admin_user_create_success", {
@@ -530,11 +523,12 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         firstName: payload.firstName,
         lastName: payload.lastName,
         email: payload.email,
-        phone: payload.phone,
-        address: payload.address,
-        city: payload.city,
-        postalCode: payload.postalCode,
-        region: payload.region,
+        phone: existing.role === "sm" ? undefined : payload.phone,
+        address: existing.role === "sm" ? undefined : payload.address,
+        city: existing.role === "sm" ? undefined : payload.city,
+        postalCode: existing.role === "sm" ? undefined : payload.postalCode,
+        region: existing.role === "sm" ? undefined : payload.region,
+        travelTimeEnabled: existing.role === "sm" ? payload.travelTimeEnabled : undefined,
         ipp: payload.ipp != null ? payload.ipp.toFixed(1) : undefined,
         isBillaGm: existing.role === "gm" ? payload.isBillaGm : undefined,
         updatedAt: new Date(),

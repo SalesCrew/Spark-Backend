@@ -110,6 +110,7 @@ export const users = pgTable(
     city: text("city"),
     postalCode: text("postal_code"),
     region: text("region"),
+    travelTimeEnabled: boolean("sm_travel_time_enabled").notNull().default(false),
     ipp: numeric("ipp", { precision: 4, scale: 1 }),
     isBillaGm: boolean("is_billa_gm").notNull().default(false),
     profilePhotoBucket: text("profile_photo_bucket"),
