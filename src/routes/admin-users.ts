@@ -6,7 +6,7 @@ import { aggregateHighVolumeLoad, logAction, markErrorAsLogged, startActionTimer
 import { getKundePermissionsForUser, hasKundePermission } from "../lib/kunde-access.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
-import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
+import { readGmKpiCaches, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { authAuditLogs, specialArthurFilter, type UserRole, users } from "../lib/schema.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { generatePassword } from "../services/password.js";
@@ -147,24 +147,7 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
       .where(whereClause)
       .orderBy(desc(users.createdAt));
     const gmRows = rows.filter((row) => row.role === "gm");
-    const gmKpiByUserId = new Map<string, { ipp: number; ippSampleCount: number }>(
-      await Promise.all(
-        gmRows.map(async (row): Promise<[string, { ipp: number; ippSampleCount: number }]> => {
-          try {
-            const summary = await recomputeGmKpiCache(row.id);
-            return [
-              row.id,
-              {
-                ipp: summary.ippAllTimeAvg,
-                ippSampleCount: summary.ippSampleCount,
-              },
-            ];
-          } catch {
-            return [row.id, { ipp: 0, ippSampleCount: 0 }];
-          }
-        }),
-      ),
-    );
+    const gmKpiByUserId = await readGmKpiCaches(gmRows.map((row) => row.id));
     const softDeletedCount = rows.filter((row) => row.deletedAt != null).length;
     aggregateHighVolumeLoad({
       metric: "users",
@@ -178,7 +161,12 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
 
     res.status(200).json({
       users: rows.map((row) => ({
-        ...(row.role === "gm" ? { ipp: Number(gmKpiByUserId.get(row.id)?.ipp ?? 0), ippSampleCount: Number(gmKpiByUserId.get(row.id)?.ippSampleCount ?? 0) } : {}),
+        ...(row.role === "gm"
+          ? {
+              ipp: Number(gmKpiByUserId.get(row.id)?.ippAllTimeAvg ?? row.ipp ?? 0),
+              ippSampleCount: Number(gmKpiByUserId.get(row.id)?.ippSampleCount ?? 0),
+            }
+          : {}),
         id: row.id,
         supabaseAuthId: row.supabaseAuthId,
         role: row.role,

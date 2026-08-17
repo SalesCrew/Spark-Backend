@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, isNotNull, lt } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, lt } from "drizzle-orm";
 import { db, sql as pgSql } from "./db.js";
 import { loadEffectiveGmIppPeriods, loadIppPeriodCatalog } from "./ipp-gm-effective.js";
 import { gmKpiCache, visitSessions } from "./schema.js";
@@ -100,6 +100,27 @@ export async function readGmKpiCache(gmUserId: string): Promise<GmKpiSummary | n
     bonusCumulativeEur: normalizeNumber(row.bonusCumulativeEur),
     lastComputedAt: row.lastComputedAt,
   });
+}
+
+export async function readGmKpiCaches(gmUserIds: string[]): Promise<Map<string, GmKpiSummary>> {
+  const uniqueIds = Array.from(new Set(gmUserIds.filter((gmUserId) => gmUserId.length > 0)));
+  const result = new Map<string, GmKpiSummary>();
+  if (uniqueIds.length === 0 || !(await ensureGmKpiCacheTableReady())) return result;
+
+  const rows = await db
+    .select()
+    .from(gmKpiCache)
+    .where(and(inArray(gmKpiCache.gmUserId, uniqueIds), eq(gmKpiCache.isDeleted, false)));
+
+  for (const row of rows) {
+    result.set(row.gmUserId, normalizeSummary({
+      ippAllTimeAvg: normalizeNumber(row.ippAllTimeAvg),
+      ippSampleCount: row.ippSampleCount,
+      bonusCumulativeEur: normalizeNumber(row.bonusCumulativeEur),
+      lastComputedAt: row.lastComputedAt,
+    }));
+  }
+  return result;
 }
 
 export async function recomputeGmKpiCache(gmUserId: string): Promise<GmKpiSummary> {
