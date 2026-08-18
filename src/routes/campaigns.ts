@@ -902,6 +902,91 @@ async function ensureGmUsersExist(gmUserIds: Array<string | null>) {
   }
 }
 
+async function findCompletedKuehlerCampaignMarketKeys(
+  rows: Array<{ campaignId: string; marketId: string; visitTargetCount: number }>,
+): Promise<Set<string>> {
+  const candidateKeys = new Set(rows.map((row) => `${row.campaignId}:${row.marketId}`));
+  if (candidateKeys.size === 0) return new Set();
+
+  const targetByKey = new Map<string, number>();
+  for (const row of rows) {
+    const key = `${row.campaignId}:${row.marketId}`;
+    targetByKey.set(key, (targetByKey.get(key) ?? 0) + Math.max(1, Number(row.visitTargetCount ?? 1)));
+  }
+
+  const campaignIds = Array.from(new Set(rows.map((row) => row.campaignId)));
+  const marketIds = Array.from(new Set(rows.map((row) => row.marketId)));
+  const [unitRows, submittedRows] = await Promise.all([
+    db
+      .select({ id: marketKuehlerUnits.id, marketId: marketKuehlerUnits.marketId })
+      .from(marketKuehlerUnits)
+      .where(and(inArray(marketKuehlerUnits.marketId, marketIds), eq(marketKuehlerUnits.isDeleted, false))),
+    db
+      .select({
+        campaignId: visitSessionSections.campaignId,
+        marketId: visitSessions.marketId,
+        visitSessionId: visitSessions.id,
+        kuehlerUnitId: visitSessions.kuehlerUnitId,
+      })
+      .from(visitSessionSections)
+      .innerJoin(visitSessions, eq(visitSessions.id, visitSessionSections.visitSessionId))
+      .where(
+        and(
+          inArray(visitSessionSections.campaignId, campaignIds),
+          inArray(visitSessions.marketId, marketIds),
+          eq(visitSessionSections.section, "kuehler"),
+          eq(visitSessionSections.isDeleted, false),
+          eq(visitSessions.status, "submitted"),
+          eq(visitSessions.isDeleted, false),
+        ),
+      ),
+  ]);
+
+  const unitIdsByMarketId = new Map<string, string[]>();
+  for (const unit of unitRows) {
+    const bucket = unitIdsByMarketId.get(unit.marketId) ?? [];
+    bucket.push(unit.id);
+    unitIdsByMarketId.set(unit.marketId, bucket);
+  }
+
+  const submittedByUnitKey = new Map<string, Set<string>>();
+  const legacySubmittedByKey = new Map<string, Set<string>>();
+  for (const row of submittedRows) {
+    const key = `${row.campaignId}:${row.marketId}`;
+    if (!candidateKeys.has(key)) continue;
+    if (row.kuehlerUnitId) {
+      const unitKey = `${key}:${row.kuehlerUnitId}`;
+      const bucket = submittedByUnitKey.get(unitKey) ?? new Set<string>();
+      bucket.add(row.visitSessionId);
+      submittedByUnitKey.set(unitKey, bucket);
+      continue;
+    }
+    const bucket = legacySubmittedByKey.get(key) ?? new Set<string>();
+    bucket.add(row.visitSessionId);
+    legacySubmittedByKey.set(key, bucket);
+  }
+
+  const completedKeys = new Set<string>();
+  for (const key of candidateKeys) {
+    const separatorIndex = key.indexOf(":");
+    const marketId = key.slice(separatorIndex + 1);
+    const unitIds = unitIdsByMarketId.get(marketId) ?? [];
+    const targetVisitCount = targetByKey.get(key) ?? 1;
+    const requiredVisitCount = Math.max(targetVisitCount, unitIds.length, 1);
+    const completedUnitCount = unitIds.reduce(
+      (count, unitId) => count + ((submittedByUnitKey.get(`${key}:${unitId}`)?.size ?? 0) > 0 ? 1 : 0),
+      0,
+    );
+    const legacySlotCount = Math.max(0, requiredVisitCount - unitIds.length);
+    const completedLegacyCount = Math.min(legacySlotCount, legacySubmittedByKey.get(key)?.size ?? 0);
+    if (completedUnitCount + completedLegacyCount >= requiredVisitCount) {
+      completedKeys.add(key);
+    }
+  }
+
+  return completedKeys;
+}
+
 async function findCampaignAssignmentConflicts(input: {
   targetCampaignId?: string;
   section: CampaignSection;
@@ -925,6 +1010,7 @@ async function findCampaignAssignmentConflicts(input: {
       startDate: campaigns.startDate,
       endDate: campaigns.endDate,
       gmUserId: campaignMarketAssignments.gmUserId,
+      visitTargetCount: campaignMarketAssignments.visitTargetCount,
       gmFirstName: users.firstName,
       gmLastName: users.lastName,
     })
@@ -944,8 +1030,12 @@ async function findCampaignAssignmentConflicts(input: {
     );
 
   const rows = await query;
+  const completedKuehlerKeys = input.section === "kuehler"
+    ? await findCompletedKuehlerCampaignMarketKeys(rows)
+    : new Set<string>();
   const conflicts: CampaignAssignmentConflict[] = [];
   for (const row of rows) {
+    if (completedKuehlerKeys.has(`${row.campaignId}:${row.marketId}`)) continue;
     const existingWindow: CampaignScheduleWindow = {
       scheduleType: row.scheduleType,
       startDate: row.startDate ? String(row.startDate) : null,

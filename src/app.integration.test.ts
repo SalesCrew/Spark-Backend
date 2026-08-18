@@ -3751,6 +3751,101 @@ test("campaign create blocks same-section overlapping market assignment with 409
   await request(app).patch(`/admin/markets/${marketId}/delete`).send({});
 });
 
+test("campaign create allows a completed Kühler market in a Zweitbesuch campaign", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForCampaignTests()) || !(await ensureDbReadyForVisitSessionTests())) {
+    t.skip("Campaign or visit-session tables are not present in the configured DATABASE_URL.");
+    return;
+  }
+  const [gmUser] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)))
+    .limit(1);
+  if (!gmUser?.id) {
+    t.skip("No active GM user available for completed Kühler reassignment test.");
+    return;
+  }
+
+  const app = createApp();
+  const uniq = `kuehler-zweitbesuch-${Date.now()}`;
+  const marketCreateRes = await request(app).post("/admin/markets").send({
+    name: `Kühler Zweitbesuch Markt ${uniq}`,
+    dbName: "",
+    address: "Zweitbesuch Testgasse 1",
+    postalCode: "1010",
+    city: "Wien",
+    region: "Wien",
+  });
+  assert.equal(marketCreateRes.status, 201);
+  const marketId = marketCreateRes.body.market?.id as string;
+  const sessionId = randomUUID();
+  const sectionId = randomUUID();
+  let firstCampaignId: string | null = null;
+  let zweitbesuchCampaignId: string | null = null;
+  t.after(async () => {
+    await db
+      .update(visitSessionSections)
+      .set({ isDeleted: true, deletedAt: new Date() })
+      .where(eq(visitSessionSections.id, sectionId));
+    await db
+      .update(visitSessions)
+      .set({ isDeleted: true, deletedAt: new Date(), status: "cancelled" })
+      .where(eq(visitSessions.id, sessionId));
+    if (firstCampaignId) await request(app).patch(`/admin/campaigns/${firstCampaignId}/delete`).send({});
+    if (zweitbesuchCampaignId) await request(app).patch(`/admin/campaigns/${zweitbesuchCampaignId}/delete`).send({});
+    await request(app).patch(`/admin/markets/${marketId}/delete`).send({});
+  });
+
+  const firstCampaign = await request(app).post("/admin/campaigns").send({
+    name: `Kühler Erstbesuch ${uniq}`,
+    section: "kuehler",
+    status: "active",
+    scheduleType: "always",
+    assignments: [{ marketId, gmUserId: gmUser.id }],
+  });
+  assert.equal(firstCampaign.status, 201);
+  firstCampaignId = firstCampaign.body.campaign?.id as string;
+
+  const blockedWhileOpen = await request(app).post("/admin/campaigns").send({
+    name: `Kühler Zweitbesuch offen ${uniq}`,
+    section: "kuehler",
+    status: "active",
+    scheduleType: "always",
+    assignments: [{ marketId, gmUserId: gmUser.id }],
+  });
+  assert.equal(blockedWhileOpen.status, 409);
+  assert.equal(blockedWhileOpen.body.code, "campaign_market_overlap");
+
+  const submittedAt = new Date();
+  await db.insert(visitSessions).values({
+    id: sessionId,
+    gmUserId: gmUser.id,
+    marketId,
+    status: "submitted",
+    startedAt: new Date(submittedAt.getTime() - 10 * 60 * 1000),
+    submittedAt,
+  });
+  await db.insert(visitSessionSections).values({
+    id: sectionId,
+    visitSessionId: sessionId,
+    campaignId: firstCampaignId,
+    section: "kuehler",
+    status: "submitted",
+    fragebogenNameSnapshot: "Kühler Erstbesuch",
+  });
+
+  const zweitbesuchCampaign = await request(app).post("/admin/campaigns").send({
+    name: `Kühler Zweitbesuch ${uniq}`,
+    section: "kuehler",
+    status: "active",
+    scheduleType: "always",
+    assignments: [{ marketId, gmUserId: gmUser.id }],
+  });
+  assert.equal(zweitbesuchCampaign.status, 201);
+  zweitbesuchCampaignId = zweitbesuchCampaign.body.campaign?.id as string;
+});
+
 test("campaign create allows same-section non-overlapping scheduled windows", async (t) => {
   enableTestAuthBypass();
   if (!(await ensureDbReadyForCampaignTests())) {
