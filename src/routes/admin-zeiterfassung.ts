@@ -26,6 +26,7 @@ import {
   praemienGmWaveContributions,
   timeEntryChangeRequests,
   timeTrackingEntries,
+  timeTrackingEntryEvents,
   users,
   visitAnswerChangeRequests,
   visitAnswerMatrixCells,
@@ -117,6 +118,12 @@ const pauseDeleteSchema = z
   .object({
     sessionId: z.string().uuid(),
     confirmation: z.literal("SOFT_DELETE_PAUSE"),
+  })
+  .strict();
+const timeEntryDeleteSchema = z
+  .object({
+    sessionId: z.string().uuid(),
+    confirmation: z.literal("SOFT_DELETE_TIME_ENTRY"),
   })
   .strict();
 const daySessionPatchSchema = z
@@ -1692,6 +1699,97 @@ adminZeiterfassungRouter.delete("/pauses/:pauseId", async (req: AuthedRequest, r
     }
 
     res.status(200).json({ ok: true, pauseId: deletedPause.id });
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminZeiterfassungRouter.delete("/entries/:entryId", async (req: AuthedRequest, res, next) => {
+  try {
+    const entryId = String(req.params.entryId ?? "").trim();
+    if (!isUuid(entryId)) {
+      res.status(400).json({ error: "Ungültige Zusatzzeit-ID." });
+      return;
+    }
+    const parsed = timeEntryDeleteSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige Löschbestätigung." });
+      return;
+    }
+
+    const [session] = await db
+      .select({
+        id: gmDaySessions.id,
+        gmUserId: gmDaySessions.gmUserId,
+        workDate: gmDaySessions.workDate,
+        timezone: gmDaySessions.timezone,
+        status: gmDaySessions.status,
+      })
+      .from(gmDaySessions)
+      .where(
+        and(
+          eq(gmDaySessions.id, parsed.data.sessionId),
+          eq(gmDaySessions.isDeleted, false),
+        ),
+      )
+      .limit(1);
+    if (!session) {
+      res.status(404).json({ error: "Arbeitstag nicht gefunden." });
+      return;
+    }
+    if (session.status !== "submitted" && session.status !== "ended") {
+      res.status(409).json({ error: "Zusatzzeiten können nur in beendeten/gespeicherten Arbeitstagen gelöscht werden." });
+      return;
+    }
+
+    const timezone = session.timezone?.trim() || "Europe/Vienna";
+    const dayStartExpr = sql`(${session.workDate}::date::timestamp at time zone ${timezone})`;
+    const dayEndExpr = sql`((${session.workDate}::date + 1)::timestamp at time zone ${timezone})`;
+    const now = new Date();
+
+    const deletedEntryId = await db.transaction(async (tx) => {
+      const [deletedEntry] = await tx
+        .update(timeTrackingEntries)
+        .set({
+          status: "cancelled",
+          cancelledAt: now,
+          isDeleted: true,
+          deletedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(timeTrackingEntries.id, entryId),
+            eq(timeTrackingEntries.gmUserId, session.gmUserId),
+            eq(timeTrackingEntries.status, "submitted"),
+            eq(timeTrackingEntries.isDeleted, false),
+            isNotNull(timeTrackingEntries.startAt),
+            sql`${timeTrackingEntries.startAt} >= ${dayStartExpr}`,
+            sql`${timeTrackingEntries.startAt} < ${dayEndExpr}`,
+          ),
+        )
+        .returning({ id: timeTrackingEntries.id });
+      if (!deletedEntry) return null;
+
+      await tx.insert(timeTrackingEntryEvents).values({
+        entryId: deletedEntry.id,
+        gmUserId: req.authUser?.appUserId ?? null,
+        eventType: "cancelled",
+        payload: {
+          cancelledAt: now.toISOString(),
+          reason: "admin_soft_delete",
+          daySessionId: session.id,
+        },
+      });
+      return deletedEntry.id;
+    });
+
+    if (!deletedEntryId) {
+      res.status(404).json({ error: "Gespeicherte Zusatzzeiterfassung nicht gefunden." });
+      return;
+    }
+
+    res.status(200).json({ ok: true, entryId: deletedEntryId });
   } catch (error) {
     next(error);
   }
