@@ -17,7 +17,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 
-export const userRoleEnum = pgEnum("user_role", ["admin", "gm", "sm", "kunde"]);
+export const userRoleEnum = pgEnum("user_role", ["admin", "sm_admin", "gm", "sm", "kunde"]);
 export const fragebogenSectionEnum = pgEnum("fragebogen_section", ["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"]);
 export const fragebogenMainSectionEnum = pgEnum("fragebogen_main_section", ["standard", "flex", "billa"]);
 export const campaignSectionEnum = pgEnum("campaign_section", ["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"]);

@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.build.json",
-    "test": "tsx --test src/admin-kurti-charts.test.ts src/admin-kurti-model-context.test.ts src/admin-kurti-tool-routing.test.ts src/admin-kurti-visualization-skill-loader.test.ts src/admin-kurti-visualizations.test.ts src/admin-zeiterfassung.shared.test.ts src/praemien-answer-persistence.test.ts src/praemien-rewards.test.ts src/red-monat.shared.test.ts src/visit-session-answer-validation.test.ts",
+    "test": "tsx --test src/admin-role.test.ts src/admin-user-scope.test.ts src/admin-kurti-charts.test.ts src/admin-kurti-model-context.test.ts src/admin-kurti-tool-routing.test.ts src/admin-kurti-visualization-skill-loader.test.ts src/admin-kurti-visualizations.test.ts src/admin-zeiterfassung.shared.test.ts src/praemien-answer-persistence.test.ts src/praemien-rewards.test.ts src/red-monat.shared.test.ts src/visit-session-answer-validation.test.ts",
     "test:integration": "tsx --test src/app.integration.test.ts",
     "start": "node dist/index.js",
     "db:generate": "drizzle-kit generate",

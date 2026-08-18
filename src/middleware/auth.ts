@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../lib/db.js";
+import { isRoleAllowedForEndpoint } from "../lib/admin-role.js";
 import { getRequestLogMeta, logger, serializeError } from "../lib/logger.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { type UserRole, users } from "../lib/schema.js";
@@ -149,7 +150,7 @@ export function requireAuth(allowedRoles?: UserRole[]) {
         const bypassRoleEnv = process.env.BYPASS_AUTH_ROLE;
         const bypassUserIdEnv = process.env.BYPASS_AUTH_USER_ID;
         const bypassRole: UserRole =
-          bypassRoleEnv === "admin" || bypassRoleEnv === "gm" || bypassRoleEnv === "sm" || bypassRoleEnv === "kunde"
+          bypassRoleEnv === "admin" || bypassRoleEnv === "sm_admin" || bypassRoleEnv === "gm" || bypassRoleEnv === "sm" || bypassRoleEnv === "kunde"
             ? bypassRoleEnv
             : "admin";
         req.authUser = {
@@ -213,7 +214,7 @@ export function requireAuth(allowedRoles?: UserRole[]) {
         return;
       }
 
-      if (allowedRoles && !allowedRoles.includes(appUser.role)) {
+      if (allowedRoles && !isRoleAllowedForEndpoint(appUser.role, allowedRoles)) {
         logger.warn("auth_role_not_allowed", {
           ...getRequestLogMeta(req),
           appUserId: appUser.id,

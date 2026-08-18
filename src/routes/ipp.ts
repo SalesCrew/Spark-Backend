@@ -1,6 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
+import { isFullAdminRole } from "../lib/admin-role.js";
 import { computeMarketIppForPeriod, computeMarketIppSummariesForPeriod } from "../lib/ipp.js";
 import {
   appendIppAdjustmentEvent,
@@ -318,7 +319,7 @@ const gmAdjustmentHistoryQuerySchema = z.object({
 });
 
 function requireIppAdmin(req: Request, res: Response, next: NextFunction) {
-  if ((req as AuthedRequest).authUser?.role !== "admin") {
+  if (!isFullAdminRole((req as AuthedRequest).authUser?.role)) {
     res.status(403).json({ error: "Nur Admins duerfen IPP-Korrekturen aendern.", code: "ipp_adjustment_admin_only" });
     return;
   }
@@ -353,7 +354,7 @@ adminIppRouter.get("/ipp/gm-periods", async (req, res, next) => {
       periods: catalog.map((period) => ({ ...period, isCurrent: period.startDate === current.redPeriodStart })),
       selectedPeriod: { ...selected, isCurrent: selected.startDate === current.redPeriodStart },
       rows,
-      canEdit: (req as AuthedRequest).authUser?.role === "admin",
+      canEdit: isFullAdminRole((req as AuthedRequest).authUser?.role),
     });
   } catch (error) {
     next(error);

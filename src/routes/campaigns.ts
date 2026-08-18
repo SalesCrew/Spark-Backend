@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { type Response, Router } from "express";
 import { z } from "zod";
+import { isFullAdminRole } from "../lib/admin-role.js";
 import { finalizeBonusForSubmittedVisitSessionTx, recomputeBonusWaveTx } from "../lib/bonus-finalizer.js";
 import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
@@ -2288,7 +2289,7 @@ adminCampaignsRouter.get("/campaigns/:campaignId/markets/:marketId/visit-detail"
 
 adminCampaignsRouter.delete("/campaigns/visit-sessions/:sessionId/photos/:photoId", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins koennen Besuchsfotos loeschen.", code: "admin_required" });
       return;
     }
@@ -2441,7 +2442,7 @@ adminCampaignsRouter.delete("/campaigns/visit-sessions/:sessionId/photos/:photoI
 
 adminCampaignsRouter.get("/campaigns/answer-change-requests", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins können ?nderungsanfragen prüfen.", code: "admin_required" });
       return;
     }
@@ -2561,7 +2562,7 @@ adminCampaignsRouter.get("/campaigns/answer-change-requests", async (req: Authed
 
 adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/reject", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins können ?nderungsanfragen prüfen.", code: "admin_required" });
       return;
     }
@@ -2604,7 +2605,7 @@ adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/reject"
 
 adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins können ?nderungsanfragen prüfen.", code: "admin_required" });
       return;
     }
@@ -3047,7 +3048,7 @@ adminCampaignsRouter.patch("/campaigns/answer-change-requests/:requestId/approve
 
 adminCampaignsRouter.get("/campaigns/visit-session-delete-requests", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins koennen Loeschanfragen pruefen.", code: "admin_required" });
       return;
     }
@@ -3128,7 +3129,7 @@ adminCampaignsRouter.get("/campaigns/visit-session-delete-requests", async (req:
 
 adminCampaignsRouter.patch("/campaigns/visit-session-delete-requests/:requestId/reject", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins koennen Loeschanfragen pruefen.", code: "admin_required" });
       return;
     }
@@ -3171,7 +3172,7 @@ adminCampaignsRouter.patch("/campaigns/visit-session-delete-requests/:requestId/
 
 adminCampaignsRouter.patch("/campaigns/visit-session-delete-requests/:requestId/approve", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins koennen Loeschanfragen pruefen.", code: "admin_required" });
       return;
     }

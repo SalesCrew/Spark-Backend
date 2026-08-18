@@ -3,6 +3,8 @@ import type { NextFunction, Response } from "express";
 import { Router } from "express";
 import { z } from "zod";
 import { aggregateHighVolumeLoad, logAction, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
+import { isFullAdminRole } from "../lib/admin-role.js";
+import { canManageUserRole, getRestrictedDirectoryRole } from "../lib/admin-user-scope.js";
 import { getKundePermissionsForUser, hasKundePermission } from "../lib/kunde-access.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
@@ -12,7 +14,7 @@ import { supabaseAdmin } from "../lib/supabase.js";
 import { generatePassword } from "../services/password.js";
 
 const createUserSchema = z.object({
-  role: z.enum(["admin", "gm", "sm"]),
+  role: z.enum(["admin", "sm_admin", "gm", "sm"]),
   firstName: z.string().min(1),
   lastName: z.string().min(1),
   email: z.string().email(),
@@ -80,7 +82,7 @@ async function requireAdminUsersAccess(req: AuthedRequest, res: Response, next: 
     res.status(401).json({ error: "Authentication required.", code: "auth_required" });
     return;
   }
-  if (req.authUser.role === "admin") {
+  if (isFullAdminRole(req.authUser.role)) {
     next();
     return;
   }
@@ -113,7 +115,7 @@ async function requireAdminUsersAccess(req: AuthedRequest, res: Response, next: 
   });
 }
 
-adminUsersRouter.use(requireAuth(["admin", "kunde"]));
+adminUsersRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
 adminUsersRouter.use(requireAdminUsersAccess);
 adminUsersRouter.use((req, res, next) => {
   if (req.method.toUpperCase() === "GET") {
@@ -139,12 +141,13 @@ adminUsersRouter.use((req, res, next) => {
 adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
   try {
     const roleParam = req.query.role;
-    const requestedRole = roleParam === "admin" || roleParam === "gm" || roleParam === "sm" ? roleParam : undefined;
-    if (req.authUser?.role === "kunde" && requestedRole && requestedRole !== "gm") {
+    const requestedRole = roleParam === "admin" || roleParam === "sm_admin" || roleParam === "gm" || roleParam === "sm" ? roleParam : undefined;
+    const actorRole = req.authUser?.role ?? "gm";
+    if (requestedRole && !canManageUserRole(actorRole, requestedRole)) {
       res.status(200).json({ users: [] });
       return;
     }
-    const role = req.authUser?.role === "kunde" ? "gm" : requestedRole;
+    const role = getRestrictedDirectoryRole(actorRole) ?? requestedRole;
     const whereClause = role ? eq(users.role, role) : undefined;
 
     const rows = await db
@@ -204,7 +207,7 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
 
 adminUsersRouter.get("/:id/special-arthur-filter", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins duerfen GM-Maerktefilter verwalten.", code: "role_not_allowed" });
       return;
     }
@@ -244,7 +247,7 @@ adminUsersRouter.get("/:id/special-arthur-filter", async (req: AuthedRequest, re
 adminUsersRouter.put("/:id/special-arthur-filter", async (req: AuthedRequest, res, next) => {
   const startedAtNs = startActionTimer();
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins duerfen GM-Maerktefilter verwalten.", code: "role_not_allowed" });
       return;
     }
@@ -353,8 +356,12 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
     }
 
     const payload = parsed.data;
-    if (req.authUser?.role === "kunde" && payload.role !== "gm") {
-      res.status(403).json({ error: "Kundenzugänge dürfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
+    if (!req.authUser || !canManageUserRole(req.authUser.role, payload.role)) {
+      const isSmAdmin = req.authUser?.role === "sm_admin";
+      res.status(403).json({
+        error: isSmAdmin ? "SM-Admins dürfen nur Shelf-Merchandiser-Benutzer verwalten." : "Kundenzugänge dürfen nur GM-Benutzer verwalten.",
+        code: isSmAdmin ? "sm_admin_scope_denied" : "kunde_permission_denied",
+      });
       return;
     }
     const password = generatePassword();
@@ -367,6 +374,9 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
         role: payload.role,
         firstName: payload.firstName,
         lastName: payload.lastName,
+      },
+      app_metadata: {
+        role: payload.role,
       },
     });
 
@@ -512,8 +522,12 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       res.status(404).json({ error: "User not found." });
       return;
     }
-    if (req.authUser?.role === "kunde" && existing.role !== "gm") {
-      res.status(403).json({ error: "Kundenzugänge dürfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
+    if (!req.authUser || !canManageUserRole(req.authUser.role, existing.role)) {
+      const isSmAdmin = req.authUser?.role === "sm_admin";
+      res.status(403).json({
+        error: isSmAdmin ? "SM-Admins dürfen nur Shelf-Merchandiser-Benutzer verwalten." : "Kundenzugänge dürfen nur GM-Benutzer verwalten.",
+        code: isSmAdmin ? "sm_admin_scope_denied" : "kunde_permission_denied",
+      });
       return;
     }
 
@@ -616,7 +630,7 @@ adminUsersRouter.patch("/:id/password", async (req: AuthedRequest, res, next) =>
       return;
     }
 
-    if (!req.authUser || req.authUser.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       logAction("warn", "admin_user_password_missing_auth", {
         req,
         action: "admin_user_password_update",
@@ -672,7 +686,7 @@ adminUsersRouter.patch("/:id/password", async (req: AuthedRequest, res, next) =>
       return;
     }
 
-    if (target.role !== "admin") {
+    if (!isFullAdminRole(target.role)) {
       logAction("warn", "admin_user_password_role_not_allowed", {
         req,
         action: "admin_user_password_update",
@@ -746,7 +760,7 @@ adminUsersRouter.patch("/:id/password", async (req: AuthedRequest, res, next) =>
 adminUsersRouter.patch("/:id/anonymize", async (req: AuthedRequest, res, next) => {
   const startedAtNs = startActionTimer();
   try {
-    if (!req.authUser || req.authUser.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins koennen Mitarbeiter anonymisieren.", code: "role_not_allowed" });
       return;
     }
@@ -881,8 +895,12 @@ adminUsersRouter.patch("/:id/deactivate", async (req: AuthedRequest, res, next) 
       res.status(404).json({ error: "User not found." });
       return;
     }
-    if (req.authUser?.role === "kunde" && target.role !== "gm") {
-      res.status(403).json({ error: "Kundenzugänge dürfen nur GM-Benutzer verwalten.", code: "kunde_permission_denied" });
+    if (!req.authUser || !canManageUserRole(req.authUser.role, target.role)) {
+      const isSmAdmin = req.authUser?.role === "sm_admin";
+      res.status(403).json({
+        error: isSmAdmin ? "SM-Admins dürfen nur Shelf-Merchandiser-Benutzer verwalten." : "Kundenzugänge dürfen nur GM-Benutzer verwalten.",
+        code: isSmAdmin ? "sm_admin_scope_denied" : "kunde_permission_denied",
+      });
       return;
     }
 

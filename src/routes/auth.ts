@@ -11,7 +11,7 @@ import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
-  role: z.enum(["gm", "sm", "admin", "kunde"]).optional(),
+  role: z.enum(["gm", "sm", "admin", "sm_admin", "kunde"]).optional(),
 });
 
 const refreshSchema = z.object({
@@ -36,7 +36,7 @@ async function buildAuthUserPayload(appUser: typeof users.$inferSelect) {
   };
 }
 
-authRouter.get("/me", requireAuth(["admin", "gm", "sm", "kunde"]), async (req: AuthedRequest, res, next) => {
+authRouter.get("/me", requireAuth(["admin", "sm_admin", "gm", "sm", "kunde"]), async (req: AuthedRequest, res, next) => {
   try {
     if (!req.authUser) {
       res.status(401).json({ error: "Authentication required." });
@@ -53,7 +53,7 @@ authRouter.get("/me", requireAuth(["admin", "gm", "sm", "kunde"]), async (req: A
   }
 });
 
-authRouter.patch("/password", requireAuth(["admin", "gm", "sm", "kunde"]), async (req: AuthedRequest, res, next) => {
+authRouter.patch("/password", requireAuth(["admin", "sm_admin", "gm", "sm", "kunde"]), async (req: AuthedRequest, res, next) => {
   const startedAtNs = startActionTimer();
   try {
     if (!req.authUser) {

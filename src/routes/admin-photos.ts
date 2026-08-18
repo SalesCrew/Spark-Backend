@@ -3,6 +3,7 @@ import { and, count, desc, eq, ilike, inArray, isNotNull, or, sql, type SQL } fr
 import { Router } from "express";
 import { Readable } from "node:stream";
 import { z } from "zod";
+import { isFullAdminRole } from "../lib/admin-role.js";
 import { db } from "../lib/db.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { shouldExcludeMhdPhotos } from "../lib/photo-archive-access.js";
@@ -916,7 +917,7 @@ adminPhotosRouter.post("/photos/export", async (req: AuthedRequest, res, next) =
 
 adminPhotosRouter.patch("/photos/:photoId/tags", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins dürfen Foto-Tags bearbeiten.", code: "admin_required" });
       return;
     }

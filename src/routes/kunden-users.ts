@@ -1,6 +1,7 @@
 import { and, desc, eq } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
+import { isFullAdminRole } from "../lib/admin-role.js";
 import { normalizeKundePagePermissions } from "../lib/kunde-access.js";
 import { logAction, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { authAuditLogs, kundeUsers, users, type KundePagePermissions } from "../lib/schema.js";
@@ -89,7 +90,7 @@ kundenUsersRouter.get("/me", requireAuth(["admin", "kunde"]), async (req: Authed
       res.status(401).json({ error: "Authentication required.", code: "auth_required" });
       return;
     }
-    if (req.authUser.role === "admin") {
+    if (isFullAdminRole(req.authUser.role)) {
       res.status(200).json({ permissions: {} });
       return;
     }

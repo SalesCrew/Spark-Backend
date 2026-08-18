@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { and, eq } from "drizzle-orm";
+import { isFullAdminRole } from "./admin-role.js";
 import { db } from "./db.js";
 import { kundeUsers, type KundePagePermissions } from "./schema.js";
 import type { AuthedRequest } from "../middleware/auth.js";
@@ -161,7 +162,7 @@ export function requireKundeAdminPermission(req: AuthedRequest, res: Response, n
     res.status(401).json({ error: "Authentication required.", code: "auth_required" });
     return;
   }
-  if (req.authUser.role === "admin") {
+  if (isFullAdminRole(req.authUser.role)) {
     next();
     return;
   }

@@ -109,7 +109,7 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
     {
       userId: NULLABLE_UUID_SCHEMA,
       query: NULLABLE_STRING_SCHEMA,
-      role: { type: ["string", "null"], enum: ["admin", "gm", "sm", "kunde", null] },
+      role: { type: ["string", "null"], enum: ["admin", "sm_admin", "gm", "sm", "kunde", null] },
       activeOnly: { type: "boolean" },
       limit: LIMIT_SCHEMA,
     },
@@ -488,7 +488,7 @@ const searchGmsSchema = z.object({
 const userAccessSchema = z.object({
   userId: z.string().uuid().nullable(),
   query: z.string().nullable(),
-  role: z.enum(["admin", "gm", "sm", "kunde"]).nullable(),
+  role: z.enum(["admin", "sm_admin", "gm", "sm", "kunde"]).nullable(),
   activeOnly: z.boolean(),
   limit: z.number().int().min(1).max(150),
 });

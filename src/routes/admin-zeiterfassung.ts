@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
+import { isFullAdminRole } from "../lib/admin-role.js";
 import { recomputeBonusWaveTx } from "../lib/bonus-finalizer.js";
 import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
@@ -1908,7 +1909,7 @@ adminZeiterfassungRouter.patch("/day-sessions/:sessionId", async (req: AuthedReq
 adminZeiterfassungRouter.delete("/day-sessions/:sessionId", async (req: AuthedRequest, res, next) => {
   const startedAtNs = startActionTimer();
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins koennen komplette Arbeitstage loeschen.", code: "admin_required" });
       return;
     }

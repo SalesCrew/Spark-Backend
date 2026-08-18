@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { and, desc, eq } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
+import { isFullAdminRole } from "../lib/admin-role.js";
 import { logAction, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
@@ -189,7 +190,7 @@ function serializeEntry(row: typeof timeTrackingEntries.$inferSelect) {
 }
 
 function canAccessEntry(req: AuthedRequest, entryGmUserId: string): boolean {
-  if (req.authUser?.role === "admin") return true;
+  if (isFullAdminRole(req.authUser?.role)) return true;
   return req.authUser?.appUserId === entryGmUserId;
 }
 
@@ -799,7 +800,7 @@ timeTrackingRouter.get("/entries/draft/active", async (req: AuthedRequest, res, 
       return;
     }
     const gmUserId =
-      req.authUser?.role === "admin" && parsed.data.gmUserId
+      isFullAdminRole(req.authUser?.role) && parsed.data.gmUserId
         ? parsed.data.gmUserId
         : authUserId;
 
