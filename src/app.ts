@@ -25,6 +25,8 @@ import { gmVisitSessionsRouter } from "./routes/gm-visit-sessions.js";
 import { gmProfileRouter } from "./routes/gm-profile.js";
 import { gmKurtiRouter } from "./routes/gm-kurti.js";
 import { smSettingsRouter } from "./routes/sm-settings.js";
+import { adminSmMarketsRouter } from "./routes/sm-markets.js";
+import { adminSmQuestionnairesRouter } from "./routes/sm-questionnaires.js";
 import { adminKurtiRouter } from "./routes/admin-kurti.js";
 import { adminIppRouter } from "./routes/ipp.js";
 import { kundenUsersRouter } from "./routes/kunden-users.js";
@@ -172,6 +174,8 @@ function createApp() {
   app.use("/admin/users", adminUsersRouter);
   app.use("/admin/dsar", adminDsarRouter);
   app.use("/admin/markets", adminMarketsRouter);
+  app.use("/admin/sm-markets", adminSmMarketsRouter);
+  app.use("/admin/sm-questionnaires", adminSmQuestionnairesRouter);
   app.use("/admin", adminLagerRouter);
   app.use("/admin", adminFragebogenRouter);
   app.use("/admin", adminCampaignsRouter);
