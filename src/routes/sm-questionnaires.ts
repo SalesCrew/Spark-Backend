@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { type NextFunction, type Request, type Response, Router } from "express";
 import { z } from "zod";
 
@@ -13,6 +13,7 @@ import {
   smQuestionLogicRules,
   smQuestionLogicRuleTargets,
   smQuestions,
+  smQuestionnaireGlobalAssignments,
   smQuestionnaireTemplates,
   smQuestionnaireVersionModules,
   smQuestionnaireVersions,
@@ -199,6 +200,26 @@ function validateModule(input: SmModuleInput): void {
     questionIndex.set(question.id, index);
     if (["single", "yesno", "yesnomulti", "multiple", "likert"].includes(question.type) && optionsForQuestion(question).length < 2) {
       throw new SmQuestionnaireDomainError(400, `Die Auswahlfrage „${question.text}“ benötigt mindestens zwei Antworten.`);
+    }
+    if (question.type === "yesnomulti") {
+      const configuredAnswers = optionsForQuestion(question);
+      if (new Set(configuredAnswers).size !== configuredAnswers.length) throw new SmQuestionnaireDomainError(400, `Die Antwortmöglichkeiten bei „${question.text}“ müssen eindeutig sein.`);
+      const allowedAnswers = new Set(configuredAnswers);
+      const branches = Array.isArray(question.config.branches) ? question.config.branches : [];
+      const seenBranchAnswers = new Set<string>();
+      for (const rawBranch of branches) {
+        if (!rawBranch || typeof rawBranch !== "object") throw new SmQuestionnaireDomainError(400, `Die Unterauswahl bei „${question.text}“ ist ungültig.`);
+        const branch = rawBranch as Record<string, unknown>;
+        const answer = typeof branch.answer === "string" ? branch.answer.trim() : "";
+        const options = Array.isArray(branch.options)
+          ? branch.options.map((value) => typeof value === "string" ? value.trim() : "").filter(Boolean)
+          : [];
+        if (!allowedAnswers.has(answer)) throw new SmQuestionnaireDomainError(400, `Eine Unterauswahl bei „${question.text}“ verweist auf eine unbekannte Antwort.`);
+        if (seenBranchAnswers.has(answer)) throw new SmQuestionnaireDomainError(400, `Die Unterauswahl für „${answer}“ ist doppelt konfiguriert.`);
+        if (options.length === 0) throw new SmQuestionnaireDomainError(400, `Die Unterauswahl für „${answer}“ benötigt mindestens eine Option.`);
+        if (new Set(options).size !== options.length) throw new SmQuestionnaireDomainError(400, `Die Unterauswahl für „${answer}“ enthält doppelte Optionen.`);
+        seenBranchAnswers.add(answer);
+      }
     }
   });
 
@@ -817,6 +838,20 @@ async function saveQuestionnaire(input: SmQuestionnaireInput, actorUserId: strin
       });
     }
 
+    if (existingTemplate && input.status !== "active") {
+      const [currentAssignment] = await tx.select({ id: smQuestionnaireGlobalAssignments.id })
+        .from(smQuestionnaireGlobalAssignments)
+        .where(and(
+          eq(smQuestionnaireGlobalAssignments.questionnaireTemplateId, templateId),
+          eq(smQuestionnaireGlobalAssignments.isDeleted, false),
+          isNull(smQuestionnaireGlobalAssignments.supersededAt),
+        ))
+        .limit(1);
+      if (currentAssignment) {
+        throw new SmQuestionnaireDomainError(409, "Der zentral zugewiesene SM-Fragebogen muss aktiv bleiben. Wähle in der Verplanung zuerst einen anderen Fragebogen aus.");
+      }
+    }
+
     const moduleRoots = await tx.select().from(smModules).where(and(
       inArray(smModules.id, input.moduleIds),
       eq(smModules.isDeleted, false),
@@ -1013,13 +1048,28 @@ adminSmQuestionnairesRouter.patch("/questionnaires/:id/delete", async (req: Auth
   try {
     const id = routeId(req);
     if (!isUuid(id)) throw new SmQuestionnaireDomainError(400, "Ungültige SM-Fragebogen-ID.");
-    const [deleted] = await db.update(smQuestionnaireTemplates).set({
-      isDeleted: true,
-      updatedByUserId: req.authUser!.appUserId,
-    }).where(and(
-      eq(smQuestionnaireTemplates.id, id),
-      eq(smQuestionnaireTemplates.isDeleted, false),
-    )).returning({ id: smQuestionnaireTemplates.id });
+    const deleted = await db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_questionnaire:${id}`}, 0))`);
+      const [currentAssignment] = await tx.select({ id: smQuestionnaireGlobalAssignments.id })
+        .from(smQuestionnaireGlobalAssignments)
+        .where(and(
+          eq(smQuestionnaireGlobalAssignments.questionnaireTemplateId, id),
+          eq(smQuestionnaireGlobalAssignments.isDeleted, false),
+          isNull(smQuestionnaireGlobalAssignments.supersededAt),
+        ))
+        .limit(1);
+      if (currentAssignment) {
+        throw new SmQuestionnaireDomainError(409, "Der zentral zugewiesene SM-Fragebogen kann nicht gelöscht werden. Wähle in der Verplanung zuerst einen anderen Fragebogen aus.");
+      }
+      const [deletedRow] = await tx.update(smQuestionnaireTemplates).set({
+        isDeleted: true,
+        updatedByUserId: req.authUser!.appUserId,
+      }).where(and(
+        eq(smQuestionnaireTemplates.id, id),
+        eq(smQuestionnaireTemplates.isDeleted, false),
+      )).returning({ id: smQuestionnaireTemplates.id });
+      return deletedRow;
+    });
     if (!deleted) throw new SmQuestionnaireDomainError(404, "SM-Fragebogen nicht gefunden.");
     res.status(200).json({ ok: true });
   } catch (error) {

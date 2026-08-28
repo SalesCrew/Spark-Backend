@@ -20,6 +20,8 @@ const OPERATOR_ALIASES: Record<string, string> = {
   not_equals: "not_equals",
   includes: "includes",
   not_includes: "not_includes",
+  contains: "includes",
+  not_contains: "not_includes",
   gt: "gt",
   gte: "gte",
   lt: "lt",
@@ -31,6 +33,8 @@ const OPERATOR_ALIASES: Record<string, string> = {
   less_than_or_equal: "lte",
   less_or_equal: "lte",
   between: "between",
+  is_answered: "is_answered",
+  is_not_answered: "is_not_answered",
 };
 
 function normalizeOperator(operator: unknown): string {
@@ -93,6 +97,8 @@ function normalizeRuleAnswerValues(answer: AnswerValue): string[] {
 
 function evaluateConditionalRule(rule: ConditionalRule, triggerAnswer: AnswerValue): boolean {
   const values = normalizeRuleAnswerValues(triggerAnswer);
+  if (rule.operator === "is_answered") return values.length > 0;
+  if (rule.operator === "is_not_answered") return values.length === 0;
   if (values.length === 0) return false;
   const expected = String(rule.triggerValue ?? "").trim().toLowerCase();
   const expectedMax = String(rule.triggerValueMax ?? "").trim().toLowerCase();

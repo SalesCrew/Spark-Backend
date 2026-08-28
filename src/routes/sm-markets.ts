@@ -1,10 +1,11 @@
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../lib/db.js";
 import { logAction, startActionTimer } from "../lib/logger.js";
 import { smMarkets, users } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
+import { resolveAutomaticSmNameMatch } from "../sm-market-user-sync.shared.js";
 
 export const adminSmMarketsRouter = Router();
 
@@ -69,6 +70,13 @@ const updateSmMarketSchema = createSmMarketSchema
     internalMarketId: z.string().trim().min(1).max(200).optional(),
   })
   .partial()
+  .strict();
+
+const manualSmUserMatchSchema = z
+  .object({
+    marketIds: z.array(z.string().uuid()).min(1).max(500),
+    smUserId: z.string().uuid(),
+  })
   .strict();
 
 const weekdayFields = [
@@ -227,6 +235,10 @@ async function isAssignableSmUser(userId: string): Promise<boolean> {
   return Boolean(user);
 }
 
+function smUserDisplayName(user: { firstName: string; lastName: string }): string {
+  return `${user.firstName} ${user.lastName}`.trim();
+}
+
 adminSmMarketsRouter.use(requireAuth(["admin"]));
 
 adminSmMarketsRouter.get("/", async (_req, res, next) => {
@@ -234,6 +246,196 @@ adminSmMarketsRouter.get("/", async (_req, res, next) => {
     const rows = await loadSmMarkets();
     res.status(200).json({ markets: rows.map(mapSmMarketRow) });
   } catch (error) {
+    next(error);
+  }
+});
+
+adminSmMarketsRouter.post("/sync-sm-users", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`set local lock_timeout = '5s'`);
+      await tx.execute(sql`set local statement_timeout = '60s'`);
+      const lock = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(47110334) as locked`);
+      if (!lock[0]?.locked) throw new Error("SM_MARKET_SYNC_IN_PROGRESS");
+
+      const marketRows = await tx.select().from(smMarkets).where(eq(smMarkets.isDeleted, false)).orderBy(asc(smMarkets.chain), asc(smMarkets.name));
+      const smUserRows = await tx.select({ id: users.id, firstName: users.firstName, lastName: users.lastName, email: users.email })
+        .from(users)
+        .where(and(eq(users.role, "sm"), eq(users.isActive, true), isNull(users.deletedAt)))
+        .orderBy(asc(users.lastName), asc(users.firstName));
+      const candidates = smUserRows.map((user) => ({ id: user.id, name: smUserDisplayName(user) }));
+      const usersById = new Map(smUserRows.map((user) => [user.id, user]));
+      const plannedMatches: Array<{
+        market: typeof smMarkets.$inferSelect;
+        smUserId: string;
+        smName: string;
+        score: number;
+        method: "exact" | "fuzzy";
+      }> = [];
+      const unmatched: Array<{
+        marketId: string;
+        marketName: string;
+        marketAddress: string;
+        importedName: string;
+        suggestions: Array<{ smUserId: string; smName: string; email: string; score: number }>;
+      }> = [];
+      let skippedAlreadyMatched = 0;
+      let withoutImportedName = 0;
+
+      for (const market of marketRows) {
+        if (market.assignedSmUserId) {
+          skippedAlreadyMatched += 1;
+          continue;
+        }
+        const importedName = market.shelfMerchandiserName.trim();
+        if (!importedName) withoutImportedName += 1;
+        const resolution = importedName
+          ? resolveAutomaticSmNameMatch(importedName, candidates)
+          : { match: null, method: null, suggestions: [] };
+        if (resolution.match && resolution.method) {
+          plannedMatches.push({
+            market,
+            smUserId: resolution.match.id,
+            smName: resolution.match.name,
+            score: resolution.match.score,
+            method: resolution.method,
+          });
+          continue;
+        }
+        unmatched.push({
+          marketId: market.id,
+          marketName: market.name,
+          marketAddress: `${market.address}, ${market.postalCode} ${market.city}`,
+          importedName,
+          suggestions: resolution.suggestions.map((suggestion) => {
+            const user = usersById.get(suggestion.id);
+            return {
+              smUserId: suggestion.id,
+              smName: suggestion.name,
+              email: user?.email ?? "",
+              score: suggestion.score,
+            };
+          }),
+        });
+      }
+
+      const plannedByUserId = new Map<string, string[]>();
+      for (const planned of plannedMatches) {
+        plannedByUserId.set(planned.smUserId, [...(plannedByUserId.get(planned.smUserId) ?? []), planned.market.id]);
+      }
+      const updatedIds = new Set<string>();
+      const now = new Date();
+      for (const [smUserId, marketIds] of plannedByUserId) {
+        const updated = await tx.update(smMarkets)
+          .set({ assignedSmUserId: smUserId, updatedAt: now })
+          .where(and(inArray(smMarkets.id, marketIds), eq(smMarkets.isDeleted, false), isNull(smMarkets.assignedSmUserId)))
+          .returning({ id: smMarkets.id });
+        for (const row of updated) updatedIds.add(row.id);
+      }
+      skippedAlreadyMatched += plannedMatches.length - updatedIds.size;
+      const matched = plannedMatches
+        .filter((planned) => updatedIds.has(planned.market.id))
+        .map((planned) => ({
+          marketId: planned.market.id,
+          marketName: planned.market.name,
+          marketAddress: `${planned.market.address}, ${planned.market.postalCode} ${planned.market.city}`,
+          importedName: planned.market.shelfMerchandiserName,
+          smUserId: planned.smUserId,
+          smName: planned.smName,
+          score: planned.score,
+          method: planned.method,
+        }));
+      return {
+        summary: {
+          scanned: marketRows.length,
+          matched: matched.length,
+          unmatched: unmatched.length,
+          skippedAlreadyMatched,
+          withoutImportedName,
+          activeSmUsers: smUserRows.length,
+        },
+        matched,
+        unmatched,
+      };
+    });
+
+    const fresh = await loadSmMarkets();
+    logAction("info", "sm_market_user_sync_completed", {
+      req,
+      action: "sm_market_user_sync",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: result.summary,
+    });
+    res.status(200).json({ ...result, markets: fresh.map(mapSmMarketRow) });
+  } catch (error) {
+    if (error instanceof Error && error.message === "SM_MARKET_SYNC_IN_PROGRESS") {
+      res.status(409).json({ error: "Ein SM-Marktimport oder eine andere SM-Synchronisierung läuft bereits. Bitte gleich erneut versuchen." });
+      return;
+    }
+    next(error);
+  }
+});
+
+adminSmMarketsRouter.post("/sync-sm-users/manual", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    const parsed = manualSmUserMatchSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige manuelle SM-Zuordnung." });
+      return;
+    }
+    const marketIds = [...new Set(parsed.data.marketIds)];
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`set local lock_timeout = '5s'`);
+      const lock = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(47110334) as locked`);
+      if (!lock[0]?.locked) throw new Error("SM_MARKET_SYNC_IN_PROGRESS");
+      const [smUser] = await tx.select({ id: users.id, firstName: users.firstName, lastName: users.lastName, email: users.email })
+        .from(users)
+        .where(and(eq(users.id, parsed.data.smUserId), eq(users.role, "sm"), eq(users.isActive, true), isNull(users.deletedAt)))
+        .limit(1);
+      if (!smUser) throw new Error("SM_USER_NOT_ASSIGNABLE");
+      const updated = await tx.update(smMarkets)
+        .set({ assignedSmUserId: smUser.id, updatedAt: new Date() })
+        .where(and(inArray(smMarkets.id, marketIds), eq(smMarkets.isDeleted, false), isNull(smMarkets.assignedSmUserId)))
+        .returning();
+      return {
+        matched: updated.map((market) => ({
+          marketId: market.id,
+          marketName: market.name,
+          marketAddress: `${market.address}, ${market.postalCode} ${market.city}`,
+          importedName: market.shelfMerchandiserName,
+          smUserId: smUser.id,
+          smName: smUserDisplayName(smUser),
+          score: 1,
+          method: "manual" as const,
+        })),
+        skippedAlreadyMatched: marketIds.length - updated.length,
+      };
+    });
+    const fresh = await loadSmMarkets();
+    logAction("info", "sm_market_user_manual_match_completed", {
+      req,
+      action: "sm_market_user_manual_match",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs,
+      details: { requested: marketIds.length, matched: result.matched.length, skippedAlreadyMatched: result.skippedAlreadyMatched },
+    });
+    res.status(200).json({ ...result, markets: fresh.map(mapSmMarketRow) });
+  } catch (error) {
+    if (error instanceof Error && error.message === "SM_USER_NOT_ASSIGNABLE") {
+      res.status(400).json({ error: "Der ausgewählte Shelf Merchandiser ist nicht aktiv oder kein SM-Account." });
+      return;
+    }
+    if (error instanceof Error && error.message === "SM_MARKET_SYNC_IN_PROGRESS") {
+      res.status(409).json({ error: "Ein SM-Marktimport oder eine andere SM-Synchronisierung läuft bereits. Bitte gleich erneut versuchen." });
+      return;
+    }
     next(error);
   }
 });

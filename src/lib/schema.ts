@@ -61,6 +61,11 @@ export const smSubmissionStatusEnum = pgEnum("sm_submission_status", ["draft", "
 export const smAnswerStateEnum = pgEnum("sm_answer_state", ["unanswered", "answered", "not_applicable", "invalidated"]);
 export const smAnswerEventTypeEnum = pgEnum("sm_answer_event_type", ["set", "clear", "state_change", "correction"]);
 export const smChangeRequestStatusEnum = pgEnum("sm_change_request_status", ["pending", "approved", "rejected", "cancelled"]);
+export const smAssignmentSeriesStatusEnum = pgEnum("sm_assignment_series_status", ["active", "ended", "cancelled"]);
+export const smAssignmentFrequencyEnum = pgEnum("sm_assignment_frequency", ["weekly", "biweekly"]);
+export const smAssignmentSourceTypeEnum = pgEnum("sm_assignment_source_type", ["single", "series"]);
+export const smAssignmentStatusEnum = pgEnum("sm_assignment_status", ["planned", "confirmed", "open", "in_progress", "completed", "cancelled", "missed"]);
+export const smAssignmentEventTypeEnum = pgEnum("sm_assignment_event_type", ["created", "updated", "rescheduled", "sm_replaced", "market_replaced", "cancelled", "restored", "series_future_sm_changed", "soft_deleted"]);
 export const visitSessionStatusEnum = pgEnum("visit_session_status", ["draft", "submitted", "cancelled"]);
 export const visitSectionStatusEnum = pgEnum("visit_section_status", ["draft", "submitted"]);
 export const visitAnswerStatusEnum = pgEnum("visit_answer_status", ["unanswered", "answered", "hidden_by_rule", "skipped", "invalid"]);
@@ -512,6 +517,71 @@ export const smMarkets = pgTable(
   ],
 );
 
+export const smMessages = pgTable(
+  "sm_messages",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    subject: text("subject").notNull(),
+    body: text("body").notNull(),
+    senderUserId: uuid("sender_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    senderNameSnapshot: text("sender_name_snapshot").notNull(),
+    sentAt: timestamp("sent_at", { withTimezone: true }).defaultNow().notNull(),
+    visibleAfterReadDays: integer("visible_after_read_days"),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("sm_messages_idempotency_ck", sql`btrim(${table.idempotencyKey}) <> ''`),
+    check("sm_messages_subject_ck", sql`char_length(btrim(${table.subject})) between 1 and 200`),
+    check("sm_messages_body_ck", sql`char_length(btrim(${table.body})) between 1 and 12000`),
+    check("sm_messages_sender_name_ck", sql`char_length(btrim(${table.senderNameSnapshot})) between 1 and 300`),
+    check("sm_messages_visible_after_read_days_ck", sql`${table.visibleAfterReadDays} is null or ${table.visibleAfterReadDays} between 0 and 3650`),
+    check("sm_messages_soft_delete_ck", sql`(${table.isDeleted} and ${table.deletedAt} is not null) or (not ${table.isDeleted} and ${table.deletedAt} is null)`),
+    uniqueIndex("sm_messages_idempotency_active_unique")
+      .on(table.idempotencyKey)
+      .where(sql`${table.isDeleted} = false`),
+    index("sm_messages_sender_idx").on(table.senderUserId),
+    index("sm_messages_sent_active_idx")
+      .on(table.sentAt)
+      .where(sql`${table.isDeleted} = false`),
+  ],
+);
+
+export const smMessageRecipients = pgTable(
+  "sm_message_recipients",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    messageId: uuid("message_id").notNull().references(() => smMessages.id, { onDelete: "restrict" }),
+    smUserId: uuid("sm_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    recipientNameSnapshot: text("recipient_name_snapshot").notNull(),
+    recipientEmailSnapshot: text("recipient_email_snapshot").notNull(),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }).defaultNow().notNull(),
+    readAt: timestamp("read_at", { withTimezone: true }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check("sm_message_recipients_name_ck", sql`char_length(btrim(${table.recipientNameSnapshot})) between 1 and 300`),
+    check("sm_message_recipients_email_ck", sql`char_length(btrim(${table.recipientEmailSnapshot})) between 3 and 500`),
+    check("sm_message_recipients_read_time_ck", sql`${table.readAt} is null or ${table.readAt} >= ${table.deliveredAt}`),
+    check("sm_message_recipients_soft_delete_ck", sql`(${table.isDeleted} and ${table.deletedAt} is not null) or (not ${table.isDeleted} and ${table.deletedAt} is null)`),
+    uniqueIndex("sm_message_recipients_message_user_unique").on(table.messageId, table.smUserId),
+    index("sm_message_recipients_message_idx").on(table.messageId),
+    index("sm_message_recipients_user_idx").on(table.smUserId),
+    index("sm_message_recipients_user_inbox_active_idx")
+      .on(table.smUserId, table.deliveredAt)
+      .where(sql`${table.isDeleted} = false`),
+    index("sm_message_recipients_user_unread_active_idx")
+      .on(table.smUserId, table.deliveredAt)
+      .where(sql`${table.isDeleted} = false and ${table.readAt} is null`),
+  ],
+);
+
 // Independent Shelf Merchandising questionnaire authoring domain. Unlike the
 // GM questionnaire tables, these records have no campaign, chain, IPP, bonus,
 // Spezialfrage, or GM photo-tag coupling. Exact versions are composed so a
@@ -777,6 +847,30 @@ export const smQuestionnaireVersions = pgTable(
   ],
 );
 
+export const smQuestionnaireGlobalAssignments = pgTable(
+  "sm_questionnaire_global_assignments",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    questionnaireTemplateId: uuid("questionnaire_template_id").notNull().references(() => smQuestionnaireTemplates.id, { onDelete: "restrict" }),
+    assignedByUserId: uuid("assigned_by_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    assignedAt: timestamp("assigned_at", { withTimezone: true }).defaultNow().notNull(),
+    supersededAt: timestamp("superseded_at", { withTimezone: true }),
+    supersededByUserId: uuid("superseded_by_user_id").references(() => users.id, { onDelete: "restrict" }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("sm_questionnaire_global_assignments_current_unique").on(sql`(true)`).where(sql`${table.supersededAt} is null and ${table.isDeleted} = false`),
+    index("sm_questionnaire_global_assignments_template_idx").on(table.questionnaireTemplateId),
+    index("sm_questionnaire_global_assignments_assigned_by_idx").on(table.assignedByUserId),
+    index("sm_questionnaire_global_assignments_superseded_by_idx").on(table.supersededByUserId).where(sql`${table.supersededByUserId} is not null`),
+    check("sm_questionnaire_global_assignments_superseded_ck", sql`(${table.supersededAt} is null and ${table.supersededByUserId} is null) or (${table.supersededAt} is not null and ${table.supersededByUserId} is not null and ${table.supersededAt} >= ${table.assignedAt})`),
+    check("sm_questionnaire_global_assignments_soft_delete_ck", sql`(${table.isDeleted} and ${table.deletedAt} is not null) or (not ${table.isDeleted} and ${table.deletedAt} is null)`),
+  ],
+);
+
 export const smQuestionnaireVersionModules = pgTable(
   "sm_questionnaire_version_modules",
   {
@@ -797,6 +891,239 @@ export const smQuestionnaireVersionModules = pgTable(
   ],
 );
 
+export const smAssignmentSeries = pgTable(
+  "sm_assignment_series",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    status: smAssignmentSeriesStatusEnum("status").notNull().default("active"),
+    timezone: text("timezone").notNull().default("Europe/Vienna"),
+    createdByUserId: uuid("created_by_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("sm_assignment_series_idempotency_active_unique").on(table.idempotencyKey).where(sql`${table.isDeleted} = false`),
+    index("sm_assignment_series_created_by_idx").on(table.createdByUserId),
+    index("sm_assignment_series_status_active_idx").on(table.status).where(sql`${table.isDeleted} = false`),
+    check("sm_assignment_series_idempotency_ck", sql`btrim(${table.idempotencyKey}) <> ''`),
+    check("sm_assignment_series_timezone_ck", sql`${table.timezone} = 'Europe/Vienna'`),
+  ],
+);
+
+export const smAssignmentSeriesVersions = pgTable(
+  "sm_assignment_series_versions",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    seriesId: uuid("series_id").notNull().references(() => smAssignmentSeries.id, { onDelete: "restrict" }),
+    versionNumber: integer("version_number").notNull(),
+    effectiveFromDate: date("effective_from_date").notNull(),
+    smMarketId: uuid("sm_market_id").notNull().references(() => smMarkets.id, { onDelete: "restrict" }),
+    marketInternalIdSnapshot: text("market_internal_id_snapshot").notNull(),
+    defaultSmUserId: uuid("default_sm_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    plannedMinutes: integer("planned_minutes").notNull(),
+    questionnaireVersionId: uuid("questionnaire_version_id").references(() => smQuestionnaireVersions.id, { onDelete: "restrict" }),
+    flatRateCents: integer("flat_rate_cents"),
+    currency: text("currency").notNull().default("EUR"),
+    frequency: smAssignmentFrequencyEnum("frequency").notNull(),
+    weekdays: integer("weekdays").array().notNull(),
+    validFrom: date("valid_from").notNull(),
+    validTo: date("valid_to").notNull(),
+    changeReason: text("change_reason"),
+    createdByUserId: uuid("created_by_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("sm_assignment_series_versions_number_active_unique").on(table.seriesId, table.versionNumber).where(sql`${table.isDeleted} = false`),
+    uniqueIndex("sm_assignment_series_versions_id_series_unique").on(table.id, table.seriesId),
+    index("sm_assignment_series_versions_market_idx").on(table.smMarketId),
+    index("sm_assignment_series_versions_sm_idx").on(table.defaultSmUserId),
+    index("sm_assignment_series_versions_questionnaire_idx").on(table.questionnaireVersionId),
+    index("sm_assignment_series_versions_created_by_idx").on(table.createdByUserId),
+    index("sm_assignment_series_versions_effective_idx").on(table.seriesId, table.effectiveFromDate).where(sql`${table.isDeleted} = false`),
+    check("sm_assignment_series_versions_number_ck", sql`${table.versionNumber} >= 1`),
+    check("sm_assignment_series_versions_market_snapshot_ck", sql`btrim(${table.marketInternalIdSnapshot}) <> ''`),
+    check("sm_assignment_series_versions_minutes_ck", sql`${table.plannedMinutes} > 0 and ${table.plannedMinutes} <= 1440`),
+    check("sm_assignment_series_versions_flat_rate_ck", sql`${table.flatRateCents} is null or ${table.flatRateCents} >= 0`),
+    check("sm_assignment_series_versions_currency_ck", sql`${table.currency} ~ '^[A-Z]{3}$'`),
+    check("sm_assignment_series_versions_weekdays_ck", sql`cardinality(${table.weekdays}) between 1 and 7 and ${table.weekdays} <@ array[1,2,3,4,5,6,7]`),
+    check("sm_assignment_series_versions_range_ck", sql`${table.validTo} >= ${table.validFrom}`),
+    check("sm_assignment_series_versions_effective_ck", sql`${table.effectiveFromDate} >= ${table.validFrom} and ${table.effectiveFromDate} <= ${table.validTo}`),
+  ],
+);
+
+export const smAssignments = pgTable(
+  "sm_assignments",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    sourceType: smAssignmentSourceTypeEnum("source_type").notNull(),
+    seriesId: uuid("series_id").references(() => smAssignmentSeries.id, { onDelete: "restrict" }),
+    seriesVersionId: uuid("series_version_id").references(() => smAssignmentSeriesVersions.id, { onDelete: "restrict" }),
+    seriesOccurrenceKey: date("series_occurrence_key"),
+    idempotencyKey: text("idempotency_key").notNull(),
+    originalWorkDate: date("original_work_date").notNull(),
+    originalSmUserId: uuid("original_sm_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    originalSmMarketId: uuid("original_sm_market_id").notNull().references(() => smMarkets.id, { onDelete: "restrict" }),
+    originalMarketInternalId: text("original_market_internal_id").notNull(),
+    originalPlannedMinutes: integer("original_planned_minutes").notNull(),
+    replacementWorkDate: date("replacement_work_date"),
+    replacementSmUserId: uuid("replacement_sm_user_id").references(() => users.id, { onDelete: "restrict" }),
+    replacementSmMarketId: uuid("replacement_sm_market_id").references(() => smMarkets.id, { onDelete: "restrict" }),
+    replacementMarketInternalId: text("replacement_market_internal_id"),
+    replacementPlannedMinutes: integer("replacement_planned_minutes"),
+    questionnaireVersionId: uuid("questionnaire_version_id").references(() => smQuestionnaireVersions.id, { onDelete: "restrict" }),
+    flatRateCents: integer("flat_rate_cents"),
+    currency: text("currency").notNull().default("EUR"),
+    status: smAssignmentStatusEnum("status").notNull().default("planned"),
+    statusBeforeCancellation: smAssignmentStatusEnum("status_before_cancellation"),
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    cancelledByUserId: uuid("cancelled_by_user_id").references(() => users.id, { onDelete: "restrict" }),
+    cancellationReason: text("cancellation_reason"),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdByUserId: uuid("created_by_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    updatedByUserId: uuid("updated_by_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({ name: "sm_assignments_series_version_series_fk", columns: [table.seriesVersionId, table.seriesId], foreignColumns: [smAssignmentSeriesVersions.id, smAssignmentSeriesVersions.seriesId] }).onDelete("restrict"),
+    uniqueIndex("sm_assignments_idempotency_active_unique").on(table.idempotencyKey).where(sql`${table.isDeleted} = false`),
+    uniqueIndex("sm_assignments_series_occurrence_active_unique").on(table.seriesId, table.seriesOccurrenceKey).where(sql`${table.isDeleted} = false and ${table.sourceType} = 'series'`),
+    index("sm_assignments_series_idx").on(table.seriesId),
+    index("sm_assignments_series_version_series_idx").on(table.seriesVersionId, table.seriesId),
+    index("sm_assignments_original_sm_idx").on(table.originalSmUserId),
+    index("sm_assignments_replacement_sm_idx").on(table.replacementSmUserId),
+    index("sm_assignments_original_market_idx").on(table.originalSmMarketId),
+    index("sm_assignments_replacement_market_idx").on(table.replacementSmMarketId),
+    index("sm_assignments_questionnaire_idx").on(table.questionnaireVersionId),
+    index("sm_assignments_cancelled_by_idx").on(table.cancelledByUserId),
+    index("sm_assignments_created_by_idx").on(table.createdByUserId),
+    index("sm_assignments_updated_by_idx").on(table.updatedByUserId),
+    index("sm_assignments_effective_date_active_idx").on(sql`coalesce(${table.replacementWorkDate}, ${table.originalWorkDate})`, table.status).where(sql`${table.isDeleted} = false`),
+    index("sm_assignments_effective_sm_date_active_idx").on(sql`coalesce(${table.replacementSmUserId}, ${table.originalSmUserId})`, sql`coalesce(${table.replacementWorkDate}, ${table.originalWorkDate})`).where(sql`${table.isDeleted} = false`),
+    index("sm_assignments_effective_market_date_active_idx").on(sql`coalesce(${table.replacementSmMarketId}, ${table.originalSmMarketId})`, sql`coalesce(${table.replacementWorkDate}, ${table.originalWorkDate})`).where(sql`${table.isDeleted} = false`),
+    check("sm_assignments_idempotency_key_ck", sql`btrim(${table.idempotencyKey}) <> ''`),
+    check("sm_assignments_source_ck", sql`(${table.sourceType} = 'single' and ${table.seriesId} is null and ${table.seriesVersionId} is null and ${table.seriesOccurrenceKey} is null) or (${table.sourceType} = 'series' and ${table.seriesId} is not null and ${table.seriesVersionId} is not null and ${table.seriesOccurrenceKey} is not null)`),
+    check("sm_assignments_market_snapshot_ck", sql`btrim(${table.originalMarketInternalId}) <> ''`),
+    check("sm_assignments_minutes_ck", sql`${table.originalPlannedMinutes} > 0 and ${table.originalPlannedMinutes} <= 1440`),
+    check("sm_assignments_replacement_date_ck", sql`${table.replacementWorkDate} is null or ${table.replacementWorkDate} <> ${table.originalWorkDate}`),
+    check("sm_assignments_replacement_sm_ck", sql`${table.replacementSmUserId} is null or ${table.replacementSmUserId} <> ${table.originalSmUserId}`),
+    check("sm_assignments_replacement_market_ck", sql`(${table.replacementSmMarketId} is null and ${table.replacementMarketInternalId} is null) or (${table.replacementSmMarketId} is not null and ${table.replacementMarketInternalId} is not null and btrim(${table.replacementMarketInternalId}) <> '' and ${table.replacementSmMarketId} <> ${table.originalSmMarketId})`),
+    check("sm_assignments_replacement_minutes_ck", sql`${table.replacementPlannedMinutes} is null or (${table.replacementPlannedMinutes} > 0 and ${table.replacementPlannedMinutes} <= 1440 and ${table.replacementPlannedMinutes} <> ${table.originalPlannedMinutes})`),
+    check("sm_assignments_flat_rate_ck", sql`${table.flatRateCents} is null or ${table.flatRateCents} >= 0`),
+    check("sm_assignments_currency_ck", sql`${table.currency} ~ '^[A-Z]{3}$'`),
+    check("sm_assignments_cancellation_ck", sql`(${table.status} = 'cancelled' and ${table.cancelledAt} is not null and ${table.cancelledByUserId} is not null and ${table.cancellationReason} is not null and btrim(${table.cancellationReason}) <> '' and ${table.statusBeforeCancellation} is not null and ${table.statusBeforeCancellation} <> 'cancelled') or (${table.status} <> 'cancelled' and ${table.cancelledAt} is null and ${table.cancelledByUserId} is null and ${table.cancellationReason} is null and ${table.statusBeforeCancellation} is null)`),
+    check("sm_assignments_execution_time_ck", sql`${table.startedAt} is null or ${table.completedAt} is null or ${table.completedAt} >= ${table.startedAt}`),
+  ],
+);
+
+export const smAssignmentEvents = pgTable(
+  "sm_assignment_events",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    assignmentId: uuid("assignment_id").notNull().references(() => smAssignments.id, { onDelete: "restrict" }),
+    seriesId: uuid("series_id").references(() => smAssignmentSeries.id, { onDelete: "restrict" }),
+    eventType: smAssignmentEventTypeEnum("event_type").notNull(),
+    actorUserId: uuid("actor_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    reason: text("reason"),
+    beforeState: jsonb("before_state").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    afterState: jsonb("after_state").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("sm_assignment_events_assignment_created_idx").on(table.assignmentId, table.createdAt),
+    index("sm_assignment_events_series_created_idx").on(table.seriesId, table.createdAt).where(sql`${table.seriesId} is not null`),
+    index("sm_assignment_events_actor_idx").on(table.actorUserId),
+    check("sm_assignment_events_before_object_ck", sql`jsonb_typeof(${table.beforeState}) = 'object'`),
+    check("sm_assignment_events_after_object_ck", sql`jsonb_typeof(${table.afterState}) = 'object'`),
+  ],
+);
+
+export const smAssignmentTimeSubmissions = pgTable(
+  "sm_assignment_time_submissions",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    assignmentId: uuid("assignment_id").notNull().references(() => smAssignments.id, { onDelete: "restrict" }),
+    revisionNumber: integer("revision_number").notNull(),
+    actualMinutes: integer("actual_minutes").notNull(),
+    isCurrent: boolean("is_current").notNull().default(true),
+    supersedesSubmissionId: uuid("supersedes_submission_id"),
+    submittedByUserId: uuid("submitted_by_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    submittedAt: timestamp("submitted_at", { withTimezone: true }).defaultNow().notNull(),
+    correctionReason: text("correction_reason"),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({ name: "sm_assignment_time_submissions_supersedes_fk", columns: [table.supersedesSubmissionId], foreignColumns: [table.id] }).onDelete("restrict"),
+    uniqueIndex("sm_assignment_time_submissions_id_assignment_unique").on(table.id, table.assignmentId),
+    uniqueIndex("sm_assignment_time_submissions_revision_active_unique").on(table.assignmentId, table.revisionNumber).where(sql`${table.isDeleted} = false`),
+    uniqueIndex("sm_assignment_time_submissions_current_active_unique").on(table.assignmentId).where(sql`${table.isDeleted} = false and ${table.isCurrent} = true`),
+    index("sm_assignment_time_submissions_supersedes_idx").on(table.supersedesSubmissionId),
+    index("sm_assignment_time_submissions_submitted_by_idx").on(table.submittedByUserId),
+    check("sm_assignment_time_submissions_revision_ck", sql`${table.revisionNumber} >= 1`),
+    check("sm_assignment_time_submissions_minutes_ck", sql`${table.actualMinutes} > 0 and ${table.actualMinutes} <= 1440`),
+    check("sm_assignment_time_submissions_supersedes_ck", sql`(${table.revisionNumber} = 1 and ${table.supersedesSubmissionId} is null and ${table.correctionReason} is null) or (${table.revisionNumber} > 1 and ${table.supersedesSubmissionId} is not null and ${table.correctionReason} is not null and btrim(${table.correctionReason}) <> '')`),
+  ],
+);
+
+export const smAssignmentTimeChangeRequests = pgTable(
+  "sm_assignment_time_change_requests",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    assignmentId: uuid("assignment_id").notNull().references(() => smAssignments.id, { onDelete: "restrict" }),
+    smUserId: uuid("sm_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+    sourceTimeSubmissionId: uuid("source_time_submission_id").notNull(),
+    requestKind: text("request_kind").notNull(),
+    originalMinutes: integer("original_minutes").notNull(),
+    requestedMinutes: integer("requested_minutes"),
+    timestampCorrectionVersion: integer("timestamp_correction_version").notNull().default(1),
+    originalStartedAt: timestamp("original_started_at", { withTimezone: true }),
+    originalCompletedAt: timestamp("original_completed_at", { withTimezone: true }),
+    requestedStartedAt: timestamp("requested_started_at", { withTimezone: true }),
+    requestedCompletedAt: timestamp("requested_completed_at", { withTimezone: true }),
+    requestReason: text("request_reason").notNull(),
+    clientRequestToken: text("client_request_token").notNull(),
+    status: smChangeRequestStatusEnum("status").notNull().default("pending"),
+    reviewedByUserId: uuid("reviewed_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    adminNote: text("admin_note"),
+    appliedTimeSubmissionId: uuid("applied_time_submission_id"),
+    appliedAt: timestamp("applied_at", { withTimezone: true }),
+    isDeleted: boolean("is_deleted").notNull().default(false),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({ name: "sm_assignment_time_change_requests_source_assignment_fk", columns: [table.sourceTimeSubmissionId, table.assignmentId], foreignColumns: [smAssignmentTimeSubmissions.id, smAssignmentTimeSubmissions.assignmentId] }).onDelete("restrict"),
+    foreignKey({ name: "sm_assignment_time_change_requests_applied_assignment_fk", columns: [table.appliedTimeSubmissionId, table.assignmentId], foreignColumns: [smAssignmentTimeSubmissions.id, smAssignmentTimeSubmissions.assignmentId] }).onDelete("restrict"),
+    uniqueIndex("sm_assignment_time_change_requests_client_token_active_unique").on(table.smUserId, table.clientRequestToken).where(sql`${table.isDeleted} = false`),
+    uniqueIndex("sm_assignment_time_change_requests_pending_assignment_unique").on(table.assignmentId).where(sql`${table.isDeleted} = false and ${table.status} = 'pending'`),
+    index("sm_assignment_time_change_requests_sm_status_idx").on(table.smUserId, table.status, table.createdAt).where(sql`${table.isDeleted} = false`),
+    index("sm_assignment_time_change_requests_assignment_idx").on(table.assignmentId, table.createdAt),
+    index("sm_assignment_time_change_requests_reviewer_idx").on(table.reviewedByUserId),
+    index("sm_assignment_time_change_requests_source_idx").on(table.sourceTimeSubmissionId),
+    index("sm_assignment_time_change_requests_applied_idx").on(table.appliedTimeSubmissionId),
+    check("sm_assignment_time_change_requests_kind_ck", sql`${table.requestKind} in ('time_change', 'deletion')`),
+    check("sm_assignment_time_change_requests_minutes_ck", sql`${table.originalMinutes} between 1 and 1440 and ((${table.requestKind} = 'time_change' and ${table.requestedMinutes} between 1 and 1440 and (${table.timestampCorrectionVersion} = 1 or ${table.requestedMinutes} <> ${table.originalMinutes})) or (${table.requestKind} = 'deletion' and ${table.requestedMinutes} is null))`),
+    check("sm_assignment_time_change_requests_timestamp_version_ck", sql`${table.timestampCorrectionVersion} in (0, 1)`),
+    check("sm_assignment_time_change_requests_timestamps_ck", sql`(${table.timestampCorrectionVersion} = 0 and ${table.originalStartedAt} is null and ${table.originalCompletedAt} is null and ${table.requestedStartedAt} is null and ${table.requestedCompletedAt} is null) or (${table.timestampCorrectionVersion} = 1 and (((${table.requestKind} = 'deletion' and ((${table.originalStartedAt} is null and ${table.originalCompletedAt} is null) or (${table.originalStartedAt} is not null and ${table.originalCompletedAt} is not null and ${table.originalCompletedAt} > ${table.originalStartedAt})) and ${table.requestedStartedAt} is null and ${table.requestedCompletedAt} is null)) or (${table.requestKind} = 'time_change' and ${table.originalStartedAt} is not null and ${table.originalCompletedAt} is not null and ${table.originalCompletedAt} > ${table.originalStartedAt} and ${table.requestedStartedAt} is not null and ${table.requestedCompletedAt} is not null and ${table.requestedCompletedAt} > ${table.requestedStartedAt} and ${table.requestedCompletedAt} <= ${table.requestedStartedAt} + interval '24 hours' and ${table.requestedMinutes} = greatest(1, round(extract(epoch from (${table.requestedCompletedAt} - ${table.requestedStartedAt})) / 60.0)::integer) and (${table.requestedStartedAt} <> ${table.originalStartedAt} or ${table.requestedCompletedAt} <> ${table.originalCompletedAt} or ${table.requestedMinutes} <> ${table.originalMinutes}))))`),
+    check("sm_assignment_time_change_requests_reason_ck", sql`btrim(${table.requestReason}) <> '' and btrim(${table.clientRequestToken}) <> ''`),
+    check("sm_assignment_time_change_requests_review_ck", sql`(${table.status} in ('pending', 'cancelled') and ${table.reviewedByUserId} is null and ${table.reviewedAt} is null and ${table.appliedTimeSubmissionId} is null and ${table.appliedAt} is null) or (${table.status} = 'rejected' and ${table.reviewedByUserId} is not null and ${table.reviewedAt} is not null and ${table.appliedTimeSubmissionId} is null and ${table.appliedAt} is null) or (${table.status} = 'approved' and ${table.reviewedByUserId} is not null and ${table.reviewedAt} is not null and ${table.appliedAt} is not null and ((${table.requestKind} = 'time_change' and ${table.appliedTimeSubmissionId} is not null) or (${table.requestKind} = 'deletion' and ${table.appliedTimeSubmissionId} is null)))`),
+  ],
+);
+
 // Runtime questionnaire data is also isolated from GM visit sessions. Each
 // concrete submission resolves the published graph into immutable snapshots so
 // future authoring changes cannot rewrite historical wording, rules, points,
@@ -805,7 +1132,7 @@ export const smQuestionnaireSubmissions = pgTable(
   "sm_questionnaire_submissions",
   {
     id: uuid("id").defaultRandom().primaryKey(),
-    assignmentId: uuid("assignment_id"),
+    assignmentId: uuid("assignment_id").references(() => smAssignments.id, { onDelete: "restrict" }),
     questionnaireTemplateId: uuid("questionnaire_template_id").notNull().references(() => smQuestionnaireTemplates.id, { onDelete: "restrict" }),
     questionnaireVersionId: uuid("questionnaire_version_id").notNull().references(() => smQuestionnaireVersions.id, { onDelete: "restrict" }),
     smUserId: uuid("sm_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
@@ -824,6 +1151,9 @@ export const smQuestionnaireSubmissions = pgTable(
     marketAddressSnapshot: text("market_address_snapshot").notNull().default(""),
     marketPostalCodeSnapshot: text("market_postal_code_snapshot").notNull().default(""),
     marketCitySnapshot: text("market_city_snapshot").notNull().default(""),
+    visitTimeMode: text("visit_time_mode"),
+    travelMinutes: integer("travel_minutes"),
+    manualVisitMinutes: integer("manual_visit_minutes"),
     visitStartedAt: timestamp("visit_started_at", { withTimezone: true }),
     visitCompletedAt: timestamp("visit_completed_at", { withTimezone: true }),
     submittedAt: timestamp("submitted_at", { withTimezone: true }),
@@ -861,6 +1191,9 @@ export const smQuestionnaireSubmissions = pgTable(
     check("sm_questionnaire_submissions_counts_ck", sql`${table.resolvedQuestionCount} >= 0 and ${table.answeredQuestionCount} >= 0 and ${table.answeredQuestionCount} <= ${table.resolvedQuestionCount}`),
     check("sm_questionnaire_submissions_points_ck", sql`${table.earnedPoints} >= 0 and ${table.possiblePoints} >= 0 and ${table.earnedPoints} <= ${table.possiblePoints}`),
     check("sm_questionnaire_submissions_visit_time_ck", sql`${table.visitStartedAt} is null or ${table.visitCompletedAt} is null or ${table.visitCompletedAt} >= ${table.visitStartedAt}`),
+    check("sm_questionnaire_submissions_visit_mode_ck", sql`${table.visitTimeMode} is null or ${table.visitTimeMode} in ('timer', 'manual')`),
+    check("sm_questionnaire_submissions_travel_minutes_ck", sql`${table.travelMinutes} is null or (${table.travelMinutes} >= 0 and ${table.travelMinutes} <= 1440)`),
+    check("sm_questionnaire_submissions_manual_minutes_ck", sql`(${table.visitTimeMode} = 'manual' and (${table.manualVisitMinutes} is null or (${table.manualVisitMinutes} > 0 and ${table.manualVisitMinutes} <= 1440))) or (${table.visitTimeMode} is distinct from 'manual' and ${table.manualVisitMinutes} is null)`),
     check("sm_questionnaire_submissions_submit_state_ck", sql`${table.status} <> 'submitted' or (${table.submittedAt} is not null and ${table.reportingAvailableAt} is not null)`),
     check("sm_questionnaire_submissions_invalidation_ck", sql`${table.status} <> 'invalidated' or (${table.invalidatedAt} is not null and ${table.invalidationReason} is not null and btrim(${table.invalidationReason}) <> '')`),
     check("sm_questionnaire_submissions_cancellation_ck", sql`${table.status} <> 'cancelled' or (${table.cancelledAt} is not null and ${table.cancellationReason} is not null and btrim(${table.cancellationReason}) <> '')`),
@@ -1098,10 +1431,13 @@ export const smAnswerChangeRequests = pgTable(
     requestedAnswerPayload: jsonb("requested_answer_payload").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
     requestedAnswerSummary: text("requested_answer_summary").notNull().default(""),
     requestReason: text("request_reason").notNull(),
+    clientRequestToken: text("client_request_token").notNull(),
     status: smChangeRequestStatusEnum("status").notNull().default("pending"),
     reviewedByUserId: uuid("reviewed_by_user_id").references(() => users.id, { onDelete: "set null" }),
     reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
     adminNote: text("admin_note"),
+    appliedAnswerId: uuid("applied_answer_id"),
+    appliedAt: timestamp("applied_at", { withTimezone: true }),
     isDeleted: boolean("is_deleted").notNull().default(false),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
@@ -1110,18 +1446,22 @@ export const smAnswerChangeRequests = pgTable(
   (table) => [
     foreignKey({ name: "sm_answer_change_requests_question_submission_fk", columns: [table.submissionQuestionId, table.submissionId], foreignColumns: [smQuestionnaireSubmissionQuestions.id, smQuestionnaireSubmissionQuestions.submissionId] }).onDelete("restrict"),
     foreignKey({ name: "sm_answer_change_requests_answer_submission_fk", columns: [table.originalAnswerId, table.submissionId], foreignColumns: [smQuestionAnswers.id, smQuestionAnswers.submissionId] }).onDelete("restrict"),
+    foreignKey({ name: "sm_answer_change_requests_applied_answer_submission_fk", columns: [table.appliedAnswerId, table.submissionId], foreignColumns: [smQuestionAnswers.id, smQuestionAnswers.submissionId] }).onDelete("restrict"),
     index("sm_answer_change_requests_question_submission_idx").on(table.submissionQuestionId, table.submissionId),
     index("sm_answer_change_requests_answer_submission_idx").on(table.originalAnswerId, table.submissionId),
     uniqueIndex("sm_answer_change_requests_pending_question_unique").on(table.submissionQuestionId).where(sql`${table.isDeleted} = false and ${table.status} = 'pending'`),
+    uniqueIndex("sm_answer_change_requests_client_token_active_unique").on(table.smUserId, table.clientRequestToken).where(sql`${table.isDeleted} = false`),
     index("sm_answer_change_requests_sm_status_idx").on(table.smUserId, table.status, table.createdAt).where(sql`${table.isDeleted} = false`),
     index("sm_answer_change_requests_market_idx").on(table.smMarketId, table.createdAt),
     index("sm_answer_change_requests_submission_idx").on(table.submissionId, table.createdAt),
     index("sm_answer_change_requests_original_answer_idx").on(table.originalAnswerId),
+    index("sm_answer_change_requests_applied_answer_submission_idx").on(table.appliedAnswerId, table.submissionId),
     index("sm_answer_change_requests_reviewer_idx").on(table.reviewedByUserId),
     check("sm_answer_change_requests_question_ck", sql`btrim(${table.questionTextSnapshot}) <> ''`),
     check("sm_answer_change_requests_reason_ck", sql`btrim(${table.requestReason}) <> ''`),
+    check("sm_answer_change_requests_client_token_ck", sql`btrim(${table.clientRequestToken}) <> ''`),
     check("sm_answer_change_requests_payload_ck", sql`jsonb_typeof(${table.originalAnswerSnapshot}) = 'object' and jsonb_typeof(${table.requestedAnswerPayload}) = 'object'`),
-    check("sm_answer_change_requests_review_ck", sql`${table.status} = 'pending' or ${table.status} = 'cancelled' or (${table.reviewedByUserId} is not null and ${table.reviewedAt} is not null)`),
+    check("sm_answer_change_requests_review_ck", sql`(${table.status} in ('pending', 'cancelled') and ${table.reviewedByUserId} is null and ${table.reviewedAt} is null and ${table.appliedAnswerId} is null and ${table.appliedAt} is null) or (${table.status} = 'rejected' and ${table.reviewedByUserId} is not null and ${table.reviewedAt} is not null and ${table.appliedAnswerId} is null and ${table.appliedAt} is null) or (${table.status} = 'approved' and ${table.reviewedByUserId} is not null and ${table.reviewedAt} is not null and ${table.appliedAnswerId} is not null and ${table.appliedAt} is not null)`),
   ],
 );
 
@@ -1137,10 +1477,12 @@ export const smQuestionnaireSubmissionDeleteRequests = pgTable(
     marketNameSnapshot: text("market_name_snapshot").notNull(),
     submittedAtSnapshot: timestamp("submitted_at_snapshot", { withTimezone: true }),
     requestReason: text("request_reason").notNull(),
+    clientRequestToken: text("client_request_token").notNull(),
     status: smChangeRequestStatusEnum("status").notNull().default("pending"),
     reviewedByUserId: uuid("reviewed_by_user_id").references(() => users.id, { onDelete: "set null" }),
     reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
     adminNote: text("admin_note"),
+    appliedAt: timestamp("applied_at", { withTimezone: true }),
     isDeleted: boolean("is_deleted").notNull().default(false),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
@@ -1148,12 +1490,14 @@ export const smQuestionnaireSubmissionDeleteRequests = pgTable(
   },
   (table) => [
     uniqueIndex("sm_questionnaire_submission_delete_requests_pending_unique").on(table.submissionId).where(sql`${table.isDeleted} = false and ${table.status} = 'pending'`),
+    uniqueIndex("sm_questionnaire_submission_delete_requests_client_token_active_unique").on(table.smUserId, table.clientRequestToken).where(sql`${table.isDeleted} = false`),
     index("sm_questionnaire_submission_delete_requests_sm_status_idx").on(table.smUserId, table.status, table.createdAt).where(sql`${table.isDeleted} = false`),
     index("sm_questionnaire_submission_delete_requests_market_idx").on(table.smMarketId, table.createdAt),
     index("sm_questionnaire_submission_delete_requests_reviewer_idx").on(table.reviewedByUserId),
     check("sm_questionnaire_submission_delete_requests_snapshot_ck", sql`btrim(${table.questionnaireNameSnapshot}) <> '' and ${table.questionnaireVersionSnapshot} >= 1 and btrim(${table.marketNameSnapshot}) <> ''`),
     check("sm_questionnaire_submission_delete_requests_reason_ck", sql`btrim(${table.requestReason}) <> ''`),
-    check("sm_questionnaire_submission_delete_requests_review_ck", sql`${table.status} = 'pending' or ${table.status} = 'cancelled' or (${table.reviewedByUserId} is not null and ${table.reviewedAt} is not null)`),
+    check("sm_questionnaire_submission_delete_requests_client_token_ck", sql`btrim(${table.clientRequestToken}) <> ''`),
+    check("sm_questionnaire_submission_delete_requests_review_ck", sql`(${table.status} in ('pending', 'cancelled') and ${table.reviewedByUserId} is null and ${table.reviewedAt} is null and ${table.appliedAt} is null) or (${table.status} = 'rejected' and ${table.reviewedByUserId} is not null and ${table.reviewedAt} is not null and ${table.appliedAt} is null) or (${table.status} = 'approved' and ${table.reviewedByUserId} is not null and ${table.reviewedAt} is not null and ${table.appliedAt} is not null)`),
   ],
 );
 
