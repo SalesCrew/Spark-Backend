@@ -96,7 +96,7 @@ async function loadAdminPayload() {
 }
 
 export const adminSmMessagesRouter = Router();
-adminSmMessagesRouter.use(requireAuth(["admin"]));
+adminSmMessagesRouter.use(requireAuth(["admin", "sm_admin"]));
 
 adminSmMessagesRouter.get("/", async (_req, res, next) => {
   try {

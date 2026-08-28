@@ -167,7 +167,7 @@ async function loadFilterOptions() {
   };
 }
 
-adminSmDashboardRouter.use(requireAuth(["admin"]));
+adminSmDashboardRouter.use(requireAuth(["admin", "sm_admin"]));
 
 adminSmDashboardRouter.get("/", async (req, res, next) => {
   try {

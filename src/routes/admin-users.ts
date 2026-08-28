@@ -9,7 +9,15 @@ import { getKundePermissionsForUser, hasKundePermission } from "../lib/kunde-acc
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { readGmKpiCaches, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
-import { authAuditLogs, specialArthurFilter, type UserRole, users } from "../lib/schema.js";
+import {
+  authAuditLogs,
+  smMarkets,
+  smMessageRecipients,
+  smQuestionnaireSubmissions,
+  specialArthurFilter,
+  type UserRole,
+  users,
+} from "../lib/schema.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { generatePassword } from "../services/password.js";
 
@@ -207,7 +215,7 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
 
 adminUsersRouter.get("/:id/special-arthur-filter", async (req: AuthedRequest, res, next) => {
   try {
-    if (!isFullAdminRole(req.authUser?.role)) {
+    if (req.authUser?.role !== "admin") {
       res.status(403).json({ error: "Nur Admins duerfen GM-Maerktefilter verwalten.", code: "role_not_allowed" });
       return;
     }
@@ -247,7 +255,7 @@ adminUsersRouter.get("/:id/special-arthur-filter", async (req: AuthedRequest, re
 adminUsersRouter.put("/:id/special-arthur-filter", async (req: AuthedRequest, res, next) => {
   const startedAtNs = startActionTimer();
   try {
-    if (!isFullAdminRole(req.authUser?.role)) {
+    if (req.authUser?.role !== "admin") {
       res.status(403).json({ error: "Nur Admins duerfen GM-Maerktefilter verwalten.", code: "role_not_allowed" });
       return;
     }
@@ -784,6 +792,15 @@ adminUsersRouter.patch("/:id/anonymize", async (req: AuthedRequest, res, next) =
       res.status(403).json({ error: "Nur GM- und SM-Mitarbeiter koennen ueber diesen Prozess anonymisiert werden.", code: "role_not_allowed" });
       return;
     }
+    if (!canManageUserRole(req.authUser.role, target.role)) {
+      res.status(403).json({
+        error: req.authUser.role === "sm_admin"
+          ? "SM-Admins dürfen nur Shelf-Merchandiser-Benutzer anonymisieren."
+          : "Dieser Mitarbeiter darf nicht anonymisiert werden.",
+        code: req.authUser.role === "sm_admin" ? "sm_admin_scope_denied" : "role_not_allowed",
+      });
+      return;
+    }
     if (target.anonymizedAt) {
       res.status(200).json({ ok: true, alreadyAnonymized: true, user: mapUserResponse(target, null) });
       return;
@@ -791,29 +808,60 @@ adminUsersRouter.patch("/:id/anonymize", async (req: AuthedRequest, res, next) =
 
     const now = new Date();
     const anonymizedEmail = buildAnonymizedEmail(target.id);
-    const [updated] = await db
-      .update(users)
-      .set({
-        email: anonymizedEmail,
-        firstName: "Mitarbeiter",
-        lastName: "1",
-        phone: "1",
-        address: "Adresse 1",
-        city: "Ort 1",
-        postalCode: "1",
-        region: "1",
-        isBillaGm: false,
-        profilePhotoBucket: null,
-        profilePhotoPath: null,
-        profilePhotoUpdatedAt: null,
-        isActive: false,
-        deletedAt: now,
-        anonymizedAt: now,
-        anonymizedByUserId: req.authUser.appUserId,
-        updatedAt: now,
-      })
-      .where(eq(users.id, target.id))
-      .returning();
+    const anonymizedUserValues: Partial<typeof users.$inferInsert> = {
+      email: anonymizedEmail,
+      firstName: "Mitarbeiter",
+      lastName: "1",
+      phone: "1",
+      address: "Adresse 1",
+      city: "Ort 1",
+      postalCode: "1",
+      region: "1",
+      isBillaGm: false,
+      profilePhotoBucket: null,
+      profilePhotoPath: null,
+      profilePhotoUpdatedAt: null,
+      isActive: false,
+      deletedAt: now,
+      anonymizedAt: now,
+      anonymizedByUserId: req.authUser.appUserId,
+      updatedAt: now,
+    };
+
+    const [updated] = target.role === "sm"
+      ? await db.transaction(async (tx) => {
+          const updatedUsers = await tx
+            .update(users)
+            .set(anonymizedUserValues)
+            .where(eq(users.id, target.id))
+            .returning();
+
+          await Promise.all([
+            tx
+              .update(smMarkets)
+              .set({ assignedSmUserId: null, shelfMerchandiserName: "", updatedAt: now })
+              .where(eq(smMarkets.assignedSmUserId, target.id)),
+            tx
+              .update(smMessageRecipients)
+              .set({
+                recipientNameSnapshot: "Anonymisierter SM",
+                recipientEmailSnapshot: anonymizedEmail,
+                updatedAt: now,
+              })
+              .where(eq(smMessageRecipients.smUserId, target.id)),
+            tx
+              .update(smQuestionnaireSubmissions)
+              .set({ smNameSnapshot: "Anonymisierter SM", updatedAt: now })
+              .where(eq(smQuestionnaireSubmissions.smUserId, target.id)),
+          ]);
+
+          return updatedUsers;
+        })
+      : await db
+          .update(users)
+          .set(anonymizedUserValues)
+          .where(eq(users.id, target.id))
+          .returning();
 
     if (!updated) {
       res.status(404).json({ error: "User not found after update.", code: "user_not_found" });

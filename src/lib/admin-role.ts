@@ -7,5 +7,5 @@ export function isFullAdminRole(role: UserRole | null | undefined): role is Full
 }
 
 export function isRoleAllowedForEndpoint(role: UserRole, allowedRoles: readonly UserRole[]): boolean {
-  return allowedRoles.includes(role) || (role === "sm_admin" && allowedRoles.includes("admin"));
+  return allowedRoles.includes(role);
 }

@@ -239,7 +239,7 @@ function smUserDisplayName(user: { firstName: string; lastName: string }): strin
   return `${user.firstName} ${user.lastName}`.trim();
 }
 
-adminSmMarketsRouter.use(requireAuth(["admin"]));
+adminSmMarketsRouter.use(requireAuth(["admin", "sm_admin"]));
 
 adminSmMarketsRouter.get("/", async (_req, res, next) => {
   try {

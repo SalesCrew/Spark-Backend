@@ -1307,7 +1307,7 @@ async function resolveActiveStandardGmNamesByMarketIds(marketIds: string[]) {
 const marketsRouter = Router();
 const adminMarketsRouter = Router();
 
-marketsRouter.use(requireAuth(["admin", "sm_admin", "gm", "sm", "kunde"]));
+marketsRouter.use(requireAuth(["admin", "gm", "kunde"]));
 marketsRouter.use((req: AuthedRequest, res, next) => {
   if (req.authUser?.role !== "kunde") {
     next();

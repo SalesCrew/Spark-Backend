@@ -12,11 +12,11 @@ test("the existing admin role keeps full user-management scope", () => {
   assert.equal(getRestrictedDirectoryRole("admin"), undefined);
 });
 
-test("sm_admin has the same full user-management scope as admin", () => {
+test("sm_admin can only manage shelf-merchandiser users", () => {
   for (const role of roles) {
-    assert.equal(canManageUserRole("sm_admin", role), true);
+    assert.equal(canManageUserRole("sm_admin", role), role === "sm");
   }
-  assert.equal(getRestrictedDirectoryRole("sm_admin"), undefined);
+  assert.equal(getRestrictedDirectoryRole("sm_admin"), "sm");
 });
 
 test("kunde keeps its existing GM-only management scope", () => {

@@ -10,6 +10,18 @@ import {
   gmDaySessionPauses,
   gmDaySessions,
   gmKpiCache,
+  smAnswerChangeRequests,
+  smAssignmentEvents,
+  smAssignments,
+  smAssignmentTimeChangeRequests,
+  smAssignmentTimeSubmissions,
+  smMarkets,
+  smMessageRecipients,
+  smQuestionAnswerEvents,
+  smQuestionAnswerFiles,
+  smQuestionAnswers,
+  smQuestionnaireSubmissionDeleteRequests,
+  smQuestionnaireSubmissions,
   timeEntryChangeRequests,
   timeTrackingEntries,
   users,
@@ -18,6 +30,7 @@ import {
   visitAnswers,
   visitSessions,
 } from "../lib/schema.js";
+import { buildSmDsarCategories } from "../sm-privacy.shared.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const requestTypes = ["access", "rectification", "erasure", "restriction", "portability", "objection", "mixed"] as const;
@@ -205,6 +218,163 @@ async function buildSubjectDataPackage(subjectUserId: string) {
     };
   }
 
+  const serializedSubject = {
+    id: subject.id,
+    role: subject.role,
+    name: `${subject.firstName} ${subject.lastName}`.trim(),
+    email: subject.email,
+    phone: subject.phone,
+    address: subject.address,
+    postalCode: subject.postalCode,
+    city: subject.city,
+    region: subject.region,
+    isActive: subject.isActive,
+    deletedAt: toIso(subject.deletedAt),
+    anonymizedAt: toIso(subject.anonymizedAt),
+    createdAt: subject.createdAt.toISOString(),
+    updatedAt: subject.updatedAt.toISOString(),
+  };
+
+  if (subject.role === "sm") {
+    const [
+      assignedMarkets,
+      assignments,
+      submissions,
+      answerCountRow,
+      photoCountRow,
+      timeRecords,
+      messages,
+      answerChangeRequests,
+      submissionDeleteRequests,
+      timeChangeRequests,
+      assignmentAuditEvents,
+      answerAuditEvents,
+      authAuditCount,
+      agreementCount,
+    ] = await Promise.all([
+      countWhere(smMarkets, and(eq(smMarkets.assignedSmUserId, subjectUserId), eq(smMarkets.isDeleted, false))),
+      countWhere(
+        smAssignments,
+        and(
+          or(eq(smAssignments.originalSmUserId, subjectUserId), eq(smAssignments.replacementSmUserId, subjectUserId)),
+          eq(smAssignments.isDeleted, false),
+        ),
+      ),
+      countWhere(
+        smQuestionnaireSubmissions,
+        and(eq(smQuestionnaireSubmissions.smUserId, subjectUserId), eq(smQuestionnaireSubmissions.isDeleted, false)),
+      ),
+      db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(smQuestionAnswers)
+        .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smQuestionAnswers.submissionId))
+        .where(
+          and(
+            eq(smQuestionnaireSubmissions.smUserId, subjectUserId),
+            eq(smQuestionnaireSubmissions.isDeleted, false),
+            eq(smQuestionAnswers.isDeleted, false),
+          ),
+        )
+        .limit(1),
+      db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(smQuestionAnswerFiles)
+        .innerJoin(smQuestionAnswers, eq(smQuestionAnswers.id, smQuestionAnswerFiles.answerId))
+        .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smQuestionAnswers.submissionId))
+        .where(
+          and(
+            eq(smQuestionnaireSubmissions.smUserId, subjectUserId),
+            eq(smQuestionnaireSubmissions.isDeleted, false),
+            eq(smQuestionAnswers.isDeleted, false),
+            eq(smQuestionAnswerFiles.isDeleted, false),
+          ),
+        )
+        .limit(1),
+      db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(smAssignmentTimeSubmissions)
+        .innerJoin(smAssignments, eq(smAssignments.id, smAssignmentTimeSubmissions.assignmentId))
+        .where(
+          and(
+            or(eq(smAssignments.originalSmUserId, subjectUserId), eq(smAssignments.replacementSmUserId, subjectUserId)),
+            eq(smAssignments.isDeleted, false),
+            eq(smAssignmentTimeSubmissions.isDeleted, false),
+          ),
+        )
+        .limit(1),
+      countWhere(
+        smMessageRecipients,
+        and(eq(smMessageRecipients.smUserId, subjectUserId), eq(smMessageRecipients.isDeleted, false)),
+      ),
+      countWhere(
+        smAnswerChangeRequests,
+        and(eq(smAnswerChangeRequests.smUserId, subjectUserId), eq(smAnswerChangeRequests.isDeleted, false)),
+      ),
+      countWhere(
+        smQuestionnaireSubmissionDeleteRequests,
+        and(
+          eq(smQuestionnaireSubmissionDeleteRequests.smUserId, subjectUserId),
+          eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false),
+        ),
+      ),
+      countWhere(
+        smAssignmentTimeChangeRequests,
+        and(eq(smAssignmentTimeChangeRequests.smUserId, subjectUserId), eq(smAssignmentTimeChangeRequests.isDeleted, false)),
+      ),
+      db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(smAssignmentEvents)
+        .innerJoin(smAssignments, eq(smAssignments.id, smAssignmentEvents.assignmentId))
+        .where(
+          and(
+            or(eq(smAssignments.originalSmUserId, subjectUserId), eq(smAssignments.replacementSmUserId, subjectUserId)),
+            eq(smAssignments.isDeleted, false),
+          ),
+        )
+        .limit(1),
+      db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(smQuestionAnswerEvents)
+        .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smQuestionAnswerEvents.submissionId))
+        .where(
+          and(
+            eq(smQuestionnaireSubmissions.smUserId, subjectUserId),
+            eq(smQuestionnaireSubmissions.isDeleted, false),
+          ),
+        )
+        .limit(1),
+      countWhere(
+        authAuditLogs,
+        or(eq(authAuditLogs.actorUserId, subjectUserId), eq(authAuditLogs.targetUserId, subjectUserId))!,
+      ),
+      countWhere(employeeAgreementAcceptances, eq(employeeAgreementAcceptances.userId, subjectUserId)),
+    ]);
+
+    return {
+      generatedAt: new Date().toISOString(),
+      subject: serializedSubject,
+      categories: buildSmDsarCategories({
+        assignedMarkets,
+        assignments,
+        submissions,
+        answers: Number(answerCountRow[0]?.count ?? 0),
+        photos: Number(photoCountRow[0]?.count ?? 0),
+        timeRecords: Number(timeRecords[0]?.count ?? 0),
+        messages,
+        answerChangeRequests,
+        submissionDeleteRequests,
+        timeChangeRequests,
+        auditEvents: Number(assignmentAuditEvents[0]?.count ?? 0) + Number(answerAuditEvents[0]?.count ?? 0),
+        securityRecords: authAuditCount + agreementCount,
+      }),
+      limitations: [
+        "Dieses Paket ist eine Arbeitsübersicht für die DSAR-Bearbeitung, kein ungeprüfter Direkt-Export.",
+        "Vor Herausgabe müssen Rechte Dritter, gesetzliche Aufbewahrungspflichten und Kundengeheimnisse geprüft werden.",
+        "Exporte außerhalb von Spark müssen intern dokumentiert und sicher gespeichert werden.",
+      ],
+    };
+  }
+
   const [
     visitCount,
     answerCountRow,
@@ -269,22 +439,7 @@ async function buildSubjectDataPackage(subjectUserId: string) {
 
   return {
     generatedAt: new Date().toISOString(),
-    subject: {
-      id: subject.id,
-      role: subject.role,
-      name: `${subject.firstName} ${subject.lastName}`.trim(),
-      email: subject.email,
-      phone: subject.phone,
-      address: subject.address,
-      postalCode: subject.postalCode,
-      city: subject.city,
-      region: subject.region,
-      isActive: subject.isActive,
-      deletedAt: toIso(subject.deletedAt),
-      anonymizedAt: toIso(subject.anonymizedAt),
-      createdAt: subject.createdAt.toISOString(),
-      updatedAt: subject.updatedAt.toISOString(),
-    },
+    subject: serializedSubject,
     categories: [
       {
         key: "profile",

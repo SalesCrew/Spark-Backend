@@ -592,7 +592,7 @@ smPlanningRouter.post("/assignments/:id/time-change-requests", async (req: Authe
 });
 
 export const adminSmPlanningRouter = Router();
-adminSmPlanningRouter.use(requireAuth(["admin"]));
+adminSmPlanningRouter.use(requireAuth(["admin", "sm_admin"]));
 
 adminSmPlanningRouter.use((req, res, next) => {
   if (req.method === "GET") {

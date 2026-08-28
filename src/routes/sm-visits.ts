@@ -122,6 +122,7 @@ const photoCleanupSchema = z.object({
 }).strict();
 
 const SM_VISIT_PHOTO_BUCKET = "sm-visit-photos";
+const SM_VISIT_PHOTO_READ_URL_TTL_SECONDS = 30 * 60;
 
 function normalizePhotoExtension(value: string | undefined): "jpg" | "png" | "webp" {
   const normalized = (value ?? "jpg").toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -485,7 +486,9 @@ async function loadVisitPayload(assignment: AssignmentRow, smUserId: string) {
   )).orderBy(asc(smQuestionAnswerFiles.uploadedAt)) : [];
   const questionIdByAnswerId = new Map(answers.map((answer) => [answer.id, answer.submissionQuestionId]));
   const signedPhotoRows = await Promise.all(photoRows.map(async (photo) => {
-    const { data, error } = await supabaseAdmin.storage.from(photo.storageBucket).createSignedUrl(photo.storagePath, 60 * 60);
+    const { data, error } = await supabaseAdmin.storage
+      .from(photo.storageBucket)
+      .createSignedUrl(photo.storagePath, SM_VISIT_PHOTO_READ_URL_TTL_SECONDS);
     return {
       id: photo.id,
       questionId: questionIdByAnswerId.get(photo.answerId) ?? null,

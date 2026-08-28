@@ -514,7 +514,7 @@ smActivityRouter.post("/submissions/:submissionId/delete-requests", async (req: 
 });
 
 export const adminSmActivityRouter = Router();
-adminSmActivityRouter.use(requireAuth(["admin"]));
+adminSmActivityRouter.use(requireAuth(["admin", "sm_admin"]));
 
 adminSmActivityRouter.get("/requests", async (_req, res, next) => {
   try {

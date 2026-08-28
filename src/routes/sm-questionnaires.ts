@@ -934,7 +934,7 @@ async function saveQuestionnaire(input: SmQuestionnaireInput, actorUserId: strin
 }
 
 export const adminSmQuestionnairesRouter = Router();
-adminSmQuestionnairesRouter.use(requireAuth(["admin"]));
+adminSmQuestionnairesRouter.use(requireAuth(["admin", "sm_admin"]));
 
 adminSmQuestionnairesRouter.use((req, res, next) => {
   if (req.method === "GET") {

@@ -138,7 +138,7 @@ function formatConfigDto(current: ResolvedRedMonthPeriod) {
   };
 }
 
-redMonthRouter.use(requireAuth(["admin", "sm_admin", "gm", "sm", "kunde"]));
+redMonthRouter.use(requireAuth(["admin", "gm", "kunde"]));
 adminRedMonthRouter.use(requireAuth(["admin", "kunde"]));
 adminRedMonthRouter.use(requireKundeAdminPermission);
 
