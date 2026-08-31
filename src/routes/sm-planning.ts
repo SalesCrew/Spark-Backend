@@ -20,6 +20,8 @@ import {
   users,
 } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
+import { assertSmVisitTimeAvailable, lockSmVisitTimes, SmTimeOverlapError } from "../sm-time-overlap.js";
+import { lockSmPlanning } from "../sm-planning-lock.js";
 import {
   buildSmSeriesDates,
   isAssignmentPlanningMutable,
@@ -135,6 +137,10 @@ class SmPlanningError extends Error {
 }
 
 function sendKnownError(error: unknown, res: Response): boolean {
+  if (error instanceof SmTimeOverlapError) {
+    res.status(error.statusCode).json({ error: error.message, code: error.code, details: error.details });
+    return true;
+  }
   if (!(error instanceof SmPlanningError)) return false;
   res.status(error.statusCode).json({ error: error.message, code: error.code });
   return true;
@@ -294,6 +300,7 @@ async function loadActiveSmUser(executor: DbExecutor, userId: string) {
 }
 
 async function loadAssignmentForUpdate(tx: DbTx, assignmentId: string): Promise<AssignmentRow> {
+  await lockSmPlanning(tx);
   const [row] = await tx.select().from(smAssignments).where(and(
     eq(smAssignments.id, assignmentId),
     eq(smAssignments.isDeleted, false),
@@ -560,6 +567,9 @@ smPlanningRouter.post("/assignments/:id/time-change-requests", async (req: Authe
       if (parsed.data.kind === "time_change" && !requestedMinutes) {
         throw new SmPlanningError(400, "sm_assignment_time_request_interval_invalid", "Die gewünschte Start- und Endzeit ist ungültig.");
       }
+      if (parsed.data.kind === "time_change" && requestedStartedAt && requestedCompletedAt) {
+        await assertSmVisitTimeAvailable(tx, { smUserId: actorUserId, assignmentId: assignment.id, startedAt: requestedStartedAt, completedAt: requestedCompletedAt });
+      }
       if (
         parsed.data.kind === "time_change"
         && requestedMinutes === currentTime.actualMinutes
@@ -726,6 +736,7 @@ adminSmPlanningRouter.post("/time-change-requests/:id/approve", async (req: Auth
           if (calculatedMinutes !== request.requestedMinutes) {
             throw new SmPlanningError(409, "sm_assignment_time_request_invalid_state", "Die gespeicherte Dauer passt nicht zu Start- und Endzeit.");
           }
+          await assertSmVisitTimeAvailable(tx, { smUserId: request.smUserId, assignmentId: assignment.id, startedAt: request.requestedStartedAt, completedAt: request.requestedCompletedAt });
         }
         await tx.update(smAssignmentTimeSubmissions).set({ isCurrent: false, updatedAt: now }).where(eq(smAssignmentTimeSubmissions.id, currentTime.id));
         const [createdRow] = await tx.insert(smAssignmentTimeSubmissions).values({
@@ -761,6 +772,7 @@ adminSmPlanningRouter.post("/time-change-requests/:id/approve", async (req: Auth
           });
         }
       } else {
+        await lockSmVisitTimes(tx, request.smUserId);
         await tx.update(smAssignmentTimeSubmissions).set({
           isCurrent: false,
           isDeleted: true,
@@ -859,6 +871,7 @@ adminSmPlanningRouter.post("/assignments", async (req: AuthedRequest, res, next)
     const actorUserId = req.authUser!.appUserId;
     const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_assignment:${parsed.data.idempotencyKey}`}, 0))`);
+      await lockSmPlanning(tx);
       const [existing] = await tx.select({ id: smAssignments.id }).from(smAssignments).where(and(
         eq(smAssignments.idempotencyKey, parsed.data.idempotencyKey),
         eq(smAssignments.isDeleted, false),
@@ -910,6 +923,7 @@ adminSmPlanningRouter.post("/series", async (req: AuthedRequest, res, next) => {
 
     const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_series:${input.idempotencyKey}`}, 0))`);
+      await lockSmPlanning(tx);
       const [existing] = await tx.select({ id: smAssignmentSeries.id }).from(smAssignmentSeries).where(and(
         eq(smAssignmentSeries.idempotencyKey, input.idempotencyKey),
         eq(smAssignmentSeries.isDeleted, false),
@@ -1026,6 +1040,7 @@ adminSmPlanningRouter.post("/assignments/:id/reschedule", async (req: AuthedRequ
       assertExpectedUpdatedAt(before, parsed.data.expectedUpdatedAt);
       assertPlanningMutable(before);
       const replacementWorkDate = replacementOrNull(before.originalWorkDate, parsed.data.workDate);
+      await loadActiveMarket(tx, resolveSmAssignmentValues(before).smMarketId);
       const [updatedRow] = await tx.update(smAssignments).set({ replacementWorkDate, updatedAt: new Date(), updatedByUserId: actorUserId }).where(eq(smAssignments.id, before.id)).returning();
       const updated = requireWrittenRow(updatedRow);
       await writeEvent(tx, { before, after: updated, eventType: "rescheduled", actorUserId, reason: parsed.data.reason });
@@ -1048,6 +1063,7 @@ adminSmPlanningRouter.post("/assignments/:id/reassign", async (req: AuthedReques
       assertExpectedUpdatedAt(before, parsed.data.expectedUpdatedAt);
       assertPlanningMutable(before);
       await loadActiveSmUser(tx, parsed.data.smUserId);
+      await loadActiveMarket(tx, resolveSmAssignmentValues(before).smMarketId);
       if (parsed.data.scope === "occurrence") {
         const replacementSmUserId = replacementOrNull(before.originalSmUserId, parsed.data.smUserId);
         const [afterRow] = await tx.update(smAssignments).set({ replacementSmUserId, updatedAt: new Date(), updatedByUserId: actorUserId }).where(eq(smAssignments.id, before.id)).returning();
@@ -1165,6 +1181,7 @@ adminSmPlanningRouter.post("/assignments/:id/restore", async (req: AuthedRequest
       const before = await loadAssignmentForUpdate(tx, id.data);
       assertExpectedUpdatedAt(before, parsed.data.expectedUpdatedAt);
       if (before.status !== "cancelled") throw new SmPlanningError(409, "sm_assignment_not_cancelled", "Der Einsatz ist nicht abgesagt.");
+      await loadActiveMarket(tx, resolveSmAssignmentValues(before).smMarketId);
       const [updatedRow] = await tx.update(smAssignments).set({
         status: before.statusBeforeCancellation ?? "planned",
         statusBeforeCancellation: null,
@@ -1194,6 +1211,13 @@ adminSmPlanningRouter.post("/assignments/:id/time", async (req: AuthedRequest, r
       const assignment = await loadAssignmentForUpdate(tx, id.data);
       if (assignment.status === "cancelled") {
         throw new SmPlanningError(409, "sm_assignment_time_cancelled", "Für einen abgesagten Einsatz kann keine Ist-Zeit gespeichert werden.");
+      }
+      const [visit] = await tx.select().from(smQuestionnaireSubmissions).where(and(
+        eq(smQuestionnaireSubmissions.assignmentId, assignment.id), eq(smQuestionnaireSubmissions.status, "submitted"),
+        eq(smQuestionnaireSubmissions.isCurrent, true), eq(smQuestionnaireSubmissions.isDeleted, false),
+      )).limit(1);
+      if (visit?.visitStartedAt && visit.visitCompletedAt) {
+        await assertSmVisitTimeAvailable(tx, { smUserId: visit.smUserId, assignmentId: assignment.id, startedAt: visit.visitStartedAt, completedAt: visit.visitCompletedAt });
       }
       const [current] = await tx.select().from(smAssignmentTimeSubmissions).where(and(
         eq(smAssignmentTimeSubmissions.assignmentId, assignment.id),

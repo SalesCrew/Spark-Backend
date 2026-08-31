@@ -6,6 +6,8 @@ import { logAction, startActionTimer } from "../lib/logger.js";
 import { smMarkets, users } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { resolveAutomaticSmNameMatch } from "../sm-market-user-sync.shared.js";
+import { lockSmPlanning } from "../sm-planning-lock.js";
+import { deactivateSmMarket, loadSmMarketDeactivationPreview, smMarketDeactivationSchema, SmMarketDeactivationError } from "../sm-market-deactivation.js";
 
 export const adminSmMarketsRouter = Router();
 
@@ -476,6 +478,7 @@ adminSmMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       const lock = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(47110334) as locked`);
       if (!lock[0]?.locked) throw new Error("SM_IMPORT_IN_PROGRESS");
 
+      await lockSmPlanning(tx);
       const existingRows = await tx.select().from(smMarkets).where(eq(smMarkets.isDeleted, false));
       const assignableSmUsers = await tx
         .select({ id: users.id, firstName: users.firstName, lastName: users.lastName })
@@ -622,6 +625,11 @@ adminSmMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         }
         const locationMatch = locationMatches.length === 1 ? locationMatches[0] : undefined;
         const existing = internalMatch ?? flexMatch ?? locationMatch;
+        if (existing?.isActive && isActive === false) {
+          summary.skipped += 1;
+          if (summary.skippedReasons.length < 50) summary.skippedReasons.push({ row: rowNumber, reason: "Bitte diesen Markt auf der Marktseite deaktivieren und dort über betroffene Einsätze entscheiden. Die Importzeile wurde nicht gespeichert.", sample });
+          continue;
+        }
         if (existing && touchedIds.has(existing.id)) {
           summary.skipped += 1;
           if (summary.skippedReasons.length < 50) summary.skippedReasons.push({ row: rowNumber, reason: "Doppelter Markt innerhalb der Importdatei.", sample });
@@ -769,6 +777,31 @@ adminSmMarketsRouter.post("/", async (req, res, next) => {
   }
 });
 
+adminSmMarketsRouter.get("/:id/deactivation-preview", async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const preview = await db.transaction((tx) => loadSmMarketDeactivationPreview(tx, id), { isolationLevel: "repeatable read", accessMode: "read only" });
+    res.set("Cache-Control", "private, no-store").json(preview);
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ error: "Ungültiger SM-Markt." });
+    if (error instanceof SmMarketDeactivationError) return res.status(error.statusCode).json({ error: error.message, code: error.code });
+    next(error);
+  }
+});
+
+adminSmMarketsRouter.post("/:id/deactivate", async (req: AuthedRequest, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const input = smMarketDeactivationSchema.parse(req.body);
+    const result = await db.transaction((tx) => deactivateSmMarket(tx, id, req.authUser!.appUserId, input));
+    res.json({ ...result, market: mapSmMarketRow(result.market) });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ error: "Bitte entscheide vollständig über die betroffenen Einsätze.", code: "sm_market_deactivation_invalid" });
+    if (error instanceof SmMarketDeactivationError) return res.status(error.statusCode).json({ error: error.message, code: error.code });
+    next(error);
+  }
+});
+
 adminSmMarketsRouter.patch("/:id", async (req, res, next) => {
   try {
     const id = z.string().uuid().safeParse(req.params.id);
@@ -782,7 +815,11 @@ adminSmMarketsRouter.patch("/:id", async (req, res, next) => {
       res.status(400).json({ error: "Der ausgewählte Shelf Merchandiser ist nicht aktiv oder kein SM-Account." });
       return;
     }
-    const [updated] = await db.update(smMarkets).set({
+    const updated = await db.transaction(async (tx) => {
+      await lockSmPlanning(tx);
+      const [current] = await tx.select().from(smMarkets).where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false))).limit(1).for("update");
+      if (current?.isActive && input.isActive === false) throw new SmMarketDeactivationError(409, "sm_market_deactivation_required", "Bitte öffne die Deaktivierungsvorschau und entscheide zuerst über betroffene Einsätze.");
+      const [saved] = await tx.update(smMarkets).set({
       ...(input.internalMarketId === undefined ? {} : { internalMarketId: input.internalMarketId }),
       ...(input.flexNumber === undefined ? {} : { flexNumber: normalizeIdentity(input.flexNumber) }),
       ...(input.name === undefined ? {} : { name: input.name }),
@@ -796,13 +833,16 @@ adminSmMarketsRouter.patch("/:id", async (req, res, next) => {
       ...(input.assignedSmUserId === undefined ? {} : { assignedSmUserId: input.assignedSmUserId }),
       ...(input.isActive === undefined ? {} : { isActive: input.isActive }),
       updatedAt: new Date(),
-    }).where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false))).returning();
+      }).where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false))).returning();
+      return saved;
+    });
     if (!updated) {
       res.status(404).json({ error: "SM-Markt nicht gefunden." });
       return;
     }
     res.status(200).json({ market: mapSmMarketRow(updated) });
   } catch (error) {
+    if (error instanceof SmMarketDeactivationError) return res.status(error.statusCode).json({ error: error.message, code: error.code });
     if (isUniqueViolation(error)) {
       res.status(409).json({ error: "Stammnummern oder Flexnummer ist bereits einem anderen aktiven SM-Markt zugeordnet." });
       return;
@@ -819,17 +859,24 @@ adminSmMarketsRouter.patch("/:id/delete", async (req, res, next) => {
       return;
     }
     const now = new Date();
-    const [deleted] = await db.update(smMarkets).set({
+    const deleted = await db.transaction(async (tx) => {
+      await lockSmPlanning(tx);
+      const preview = await loadSmMarketDeactivationPreview(tx, id.data);
+      if (preview.affectedCount || preview.endingSeriesCount || preview.protectedAssignments.some((row) => row.status === "in_progress")) throw new SmMarketDeactivationError(409, "sm_market_deactivation_required", "Dieser Markt hat noch Einsätze. Bitte zuerst deaktivieren und über Absage oder Ersatz entscheiden. Laufende Besuche müssen abgeschlossen werden.");
+      const [removed] = await tx.update(smMarkets).set({
       isDeleted: true,
       deletedAt: now,
       updatedAt: now,
-    }).where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false))).returning({ id: smMarkets.id });
+      }).where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false))).returning({ id: smMarkets.id });
+      return removed;
+    });
     if (!deleted) {
       res.status(404).json({ error: "SM-Markt nicht gefunden." });
       return;
     }
     res.status(200).json({ ok: true, marketId: deleted.id });
   } catch (error) {
+    if (error instanceof SmMarketDeactivationError) return res.status(error.statusCode).json({ error: error.message, code: error.code });
     next(error);
   }
 });

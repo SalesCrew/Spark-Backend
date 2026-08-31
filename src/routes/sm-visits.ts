@@ -36,6 +36,9 @@ import {
 import { supabaseAdmin } from "../lib/supabase.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { resolveSmAssignmentValues } from "../sm-planning.shared.js";
+import { assertSmVisitTimeAvailable, SmTimeOverlapError } from "../sm-time-overlap.js";
+import { lockSmPlanning } from "../sm-planning-lock.js";
+import { smDeactivationToday } from "../sm-market-deactivation.js";
 import {
   isCompleteSmVisitAnswer,
   isAnsweredSmVisitPayload,
@@ -153,6 +156,10 @@ class SmVisitError extends Error {
 }
 
 function sendError(error: unknown, res: Response): boolean {
+  if (error instanceof SmTimeOverlapError) {
+    res.status(error.statusCode).json({ error: error.message, code: error.code, details: error.details });
+    return true;
+  }
   if (error instanceof SmVisitAnswerValidationError) {
     res.status(400).json({ error: error.message, code: "sm_visit_answer_invalid" });
     return true;
@@ -635,6 +642,7 @@ smVisitsRouter.delete("/:assignmentId", async (req: AuthedRequest, res, next) =>
     discardSchema.parse(req.body);
     const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_visit:${assignmentId}`}, 0))`);
+      await lockSmPlanning(tx);
       const assignment = await loadOwnedAssignment(tx, assignmentId, actor.appUserId, true);
       const [submission] = await tx.select().from(smQuestionnaireSubmissions).where(and(
         eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
@@ -663,9 +671,13 @@ smVisitsRouter.delete("/:assignmentId", async (req: AuthedRequest, res, next) =>
         .orderBy(desc(smAssignmentEvents.createdAt))
         .limit(1);
       const previousStatusValue = startEvent?.beforeState?.status;
-      const restoredStatus = previousStatusValue === "planned" || previousStatusValue === "confirmed" || previousStatusValue === "open"
+      const previousStatus = previousStatusValue === "planned" || previousStatusValue === "confirmed" || previousStatusValue === "open"
         ? previousStatusValue
         : "planned";
+      const effective = resolveSmAssignmentValues(assignment);
+      const [market] = await tx.select({ isActive: smMarkets.isActive, isDeleted: smMarkets.isDeleted }).from(smMarkets).where(eq(smMarkets.id, effective.smMarketId)).limit(1);
+      const cancelInactive = effective.workDate >= smDeactivationToday() && (!market || !market.isActive || market.isDeleted);
+      const restoredStatus = cancelInactive ? "cancelled" : previousStatus;
       const previousStartedAtValue = startEvent?.beforeState?.startedAt;
       const parsedPreviousStartedAt = typeof previousStartedAtValue === "string" ? new Date(previousStartedAtValue) : null;
       const restoredStartedAt = parsedPreviousStartedAt && Number.isFinite(parsedPreviousStartedAt.getTime()) ? parsedPreviousStartedAt : null;
@@ -691,6 +703,7 @@ smVisitsRouter.delete("/:assignmentId", async (req: AuthedRequest, res, next) =>
       }).where(eq(smQuestionnaireSubmissions.id, submission.id));
       const [restoredAssignment] = await tx.update(smAssignments).set({
         status: restoredStatus,
+        ...(cancelInactive ? { statusBeforeCancellation: previousStatus, cancelledAt: now, cancelledByUserId: actor.appUserId, cancellationReason: "Fragebogen verworfen; Markt inzwischen inaktiv" } : {}),
         startedAt: restoredStartedAt,
         completedAt: null,
         updatedByUserId: actor.appUserId,
@@ -700,9 +713,9 @@ smVisitsRouter.delete("/:assignmentId", async (req: AuthedRequest, res, next) =>
       await tx.insert(smAssignmentEvents).values({
         assignmentId,
         seriesId: assignment.seriesId,
-        eventType: "updated",
+        eventType: cancelInactive ? "cancelled" : "updated",
         actorUserId: actor.appUserId,
-        reason: "SM Marktbesuch verworfen",
+        reason: cancelInactive ? "SM Marktbesuch verworfen; Markt inzwischen inaktiv – Einsatz abgesagt" : "SM Marktbesuch verworfen",
         beforeState: { status: assignment.status, startedAt: assignment.startedAt?.toISOString() ?? null, submissionId: submission.id },
         afterState: { status: restoredStatus, startedAt: restoredStartedAt?.toISOString() ?? null, submissionId: null },
       });
@@ -733,6 +746,7 @@ smVisitsRouter.post("/:assignmentId/start", async (req: AuthedRequest, res, next
     const input = startSchema.parse(req.body);
     await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_visit:${assignmentId}`}, 0))`);
+      await lockSmPlanning(tx);
       const assignment = await loadOwnedAssignment(tx, assignmentId, actor.appUserId, true);
       const context = await loadContext(tx, assignment, actor.appUserId);
       const [existing] = await tx.select().from(smQuestionnaireSubmissions).where(and(
@@ -741,6 +755,7 @@ smVisitsRouter.post("/:assignmentId/start", async (req: AuthedRequest, res, next
         eq(smQuestionnaireSubmissions.isCurrent, true),
       )).limit(1).for("update");
       if (existing) return;
+      if (!context.market.isActive) throw new SmVisitError(409, "sm_visit_market_inactive", "Dieser Markt ist inaktiv. Der Einsatz kann nicht gestartet werden. Bitte wende dich an die Einsatzplanung.");
       if (["cancelled", "missed", "completed"].includes(assignment.status)) {
         throw new SmVisitError(409, "sm_visit_assignment_locked", "Dieser Einsatz kann nicht mehr gestartet werden.");
       }
@@ -1300,13 +1315,19 @@ smVisitsRouter.post("/:assignmentId/submit", async (req: AuthedRequest, res, nex
       const selectedVisitCompletedAt = input.visitCompletedAt ? new Date(input.visitCompletedAt) : null;
       const effectiveVisitStartedAt = selectedVisitStartedAt ?? submission.visitStartedAt;
       const effectiveVisitCompletedAt = selectedVisitCompletedAt ?? (effectiveVisitStartedAt ? now : null);
+      if (!effectiveVisitStartedAt || !effectiveVisitCompletedAt) {
+        throw new SmVisitError(409, "sm_visit_timestamps_required", "Bitte trage Start und Ende deines Marktbesuchs ein. Nur mit beiden Uhrzeiten können wir prüfen, dass sich deine Einsätze nicht überschneiden.");
+      }
+      const elapsedMs = effectiveVisitCompletedAt.getTime() - effectiveVisitStartedAt.getTime();
+      if (!Number.isFinite(elapsedMs) || elapsedMs < 60_000 || elapsedMs > 86_400_000) {
+        throw new SmVisitError(409, "sm_visit_time_range_invalid", "Die Endzeit muss mindestens eine Minute nach der Startzeit und höchstens 24 Stunden später liegen.");
+      }
       const elapsedMinutes = effectiveVisitStartedAt && effectiveVisitCompletedAt
         ? Math.max(1, Math.round((effectiveVisitCompletedAt.getTime() - effectiveVisitStartedAt.getTime()) / 60_000))
         : null;
-      const actualMinutes = selectedVisitStartedAt && selectedVisitCompletedAt
-        ? elapsedMinutes
-        : input.actualMinutes ?? (submission.visitTimeMode === "manual" ? submission.manualVisitMinutes : elapsedMinutes);
+      const actualMinutes = elapsedMinutes;
       if (!actualMinutes || actualMinutes < 1 || actualMinutes > 1440) throw new SmVisitError(409, "sm_visit_actual_time_missing", "Bitte trage vor dem Abschluss die tatsächliche Besuchszeit ein.");
+      await assertSmVisitTimeAvailable(tx, { smUserId: actor.appUserId, assignmentId, startedAt: effectiveVisitStartedAt, completedAt: effectiveVisitCompletedAt });
       const [existingTime] = await tx.select().from(smAssignmentTimeSubmissions).where(and(
         eq(smAssignmentTimeSubmissions.assignmentId, assignmentId),
         eq(smAssignmentTimeSubmissions.isDeleted, false),
