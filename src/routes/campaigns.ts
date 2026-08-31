@@ -2,6 +2,7 @@ import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { type Response, Router } from "express";
 import { z } from "zod";
 import { isFullAdminRole } from "../lib/admin-role.js";
+import { buildKuehlerVisitSlots, kuehlerSubmissionInDateRange, planKuehlerMarketAddition } from "../lib/kuehler-repeat-visits.js";
 import { finalizeBonusForSubmittedVisitSessionTx, recomputeBonusWaveTx } from "../lib/bonus-finalizer.js";
 import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
@@ -111,6 +112,7 @@ const assignMarketsSchema = z
   .object({
     marketIds: z.array(z.string().uuid()).default([]),
     assignments: z.array(campaignAssignmentSchema).optional(),
+    additionId: z.string().uuid().optional(),
   })
   .refine((value) => value.marketIds.length > 0 || (value.assignments?.length ?? 0) > 0, {
     message: "Mindestens ein Markt muss zugewiesen werden.",
@@ -196,6 +198,10 @@ function deriveVisitAnswerEventType(input: {
 
 class CampaignDomainError extends Error {
   code:
+    | "invalid_addition"
+    | "addition_conflict"
+    | "assignment_not_found"
+    | "addition_in_use"
     | "invalid_id"
     | "invalid_payload"
     | "schedule_invalid"
@@ -208,16 +214,7 @@ class CampaignDomainError extends Error {
   status: number;
 
   constructor(
-    code:
-      | "invalid_id"
-      | "invalid_payload"
-      | "schedule_invalid"
-      | "market_missing"
-      | "gm_missing"
-      | "gm_required"
-      | "campaign_market_overlap"
-      | "fragebogen_mismatch"
-      | "campaign_not_found",
+    code: CampaignDomainError["code"],
     status: number,
     message: string,
   ) {
@@ -477,6 +474,7 @@ function mapCampaignMarketRow(row: typeof markets.$inferSelect) {
 type CampaignMarketVisitStatusRow = {
   rowId: string;
   marketId: string;
+  visitNumber?: number;
   kuehlerUnitId: string | null;
   kuehlerNumber: string | null;
   kuehlerTechnicalIdentNo: string | null;
@@ -509,15 +507,20 @@ async function buildCampaignMarketVisitStatusBatch(
     .select({
       campaignId: campaignMarketAssignments.campaignId,
       marketId: campaignMarketAssignments.marketId,
+      gmUserId: campaignMarketAssignments.gmUserId,
       visitTargetCount: campaignMarketAssignments.visitTargetCount,
     })
     .from(campaignMarketAssignments)
     .where(and(inArray(campaignMarketAssignments.campaignId, uniqueCampaignIds), eq(campaignMarketAssignments.isDeleted, false)));
 
   const targetByCampaignMarket = new Map<string, number>();
+  const targetsByCampaignMarketGm = new Map<string, Map<string | null, number>>();
   const marketsByCampaign = new Map<string, Set<string>>();
   for (const row of assignmentRows) {
     const key = `${row.campaignId}:${row.marketId}`;
+    const gmTargets = targetsByCampaignMarketGm.get(key) ?? new Map<string | null, number>();
+    gmTargets.set(row.gmUserId, (gmTargets.get(row.gmUserId) ?? 0) + row.visitTargetCount);
+    targetsByCampaignMarketGm.set(key, gmTargets);
     targetByCampaignMarket.set(key, (targetByCampaignMarket.get(key) ?? 0) + row.visitTargetCount);
     const markets = marketsByCampaign.get(row.campaignId) ?? new Set<string>();
     markets.add(row.marketId);
@@ -548,10 +551,10 @@ async function buildCampaignMarketVisitStatusBatch(
         eq(visitSessions.isDeleted, false),
         eq(visitSessions.status, "submitted"),
         dateRange.dateFrom
-          ? sql`${visitSessions.submittedAt} >= (${dateRange.dateFrom}::date::timestamp at time zone 'Europe/Vienna')`
+          ? sql`(${visitSessionSections.section} = 'kuehler' OR ${visitSessions.submittedAt} >= (${dateRange.dateFrom}::date::timestamp at time zone 'Europe/Vienna'))`
           : undefined,
         dateRange.dateTo
-          ? sql`${visitSessions.submittedAt} < (((${dateRange.dateTo}::date + interval '1 day')::timestamp) at time zone 'Europe/Vienna')`
+          ? sql`(${visitSessionSections.section} = 'kuehler' OR ${visitSessions.submittedAt} < (((${dateRange.dateTo}::date + interval '1 day')::timestamp) at time zone 'Europe/Vienna'))`
           : undefined,
       ),
     )
@@ -559,36 +562,21 @@ async function buildCampaignMarketVisitStatusBatch(
 
   const submittedCountByCampaignMarket = new Map<string, number>();
   const latestByCampaignMarket = new Map<string, (typeof submittedRows)[number]>();
-  const submittedCountByKuehlerUnit = new Map<string, number>();
-  const latestByKuehlerUnit = new Map<string, (typeof submittedRows)[number]>();
-  const submittedCountByLegacyKuehlerMarket = new Map<string, number>();
-  const latestByLegacyKuehlerMarket = new Map<string, (typeof submittedRows)[number]>();
+  const kuehlerSubmissionsByGm = new Map<string, typeof submittedRows>();
   const seenSubmittedSession = new Set<string>();
   for (const row of submittedRows) {
     const key = `${row.campaignId}:${row.marketId}`;
     if (!targetByCampaignMarket.has(key)) continue;
-    const isKuehlerCampaign = campaignSectionById.get(row.campaignId) === "kuehler";
     const sessionKey = `${key}:${row.sessionId}`;
-    if (!seenSubmittedSession.has(sessionKey)) {
-      seenSubmittedSession.add(sessionKey);
-      submittedCountByCampaignMarket.set(key, (submittedCountByCampaignMarket.get(key) ?? 0) + 1);
-      if (isKuehlerCampaign && row.kuehlerUnitId) {
-        const unitKey = `${key}:${row.kuehlerUnitId}`;
-        submittedCountByKuehlerUnit.set(unitKey, (submittedCountByKuehlerUnit.get(unitKey) ?? 0) + 1);
-      } else if (isKuehlerCampaign) {
-        submittedCountByLegacyKuehlerMarket.set(key, (submittedCountByLegacyKuehlerMarket.get(key) ?? 0) + 1);
-      }
-    }
-    if (!latestByCampaignMarket.has(key)) {
-      latestByCampaignMarket.set(key, row);
-    }
-    if (isKuehlerCampaign && row.kuehlerUnitId) {
-      const unitKey = `${key}:${row.kuehlerUnitId}`;
-      if (!latestByKuehlerUnit.has(unitKey)) {
-        latestByKuehlerUnit.set(unitKey, row);
-      }
-    } else if (isKuehlerCampaign && !latestByLegacyKuehlerMarket.has(key)) {
-      latestByLegacyKuehlerMarket.set(key, row);
+    if (seenSubmittedSession.has(sessionKey)) continue;
+    seenSubmittedSession.add(sessionKey);
+    submittedCountByCampaignMarket.set(key, (submittedCountByCampaignMarket.get(key) ?? 0) + 1);
+    if (!latestByCampaignMarket.has(key)) latestByCampaignMarket.set(key, row);
+    if (campaignSectionById.get(row.campaignId) === "kuehler") {
+      const gmKey = `${key}:${row.gmUserId}`;
+      const bucket = kuehlerSubmissionsByGm.get(gmKey) ?? [];
+      bucket.push(row);
+      kuehlerSubmissionsByGm.set(gmKey, bucket);
     }
   }
 
@@ -616,7 +604,7 @@ async function buildCampaignMarketVisitStatusBatch(
   }
 
   const gmUserIds = normalizeUnique(
-    Array.from(latestByCampaignMarket.values())
+    [...submittedRows, ...assignmentRows]
       .map((entry) => entry.gmUserId)
       .filter((entry): entry is string => Boolean(entry)),
   );
@@ -641,22 +629,17 @@ async function buildCampaignMarketVisitStatusBatch(
         const targetVisitCount = targetByCampaignMarket.get(key) ?? 0;
         if (isKuehlerCampaign) {
           const units = kuehlerUnitsByMarketId.get(marketId) ?? [];
-          const rowCount = Math.max(targetVisitCount, units.length, 1);
-          return Array.from({ length: rowCount }, (_, index) => {
-            const unit = units[index] ?? null;
-            const unitKey = unit ? `${key}:${unit.id}` : null;
-            const legacyAvailable = !unit ? Math.max(0, (submittedCountByLegacyKuehlerMarket.get(key) ?? 0) - index) : 0;
-            const submittedVisitCount = unitKey
-              ? Math.min(1, submittedCountByKuehlerUnit.get(unitKey) ?? 0)
-              : legacyAvailable > 0 ? 1 : 0;
-            const latest = unitKey
-              ? latestByKuehlerUnit.get(unitKey) ?? null
-              : index === 0 ? latestByLegacyKuehlerMarket.get(key) ?? null : null;
+          return [...(targetsByCampaignMarketGm.get(key) ?? new Map<string | null, number>())].flatMap(([gmUserId, target]) =>
+            buildKuehlerVisitSlots(units, target, kuehlerSubmissionsByGm.get(`${key}:${gmUserId}`) ?? []).map(({ unit, visitNumber, submission }) => {
+            // Assign occurrence numbers before date filtering so a later visit never masquerades as visit 1.
+            const latest = submission && kuehlerSubmissionInDateRange(submission.submittedAt, dateRange) ? submission : null;
+            const submittedVisitCount = latest ? 1 : 0;
             return {
-              rowId: `kuehler:${marketId}:${unit?.id ?? `slot-${index + 1}`}`,
+              rowId: `kuehler:${marketId}:${gmUserId ?? "unassigned"}:${unit?.id ?? "legacy"}:${visitNumber}`,
               marketId,
+              visitNumber,
               kuehlerUnitId: unit?.id ?? null,
-              kuehlerNumber: unit?.kuehlerInternalId ?? (rowCount > 1 ? `Kühler ${index + 1}` : null),
+              kuehlerNumber: unit?.kuehlerInternalId ?? null,
               kuehlerTechnicalIdentNo: unit?.kuehlerTechnicalIdentNo ?? null,
               targetVisitCount: 1,
               submittedVisitCount,
@@ -666,10 +649,10 @@ async function buildCampaignMarketVisitStatusBatch(
               startedAt: latest?.startedAt?.toISOString() ?? null,
               submittedAt: latest?.submittedAt?.toISOString() ?? null,
               durationMinutes: latest ? calculateDurationMinutes(latest.startedAt, latest.submittedAt) : null,
-              gmUserId: latest?.gmUserId ?? null,
-              gmName: latest?.gmUserId ? gmNameById.get(latest.gmUserId) ?? null : null,
+              gmUserId,
+              gmName: gmUserId ? gmNameById.get(gmUserId) ?? null : null,
             };
-          });
+          }));
         }
         const submittedVisitCount = submittedCountByCampaignMarket.get(key) ?? 0;
         const latest = latestByCampaignMarket.get(key) ?? null;
@@ -906,86 +889,19 @@ async function ensureGmUsersExist(gmUserIds: Array<string | null>) {
 async function findCompletedKuehlerCampaignMarketKeys(
   rows: Array<{ campaignId: string; marketId: string; visitTargetCount: number }>,
 ): Promise<Set<string>> {
-  const candidateKeys = new Set(rows.map((row) => `${row.campaignId}:${row.marketId}`));
-  if (candidateKeys.size === 0) return new Set();
-
-  const targetByKey = new Map<string, number>();
-  for (const row of rows) {
-    const key = `${row.campaignId}:${row.marketId}`;
-    targetByKey.set(key, (targetByKey.get(key) ?? 0) + Math.max(1, Number(row.visitTargetCount ?? 1)));
-  }
-
-  const campaignIds = Array.from(new Set(rows.map((row) => row.campaignId)));
-  const marketIds = Array.from(new Set(rows.map((row) => row.marketId)));
-  const [unitRows, submittedRows] = await Promise.all([
-    db
-      .select({ id: marketKuehlerUnits.id, marketId: marketKuehlerUnits.marketId })
-      .from(marketKuehlerUnits)
-      .where(and(inArray(marketKuehlerUnits.marketId, marketIds), eq(marketKuehlerUnits.isDeleted, false))),
-    db
-      .select({
-        campaignId: visitSessionSections.campaignId,
-        marketId: visitSessions.marketId,
-        visitSessionId: visitSessions.id,
-        kuehlerUnitId: visitSessions.kuehlerUnitId,
-      })
-      .from(visitSessionSections)
-      .innerJoin(visitSessions, eq(visitSessions.id, visitSessionSections.visitSessionId))
-      .where(
-        and(
-          inArray(visitSessionSections.campaignId, campaignIds),
-          inArray(visitSessions.marketId, marketIds),
-          eq(visitSessionSections.section, "kuehler"),
-          eq(visitSessionSections.isDeleted, false),
-          eq(visitSessions.status, "submitted"),
-          eq(visitSessions.isDeleted, false),
-        ),
-      ),
-  ]);
-
-  const unitIdsByMarketId = new Map<string, string[]>();
-  for (const unit of unitRows) {
-    const bucket = unitIdsByMarketId.get(unit.marketId) ?? [];
-    bucket.push(unit.id);
-    unitIdsByMarketId.set(unit.marketId, bucket);
-  }
-
-  const submittedByUnitKey = new Map<string, Set<string>>();
-  const legacySubmittedByKey = new Map<string, Set<string>>();
-  for (const row of submittedRows) {
-    const key = `${row.campaignId}:${row.marketId}`;
-    if (!candidateKeys.has(key)) continue;
-    if (row.kuehlerUnitId) {
-      const unitKey = `${key}:${row.kuehlerUnitId}`;
-      const bucket = submittedByUnitKey.get(unitKey) ?? new Set<string>();
-      bucket.add(row.visitSessionId);
-      submittedByUnitKey.set(unitKey, bucket);
-      continue;
+  // Use the same occurrence/GM accounting as the admin and GM progress displays.
+  const statuses = await buildCampaignMarketVisitStatusBatch(rows.map((row) => row.campaignId));
+  const completed = new Set<string>();
+  for (const campaign of statuses) {
+    const byMarket = new Map<string, boolean>();
+    for (const visit of campaign.markets) {
+      byMarket.set(visit.marketId, (byMarket.get(visit.marketId) ?? true) && visit.isComplete);
     }
-    const bucket = legacySubmittedByKey.get(key) ?? new Set<string>();
-    bucket.add(row.visitSessionId);
-    legacySubmittedByKey.set(key, bucket);
-  }
-
-  const completedKeys = new Set<string>();
-  for (const key of candidateKeys) {
-    const separatorIndex = key.indexOf(":");
-    const marketId = key.slice(separatorIndex + 1);
-    const unitIds = unitIdsByMarketId.get(marketId) ?? [];
-    const targetVisitCount = targetByKey.get(key) ?? 1;
-    const requiredVisitCount = Math.max(targetVisitCount, unitIds.length, 1);
-    const completedUnitCount = unitIds.reduce(
-      (count, unitId) => count + ((submittedByUnitKey.get(`${key}:${unitId}`)?.size ?? 0) > 0 ? 1 : 0),
-      0,
-    );
-    const legacySlotCount = Math.max(0, requiredVisitCount - unitIds.length);
-    const completedLegacyCount = Math.min(legacySlotCount, legacySubmittedByKey.get(key)?.size ?? 0);
-    if (completedUnitCount + completedLegacyCount >= requiredVisitCount) {
-      completedKeys.add(key);
+    for (const [marketId, isComplete] of byMarket) {
+      if (isComplete) completed.add(`${campaign.campaignId}:${marketId}`);
     }
   }
-
-  return completedKeys;
+  return completed;
 }
 
 async function findCampaignAssignmentConflicts(input: {
@@ -4462,6 +4378,9 @@ adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, r
     if (!campaignForValidation) {
       throw new CampaignDomainError("campaign_not_found", 404, "Kampagne nicht gefunden.");
     }
+    if (parsed.data.additionId && (campaignForValidation.section !== "kuehler" || parsed.data.assignments?.length !== 1 || parsed.data.marketIds.length > 0)) {
+      throw new CampaignDomainError("invalid_addition", 400, "Ein weiterer Marktbesuch ist nur für eine einzelne Kühler-Marktzuweisung möglich.");
+    }
     const assignments = normalizeAssignments({
       section: campaignForValidation.section,
       marketIds: parsed.data.marketIds,
@@ -4496,6 +4415,33 @@ adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, r
         .limit(1);
       if (!campaignRow) throw new CampaignDomainError("campaign_not_found", 404, "Kampagne nicht gefunden.");
 
+      if (parsed.data.additionId) {
+        // Serialize slot allocation and retries with every other campaign assignment writer.
+        await tx.execute(sql`SELECT ${campaigns.id} FROM ${campaigns} WHERE ${campaigns.id} = ${campaignId} FOR UPDATE`);
+        const assignment = assignments[0]!;
+        const [existing] = await tx.select().from(campaignMarketAssignments)
+          .where(eq(campaignMarketAssignments.id, parsed.data.additionId)).limit(1);
+        if (existing) {
+          if (existing.campaignId !== campaignId || existing.marketId !== assignment.marketId || existing.gmUserId !== assignment.gmUserId || existing.isDeleted) {
+            throw new CampaignDomainError("addition_conflict", 409, "Diese Marktzuweisung wurde bereits verwendet oder rückgängig gemacht. Bitte neu hinzufügen.");
+          }
+          return;
+        }
+        const previous = await tx.select().from(campaignMarketAssignments).where(and(
+          eq(campaignMarketAssignments.campaignId, campaignId),
+          eq(campaignMarketAssignments.marketId, assignment.marketId),
+          eq(campaignMarketAssignments.gmUserId, assignment.gmUserId!),
+        ));
+        const units = await tx.select({ id: marketKuehlerUnits.id }).from(marketKuehlerUnits).where(and(
+          eq(marketKuehlerUnits.marketId, assignment.marketId), eq(marketKuehlerUnits.isDeleted, false),
+        ));
+        const planned = planKuehlerMarketAddition(previous, units.length);
+        await tx.insert(campaignMarketAssignments).values({
+          id: parsed.data.additionId, campaignId, marketId: assignment.marketId, gmUserId: assignment.gmUserId,
+          ...planned, assignedAt: now, assignedByUserId: auditUserId, createdAt: now, updatedAt: now,
+        });
+        return;
+      }
       for (const assignment of assignments) {
         await mergeCampaignAssignment(tx, {
           campaignId,
@@ -5109,10 +5055,44 @@ adminCampaignsRouter.patch("/campaigns/:id/markets/:marketId/delete", async (req
       res.status(400).json({ error: "Ungültige ID.", code: "invalid_id" });
       return;
     }
+    const parsed = z.object({ additionId: z.string().uuid().optional() }).strict().safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültige Marktzuweisung.", code: "invalid_payload" });
+      return;
+    }
     const now = new Date();
-    // Removing a market from a campaign is market-scoped: all active assignment rows
-    // for this campaign+market are soft-deleted, regardless of GM.
-    const removed = await db
+    const additionId = parsed.data.additionId;
+    const removed = additionId ? await db.transaction(async (tx) => {
+      const [campaign] = await tx.select().from(campaigns)
+        .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false))).for("update").limit(1);
+      if (!campaign || campaign.section !== "kuehler") {
+        throw new CampaignDomainError("invalid_addition", 400, "Einzelne Besuchszuweisungen können nur bei Kühlerinventur rückgängig gemacht werden.");
+      }
+      const [addition] = await tx.select().from(campaignMarketAssignments).where(and(
+        eq(campaignMarketAssignments.id, additionId), eq(campaignMarketAssignments.campaignId, campaignId),
+        eq(campaignMarketAssignments.marketId, marketId),
+      )).limit(1);
+      if (!addition) throw new CampaignDomainError("assignment_not_found", 404, "Marktzuweisung nicht gefunden.");
+      if (addition.isDeleted) return [];
+      const [laterAssignment] = await tx.select({ id: campaignMarketAssignments.id }).from(campaignMarketAssignments).where(and(
+        eq(campaignMarketAssignments.campaignId, campaignId), eq(campaignMarketAssignments.marketId, marketId),
+        sql`${campaignMarketAssignments.gmUserId} IS NOT DISTINCT FROM ${addition.gmUserId}::uuid`,
+        eq(campaignMarketAssignments.isDeleted, false),
+        sql`${campaignMarketAssignments.assignmentSlot} > ${addition.assignmentSlot}`,
+      )).limit(1);
+      const [visit] = await tx.select({ id: visitSessions.id }).from(visitSessions)
+        .innerJoin(visitSessionSections, eq(visitSessionSections.visitSessionId, visitSessions.id)).where(and(
+          eq(visitSessionSections.campaignId, campaignId), eq(visitSessionSections.isDeleted, false),
+          eq(visitSessions.marketId, marketId), eq(visitSessions.isDeleted, false),
+          sql`${visitSessions.gmUserId} IS NOT DISTINCT FROM ${addition.gmUserId}::uuid`,
+          sql`(${visitSessions.status} = 'draft' OR (${visitSessions.status} = 'submitted' AND ${visitSessions.submittedAt} >= ${addition.assignedAt}))`,
+        )).limit(1);
+      if (laterAssignment || visit) {
+        throw new CampaignDomainError("addition_in_use", 409, "Dieser Besuch kann nicht rückgängig gemacht werden: Es gibt bereits einen begonnenen/abgeschlossenen Besuch oder eine spätere Zuweisung. Frühere Ergebnisse bleiben erhalten.");
+      }
+      return tx.update(campaignMarketAssignments).set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(eq(campaignMarketAssignments.id, additionId)).returning({ campaignId: campaignMarketAssignments.campaignId });
+    }) : await db
       .update(campaignMarketAssignments)
       .set({ isDeleted: true, deletedAt: now, updatedAt: now })
       .where(
@@ -5154,6 +5134,10 @@ adminCampaignsRouter.patch("/campaigns/:id/markets/:marketId/delete", async (req
       details: { campaignId, marketId, removed: removed.length > 0 },
     });
   } catch (error) {
+    if (error instanceof CampaignDomainError) {
+      respondDomainError(res, error);
+      return;
+    }
     logAction("error", "campaign_market_remove_failed", {
       req,
       action: "campaign_market_remove",

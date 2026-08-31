@@ -215,7 +215,7 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
 
 adminUsersRouter.get("/:id/special-arthur-filter", async (req: AuthedRequest, res, next) => {
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins duerfen GM-Maerktefilter verwalten.", code: "role_not_allowed" });
       return;
     }
@@ -255,7 +255,7 @@ adminUsersRouter.get("/:id/special-arthur-filter", async (req: AuthedRequest, re
 adminUsersRouter.put("/:id/special-arthur-filter", async (req: AuthedRequest, res, next) => {
   const startedAtNs = startActionTimer();
   try {
-    if (req.authUser?.role !== "admin") {
+    if (!isFullAdminRole(req.authUser?.role)) {
       res.status(403).json({ error: "Nur Admins duerfen GM-Maerktefilter verwalten.", code: "role_not_allowed" });
       return;
     }

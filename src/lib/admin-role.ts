@@ -7,5 +7,6 @@ export function isFullAdminRole(role: UserRole | null | undefined): role is Full
 }
 
 export function isRoleAllowedForEndpoint(role: UserRole, allowedRoles: readonly UserRole[]): boolean {
-  return allowedRoles.includes(role);
+  // sm_admin differs from admin only in its default workspace. Worker-only routes stay explicit.
+  return allowedRoles.includes(role) || (role === "sm_admin" && allowedRoles.includes("admin"));
 }

@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, gt, gte, ilike, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Router } from "express";
+import { buildKuehlerVisitSlots } from "../lib/kuehler-repeat-visits.js";
 import { z } from "zod";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
@@ -1173,6 +1174,7 @@ type ProgressSectionKey = "kuehler" | "mhd" | "durcharbeit";
 
 type ProgressMarketRow = {
   marketId: string;
+  visitNumber?: number;
   campaignId: string;
   campaignName: string;
   kuehlerUnitId: string | null;
@@ -2170,6 +2172,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
         ? []
         : await db
             .select({
+              sessionId: visitSessions.id,
               marketId: visitSessions.marketId,
               kuehlerUnitId: visitSessions.kuehlerUnitId,
               campaignId: visitSessionSections.campaignId,
@@ -2191,26 +2194,15 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
             .orderBy(desc(visitSessions.submittedAt));
 
     const completedByKey = new Map<string, string>();
-    const completedByUnitKey = new Map<string, string>();
-    const legacyCompletedDatesByKey = new Map<string, string[]>();
+    const completionsByKey = new Map<string, typeof completionRows>();
     for (const row of completionRows) {
       if (!row.submittedAt) continue;
       const key = `${row.marketId}__${row.campaignId}`;
       if (!assignmentKeys.has(key)) continue;
-      const submittedAtIso = row.submittedAt.toISOString();
-      if (row.kuehlerUnitId) {
-        const unitKey = `${key}__${row.kuehlerUnitId}`;
-        if (!completedByUnitKey.has(unitKey)) {
-          completedByUnitKey.set(unitKey, submittedAtIso);
-        }
-      } else {
-        const current = legacyCompletedDatesByKey.get(key) ?? [];
-        current.push(submittedAtIso);
-        legacyCompletedDatesByKey.set(key, current);
-      }
-      if (!completedByKey.has(key)) {
-        completedByKey.set(key, submittedAtIso);
-      }
+      const bucket = completionsByKey.get(key) ?? [];
+      bucket.push(row);
+      completionsByKey.set(key, bucket);
+      if (!completedByKey.has(key)) completedByKey.set(key, row.submittedAt.toISOString());
     }
 
     const buildSectionPayload = (section: ProgressSectionKey): ProgressSectionPayload => {
@@ -2219,20 +2211,15 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
         const key = `${row.marketId}__${row.campaignId}`;
         if (section === "kuehler") {
           const units = kuehlerUnitsByMarketId.get(row.marketId) ?? [];
-          const desiredCount = Math.max(row.visitTargetCount, units.length, 1);
-          const legacyDates = legacyCompletedDatesByKey.get(key) ?? [];
-          let legacyCursor = 0;
-          return Array.from({ length: desiredCount }, (_, index) => {
-            const unit = units[index] ?? null;
-            const unitDoneAt = unit ? completedByUnitKey.get(`${key}__${unit.id}`) ?? null : null;
-            const legacyDoneAt = unitDoneAt ? null : legacyDates[legacyCursor++] ?? null;
-            const doneAt = unitDoneAt ?? legacyDoneAt;
+          return buildKuehlerVisitSlots(units, row.visitTargetCount, completionsByKey.get(key) ?? []).map(({ unit, visitNumber, submission }) => {
+            const doneAt = submission?.submittedAt?.toISOString() ?? null;
             return {
               marketId: row.marketId,
+              visitNumber,
               campaignId: row.campaignId,
               campaignName: row.campaignName,
               kuehlerUnitId: unit?.id ?? null,
-              kuehlerNumber: unit?.kuehlerInternalId ?? (desiredCount > 1 ? `Kühler ${index + 1}` : null),
+              kuehlerNumber: unit?.kuehlerInternalId ?? null,
               kuehlerTechnicalIdentNo: unit?.kuehlerTechnicalIdentNo ?? null,
               chain: row.chain,
               address: row.address,
