@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   aggregateSmDashboard,
+  aggregateSmHomeVisits,
   type SmDashboardOosRow,
   type SmDashboardVisitRow,
 } from "./sm-dashboard.shared.js";
@@ -147,4 +148,55 @@ test("one current question row wins when a correction replaces an unclassified r
   ]);
   assert.equal(result.summary.classifiedChecks, 1);
   assert.equal(result.summary.foundCases, 0);
+});
+
+test("phone hero never labels missing/unclassified results as without OOS", () => {
+  assert.deepEqual(aggregateSmHomeVisits([], [oos()]), {
+    completed: 0, classified: 0, withoutOos: 0, fixedOos: 0, openOos: 0, unclassified: 0,
+  });
+  const unclassified = aggregateSmHomeVisits([visit(), visit()], [oos({ outcome: null })]);
+  assert.equal(unclassified.completed, 1);
+  assert.equal(unclassified.unclassified, 1);
+  assert.equal(unclassified.withoutOos, 0);
+});
+
+test("phone hero counts visits, not questions, and any unresolved case makes the visit open", () => {
+  const base = [oos(), remediation("resolved"), oos({ submissionQuestionId: "q2", questionRootId: "root2" })];
+  assert.equal(aggregateSmHomeVisits([visit()], base).openOos, 1);
+  assert.equal(aggregateSmHomeVisits([visit()], base).fixedOos, 0);
+  const fixed = aggregateSmHomeVisits([visit()], [...base, remediation("resolved", { submissionQuestionId: "r2", detectionQuestionRootId: "root2" })]);
+  assert.equal(fixed.fixedOos, 1);
+  assert.equal(fixed.classified, 1);
+});
+
+test("phone hero respects pairing, category, snapshot partial rules and repeated visits", () => {
+  assert.equal(aggregateSmHomeVisits([visit()], [oos(), remediation("resolved", { category: "juice_iced_tea" })]).openOos, 1);
+  assert.equal(aggregateSmHomeVisits([visit()], [oos(), remediation("partially_resolved")]).openOos, 1);
+  assert.equal(aggregateSmHomeVisits([visit()], [oos(), remediation("partially_resolved", { partialCountsAsResolved: true })]).fixedOos, 1);
+  const second = visit({ submissionId: "submission-2" });
+  assert.deepEqual(aggregateSmHomeVisits([visit(), second], [
+    oos(), remediation("resolved"),
+    oos({ ...second, submissionQuestionId: "q2", outcome: "oos_absent" }),
+    remediation("resolved", { ...second, submissionQuestionId: "r2" }),
+  ]), { completed: 2, classified: 2, withoutOos: 1, fixedOos: 1, openOos: 0, unclassified: 0 });
+});
+
+test("all 81 four-category yes/no scenarios reconcile with admin OOS aggregation", () => {
+  const categories = ["action_placements", "softdrinks_energy", "water_near_water", "juice_iced_tea"] as const;
+  for (let scenario = 0; scenario < 81; scenario += 1) {
+    let remaining = scenario;
+    const rows: SmDashboardOosRow[] = [];
+    for (const [index, category] of categories.entries()) {
+      const choice = remaining % 3; // absent / found+fixed / found+open
+      remaining = Math.floor(remaining / 3);
+      rows.push(oos({ category, submissionQuestionId: `q${index}`, questionRootId: `root${index}`, outcome: choice === 0 ? "oos_absent" : "oos_present" }));
+      if (choice > 0) rows.push(remediation(choice === 1 ? "resolved" : "not_resolved", { category, submissionQuestionId: `r${index}`, detectionQuestionRootId: `root${index}` }));
+    }
+    const admin = aggregateSmDashboard([visit()], rows).summary;
+    const phone = aggregateSmHomeVisits([visit()], rows);
+    assert.equal(phone.withoutOos, Number(admin.foundCases === 0));
+    assert.equal(phone.fixedOos, Number(admin.foundCases > 0 && admin.foundCases === admin.fixedCases));
+    assert.equal(phone.openOos, Number(admin.foundCases > admin.fixedCases));
+    assert.equal(phone.withoutOos + phone.fixedOos + phone.openOos, 1);
+  }
 });

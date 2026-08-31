@@ -193,3 +193,31 @@ export function aggregateSmDashboard(
     regions: dimensionRows(visits, cases, (row) => row.region),
   };
 }
+
+/** One segment per completed visit, never one per answer or scheduled assignment. */
+export function aggregateSmHomeVisits(
+  visitRows: readonly SmDashboardVisitRow[],
+  oosRows: readonly SmDashboardOosRow[],
+) {
+  const visits = dedupeVisits(visitRows);
+  const casesByVisit = new Map<string, DetectionCase[]>();
+  for (const item of buildDetectionCases(oosRows)) {
+    const group = casesByVisit.get(item.row.submissionId) ?? [];
+    group.push(item);
+    casesByVisit.set(item.row.submissionId, group);
+  }
+  const result = { completed: visits.length, classified: 0, withoutOos: 0, fixedOos: 0, openOos: 0, unclassified: 0 };
+  for (const visit of visits) {
+    const cases = casesByVisit.get(visit.submissionId) ?? [];
+    if (!cases.length) {
+      result.unclassified += 1;
+      continue;
+    }
+    result.classified += 1;
+    const found = cases.filter((item) => item.row.outcome === "oos_present");
+    if (!found.length) result.withoutOos += 1;
+    else if (found.every((item) => item.fixed)) result.fixedOos += 1;
+    else result.openOos += 1;
+  }
+  return result;
+}

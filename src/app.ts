@@ -30,7 +30,7 @@ import { adminSmPlanningRouter, smPlanningRouter } from "./routes/sm-planning.js
 import { adminSmActivityRouter, smActivityRouter } from "./routes/sm-activity.js";
 import { adminSmMessagesRouter, smMessagesRouter } from "./routes/sm-messages.js";
 import { adminSmQuestionnairesRouter } from "./routes/sm-questionnaires.js";
-import { adminSmDashboardRouter } from "./routes/sm-dashboard.js";
+import { adminSmDashboardRouter, smHomeDashboardRouter } from "./routes/sm-dashboard.js";
 import { smVisitsRouter } from "./routes/sm-visits.js";
 import { adminKurtiRouter } from "./routes/admin-kurti.js";
 import { adminIppRouter } from "./routes/ipp.js";
@@ -173,6 +173,7 @@ function createApp() {
   app.use("/sm/settings", smSettingsRouter);
   app.use("/sm/messages", smMessagesRouter);
   app.use("/sm/planning", smPlanningRouter);
+  app.use("/sm/dashboard", smHomeDashboardRouter);
   app.use("/sm/activity", smActivityRouter);
   app.use("/sm/visits", smVisitsRouter);
   app.use("/time-tracking", timeTrackingRouter);

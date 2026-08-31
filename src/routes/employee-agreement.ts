@@ -11,6 +11,7 @@ import {
 } from "../lib/employee-agreement-meta.js";
 import { employeeAgreementAcceptances } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
+import { SM_EMPLOYEE_AGREEMENT } from "../lib/sm-employee-agreement.js";
 
 const agreementSections = [
   {
@@ -89,7 +90,8 @@ const acceptSchema = z.object({
   version: z.string().min(1),
 });
 
-function agreementPayload() {
+export function agreementPayload(role: "gm" | "sm") {
+  if (role === "sm") return SM_EMPLOYEE_AGREEMENT;
   return {
     key: EMPLOYEE_AGREEMENT_KEY,
     version: EMPLOYEE_AGREEMENT_VERSION,
@@ -109,21 +111,23 @@ employeeAgreementRouter.get("/current", requireAuth(["gm", "sm"]), async (req: A
       return;
     }
 
+    const agreement = agreementPayload(req.authUser.role === "sm" ? "sm" : "gm");
+
     const [acceptance] = await db
       .select()
       .from(employeeAgreementAcceptances)
       .where(
         and(
           eq(employeeAgreementAcceptances.userId, req.authUser.appUserId),
-          eq(employeeAgreementAcceptances.agreementKey, EMPLOYEE_AGREEMENT_KEY),
-          eq(employeeAgreementAcceptances.agreementVersion, EMPLOYEE_AGREEMENT_VERSION),
+          eq(employeeAgreementAcceptances.agreementKey, agreement.key),
+          eq(employeeAgreementAcceptances.agreementVersion, agreement.version),
         ),
       )
       .orderBy(desc(employeeAgreementAcceptances.acceptedAt))
       .limit(1);
 
     res.status(200).json({
-      agreement: agreementPayload(),
+      agreement,
       accepted: Boolean(acceptance),
       acceptance: acceptance
         ? {
@@ -151,11 +155,12 @@ employeeAgreementRouter.post("/accept", requireAuth(["gm", "sm"]), async (req: A
       return;
     }
 
-    if (parsed.data.version !== EMPLOYEE_AGREEMENT_VERSION) {
+    const agreement = agreementPayload(req.authUser.role === "sm" ? "sm" : "gm");
+    if (parsed.data.version !== agreement.version) {
       res.status(409).json({
         error: "Diese Vereinbarung ist nicht mehr aktuell. Bitte aktuelle Version laden.",
         code: "agreement_version_mismatch",
-        agreement: agreementPayload(),
+        agreement,
       });
       return;
     }
@@ -166,8 +171,8 @@ employeeAgreementRouter.post("/accept", requireAuth(["gm", "sm"]), async (req: A
       .where(
         and(
           eq(employeeAgreementAcceptances.userId, req.authUser.appUserId),
-          eq(employeeAgreementAcceptances.agreementKey, EMPLOYEE_AGREEMENT_KEY),
-          eq(employeeAgreementAcceptances.agreementVersion, EMPLOYEE_AGREEMENT_VERSION),
+          eq(employeeAgreementAcceptances.agreementKey, agreement.key),
+          eq(employeeAgreementAcceptances.agreementVersion, agreement.version),
         ),
       )
       .limit(1);
@@ -179,10 +184,10 @@ employeeAgreementRouter.post("/accept", requireAuth(["gm", "sm"]), async (req: A
             .insert(employeeAgreementAcceptances)
             .values({
               userId: req.authUser.appUserId,
-              agreementKey: EMPLOYEE_AGREEMENT_KEY,
-              agreementVersion: EMPLOYEE_AGREEMENT_VERSION,
-              agreementTitle: EMPLOYEE_AGREEMENT_TITLE,
-              agreementHash,
+              agreementKey: agreement.key,
+              agreementVersion: agreement.version,
+              agreementTitle: agreement.title,
+              agreementHash: agreement.hash,
               acceptedIp: req.ip ?? req.socket.remoteAddress ?? null,
               acceptedUserAgent: req.get("user-agent")?.slice(0, 512) ?? null,
             })
