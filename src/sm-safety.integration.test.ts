@@ -18,6 +18,7 @@ const { deactivateSmMarket, loadSmMarketDeactivationPreview, SmMarketDeactivatio
 const { smVisitsRouter } = await import("./routes/sm-visits.js");
 const { adminSmMarketsRouter } = await import("./routes/sm-markets.js");
 const { adminSmPlanningRouter, smPlanningRouter } = await import("./routes/sm-planning.js");
+const { adjustSmHolidayAssignments, loadSmHolidayStates } = await import("./sm-holiday-planning.js");
 after(async () => { await client.end(); });
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 const owner = "eff25681-6964-4593-b3e5-5778f6e8eebe";
@@ -201,4 +202,59 @@ test("SM live concurrency: two independent connections cannot complete overlappi
     assert.equal(visible.length, 0);
     console.log("SM concurrency fixtures soft-deleted by exact IDs; audit history retained:", JSON.stringify({ assignmentIds, submissionIds, marketIds: data.marketIds }));
   }
+});
+
+test("SM holidays: creation, single series exception, load balancing, manual override, restore and API parity (rolled back)", { skip: !enabled }, async (t) => {
+  const rollback = new Error("SM_HOLIDAYS_EXPECTED_ROLLBACK");
+  await assert.rejects(db.transaction(async (tx) => {
+    const f = await fixture(tx);
+    t.mock.method(db, "transaction", (callback: (nested: Tx) => Promise<unknown>) => tx.transaction(callback));
+    t.mock.method(db, "select", tx.select.bind(tx));
+    await f.assignment(f.source.id, { originalWorkDate: "2027-10-25", originalPlannedMinutes: 120 });
+    await f.assignment(f.source.id, { originalWorkDate: "2027-10-27", originalPlannedMinutes: 360 });
+    const idempotencyKey = randomUUID();
+    asAdmin();
+    const create = await request(app).post("/admin/sm-planning/assignments").send({ smMarketId: f.source.id, smUserId: owner, workDate: "2027-10-26", plannedMinutes: 90, idempotencyKey });
+    assert.equal(create.status, 201, JSON.stringify(create.body));
+    const singleId = create.body.assignmentId;
+    const [single] = await tx.select().from(smAssignments).where(eq(smAssignments.id, singleId));
+    assert.equal(single!.originalWorkDate, "2027-10-26"); assert.equal(single!.replacementWorkDate, "2027-10-25");
+    const metadata = (await loadSmHolidayStates(tx, [singleId])).get(singleId)!;
+    assert.equal(metadata.adjustment!.holidayName, "Nationalfeiertag"); assert.equal(metadata.adjustment!.previousMinutes, 120); assert.equal(metadata.adjustment!.nextMinutes, 360);
+    const replay = await request(app).post("/admin/sm-planning/assignments").send({ smMarketId: f.source.id, smUserId: owner, workDate: "2027-10-26", plannedMinutes: 90, idempotencyKey });
+    assert.equal(replay.status, 200); assert.equal(replay.body.assignmentId, singleId);
+    const series = await request(app).post("/admin/sm-planning/series").send({ smMarketId: f.source.id, smUserId: owner, plannedMinutes: 90, frequency: "weekly", weekdays: [2], validFrom: "2027-10-19", validTo: "2027-11-02", idempotencyKey: randomUUID() });
+    assert.equal(series.status, 201, JSON.stringify(series.body));
+    const seriesRows = await tx.select().from(smAssignments).where(eq(smAssignments.seriesId, series.body.seriesId));
+    assert.equal(seriesRows.length, 3); assert.equal(seriesRows.filter((row) => row.replacementWorkDate).length, 1);
+    const holiday = seriesRows.find((row) => row.originalWorkDate === "2027-10-26")!;
+    assert.equal(holiday.replacementWorkDate, "2027-10-25"); assert.equal(holiday.seriesOccurrenceKey, "2027-10-26");
+    assert.equal((await tx.select().from(smAssignmentSeriesVersions).where(eq(smAssignmentSeriesVersions.seriesId, series.body.seriesId))).length, 1);
+    const beforeCount = (await tx.select().from(smAssignmentEvents).where(eq(smAssignmentEvents.assignmentId, singleId))).length;
+    assert.deepEqual(await adjustSmHolidayAssignments(tx, { actorUserId: admin, assignmentIds: [singleId, holiday.id] }), []);
+    assert.equal((await tx.select().from(smAssignmentEvents).where(eq(smAssignmentEvents.assignmentId, singleId))).length, beforeCount);
+    const manual = await request(app).post(`/admin/sm-planning/assignments/${singleId}/reschedule`).send({ workDate: "2027-10-26", expectedUpdatedAt: single!.updatedAt.toISOString(), reason: "Bewusst manuell für diesen Termin" });
+    assert.equal(manual.status, 200, JSON.stringify(manual.body));
+    assert.deepEqual(await adjustSmHolidayAssignments(tx, { actorUserId: admin, assignmentIds: [singleId] }), []);
+    const adminList = await request(app).get("/admin/sm-planning/assignments?from=2027-10-18&to=2027-11-03"); assert.equal(adminList.status, 200);
+    const adminSingle = adminList.body.assignments.find((row: { id: string }) => row.id === singleId);
+    assert.equal(adminSingle.effective.workDate, "2027-10-26"); assert.equal(adminSingle.holidayAdjustment.manualOverride, true);
+    asSm();
+    const phoneList = await request(app).get("/sm/planning/assignments?from=2027-10-18&to=2027-11-03"); assert.equal(phoneList.status, 200);
+    assert.deepEqual(phoneList.body.assignments.find((row: { id: string }) => row.id === singleId), adminSingle);
+    const another = await f.assignment(f.source.id, { originalWorkDate: "2027-10-26", originalPlannedMinutes: 150 });
+    const another2 = await f.assignment(f.source.id, { originalWorkDate: "2027-10-26", originalPlannedMinutes: 150 });
+    const decisions = await adjustSmHolidayAssignments(tx, { actorUserId: admin, assignmentIds: [another.id, another2.id], dryRun: true });
+    assert.deepEqual(decisions.map((d) => d.adjustment.adjustedDate).sort(), ["2027-10-25", "2027-10-27"]);
+    const [unchanged] = await tx.select().from(smAssignments).where(eq(smAssignments.id, another.id)); assert.equal(unchanged!.replacementWorkDate, null);
+    asAdmin();
+    const cancel = await request(app).post(`/admin/sm-planning/assignments/${another.id}/cancel`).send({ expectedUpdatedAt: another.updatedAt.toISOString(), reason: "Feiertags-Testabsage" }); assert.equal(cancel.status, 200);
+    const restore = await request(app).post(`/admin/sm-planning/assignments/${another.id}/restore`).send({ expectedUpdatedAt: cancel.body.updatedAt, reason: "Feiertags-Testwiederherstellung" }); assert.equal(restore.status, 200, JSON.stringify(restore.body));
+    const [restored] = await tx.select().from(smAssignments).where(eq(smAssignments.id, another.id)); assert.equal(restored!.replacementWorkDate, "2027-10-25");
+    const completed = await f.assignment(f.source.id, { originalWorkDate: "2027-10-26", status: "completed" });
+    const historical = await f.assignment(f.source.id, { originalWorkDate: "2025-12-08" });
+    assert.deepEqual(await adjustSmHolidayAssignments(tx, { actorUserId: admin, assignmentIds: [completed.id, historical.id] }), []);
+    throw rollback;
+  }), (error) => { if (error !== rollback) throw error; return true; });
+  t.mock.restoreAll();
 });

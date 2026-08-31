@@ -22,6 +22,7 @@ import {
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { assertSmVisitTimeAvailable, lockSmVisitTimes, SmTimeOverlapError } from "../sm-time-overlap.js";
 import { lockSmPlanning } from "../sm-planning-lock.js";
+import { adjustSmHolidayAssignments, loadSmHolidayStates } from "../sm-holiday-planning.js";
 import {
   buildSmSeriesDates,
   isAssignmentPlanningMutable,
@@ -338,7 +339,8 @@ async function writeEvent(tx: DbTx, input: {
     actorUserId: input.actorUserId,
     reason: input.reason?.trim() || null,
     beforeState: input.before ? assignmentState(input.before) : {},
-    afterState: assignmentState(input.after),
+    afterState: { ...assignmentState(input.after), ...(input.eventType === "rescheduled" ? { holidayManualOverride: true } : {}) },
+    createdAt: sql`clock_timestamp()`,
   });
 }
 
@@ -361,7 +363,7 @@ async function loadAssignments(from: string, to: string, smUserId?: string) {
   const seriesVersionIds = [...new Set(rows.map((row) => row.seriesVersionId).filter((value): value is string => Boolean(value)))];
   const assignmentIds = rows.map((row) => row.id);
 
-  const [userRows, marketRows, seriesVersionRows, timeRows, submissionRows, requestRows] = await Promise.all([
+  const [userRows, marketRows, seriesVersionRows, timeRows, submissionRows, requestRows, holidayStates] = await Promise.all([
     userIds.length ? db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName }).from(users).where(inArray(users.id, userIds)) : [],
     marketIds.length ? db.select({ id: smMarkets.id, name: smMarkets.name, address: smMarkets.address, postalCode: smMarkets.postalCode, city: smMarkets.city, region: smMarkets.region, internalMarketId: smMarkets.internalMarketId }).from(smMarkets).where(inArray(smMarkets.id, marketIds)) : [],
     seriesVersionIds.length ? db.select().from(smAssignmentSeriesVersions).where(inArray(smAssignmentSeriesVersions.id, seriesVersionIds)) : [],
@@ -390,6 +392,7 @@ async function loadAssignments(from: string, to: string, smUserId?: string) {
       eq(smAssignmentTimeChangeRequests.isDeleted, false),
       eq(smAssignmentTimeChangeRequests.status, "pending"),
     )),
+    loadSmHolidayStates(db, assignmentIds),
   ]);
 
   const userById = new Map(userRows.map((row) => [row.id, `${row.firstName} ${row.lastName}`.trim()]));
@@ -413,6 +416,7 @@ async function loadAssignments(from: string, to: string, smUserId?: string) {
       seriesVersionId: row.seriesVersionId,
       seriesOccurrenceKey: row.seriesOccurrenceKey,
       status: row.status,
+      holidayAdjustment: holidayStates.get(row.id)?.adjustment ? { ...holidayStates.get(row.id)!.adjustment!, manualOverride: holidayStates.get(row.id)!.manualOverride } : null,
       original: {
         workDate: row.originalWorkDate,
         smUserId: row.originalSmUserId,
@@ -603,6 +607,17 @@ smPlanningRouter.post("/assignments/:id/time-change-requests", async (req: Authe
 
 export const adminSmPlanningRouter = Router();
 adminSmPlanningRouter.use(requireAuth(["admin", "sm_admin"]));
+
+adminSmPlanningRouter.post("/holidays/reconcile", async (req: AuthedRequest, res, next) => {
+  try {
+    const input = z.object({ dryRun: z.boolean().default(true) }).strict().parse(req.body);
+    const changes = await db.transaction((tx) => adjustSmHolidayAssignments(tx, { actorUserId: req.authUser!.appUserId, dryRun: input.dryRun }));
+    res.json({ dryRun: input.dryRun, count: changes.length, changes });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ error: "Ungültige Feiertagsprüfung." });
+    next(error);
+  }
+});
 
 adminSmPlanningRouter.use((req, res, next) => {
   if (req.method === "GET") {
@@ -899,9 +914,10 @@ adminSmPlanningRouter.post("/assignments", async (req: AuthedRequest, res, next)
       }).returning();
       const created = requireWrittenRow(createdRow);
       await writeEvent(tx, { before: null, after: created, eventType: "created", actorUserId });
-      return { id: created.id, replayed: false };
+      const holidayChanges = await adjustSmHolidayAssignments(tx, { actorUserId, assignmentIds: [created.id] });
+      return { id: created.id, replayed: false, holidayAdjustment: holidayChanges[0]?.adjustment ?? null };
     });
-    res.status(result.replayed ? 200 : 201).json({ assignmentId: result.id, replayed: result.replayed });
+    res.status(result.replayed ? 200 : 201).json({ assignmentId: result.id, replayed: result.replayed, holidayAdjustment: "holidayAdjustment" in result ? result.holidayAdjustment : null });
   } catch (error) {
     if (!sendKnownError(error, res)) next(error);
   }
@@ -985,7 +1001,8 @@ adminSmPlanningRouter.post("/series", async (req: AuthedRequest, res, next) => {
         beforeState: {},
         afterState: assignmentState(assignment),
       })));
-      return { seriesId: series.id, count: created.length, replayed: false };
+      const holidayChanges = await adjustSmHolidayAssignments(tx, { actorUserId, assignmentIds: created.map((row) => row.id) });
+      return { seriesId: series.id, count: created.length, replayed: false, holidayAdjustedCount: holidayChanges.length };
     });
     res.status(result.replayed ? 200 : 201).json(result);
   } catch (error) {
@@ -1193,7 +1210,9 @@ adminSmPlanningRouter.post("/assignments/:id/restore", async (req: AuthedRequest
       }).where(eq(smAssignments.id, before.id)).returning();
       const updated = requireWrittenRow(updatedRow);
       await writeEvent(tx, { before, after: updated, eventType: "restored", actorUserId, reason: parsed.data.reason });
-      return updated;
+      await adjustSmHolidayAssignments(tx, { actorUserId, assignmentIds: [updated.id] });
+      const [final] = await tx.select().from(smAssignments).where(eq(smAssignments.id, updated.id));
+      return requireWrittenRow(final);
     });
     res.status(200).json({ assignmentId: after.id, updatedAt: after.updatedAt.toISOString() });
   } catch (error) {
