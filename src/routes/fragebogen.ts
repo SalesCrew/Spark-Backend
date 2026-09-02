@@ -1,6 +1,6 @@
-import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import { type NextFunction, type Request, type Response, Router } from "express";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { db, sql as pgSql } from "../lib/db.js";
 import {
@@ -42,6 +42,7 @@ import {
   moduleMhd,
   moduleMhdQuestion,
   moduleQuestionChains,
+  moduleSaveMutations,
   markets,
   photoTags,
   questionAttachments,
@@ -196,6 +197,8 @@ const moduleSchema = z
     sectionKeywords: z.array(mainSectionSchema).optional(),
     createdAt: z.string().optional(),
     usedInCount: z.number().optional(),
+    revision: z.number().int().positive().optional(),
+    mutationToken: z.string().uuid().optional(),
   })
   .strict();
 
@@ -244,6 +247,48 @@ class DomainValidationError extends Error {
     super(message);
     this.name = "DomainValidationError";
   }
+}
+
+class ModuleSaveConflictError extends Error {
+  readonly code = "module_save_conflict";
+
+  constructor() {
+    super("Dieses Modul wurde zwischenzeitlich geändert. Bitte neu laden und deine Änderung erneut prüfen.");
+    this.name = "ModuleSaveConflictError";
+  }
+}
+
+function moduleSavePayloadHash(scope: Scope, moduleId: string, input: UiModule): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      scope,
+      moduleId,
+      revision: input.revision,
+      name: input.name,
+      description: input.description,
+      questions: input.questions,
+      sectionKeywords: input.sectionKeywords,
+    }))
+    .digest("hex");
+}
+
+async function markModuleSaveMutationFailed(
+  token: string,
+  code: string,
+  message: string,
+): Promise<void> {
+  const completedAt = new Date();
+  await db
+    .update(moduleSaveMutations)
+    .set({
+      status: "failed",
+      resultRevision: null,
+      errorCode: code,
+      errorMessage: message,
+      completedAt,
+      updatedAt: completedAt,
+    })
+    .where(and(eq(moduleSaveMutations.token, token), eq(moduleSaveMutations.status, "pending")));
 }
 
 async function ensureModuleQuestionChainsReady(): Promise<boolean> {
@@ -792,56 +837,37 @@ async function persistQuestionRulesTx(
     })
     .where(and(eq(questionRules.questionId, questionId), eq(questionRules.isDeleted, false)));
 
-  for (const [index, rule] of rules.entries()) {
-    const [createdRule] = await tx
-      .insert(questionRules)
-      .values({
-        questionId,
-        triggerQuestionId: isUuid(rule.triggerQuestionId) ? rule.triggerQuestionId : null,
-        operator: rule.operator,
-        triggerValue: rule.triggerValue || null,
-        triggerValueMax: rule.triggerValueMax || null,
-        action: rule.action,
-        orderIndex: index,
-        isDeleted: false,
-        deletedAt: null,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning();
-    if (!createdRule) {
-      throw new Error("Regel konnte nicht erstellt werden.");
-    }
+  const nextRules = rules.map((rule, orderIndex) => ({
+    id: randomUUID(),
+    questionId,
+    triggerQuestionId: isUuid(rule.triggerQuestionId) ? rule.triggerQuestionId : null,
+    operator: rule.operator,
+    triggerValue: rule.triggerValue || null,
+    triggerValueMax: rule.triggerValueMax || null,
+    action: rule.action,
+    orderIndex,
+    isDeleted: false,
+    deletedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  }));
+  if (nextRules.length === 0) return;
 
-    if (rule.targetQuestionIds.length === 0) continue;
-    for (const [targetIndex, targetQuestionId] of rule.targetQuestionIds.entries()) {
-      const [restored] = await tx
-        .update(questionRuleTargets)
-        .set({
-          orderIndex: targetIndex,
-          isDeleted: false,
-          deletedAt: null,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(questionRuleTargets.ruleId, createdRule.id),
-            eq(questionRuleTargets.targetQuestionId, targetQuestionId),
-          ),
-        )
-        .returning({ id: questionRuleTargets.id });
-      if (!restored) {
-        await tx.insert(questionRuleTargets).values({
-          ruleId: createdRule.id,
-          targetQuestionId,
-          orderIndex: targetIndex,
-          isDeleted: false,
-          deletedAt: null,
-          createdAt: now,
-          updatedAt: now,
-        });
-      }
-    }
+  await tx.insert(questionRules).values(nextRules);
+  const nextTargets = nextRules.flatMap((savedRule, ruleIndex) =>
+    rules[ruleIndex]!.targetQuestionIds.map((targetQuestionId, orderIndex) => ({
+      id: randomUUID(),
+      ruleId: savedRule.id,
+      targetQuestionId,
+      orderIndex,
+      isDeleted: false,
+      deletedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    })),
+  );
+  if (nextTargets.length > 0) {
+    await tx.insert(questionRuleTargets).values(nextTargets);
   }
 }
 
@@ -1357,7 +1383,12 @@ async function upsertQuestionGraphTx(
   tx: DbTx,
   input: UiQuestion,
   scope: Scope = "main",
-  options: { recordAnswerHistory?: boolean } = {},
+  options: {
+    recordAnswerHistory?: boolean;
+    previousQuestion?: UiQuestion | null;
+    hydrate?: boolean;
+    persistRules?: boolean;
+  } = {},
 ): Promise<UiQuestion> {
   const parsed = questionSchema.parse(input);
   validateQuestionDomain(parsed);
@@ -1407,8 +1438,9 @@ async function upsertQuestionGraphTx(
   await ensureQuestionRefsExist(tx, referencedIds, scope);
   await ensurePhotoTagsActive(tx, tagIds);
 
-  const previousQuestion =
-    questionId && isUuid(questionId)
+  const previousQuestion = options.previousQuestion !== undefined
+    ? options.previousQuestion
+    : questionId && isUuid(questionId)
       ? (await fetchQuestionsByIds(tx, [questionId], scope)).get(questionId) ?? null
       : null;
   const hasZweitplatzierungColumn = await hasQuestionScoringZweitplatzierungColumn();
@@ -1527,35 +1559,11 @@ async function upsertQuestionGraphTx(
     questionId = created.id;
   }
 
-  await tx
-    .update(questionScoring)
-    .set({
-      isDeleted: true,
-      deletedAt: now,
-      updatedAt: now,
-    })
-    .where(and(eq(questionScoring.questionId, questionId), eq(questionScoring.isDeleted, false)));
   const scoringEntries = Object.entries(parsed.scoring ?? {});
-  for (const [scoreKey, value] of scoringEntries) {
-    const [restored] = await tx
-      .update(questionScoring)
-      .set({
-        ipp: value.ipp != null ? String(value.ipp) : null,
-        ...(hasZweitplatzierungColumn
-          ? { zweitplatzierung: value.zweitplatzierung != null ? String(value.zweitplatzierung) : null }
-          : {}),
-        ...(hasMitbewerberabfrageColumn
-          ? { mitbewerberabfrage: value.mitbewerberabfrage != null ? String(value.mitbewerberabfrage) : null }
-          : {}),
-        boni: value.boni != null ? String(value.boni) : null,
-        isDeleted: false,
-        deletedAt: null,
-        updatedAt: now,
-      })
-      .where(and(eq(questionScoring.questionId, questionId), eq(questionScoring.scoreKey, scoreKey)))
-      .returning({ id: questionScoring.id });
-    if (!restored) {
-      await tx.insert(questionScoring).values({
+  if (scoringEntries.length > 0) {
+    await tx
+      .insert(questionScoring)
+      .values(scoringEntries.map(([scoreKey, value]) => ({
         questionId,
         scoreKey,
         ipp: value.ipp != null ? String(value.ipp) : null,
@@ -1570,15 +1578,38 @@ async function upsertQuestionGraphTx(
         deletedAt: null,
         createdAt: now,
         updatedAt: now,
+      })))
+      .onConflictDoUpdate({
+        target: [questionScoring.questionId, questionScoring.scoreKey],
+        targetWhere: sql`${questionScoring.isDeleted} = false`,
+        set: {
+          ipp: sql`excluded.ipp`,
+          ...(hasZweitplatzierungColumn ? { zweitplatzierung: sql`excluded.zweitplatzierung` } : {}),
+          ...(hasMitbewerberabfrageColumn ? { mitbewerberabfrage: sql`excluded.mitbewerberabfrage` } : {}),
+          boni: sql`excluded.boni`,
+          updatedAt: now,
+        },
       });
-    }
   }
+  const activeScoreKeys = scoringEntries.map(([scoreKey]) => scoreKey);
+  await tx
+    .update(questionScoring)
+    .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+    .where(
+      and(
+        eq(questionScoring.questionId, questionId),
+        eq(questionScoring.isDeleted, false),
+        ...(activeScoreKeys.length > 0 ? [notInArray(questionScoring.scoreKey, activeScoreKeys)] : []),
+      ),
+    );
 
   const dedupedRules = rules.map((rule) => ({
     ...rule,
     targetQuestionIds: Array.from(new Set(rule.targetQuestionIds)),
   }));
-  await persistQuestionRulesTx(tx, questionId, dedupedRules, now);
+  if (options.persistRules !== false) {
+    await persistQuestionRulesTx(tx, questionId, dedupedRules, now);
+  }
 
   if (parsed.type === "matrix") {
     await tx
@@ -1637,36 +1668,43 @@ async function upsertQuestionGraphTx(
     );
   }
 
-  await tx
-    .update(questionPhotoTags)
-    .set({
-      isDeleted: true,
-      deletedAt: now,
-      updatedAt: now,
-    })
-    .where(and(eq(questionPhotoTags.questionId, questionId), eq(questionPhotoTags.isDeleted, false)));
   if (tagIds.length > 0) {
-    for (const photoTagId of tagIds) {
-      const [restored] = await tx
-        .update(questionPhotoTags)
-        .set({
-          isDeleted: false,
-          deletedAt: null,
-          updatedAt: now,
-        })
-        .where(and(eq(questionPhotoTags.questionId, questionId), eq(questionPhotoTags.photoTagId, photoTagId)))
-        .returning({ questionId: questionPhotoTags.questionId });
-      if (!restored) {
-        await tx.insert(questionPhotoTags).values({
+    await tx
+      .insert(questionPhotoTags)
+      .values(tagIds.map((photoTagId) => ({
           questionId,
           photoTagId,
           isDeleted: false,
           deletedAt: null,
           createdAt: now,
           updatedAt: now,
-        });
-      }
-    }
+      })))
+      .onConflictDoUpdate({
+        target: [questionPhotoTags.questionId, questionPhotoTags.photoTagId],
+        set: { isDeleted: false, deletedAt: null, updatedAt: now },
+      });
+  }
+  await tx
+    .update(questionPhotoTags)
+    .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+    .where(
+      and(
+        eq(questionPhotoTags.questionId, questionId),
+        eq(questionPhotoTags.isDeleted, false),
+        ...(tagIds.length > 0 ? [notInArray(questionPhotoTags.photoTagId, tagIds)] : []),
+      ),
+    );
+
+  if (options.hydrate === false) {
+    return {
+      ...parsed,
+      id: questionId,
+      redSurvey: nextRedSurvey,
+      singleChoiceAvailability: nextSingleChoiceAvailability,
+      singleChoiceAvailabilityType: nextSingleChoiceAvailabilityType,
+      config: cleanConfig,
+      rules: dedupedRules,
+    };
   }
 
   const hydrated = await fetchQuestionsByIds(tx, [questionId], scope);
@@ -1795,6 +1833,7 @@ export async function fetchModulesUi(scope: Scope, ids?: string[]): Promise<UiMo
     id: row.id,
     name: row.name,
     description: row.description ?? "",
+    revision: Number(row.revision ?? 1),
     createdAt: row.createdAt.toISOString(),
     usedInCount: usageMap.get(row.id) ?? 0,
     sectionKeywords: scope === "main" ? ((row as typeof moduleMain.$inferSelect).sectionKeywords ?? ["standard"]) : undefined,
@@ -2254,6 +2293,47 @@ adminFragebogenRouter.post("/modules/:scope", async (req, res, next) => {
   }
 });
 
+adminFragebogenRouter.get("/modules/:scope/:id/save-status/:token", async (req, res, next) => {
+  try {
+    const scope = getScopeParam(req.params as Record<string, string | undefined>);
+    if (!isUuid(req.params.id) || !isUuid(req.params.token)) {
+      res.status(400).json({ error: "Ungültige Speicher-ID." });
+      return;
+    }
+    const [mutation] = await db
+      .select()
+      .from(moduleSaveMutations)
+      .where(
+        and(
+          eq(moduleSaveMutations.token, req.params.token),
+          eq(moduleSaveMutations.scope, scope),
+          eq(moduleSaveMutations.moduleId, req.params.id),
+        ),
+      )
+      .limit(1);
+    if (!mutation) {
+      res.status(404).json({ error: "Speichervorgang nicht gefunden.", code: "module_save_not_found" });
+      return;
+    }
+    if (mutation.status === "completed") {
+      const [module] = await fetchModulesUi(scope, [req.params.id]);
+      res.status(200).json({ status: "completed", resultRevision: mutation.resultRevision, module });
+      return;
+    }
+    if (mutation.status === "failed") {
+      res.status(200).json({
+        status: "failed",
+        code: mutation.errorCode ?? "module_save_failed",
+        error: mutation.errorMessage ?? "Modul konnte nicht gespeichert werden.",
+      });
+      return;
+    }
+    res.status(200).json({ status: "pending" });
+  } catch (error) {
+    next(error);
+  }
+});
+
 adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
   try {
     const scope = getScopeParam(req.params as Record<string, string | undefined>);
@@ -2266,21 +2346,93 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
       res.status(400).json({ error: "Ungültiges Modul." });
       return;
     }
+    if (parsed.data.revision == null || !parsed.data.mutationToken) {
+      res.status(428).json({
+        error: "Das Modul muss vor dem Speichern neu geladen werden.",
+        code: "module_save_revision_required",
+      });
+      return;
+    }
+    const mutationToken = parsed.data.mutationToken;
+    const payloadHash = moduleSavePayloadHash(scope, req.params.id, parsed.data);
     const now = new Date();
 
+    const [registeredMutation] = await db
+      .insert(moduleSaveMutations)
+      .values({
+        token: mutationToken,
+        scope,
+        moduleId: req.params.id,
+        expectedRevision: parsed.data.revision,
+        payloadHash,
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+      })
+      .onConflictDoNothing()
+      .returning({ token: moduleSaveMutations.token });
+
+    if (!registeredMutation) {
+      const [existingMutation] = await db
+        .select()
+        .from(moduleSaveMutations)
+        .where(eq(moduleSaveMutations.token, mutationToken))
+        .limit(1);
+      if (
+        !existingMutation
+        || existingMutation.scope !== scope
+        || existingMutation.moduleId !== req.params.id
+        || existingMutation.expectedRevision !== parsed.data.revision
+        || existingMutation.payloadHash !== payloadHash
+      ) {
+        res.status(409).json({
+          error: "Diese Speicher-ID gehört zu einer anderen Änderung.",
+          code: "module_save_token_mismatch",
+        });
+        return;
+      }
+      if (existingMutation.status === "completed") {
+        const [module] = await fetchModulesUi(scope, [req.params.id]);
+        res.status(200).json({ module, idempotentReplay: true });
+        return;
+      }
+      if (existingMutation.status === "failed") {
+        res.status(409).json({
+          error: existingMutation.errorMessage ?? "Der vorherige Speicherversuch ist fehlgeschlagen.",
+          code: existingMutation.errorCode ?? "module_save_failed",
+        });
+        return;
+      }
+      res.status(202).json({ status: "pending", mutationToken });
+      return;
+    }
+
     const affectedQuestionIds: string[] = [];
-    await db.transaction(async (tx) => {
-      const cfg = pickScopeConfig(scope);
-      const [existing] = await tx
-        .select({ id: (cfg.moduleTable as typeof moduleMain).id, isDeleted: (cfg.moduleTable as typeof moduleMain).isDeleted })
+    const phaseStartedAt = Date.now();
+    const phaseMs: Record<string, number> = {};
+    let resultRevision: number | null = null;
+    try {
+      await db.transaction(async (tx) => {
+        await tx.execute(sql`set local lock_timeout = '3s'`);
+        await tx.execute(sql`set local statement_timeout = '25s'`);
+        const cfg = pickScopeConfig(scope);
+        const [existing] = await tx
+        .select({
+          id: (cfg.moduleTable as typeof moduleMain).id,
+          isDeleted: (cfg.moduleTable as typeof moduleMain).isDeleted,
+          revision: (cfg.moduleTable as typeof moduleMain).revision,
+        })
         .from(cfg.moduleTable as typeof moduleMain)
         .where(eq((cfg.moduleTable as typeof moduleMain).id, req.params.id))
         .limit(1);
       if (!existing || existing.isDeleted) {
         throw new Error("Modul nicht gefunden.");
       }
+      if (existing.revision !== parsed.data.revision) {
+        throw new ModuleSaveConflictError();
+      }
 
-      await tx
+      const [updatedModule] = await tx
         .update(cfg.moduleTable as typeof moduleMain)
         .set({
           name: parsed.data.name,
@@ -2293,14 +2445,23 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
                     : (["standard"] as MainSection[]),
               }
             : {}),
+          revision: existing.revision + 1,
           updatedAt: now,
         } as Partial<typeof moduleMain.$inferInsert>)
-        .where(eq((cfg.moduleTable as typeof moduleMain).id, req.params.id));
+        .where(
+          and(
+            eq((cfg.moduleTable as typeof moduleMain).id, req.params.id),
+            eq((cfg.moduleTable as typeof moduleMain).revision, parsed.data.revision),
+            eq((cfg.moduleTable as typeof moduleMain).isDeleted, false),
+          ),
+        )
+        .returning({ revision: (cfg.moduleTable as typeof moduleMain).revision });
+      if (!updatedModule) throw new ModuleSaveConflictError();
+      resultRevision = updatedModule.revision;
 
       const existingModuleLinks = await tx
         .select({
           questionId: (cfg.linkTable as typeof moduleMainQuestion).questionId,
-          orderIndex: (cfg.linkTable as typeof moduleMainQuestion).orderIndex,
         })
         .from(cfg.linkTable as typeof moduleMainQuestion)
         .where(
@@ -2309,9 +2470,6 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
             eq((cfg.linkTable as typeof moduleMainQuestion).isDeleted, false),
           ),
         );
-      const existingOrderByQuestionId = new Map<string, number>(
-        existingModuleLinks.map((link) => [link.questionId, link.orderIndex]),
-      );
       const existingModuleQuestionIds = existingModuleLinks.map((link) => link.questionId);
 
       const incomingQuestionIds = parsed.data.questions
@@ -2360,26 +2518,32 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
       const desiredOrderByQuestionId = new Map<string, number>();
       const desiredChainsByQuestionId = new Map<string, string[]>();
 
+      const questionGraphStartedAt = Date.now();
       for (const [orderIndex, question] of parsed.data.questions.entries()) {
         const previousQuestion =
           question.id && isUuid(question.id) ? previousQuestionsById.get(question.id) ?? null : null;
-        const scopedQuestion = normalizeSingleChoiceAvailabilityForScope(
-          { ...question, rules: [] },
+        const sourceQuestion = normalizeSingleChoiceAvailabilityForScope(
+          question,
           scope,
           previousQuestion,
         );
-        const shouldPersistQuestion = needsQuestionGraphUpdate(previousQuestion, scopedQuestion);
+        const graphQuestion = { ...sourceQuestion, rules: [] };
+        const shouldPersistQuestion = needsQuestionGraphUpdate(previousQuestion, sourceQuestion);
         let persistedQuestionId: string;
 
         if (shouldPersistQuestion) {
-          const saved = await upsertQuestionGraphTx(tx, scopedQuestion, scope);
+          const saved = await upsertQuestionGraphTx(tx, graphQuestion, scope, {
+            previousQuestion,
+            hydrate: false,
+            persistRules: false,
+          });
           if (!saved.id) continue;
           persistedQuestionId = saved.id;
-          if (needsIppRecalcForQuestionChange(previousQuestion, scopedQuestion)) {
+          if (needsIppRecalcForQuestionChange(previousQuestion, sourceQuestion)) {
             affectedQuestionIds.push(saved.id);
           }
           savedQuestionRowsById.set(saved.id, {
-            sourceQuestion: scopedQuestion,
+            sourceQuestion,
             persistedQuestionId: saved.id,
           });
         } else {
@@ -2393,11 +2557,13 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
         desiredOrderByQuestionId.set(persistedQuestionId, orderIndex);
         desiredChainsByQuestionId.set(
           persistedQuestionId,
-          normalizeChainsForComparison(scopedQuestion.chains),
+          normalizeChainsForComparison(sourceQuestion.chains),
         );
       }
+      phaseMs.questionGraphs = Date.now() - questionGraphStartedAt;
 
       const questionOrderById = new Map<string, number>(desiredOrderByQuestionId.entries());
+      const rulesStartedAt = Date.now();
       for (const savedQuestionRow of savedQuestionRowsById.values()) {
         const remappedRules = remapAndValidateQuestionRules(
           savedQuestionRow.sourceQuestion.rules ?? [],
@@ -2412,47 +2578,32 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
         await ensureQuestionRefsExist(tx, referencedIds, scope);
         await persistQuestionRulesTx(tx, savedQuestionRow.persistedQuestionId, remappedRules, now);
       }
+      phaseMs.rules = Date.now() - rulesStartedAt;
 
-      for (const [questionId, orderIndex] of desiredOrderByQuestionId.entries()) {
-        const existingOrder = existingOrderByQuestionId.get(questionId);
-        if (existingOrder == null) {
-          await tx
-            .insert(cfg.linkTable as typeof moduleMainQuestion)
-            .values({
-              moduleId: req.params.id,
-              questionId,
-              orderIndex,
+      const linksStartedAt = Date.now();
+      const desiredLinks = Array.from(desiredOrderByQuestionId.entries()).map(([questionId, orderIndex]) => ({
+        moduleId: req.params.id,
+        questionId,
+        orderIndex,
+        isDeleted: false,
+        deletedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      }));
+      if (desiredLinks.length > 0) {
+        const linkTable = cfg.linkTable as typeof moduleMainQuestion;
+        await tx
+          .insert(linkTable)
+          .values(desiredLinks)
+          .onConflictDoUpdate({
+            target: [linkTable.moduleId, linkTable.questionId],
+            set: {
+              orderIndex: sql`excluded.order_index`,
               isDeleted: false,
               deletedAt: null,
-              createdAt: now,
               updatedAt: now,
-            })
-            .onConflictDoUpdate({
-              target: [
-                (cfg.linkTable as typeof moduleMainQuestion).moduleId,
-                (cfg.linkTable as typeof moduleMainQuestion).questionId,
-              ],
-              set: {
-                orderIndex,
-                isDeleted: false,
-                deletedAt: null,
-                updatedAt: now,
-              },
-            });
-          continue;
-        }
-        if (existingOrder !== orderIndex) {
-          await tx
-            .update(cfg.linkTable as typeof moduleMainQuestion)
-            .set({ orderIndex, updatedAt: now })
-            .where(
-              and(
-                eq((cfg.linkTable as typeof moduleMainQuestion).moduleId, req.params.id),
-                eq((cfg.linkTable as typeof moduleMainQuestion).questionId, questionId),
-                eq((cfg.linkTable as typeof moduleMainQuestion).isDeleted, false),
-              ),
-            );
-        }
+            },
+          });
       }
 
       const removedQuestionIds = existingModuleQuestionIds.filter(
@@ -2474,62 +2625,141 @@ adminFragebogenRouter.patch("/modules/:scope/:id", async (req, res, next) => {
             ),
           );
       }
+      phaseMs.links = Date.now() - linksStartedAt;
 
       if (chainsReady) {
         const questionIdsForChainDiff = new Set<string>([
           ...desiredOrderByQuestionId.keys(),
           ...existingChainsByQuestionId.keys(),
         ]);
+        const changedChainQuestionIds: string[] = [];
         for (const questionId of questionIdsForChainDiff) {
           const previousChains = existingChainsByQuestionId.get(questionId) ?? [];
           const desiredChains = desiredChainsByQuestionId.get(questionId) ?? [];
           if (areStringArraysEqual(previousChains, desiredChains)) continue;
-
-          if (previousChains.length > 0) {
-            await tx
-              .update(moduleQuestionChains)
-              .set({
-                isDeleted: true,
-                deletedAt: now,
-                updatedAt: now,
-              })
-              .where(
-                and(
-                  eq(moduleQuestionChains.scope, scope),
-                  eq(moduleQuestionChains.moduleId, req.params.id),
-                  eq(moduleQuestionChains.questionId, questionId),
-                  eq(moduleQuestionChains.isDeleted, false),
-                ),
-              );
-          }
-
-          if (desiredChains.length > 0) {
-            await tx.insert(moduleQuestionChains).values(
-              desiredChains.map((chainDbName) => ({
-                scope,
-                moduleId: req.params.id,
-                questionId,
-                chainDbName,
-                isDeleted: false,
-                deletedAt: null,
-                createdAt: now,
-                updatedAt: now,
-              })),
+          changedChainQuestionIds.push(questionId);
+        }
+        const chainsStartedAt = Date.now();
+        if (changedChainQuestionIds.length > 0) {
+          await tx
+            .update(moduleQuestionChains)
+            .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+            .where(
+              and(
+                eq(moduleQuestionChains.scope, scope),
+                eq(moduleQuestionChains.moduleId, req.params.id),
+                inArray(moduleQuestionChains.questionId, changedChainQuestionIds),
+                eq(moduleQuestionChains.isDeleted, false),
+              ),
             );
+          const desiredChainRows = changedChainQuestionIds.flatMap((questionId) =>
+            (desiredChainsByQuestionId.get(questionId) ?? []).map((chainDbName) => ({
+              scope,
+              moduleId: req.params.id,
+              questionId,
+              chainDbName,
+              isDeleted: false,
+              deletedAt: null,
+              createdAt: now,
+              updatedAt: now,
+            })),
+          );
+          if (desiredChainRows.length > 0) {
+            await tx.insert(moduleQuestionChains).values(desiredChainRows);
           }
         }
+        phaseMs.chains = Date.now() - chainsStartedAt;
       }
-    });
 
-    if (affectedQuestionIds.length > 0) {
-      await enqueueIppRecalcForQuestionScoringChanges(affectedQuestionIds, "module_scoring_changed");
+      const transactionCompletedAt = new Date();
+      await tx
+        .update(moduleSaveMutations)
+        .set({
+          status: "completed",
+          resultRevision: updatedModule.revision,
+          errorCode: null,
+          errorMessage: null,
+          completedAt: transactionCompletedAt,
+          updatedAt: transactionCompletedAt,
+        })
+        .where(and(eq(moduleSaveMutations.token, mutationToken), eq(moduleSaveMutations.status, "pending")));
+      });
+      phaseMs.transaction = Date.now() - phaseStartedAt;
+    } catch (error) {
+      const databaseCode = error && typeof error === "object" && "code" in error
+        ? String((error as { code?: unknown }).code ?? "")
+        : "";
+      const isBusy = databaseCode === "55P03" || databaseCode === "57014";
+      const code = error instanceof ModuleSaveConflictError
+        ? error.code
+        : isBusy
+          ? "module_save_busy"
+          : error instanceof DomainValidationError
+            ? "module_save_validation_failed"
+            : "module_save_failed";
+      const message = error instanceof ModuleSaveConflictError
+        ? error.message
+        : isBusy
+          ? "Das Modul wird gerade gespeichert. Bitte kurz warten und neu laden."
+          : error instanceof Error
+            ? error.message
+            : "Modul konnte nicht gespeichert werden.";
+      await markModuleSaveMutationFailed(mutationToken, code, message).catch((mutationError) => {
+        logger.error("module_save_mutation_failure_record_failed", {
+          ...getRequestLogMeta(req),
+          scope,
+          moduleId: req.params.id,
+          error: serializeError(mutationError),
+        });
+      });
+      if (error instanceof ModuleSaveConflictError || isBusy) {
+        const [currentModule] = await fetchModulesUi(scope, [req.params.id]);
+        res.status(409).json({ error: message, code, currentModule });
+        return;
+      }
+      throw error;
     }
 
+    if (resultRevision == null) {
+      await markModuleSaveMutationFailed(
+        mutationToken,
+        "module_save_failed",
+        "Die neue Modulversion konnte nicht bestätigt werden.",
+      );
+      throw new Error("Die neue Modulversion konnte nicht bestätigt werden.");
+    }
+
+    const enqueueStartedAt = Date.now();
+    if (affectedQuestionIds.length > 0) {
+      await enqueueIppRecalcForQuestionScoringChanges(affectedQuestionIds, "module_scoring_changed").catch((error) => {
+        logger.error("module_save_ipp_enqueue_failed", {
+          ...getRequestLogMeta(req),
+          scope,
+          moduleId: req.params.id,
+          affectedQuestionCount: affectedQuestionIds.length,
+          error: serializeError(error),
+        });
+      });
+    }
+    phaseMs.ippEnqueue = Date.now() - enqueueStartedAt;
+
+    const hydrateStartedAt = Date.now();
     const [module] = await fetchModulesUi(scope, [req.params.id]);
+    phaseMs.hydration = Date.now() - hydrateStartedAt;
     if (!module) {
       res.status(404).json({ error: "Modul nicht gefunden." });
       return;
     }
+    logger.info("module_save_timing", {
+      ...getRequestLogMeta(req),
+      scope,
+      moduleId: req.params.id,
+      questionCount: parsed.data.questions.length,
+      ippAffectedQuestionCount: affectedQuestionIds.length,
+      resultRevision,
+      durationMs: Date.now() - phaseStartedAt,
+      phases: phaseMs,
+    });
     res.status(200).json({ module });
   } catch (error) {
     if (error instanceof Error && error.message === "Modul nicht gefunden.") {

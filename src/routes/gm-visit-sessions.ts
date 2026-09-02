@@ -11,6 +11,7 @@ import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { db } from "../lib/db.js";
 import { DEFAULT_TIMEZONE, ensureGmSubmissionGate, gmSubmissionGateError } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
+import { planGmPhotoCommit } from "../lib/gm-photo-commit.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import { addDays, startOfDay } from "../lib/red-monat.js";
 import { resolveCurrentRedPeriod, resolveRedPeriodForDate } from "../lib/red-month-periods.js";
@@ -4255,6 +4256,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
     const parsed = z
       .object({
         visitAnswerId: z.string().uuid(),
+        mode: z.enum(["replace", "append"]).optional().default("replace"),
         photos: z.array(
           z.object({
             storageBucket: z.string().min(1),
@@ -4421,7 +4423,12 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
     }
 
     const now = new Date();
-    await db.transaction(async (tx) => {
+    const commitStartedAtNs = startActionTimer();
+    const commitSummary = await db.transaction(async (tx) => {
+      let insertedPhotoCount = 0;
+      let updatedPhotoCount = 0;
+      let deletedPhotoCount = 0;
+      let activePhotoCount = 0;
       const siblingQuestions = await loadSiblingSessionQuestions(tx, {
         sessionId,
         questionId: answerRow.sharedQuestionId,
@@ -4506,51 +4513,80 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
         }));
 
         const existingPhotos = await tx
-          .select({ id: visitAnswerPhotos.id })
+          .select()
           .from(visitAnswerPhotos)
           .where(and(eq(visitAnswerPhotos.visitAnswerId, target.answerId), eq(visitAnswerPhotos.isDeleted, false)));
-        const existingPhotoIds = existingPhotos.map((row) => row.id);
-        if (existingPhotoIds.length > 0) {
+        const existingPhotoByPath = new Map(existingPhotos.map((row) => [row.storagePath, row]));
+        const commitPlan = planGmPhotoCommit(
+          existingPhotos.map((row) => row.storagePath),
+          normalizedForTarget.map((photo) => photo.storagePath),
+          parsed.data.mode,
+        );
+        const deletedPaths = new Set(commitPlan.deletePaths);
+        const removedPhotoIds = existingPhotos.filter((row) => deletedPaths.has(row.storagePath)).map((row) => row.id);
+        if (removedPhotoIds.length > 0) {
           await tx
             .update(visitAnswerPhotoTags)
             .set({ isDeleted: true, deletedAt: now, updatedAt: now })
-            .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, existingPhotoIds), eq(visitAnswerPhotoTags.isDeleted, false)));
+            .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, removedPhotoIds), eq(visitAnswerPhotoTags.isDeleted, false)));
+          await tx
+            .update(visitAnswerPhotos)
+            .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+            .where(and(inArray(visitAnswerPhotos.id, removedPhotoIds), eq(visitAnswerPhotos.isDeleted, false)));
+          deletedPhotoCount += removedPhotoIds.length;
         }
-        await tx
-          .update(visitAnswerPhotos)
-          .set({ isDeleted: true, deletedAt: now, updatedAt: now })
-          .where(and(eq(visitAnswerPhotos.visitAnswerId, target.answerId), eq(visitAnswerPhotos.isDeleted, false)));
 
-        const inserted = normalizedForTarget.length === 0
-          ? []
-          : await tx
-              .insert(visitAnswerPhotos)
-              .values(
-                normalizedForTarget.map((photo) => ({
-                  visitAnswerId: target.answerId,
-                  storageBucket: photo.storageBucket,
-                  storagePath: photo.storagePath,
-                  mimeType: photo.mimeType,
-                  byteSize: photo.byteSize,
-                  widthPx: photo.widthPx,
-                  heightPx: photo.heightPx,
-                  sha256: photo.sha256,
-                  uploadedAt: now,
-                  isDeleted: false,
-                  deletedAt: null,
-                  createdAt: now,
-                  updatedAt: now,
-                })),
-              )
+        for (const photo of normalizedForTarget) {
+          const existingPhoto = existingPhotoByPath.get(photo.storagePath);
+          let photoRow: typeof visitAnswerPhotos.$inferSelect;
+          if (existingPhoto && !removedPhotoIds.includes(existingPhoto.id)) {
+            const [updated] = await tx
+              .update(visitAnswerPhotos)
+              .set({
+                storageBucket: photo.storageBucket,
+                mimeType: photo.mimeType ?? existingPhoto.mimeType,
+                byteSize: photo.byteSize ?? existingPhoto.byteSize,
+                widthPx: photo.widthPx ?? existingPhoto.widthPx,
+                heightPx: photo.heightPx ?? existingPhoto.heightPx,
+                sha256: photo.sha256 ?? existingPhoto.sha256,
+                updatedAt: now,
+              })
+              .where(and(eq(visitAnswerPhotos.id, existingPhoto.id), eq(visitAnswerPhotos.isDeleted, false)))
               .returning();
+            photoRow = updated ?? existingPhoto;
+            updatedPhotoCount += 1;
+          } else {
+            const [inserted] = await tx
+              .insert(visitAnswerPhotos)
+              .values({
+                visitAnswerId: target.answerId,
+                storageBucket: photo.storageBucket,
+                storagePath: photo.storagePath,
+                mimeType: photo.mimeType,
+                byteSize: photo.byteSize,
+                widthPx: photo.widthPx,
+                heightPx: photo.heightPx,
+                sha256: photo.sha256,
+                uploadedAt: now,
+                isDeleted: false,
+                deletedAt: null,
+                createdAt: now,
+                updatedAt: now,
+              })
+              .returning();
+            if (!inserted) throw new Error("Foto konnte nicht gespeichert werden.");
+            photoRow = inserted;
+            insertedPhotoCount += 1;
+          }
 
-        const photoTagValues: Array<typeof visitAnswerPhotoTags.$inferInsert> = [];
-        inserted.forEach((photoRow, idx) => {
-          const ids = normalizedForTarget[idx]?.photoTagIds ?? [];
-          ids.forEach((tagId) => {
+          await tx
+            .update(visitAnswerPhotoTags)
+            .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+            .where(and(eq(visitAnswerPhotoTags.visitAnswerPhotoId, photoRow.id), eq(visitAnswerPhotoTags.isDeleted, false)));
+          const photoTagValues = photo.photoTagIds.flatMap((tagId) => {
             const label = tagById.get(tagId);
-            if (!label) return;
-            photoTagValues.push({
+            return label
+              ? [{
               visitAnswerPhotoId: photoRow.id,
               photoTagId: tagId,
               photoTagLabelSnapshot: label,
@@ -4558,20 +4594,33 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
               deletedAt: null,
               createdAt: now,
               updatedAt: now,
-            });
+                } satisfies typeof visitAnswerPhotoTags.$inferInsert]
+              : [];
           });
-        });
-        if (photoTagValues.length > 0) {
-          await tx.insert(visitAnswerPhotoTags).values(photoTagValues);
+          if (photoTagValues.length > 0) {
+            await tx.insert(visitAnswerPhotoTags).values(photoTagValues);
+          }
         }
 
+        const activePhotos = await tx
+          .select()
+          .from(visitAnswerPhotos)
+          .where(and(eq(visitAnswerPhotos.visitAnswerId, target.answerId), eq(visitAnswerPhotos.isDeleted, false)))
+          .orderBy(asc(visitAnswerPhotos.createdAt));
+        const activePhotoIds = activePhotos.map((row) => row.id);
+        const activePhotoTags = activePhotoIds.length === 0
+          ? []
+          : await tx
+              .select({ visitAnswerPhotoId: visitAnswerPhotoTags.visitAnswerPhotoId })
+              .from(visitAnswerPhotoTags)
+              .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, activePhotoIds), eq(visitAnswerPhotoTags.isDeleted, false)));
         const config = target.questionConfigSnapshot ?? {};
         const tagsEnabled = Boolean(config.tagsEnabled) && Array.isArray(config.tagIds) && (config.tagIds as unknown[]).length > 0;
         const requiredPhotoQuestion = Boolean(target.requiredSnapshot);
         const requiresTagSelection = requiredPhotoQuestion && tagsEnabled;
-        const taggedPhotoIds = new Set(photoTagValues.map((value) => value.visitAnswerPhotoId));
-        const everyPhotoHasTag = !tagsEnabled || inserted.every((photoRow) => taggedPhotoIds.has(photoRow.id));
-        const isAnswered = inserted.length > 0;
+        const taggedPhotoIds = new Set(activePhotoTags.map((value) => value.visitAnswerPhotoId));
+        const everyPhotoHasTag = !tagsEnabled || activePhotos.every((photoRow) => taggedPhotoIds.has(photoRow.id));
+        const isAnswered = activePhotos.length > 0;
         const isValid = requiredPhotoQuestion ? isAnswered && everyPhotoHasTag : true;
 
         await tx
@@ -4581,7 +4630,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
             isValid,
             validationError: isValid ? null : (requiresTagSelection ? "Foto-Frage benötigt mindestens einen Tag." : null),
             valueJson: {
-              storage: inserted.map((row) => ({
+              storage: activePhotos.map((row) => ({
                 id: row.id,
                 bucket: row.storageBucket,
                 path: row.storagePath,
@@ -4593,12 +4642,40 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/photos/commit", async 
             updatedAt: now,
           })
           .where(eq(visitAnswers.id, target.answerId));
+
+        if (target.answerId === parsed.data.visitAnswerId) {
+          activePhotoCount = activePhotos.length;
+        }
       }
 
       await tx
         .update(visitSessions)
         .set({ lastSavedAt: now, updatedAt: now })
         .where(eq(visitSessions.id, sessionId));
+
+      return {
+        insertedPhotoCount,
+        updatedPhotoCount,
+        deletedPhotoCount,
+        activePhotoCount,
+        mirroredAnswerCount: targetAnswers.length,
+      };
+    });
+
+    logAction("info", "gm_visit_photo_commit_completed", {
+      req,
+      action: "gm_visit_photo_commit",
+      result: "success",
+      statusCode: 200,
+      requestClass: "success",
+      startedAtNs: commitStartedAtNs,
+      details: {
+        sessionId,
+        visitAnswerId: parsed.data.visitAnswerId,
+        mode: parsed.data.mode,
+        requestedPhotoCount: normalizedPhotos.length,
+        ...commitSummary,
+      },
     });
 
     res.status(200).json({ ok: true });

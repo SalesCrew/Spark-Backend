@@ -2030,6 +2030,7 @@ export const questionRules = pgTable(
   },
   (table) => [
     index("question_rules_question_idx").on(table.questionId),
+    index("question_rules_active_question_idx").on(table.questionId).where(sql`${table.isDeleted} = false`),
     index("question_rules_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -2584,6 +2585,7 @@ export const moduleMain = pgTable("module_main", {
   name: text("name").notNull(),
   description: text("description").notNull().default(""),
   sectionKeywords: fragebogenMainSectionEnum("section_keywords").array().notNull().default(sql`'{standard}'::fragebogen_main_section[]`),
+  revision: integer("revision").notNull().default(1),
   isDeleted: boolean("is_deleted").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
@@ -2607,6 +2609,9 @@ export const moduleMainQuestion = pgTable(
   (table) => [
     primaryKey({ columns: [table.moduleId, table.questionId] }),
     index("module_main_question_question_idx").on(table.questionId),
+    index("module_main_question_active_module_order_idx")
+      .on(table.moduleId, table.orderIndex)
+      .where(sql`${table.isDeleted} = false`),
     index("module_main_question_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -2741,6 +2746,7 @@ export const moduleKuehler = pgTable("module_kuehler", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: text("name").notNull(),
   description: text("description").notNull().default(""),
+  revision: integer("revision").notNull().default(1),
   isDeleted: boolean("is_deleted").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
@@ -2764,6 +2770,9 @@ export const moduleKuehlerQuestion = pgTable(
   (table) => [
     primaryKey({ columns: [table.moduleId, table.questionId] }),
     index("module_kuehler_question_question_idx").on(table.questionId),
+    index("module_kuehler_question_active_module_order_idx")
+      .on(table.moduleId, table.orderIndex)
+      .where(sql`${table.isDeleted} = false`),
     index("module_kuehler_question_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -2840,6 +2849,7 @@ export const moduleMhd = pgTable("module_mhd", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: text("name").notNull(),
   description: text("description").notNull().default(""),
+  revision: integer("revision").notNull().default(1),
   isDeleted: boolean("is_deleted").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
@@ -2863,6 +2873,9 @@ export const moduleMhdQuestion = pgTable(
   (table) => [
     primaryKey({ columns: [table.moduleId, table.questionId] }),
     index("module_mhd_question_question_idx").on(table.questionId),
+    index("module_mhd_question_active_module_order_idx")
+      .on(table.moduleId, table.orderIndex)
+      .where(sql`${table.isDeleted} = false`),
     index("module_mhd_question_deleted_idx").on(table.isDeleted),
   ],
 );
@@ -2892,6 +2905,9 @@ export const moduleQuestionChains = pgTable(
       table.questionId,
       table.isDeleted,
     ),
+    index("module_question_chains_active_module_idx")
+      .on(table.scope, table.moduleId, table.questionId)
+      .where(sql`${table.isDeleted} = false`),
   ],
 );
 
@@ -2967,10 +2983,41 @@ export const moduleDurcharbeit = pgTable("module_durcharbeit", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: text("name").notNull(),
   description: text("description").notNull().default(""),
+  revision: integer("revision").notNull().default(1),
   isDeleted: boolean("is_deleted").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+export const moduleSaveMutations = pgTable(
+  "module_save_mutations",
+  {
+    token: uuid("token").primaryKey(),
+    scope: fragebogenScopeEnum("scope").notNull(),
+    moduleId: uuid("module_id").notNull(),
+    expectedRevision: integer("expected_revision").notNull(),
+    payloadHash: text("payload_hash").notNull(),
+    status: text("status").notNull().default("pending"),
+    resultRevision: integer("result_revision"),
+    errorCode: text("error_code"),
+    errorMessage: text("error_message"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => [
+    check("module_save_mutations_expected_revision_ck", sql`${table.expectedRevision} > 0`),
+    check("module_save_mutations_status_ck", sql`${table.status} in ('pending', 'completed', 'failed')`),
+    check("module_save_mutations_payload_hash_ck", sql`length(${table.payloadHash}) = 64`),
+    check(
+      "module_save_mutations_terminal_state_ck",
+      sql`(${table.status} = 'pending' and ${table.resultRevision} is null and ${table.completedAt} is null)
+        or (${table.status} = 'completed' and ${table.resultRevision} is not null and ${table.completedAt} is not null)
+        or (${table.status} = 'failed' and ${table.resultRevision} is null and ${table.completedAt} is not null)`,
+    ),
+    index("module_save_mutations_module_created_idx").on(table.scope, table.moduleId, table.createdAt),
+  ],
+);
 
 export const moduleDurcharbeitQuestion = pgTable(
   "module_durcharbeit_question",
@@ -2990,6 +3037,9 @@ export const moduleDurcharbeitQuestion = pgTable(
   (table) => [
     primaryKey({ columns: [table.moduleId, table.questionId] }),
     index("module_durcharbeit_question_question_idx").on(table.questionId),
+    index("module_durcharbeit_question_active_module_order_idx")
+      .on(table.moduleId, table.orderIndex)
+      .where(sql`${table.isDeleted} = false`),
     index("module_durcharbeit_question_deleted_idx").on(table.isDeleted),
   ],
 );

@@ -20,6 +20,7 @@ import {
   fragebogenMainModule,
   markets,
   moduleMain,
+  moduleSaveMutations,
   fragebogenMainSpezialItems,
   ippMarketRedmonthResults,
   ippRecalcQueue,
@@ -1499,9 +1500,14 @@ test("module update soft-deletes old module_question links", async (t) => {
   });
   assert.equal(createModuleRes.status, 201);
   const moduleId = createModuleRes.body.module?.id as string;
+  const moduleRevision = Number(createModuleRes.body.module?.revision);
   assert.ok(moduleId);
+  assert.equal(moduleRevision, 1);
 
+  const mutationToken = randomUUID();
   const patchModuleRes = await request(app).patch(`/admin/modules/main/${moduleId}`).send({
+    revision: moduleRevision,
+    mutationToken,
     name: `Module ${uniq}`,
     description: "",
     sectionKeywords: ["standard"],
@@ -1518,6 +1524,40 @@ test("module update soft-deletes old module_question links", async (t) => {
     ],
   });
   assert.equal(patchModuleRes.status, 200);
+  assert.equal(patchModuleRes.body.module?.revision, 2);
+
+  const replayModuleRes = await request(app).patch(`/admin/modules/main/${moduleId}`).send({
+    revision: moduleRevision,
+    mutationToken,
+    name: `Module ${uniq}`,
+    description: "",
+    sectionKeywords: ["standard"],
+    questions: [
+      {
+        id: q2Id,
+        type: "text",
+        text: `Q2 ${uniq}`,
+        required: true,
+        config: {},
+        rules: [],
+        scoring: {},
+      },
+    ],
+  });
+  assert.equal(replayModuleRes.status, 200);
+  assert.equal(replayModuleRes.body.idempotentReplay, true);
+  assert.equal(replayModuleRes.body.module?.revision, 2);
+
+  const staleModuleRes = await request(app).patch(`/admin/modules/main/${moduleId}`).send({
+    revision: moduleRevision,
+    mutationToken: randomUUID(),
+    name: `Module ${uniq} stale`,
+    description: "",
+    sectionKeywords: ["standard"],
+    questions: [],
+  });
+  assert.equal(staleModuleRes.status, 409);
+  assert.equal(staleModuleRes.body.code, "module_save_conflict");
 
   const activeRows = await db
     .select()
@@ -1530,6 +1570,7 @@ test("module update soft-deletes old module_question links", async (t) => {
   assert.equal(q1Link?.isDeleted, true);
   assert.equal(q2Link?.isDeleted, false);
 
+  await db.delete(moduleSaveMutations).where(eq(moduleSaveMutations.moduleId, moduleId));
   await request(app).patch(`/admin/modules/main/${moduleId}/delete`).send({});
 });
 
@@ -1903,9 +1944,13 @@ test("kuehler scope preserves existing availability fields on module saves", asy
     });
     assert.equal(createModuleRes.status, 201);
     moduleId = createModuleRes.body.module?.id as string;
+    const moduleRevision = Number(createModuleRes.body.module?.revision);
     assert.ok(moduleId);
+    assert.equal(moduleRevision, 1);
 
     const patchModuleRes = await request(app).patch(`/admin/modules/kuehler/${moduleId}`).send({
+      revision: moduleRevision,
+      mutationToken: randomUUID(),
       name: `Kuehler ${uniq} edited`,
       description: "edited",
       questions: [
@@ -1936,6 +1981,7 @@ test("kuehler scope preserves existing availability fields on module saves", asy
     assert.equal(persisted?.singleChoiceAvailabilityType ?? null, "Promos");
   } finally {
     if (moduleId) {
+      await db.delete(moduleSaveMutations).where(eq(moduleSaveMutations.moduleId, moduleId));
       await request(app).patch(`/admin/modules/kuehler/${moduleId}/delete`).send({});
     }
     if (questionId) {
@@ -2729,7 +2775,9 @@ test("module question chains stay module-scoped and duplicate with module", asyn
   });
   assert.equal(moduleBRes.status, 201);
   const moduleBId = moduleBRes.body.module?.id as string;
+  const moduleBRevision = Number(moduleBRes.body.module?.revision);
   assert.ok(moduleBId);
+  assert.equal(moduleBRevision, 1);
 
   const modulesReadRes = await request(app).get("/admin/modules/main");
   assert.equal(modulesReadRes.status, 200);
@@ -2746,6 +2794,8 @@ test("module question chains stay module-scoped and duplicate with module", asyn
 
   const patchModuleBRes = await request(app).patch(`/admin/modules/main/${moduleBId}`).send({
     id: moduleBId,
+    revision: moduleBRevision,
+    mutationToken: randomUUID(),
     name: `Module B ${uniq}`,
     description: "",
     sectionKeywords: ["standard"],
@@ -2788,6 +2838,7 @@ test("module question chains stay module-scoped and duplicate with module", asyn
   assert.equal(chainRows.some((row) => row.moduleId === moduleBId && row.chainDbName === "SPAR" && !row.isDeleted), false);
   assert.equal(chainRows.some((row) => row.moduleId === duplicatedModuleId && row.chainDbName === "SPAR" && !row.isDeleted), true);
 
+  await db.delete(moduleSaveMutations).where(eq(moduleSaveMutations.moduleId, moduleBId));
   await request(app).patch(`/admin/modules/main/${moduleAId}/delete`).send({});
   await request(app).patch(`/admin/modules/main/${moduleBId}/delete`).send({});
   await request(app).patch(`/admin/modules/main/${duplicatedModuleId}/delete`).send({});
@@ -2833,10 +2884,14 @@ test("module patch persists attachment-only question edits", async (t) => {
   });
   assert.equal(moduleRes.status, 201);
   const moduleId = moduleRes.body.module?.id as string;
+  const moduleRevision = Number(moduleRes.body.module?.revision);
   assert.ok(moduleId);
+  assert.equal(moduleRevision, 1);
 
   const patchRes = await request(app).patch(`/admin/modules/main/${moduleId}`).send({
     id: moduleId,
+    revision: moduleRevision,
+    mutationToken: randomUUID(),
     name: `Module ${uniq}`,
     description: "",
     sectionKeywords: ["standard"],
@@ -2865,6 +2920,7 @@ test("module patch persists attachment-only question edits", async (t) => {
   );
   assert.equal(attachmentRows.some((row) => !row.isDeleted), false);
 
+  await db.delete(moduleSaveMutations).where(eq(moduleSaveMutations.moduleId, moduleId));
   await request(app).patch(`/admin/modules/main/${moduleId}/delete`).send({});
 });
 
@@ -6303,7 +6359,7 @@ test("gm bonus summary resolves active wave using wave timezone at utc boundary"
   }
 });
 
-test("gm visit photo comment-only patch persists and photo commit dedupes duplicates", async (t) => {
+test("gm visit photo comment-only patch persists and photo commits dedupe and append safely", async (t) => {
   enableTestAuthBypass();
   if (!(await ensureDbReadyForVisitSessionTests())) {
     t.skip("Visit session tables are not present in the configured DATABASE_URL.");
@@ -6470,6 +6526,30 @@ test("gm visit photo comment-only patch persists and photo commit dedupes duplic
   });
   assert.equal(commitRes.status, 200);
 
+  const appendRes = await request(app).post(`/markets/gm/visit-sessions/${sessionId}/photos/commit`).send({
+    visitAnswerId: answerRow?.id,
+    mode: "append",
+    photos: [
+      {
+        storageBucket: "visit-photos",
+        storagePath: `visit-photos/${sessionId}/${answerRow?.id}/second.jpg`,
+        mimeType: "image/jpeg",
+        byteSize: 456,
+        sha256: "def456",
+        photoTagIds: [photoTagId],
+      },
+    ],
+  });
+  assert.equal(appendRes.status, 200);
+
+  const photosAfterAppend = await db
+    .select({ id: visitAnswerPhotos.id, storagePath: visitAnswerPhotos.storagePath })
+    .from(visitAnswerPhotos)
+    .where(and(eq(visitAnswerPhotos.visitAnswerId, answerRow!.id), eq(visitAnswerPhotos.isDeleted, false)));
+  assert.equal(photosAfterAppend.length, 2);
+  assert.ok(photosAfterAppend.some((photo) => photo.storagePath.endsWith("/same.jpg")));
+  assert.ok(photosAfterAppend.some((photo) => photo.storagePath.endsWith("/second.jpg")));
+
   const conflictingCommit = await request(app).post(`/markets/gm/visit-sessions/${sessionId}/photos/commit`).send({
     visitAnswerId: answerRow?.id,
     photos: [
@@ -6497,12 +6577,12 @@ test("gm visit photo comment-only patch persists and photo commit dedupes duplic
     .select({ id: visitAnswerPhotos.id })
     .from(visitAnswerPhotos)
     .where(and(eq(visitAnswerPhotos.visitAnswerId, answerRow!.id), eq(visitAnswerPhotos.isDeleted, false)));
-  assert.equal(activePhotos.length, 1);
+  assert.equal(activePhotos.length, 2);
   const activePhotoTags = await db
     .select({ id: visitAnswerPhotoTags.id })
     .from(visitAnswerPhotoTags)
-    .where(and(eq(visitAnswerPhotoTags.visitAnswerPhotoId, activePhotos[0]!.id), eq(visitAnswerPhotoTags.isDeleted, false)));
-  assert.equal(activePhotoTags.length, 1);
+    .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, activePhotos.map((photo) => photo.id)), eq(visitAnswerPhotoTags.isDeleted, false)));
+  assert.equal(activePhotoTags.length, 2);
 
   const clearComment = await request(app).patch(`/markets/gm/visit-sessions/${sessionId}/answers`).send({
     visitQuestionId: photoQuestionId,
