@@ -1,9 +1,8 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import {
   finalizeBonusForSubmittedVisitSessionTx,
-  readActivePraemienWaveForInstant,
   readGmActiveBonusSummary,
 } from "../lib/bonus-finalizer.js";
 import { ensureAndGetGmKpiCache, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
@@ -13,6 +12,11 @@ import { DEFAULT_TIMEZONE, ensureGmSubmissionGate, gmSubmissionGateError } from 
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { planGmPhotoCommit } from "../lib/gm-photo-commit.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
+import {
+  calendarQuarterDateWindow,
+  quarterPersistentQuestionIds,
+  revalidateReusableAnswer,
+} from "../lib/praemien-answer-persistence.js";
 import { addDays, startOfDay } from "../lib/red-monat.js";
 import { resolveCurrentRedPeriod, resolveRedPeriodForDate } from "../lib/red-month-periods.js";
 import { selectMissingSpezialfragenForSession } from "../lib/spezialfragen-session-sync.js";
@@ -36,6 +40,7 @@ import {
   photoTags,
   praemienWavePillars,
   praemienWaveSources,
+  praemienWaves,
   users,
   visitAnswerChangeRequests,
   visitAnswerMatrixCells,
@@ -593,6 +598,7 @@ async function verifyStorageObjectExists(bucket: string, storagePath: string): P
 }
 
 type ReusableSourceAnswer = {
+  reuseScope: "red-month" | "calendar-quarter";
   answer: typeof visitAnswers.$inferSelect;
   options: Array<typeof visitAnswerOptions.$inferSelect>;
   matrixCells: Array<typeof visitAnswerMatrixCells.$inferSelect>;
@@ -656,6 +662,8 @@ async function loadLatestSubmittedAnswersByQuestionId(input: {
   marketId: string;
   questionIds: string[];
   window: AnswerReuseWindow;
+  reuseScope: ReusableSourceAnswer["reuseScope"];
+  requireAnswered?: boolean;
 }): Promise<Map<string, ReusableSourceAnswer>> {
   const questionIds = normalizeUnique(input.questionIds.filter((id) => isUuid(id)));
   if (questionIds.length === 0) return new Map();
@@ -681,6 +689,8 @@ async function loadLatestSubmittedAnswersByQuestionId(input: {
       and(
         inArray(visitAnswers.questionId, questionIds),
         eq(visitAnswers.isDeleted, false),
+        input.requireAnswered ? eq(visitAnswers.answerStatus, "answered") : undefined,
+        input.requireAnswered ? eq(visitAnswers.isValid, true) : undefined,
         eq(visitSessions.isDeleted, false),
         eq(visitSessions.status, "submitted"),
         eq(visitSessions.gmUserId, input.gmUserId),
@@ -782,6 +792,7 @@ async function loadLatestSubmittedAnswersByQuestionId(input: {
   const output = new Map<string, ReusableSourceAnswer>();
   for (const row of selectedAnswers) {
     output.set(row.questionId, {
+      reuseScope: input.reuseScope,
       answer: row,
       options: optionsByAnswerId.get(row.id) ?? [],
       matrixCells: matrixByAnswerId.get(row.id) ?? [],
@@ -804,6 +815,7 @@ async function loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(input: {
     gmUserId: input.gmUserId,
     marketId: input.marketId,
     questionIds: input.questionIds,
+    reuseScope: "red-month",
     window: {
       kind: "timestamp",
       start: startOfDay(period.start),
@@ -821,39 +833,53 @@ async function loadReusableSubmittedAnswersByQuestionId(input: {
   const questionIds = normalizeUnique(input.questionIds.filter((id) => isUuid(id)));
   if (questionIds.length === 0) return new Map();
 
-  const activeWave = await readActivePraemienWaveForInstant(input.now);
-  if (!activeWave) {
+  const quarterWindow = calendarQuarterDateWindow(input.now, DEFAULT_TIMEZONE);
+  const overlappingWaves = await db
+    .select({ id: praemienWaves.id })
+    .from(praemienWaves)
+    .where(
+      and(
+        eq(praemienWaves.isDeleted, false),
+        ne(praemienWaves.status, "archived"),
+        lte(praemienWaves.startDate, quarterWindow.endDate),
+        gte(praemienWaves.endDate, quarterWindow.startDate),
+      ),
+    );
+  const overlappingWaveIds = normalizeUnique(overlappingWaves.map((row) => row.id));
+  if (overlappingWaveIds.length === 0) {
     return loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({ ...input, questionIds });
   }
 
   const waveQuestionRows = await db
-    .select({ questionId: praemienWaveSources.questionId })
+    .select({
+      questionId: praemienWaveSources.questionId,
+      pillarName: praemienWavePillars.name,
+      carryAnswersForWave: praemienWavePillars.carryAnswersForWave,
+    })
     .from(praemienWaveSources)
     .innerJoin(
       praemienWavePillars,
       and(
         eq(praemienWavePillars.id, praemienWaveSources.pillarId),
-        eq(praemienWavePillars.waveId, activeWave.id),
+        eq(praemienWavePillars.waveId, praemienWaveSources.waveId),
       ),
     )
     .where(
       and(
-        eq(praemienWaveSources.waveId, activeWave.id),
+        inArray(praemienWaveSources.waveId, overlappingWaveIds),
         inArray(praemienWaveSources.questionId, questionIds),
         eq(praemienWaveSources.isDeleted, false),
         eq(praemienWavePillars.isDeleted, false),
-        eq(praemienWavePillars.carryAnswersForWave, true),
       ),
     );
-  const waveQuestionIds = normalizeUnique(waveQuestionRows.map((row) => row.questionId));
-  if (waveQuestionIds.length === 0) {
+  const quarterQuestionIds = normalizeUnique(quarterPersistentQuestionIds(waveQuestionRows));
+  if (quarterQuestionIds.length === 0) {
     return loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({ ...input, questionIds });
   }
 
-  const waveQuestionIdSet = new Set(waveQuestionIds);
-  const redMonthQuestionIds = questionIds.filter((questionId) => !waveQuestionIdSet.has(questionId));
-  const timezone = activeWave.timezone.trim() || DEFAULT_TIMEZONE;
-  const [redMonthAnswers, waveAnswers] = await Promise.all([
+  const quarterQuestionIdSet = new Set(quarterQuestionIds);
+  const redMonthQuestionIds = questionIds.filter((questionId) => !quarterQuestionIdSet.has(questionId));
+  const [redMonthAnswers, quarterAnswers] = await Promise.all([
     loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({
       ...input,
       questionIds: redMonthQuestionIds,
@@ -861,17 +887,17 @@ async function loadReusableSubmittedAnswersByQuestionId(input: {
     loadLatestSubmittedAnswersByQuestionId({
       gmUserId: input.gmUserId,
       marketId: input.marketId,
-      questionIds: waveQuestionIds,
+      questionIds: quarterQuestionIds,
+      reuseScope: "calendar-quarter",
+      requireAnswered: true,
       window: {
         kind: "local-date",
-        startDate: activeWave.startDate,
-        endDate: activeWave.endDate,
-        timezone,
+        ...quarterWindow,
       },
     }),
   ]);
 
-  return new Map([...redMonthAnswers, ...waveAnswers]);
+  return new Map([...redMonthAnswers, ...quarterAnswers]);
 }
 
 type RedMonthHistoryPhoto = {
@@ -2376,10 +2402,20 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
           const reusableSource = latestReusableAnswersByQuestionId.get(question.questionId);
           if (reusableSource) {
             const sourceAnswer = reusableSource.answer;
-            const isPhotoAnswer = sourceAnswer.questionType === "photo";
-            const prefilledValueJson = isPhotoAnswer
-              ? { storage: [] }
-              : (sourceAnswer.valueJson as Record<string, unknown> | null);
+            const isQuarterReuse = reusableSource.reuseScope === "calendar-quarter";
+            const quarterValidation = isQuarterReuse
+              ? revalidateReusableAnswer(sourceAnswer, {
+                  questionType: question.type,
+                  config: question.config,
+                })
+              : null;
+            if (isQuarterReuse && !quarterValidation) {
+              withIds.push({ ...question, visitQuestionId: qRow.id });
+              continue;
+            }
+            const isPhotoAnswer = !isQuarterReuse && sourceAnswer.questionType === "photo";
+            const answerOptions = quarterValidation?.options ?? reusableSource.options;
+            const answerMatrixCells = quarterValidation?.matrixCells ?? reusableSource.matrixCells;
             const [insertedAnswer] = await tx
               .insert(visitAnswers)
                 .values({
@@ -2387,14 +2423,26 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
                   visitSessionSectionId: sectionRow.id,
                   visitSessionQuestionId: qRow.id,
                   questionId: question.questionId,
-                  questionType: sourceAnswer.questionType,
-                  answerStatus: isPhotoAnswer ? "unanswered" : sourceAnswer.answerStatus,
-                  valueText: isPhotoAnswer ? null : sourceAnswer.valueText,
-                  valueNumber: isPhotoAnswer || sourceAnswer.valueNumber == null ? null : String(sourceAnswer.valueNumber),
-                  valueJson: prefilledValueJson,
-                  isValid: isPhotoAnswer ? true : sourceAnswer.isValid,
-                  validationError: isPhotoAnswer ? null : sourceAnswer.validationError,
-                  answeredAt: isPhotoAnswer ? null : (sourceAnswer.answeredAt ? now : null),
+                  questionType: isQuarterReuse ? question.type : sourceAnswer.questionType,
+                  answerStatus: isQuarterReuse
+                    ? quarterValidation!.answerStatus
+                    : (isPhotoAnswer ? "unanswered" : sourceAnswer.answerStatus),
+                  valueText: isQuarterReuse
+                    ? quarterValidation!.valueText
+                    : (isPhotoAnswer ? null : sourceAnswer.valueText),
+                  valueNumber: isQuarterReuse
+                    ? quarterValidation!.valueNumber
+                    : (isPhotoAnswer || sourceAnswer.valueNumber == null ? null : String(sourceAnswer.valueNumber)),
+                  valueJson: isQuarterReuse
+                    ? quarterValidation!.valueJson
+                    : (isPhotoAnswer ? { storage: [] } : (sourceAnswer.valueJson as Record<string, unknown> | null)),
+                  isValid: isQuarterReuse ? quarterValidation!.isValid : (isPhotoAnswer ? true : sourceAnswer.isValid),
+                  validationError: isQuarterReuse
+                    ? quarterValidation!.validationError
+                    : (isPhotoAnswer ? null : sourceAnswer.validationError),
+                  answeredAt: isQuarterReuse
+                    ? now
+                    : (isPhotoAnswer ? null : (sourceAnswer.answeredAt ? now : null)),
                 changedAt: now,
                 version: 1,
                 isDeleted: false,
@@ -2405,9 +2453,9 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
               .returning();
             if (!insertedAnswer) throw new Error("Vorbelegte Antwort konnte nicht erstellt werden.");
 
-            if (reusableSource.options.length > 0) {
+            if (answerOptions.length > 0) {
               await tx.insert(visitAnswerOptions).values(
-                reusableSource.options.map((option, idx) => ({
+                answerOptions.map((option, idx) => ({
                   visitAnswerId: insertedAnswer.id,
                   optionRole: option.optionRole,
                   optionValue: option.optionValue,
@@ -2420,9 +2468,9 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
               );
             }
 
-            if (reusableSource.matrixCells.length > 0) {
+            if (answerMatrixCells.length > 0) {
               await tx.insert(visitAnswerMatrixCells).values(
-                reusableSource.matrixCells.map((cell, idx) => ({
+                answerMatrixCells.map((cell, idx) => ({
                   visitAnswerId: insertedAnswer.id,
                   rowKey: cell.rowKey,
                   columnKey: cell.columnKey,
