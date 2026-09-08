@@ -150,6 +150,34 @@ test("one current question row wins when a correction replaces an unclassified r
   assert.equal(result.summary.foundCases, 0);
 });
 
+test("multiple-choice options with the same OOS tag contribute only once per question", () => {
+  const rows = [
+    oos({ outcome: "oos_present" }),
+    oos({ outcome: "oos_present" }),
+    remediation("resolved"),
+    remediation("resolved"),
+  ];
+  const result = aggregateSmDashboard([visit()], rows);
+  assert.equal(result.summary.classifiedChecks, 1);
+  assert.equal(result.summary.foundCases, 1);
+  assert.equal(result.summary.fixedCases, 1);
+  assert.equal(result.summary.fixedRate, 100);
+  assert.equal(aggregateSmHomeVisits([visit()], rows).fixedOos, 1);
+});
+
+test("mixed multiple-choice OOS outcomes resolve conservatively", () => {
+  const result = aggregateSmDashboard([visit()], [
+    oos({ outcome: "oos_absent" }),
+    oos({ outcome: "oos_present" }),
+    remediation("resolved"),
+    remediation("not_resolved"),
+  ]);
+  assert.equal(result.summary.classifiedChecks, 1);
+  assert.equal(result.summary.foundCases, 1);
+  assert.equal(result.summary.fixedCases, 0);
+  assert.equal(result.summary.documentedRemediations, 1);
+});
+
 test("phone hero never labels missing/unclassified results as without OOS", () => {
   assert.deepEqual(aggregateSmHomeVisits([], [oos()]), {
     completed: 0, classified: 0, withoutOos: 0, fixedOos: 0, openOos: 0, unclassified: 0,

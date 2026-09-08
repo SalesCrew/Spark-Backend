@@ -58,6 +58,10 @@ const smOosOutcomes = [
   "not_resolved",
   "not_applicable",
 ] as const;
+const smOosQuestionTypes: ReadonlySet<string> = new Set(["yesno", "yesnomulti", "single", "multiple"]);
+const smOosDetectionOutcomes: ReadonlySet<string> = new Set(["oos_present", "oos_absent", "not_applicable"]);
+const smOosRemediationOutcomes: ReadonlySet<string> = new Set(["resolved", "partially_resolved", "not_resolved", "not_applicable"]);
+const SM_SUBHEADING_MAX_LENGTH = 500;
 
 const conditionalRuleSchema = z.object({
   id: z.string().max(200),
@@ -198,6 +202,14 @@ function validateModule(input: SmModuleInput): void {
     ids.add(question.id);
     questionsById.set(question.id, question);
     questionIndex.set(question.id, index);
+    if (question.config.subheading !== undefined && (typeof question.config.subheading !== "string" || question.config.subheading.length > SM_SUBHEADING_MAX_LENGTH)) {
+      throw new SmQuestionnaireDomainError(400, `Die Unterzeile bei „${question.text}“ darf höchstens ${SM_SUBHEADING_MAX_LENGTH} Zeichen enthalten.`);
+    }
+    if (question.config.answerSubheadings !== undefined && (!Array.isArray(question.config.answerSubheadings)
+      || question.config.answerSubheadings.length > 500
+      || question.config.answerSubheadings.some((value) => typeof value !== "string" || value.length > SM_SUBHEADING_MAX_LENGTH))) {
+      throw new SmQuestionnaireDomainError(400, `Die Antwort-Unterzeilen bei „${question.text}“ sind ungültig oder zu lang.`);
+    }
     if (["single", "yesno", "yesnomulti", "multiple", "likert"].includes(question.type) && optionsForQuestion(question).length < 2) {
       throw new SmQuestionnaireDomainError(400, `Die Auswahlfrage „${question.text}“ benötigt mindestens zwei Antworten.`);
     }
@@ -214,6 +226,11 @@ function validateModule(input: SmModuleInput): void {
         const options = Array.isArray(branch.options)
           ? branch.options.map((value) => typeof value === "string" ? value.trim() : "").filter(Boolean)
           : [];
+        if (branch.answerSubheadings !== undefined && (!Array.isArray(branch.answerSubheadings)
+          || branch.answerSubheadings.length > 500
+          || branch.answerSubheadings.some((value) => typeof value !== "string" || value.length > SM_SUBHEADING_MAX_LENGTH))) {
+          throw new SmQuestionnaireDomainError(400, `Die Unterzeilen der Unterauswahl bei „${question.text}“ sind ungültig oder zu lang.`);
+        }
         if (!allowedAnswers.has(answer)) throw new SmQuestionnaireDomainError(400, `Eine Unterauswahl bei „${question.text}“ verweist auf eine unbekannte Antwort.`);
         if (seenBranchAnswers.has(answer)) throw new SmQuestionnaireDomainError(400, `Die Unterauswahl für „${answer}“ ist doppelt konfiguriert.`);
         if (options.length === 0) throw new SmQuestionnaireDomainError(400, `Die Unterauswahl für „${answer}“ benötigt mindestens eine Option.`);
@@ -225,11 +242,25 @@ function validateModule(input: SmModuleInput): void {
 
   for (const [ownerIndex, question] of input.questions.entries()) {
     if (question.oos?.enabled) {
+      if (!smOosQuestionTypes.has(question.type)) {
+        throw new SmQuestionnaireDomainError(400, `Die OOS-Zuordnung bei „${question.text}“ benötigt eine Ja/Nein-, Single-Choice- oder Multiple-Choice-Frage.`);
+      }
       if (!question.oos.role || !question.oos.category) {
         throw new SmQuestionnaireDomainError(400, `Die OOS-Zuordnung bei „${question.text}“ ist nicht vollständig.`);
       }
-      if (!question.oos.answerOutcomes || Object.keys(question.oos.answerOutcomes).length === 0) {
+      const answerOptions = optionsForQuestion(question);
+      const uniqueAnswerOptions = new Set(answerOptions);
+      if (uniqueAnswerOptions.size !== answerOptions.length) {
+        throw new SmQuestionnaireDomainError(400, `Die Antwortmöglichkeiten bei „${question.text}“ müssen für die OOS-Zuordnung eindeutig sein.`);
+      }
+      const allowedOutcomes = question.oos.role === "detection" ? smOosDetectionOutcomes : smOosRemediationOutcomes;
+      const configuredOutcomes = Object.entries(question.oos.answerOutcomes ?? {})
+        .filter(([answer]) => uniqueAnswerOptions.has(answer));
+      if (configuredOutcomes.length === 0) {
         throw new SmQuestionnaireDomainError(400, `Bitte ordne bei „${question.text}“ mindestens eine Antwort einer OOS-Auswertung zu.`);
+      }
+      if (configuredOutcomes.some(([, outcome]) => !allowedOutcomes.has(outcome))) {
+        throw new SmQuestionnaireDomainError(400, `Eine Antwort bei „${question.text}“ hat eine OOS-Zuordnung, die nicht zur gewählten Rolle passt.`);
       }
       if (question.oos.role === "remediation") {
         const detection = question.oos.detectionQuestionId ? questionsById.get(question.oos.detectionQuestionId) : undefined;

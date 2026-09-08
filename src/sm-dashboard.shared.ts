@@ -95,17 +95,31 @@ function dedupeVisits(rows: readonly SmDashboardVisitRow[]): SmDashboardVisitRow
   return [...new Map(rows.map((row) => [row.submissionId, row])).values()];
 }
 
-function dedupeQuestionRows(rows: readonly SmDashboardOosRow[]): SmDashboardOosRow[] {
-  const byQuestion = new Map<string, SmDashboardOosRow>();
+function collapseQuestionRows(rows: readonly SmDashboardOosRow[]): SmDashboardOosRow[] {
+  const byQuestion = new Map<string, SmDashboardOosRow[]>();
   for (const row of rows) {
-    const current = byQuestion.get(row.submissionQuestionId);
-    if (!current || (current.outcome === null && row.outcome !== null)) byQuestion.set(row.submissionQuestionId, row);
+    byQuestion.set(row.submissionQuestionId, [...(byQuestion.get(row.submissionQuestionId) ?? []), row]);
   }
-  return [...byQuestion.values()];
+  return [...byQuestion.values()].map((questionRows) => {
+    const first = questionRows[0]!;
+    const outcomes = new Set(questionRows.map((row) => row.outcome).filter((outcome): outcome is SmDashboardOosOutcome => outcome !== null));
+    let outcome: SmDashboardOosOutcome | null = null;
+    if (first.role === "oos_detection") {
+      if (outcomes.has("oos_present")) outcome = "oos_present";
+      else if (outcomes.has("oos_absent")) outcome = "oos_absent";
+      else if (outcomes.has("not_applicable")) outcome = "not_applicable";
+    } else {
+      if (outcomes.has("not_resolved")) outcome = "not_resolved";
+      else if (outcomes.has("partially_resolved")) outcome = "partially_resolved";
+      else if (outcomes.has("resolved")) outcome = "resolved";
+      else if (outcomes.has("not_applicable")) outcome = "not_applicable";
+    }
+    return { ...first, outcome };
+  });
 }
 
 function buildDetectionCases(rows: readonly SmDashboardOosRow[]): DetectionCase[] {
-  const uniqueRows = dedupeQuestionRows(rows);
+  const uniqueRows = collapseQuestionRows(rows);
   const remediationByDetection = new Map<string, SmDashboardOosRow[]>();
 
   for (const row of uniqueRows) {
