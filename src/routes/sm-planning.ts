@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
 
@@ -17,7 +17,14 @@ import {
   smQuestionnaireSubmissions,
   smQuestionnaireTemplates,
   smQuestionnaireVersions,
+  campaigns,
+  markets as gmMarkets,
   users,
+  visitAnswerPhotos,
+  visitAnswers,
+  visitSessionQuestions,
+  visitSessionSections,
+  visitSessions,
 } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { assertSmVisitTimeAvailable, lockSmVisitTimes, SmTimeOverlapError } from "../sm-time-overlap.js";
@@ -492,6 +499,15 @@ function parseAssignmentRange(query: unknown): { from: string; to: string } {
   return parsed.data;
 }
 
+function viennaDate(value: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Vienna",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(value);
+}
+
 export const smPlanningRouter = Router();
 smPlanningRouter.use(requireAuth(["sm"]));
 
@@ -689,6 +705,131 @@ adminSmPlanningRouter.get("/assignments", async (req, res, next) => {
   try {
     const range = parseAssignmentRange(req.query);
     res.status(200).json({ assignments: await loadAssignments(range.from, range.to) });
+  } catch (error) {
+    if (!sendKnownError(error, res)) next(error);
+  }
+});
+
+adminSmPlanningRouter.get("/gm-visits", async (req, res, next) => {
+  try {
+    const range = parseAssignmentRange(req.query);
+    const startBoundary = sql<Date>`(${range.from}::date::timestamp at time zone 'Europe/Vienna')`;
+    const endBoundary = sql<Date>`(((${range.to}::date + 1)::timestamp) at time zone 'Europe/Vienna')`;
+    const sessionRows = await db.select({
+      id: visitSessions.id,
+      gmUserId: users.id,
+      gmFirstName: users.firstName,
+      gmLastName: users.lastName,
+      gmRegion: users.region,
+      startedAt: visitSessions.startedAt,
+      submittedAt: visitSessions.submittedAt,
+      marketId: gmMarkets.id,
+      marketName: gmMarkets.name,
+      marketAddress: gmMarkets.address,
+      marketPostalCode: gmMarkets.postalCode,
+      marketCity: gmMarkets.city,
+      marketRegion: gmMarkets.region,
+      cokeMasterNumber: gmMarkets.cokeMasterNumber,
+      standardMarketNumber: gmMarkets.standardMarketNumber,
+      flexNumber: gmMarkets.flexNumber,
+    })
+      .from(visitSessions)
+      .innerJoin(users, eq(users.id, visitSessions.gmUserId))
+      .innerJoin(gmMarkets, eq(gmMarkets.id, visitSessions.marketId))
+      .where(and(
+        eq(visitSessions.status, "submitted"),
+        isNotNull(visitSessions.submittedAt),
+        eq(visitSessions.isDeleted, false),
+        eq(gmMarkets.isDeleted, false),
+        gte(visitSessions.submittedAt, startBoundary),
+        lt(visitSessions.submittedAt, endBoundary),
+      ))
+      .orderBy(asc(visitSessions.submittedAt), asc(visitSessions.id));
+
+    const sessionIds = sessionRows.map((row) => row.id);
+    if (sessionIds.length === 0) {
+      res.status(200).json({ visits: [] });
+      return;
+    }
+
+    const sectionRows = await db.select({
+      id: visitSessionSections.id,
+      visitSessionId: visitSessionSections.visitSessionId,
+      section: visitSessionSections.section,
+      campaignName: campaigns.name,
+      fragebogenName: visitSessionSections.fragebogenNameSnapshot,
+      orderIndex: visitSessionSections.orderIndex,
+    })
+      .from(visitSessionSections)
+      .leftJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
+      .where(and(inArray(visitSessionSections.visitSessionId, sessionIds), eq(visitSessionSections.isDeleted, false)))
+      .orderBy(asc(visitSessionSections.orderIndex), asc(visitSessionSections.id));
+
+    const sectionIds = sectionRows.map((row) => row.id);
+    const sectionCountRows = sectionIds.length === 0 ? [] : await db.select({
+      sectionId: visitSessionQuestions.visitSessionSectionId,
+      questionCount: sql<number>`count(distinct ${visitSessionQuestions.id})::int`,
+      answeredCount: sql<number>`count(distinct case when ${visitAnswers.id} is not null and ${visitAnswers.answerStatus} <> 'unanswered' then ${visitSessionQuestions.id} end)::int`,
+      photoCount: sql<number>`count(distinct ${visitAnswerPhotos.id})::int`,
+    })
+      .from(visitSessionQuestions)
+      .leftJoin(visitAnswers, and(
+        eq(visitAnswers.visitSessionQuestionId, visitSessionQuestions.id),
+        eq(visitAnswers.isDeleted, false),
+      ))
+      .leftJoin(visitAnswerPhotos, and(
+        eq(visitAnswerPhotos.visitAnswerId, visitAnswers.id),
+        eq(visitAnswerPhotos.isDeleted, false),
+      ))
+      .where(and(inArray(visitSessionQuestions.visitSessionSectionId, sectionIds), eq(visitSessionQuestions.isDeleted, false)))
+      .groupBy(visitSessionQuestions.visitSessionSectionId);
+
+    const summaryBySectionId = new Map(sectionCountRows.map((row) => [row.sectionId, row]));
+    const sectionsBySessionId = new Map<string, typeof sectionRows>();
+    for (const section of sectionRows) sectionsBySessionId.set(section.visitSessionId, [...(sectionsBySessionId.get(section.visitSessionId) ?? []), section]);
+
+    res.status(200).json({ visits: sessionRows.map((session) => {
+      const submittedAt = session.submittedAt!;
+      const sections = (sectionsBySessionId.get(session.id) ?? []).map((section) => {
+        const summary = summaryBySectionId.get(section.id);
+        return {
+          id: section.id,
+          section: section.section,
+          campaignName: section.campaignName ?? "",
+          fragebogenName: section.fragebogenName,
+          questionCount: summary?.questionCount ?? 0,
+          answeredCount: summary?.answeredCount ?? 0,
+          photoCount: summary?.photoCount ?? 0,
+        };
+      });
+      return {
+        id: session.id,
+        workDate: viennaDate(submittedAt),
+        startedAt: session.startedAt.toISOString(),
+        submittedAt: submittedAt.toISOString(),
+        durationMinutes: Math.max(0, Math.round((submittedAt.getTime() - session.startedAt.getTime()) / 60000)),
+        gm: {
+          id: session.gmUserId,
+          name: `${session.gmFirstName} ${session.gmLastName}`.trim(),
+          region: session.gmRegion ?? "",
+        },
+        market: {
+          id: session.marketId,
+          internalId: session.cokeMasterNumber ?? session.standardMarketNumber ?? session.flexNumber ?? "—",
+          name: session.marketName,
+          address: session.marketAddress,
+          postalCode: session.marketPostalCode,
+          city: session.marketCity,
+          region: session.marketRegion,
+        },
+        sections,
+        totals: {
+          questionCount: sections.reduce((sum, section) => sum + section.questionCount, 0),
+          answeredCount: sections.reduce((sum, section) => sum + section.answeredCount, 0),
+          photoCount: sections.reduce((sum, section) => sum + section.photoCount, 0),
+        },
+      };
+    }) });
   } catch (error) {
     if (!sendKnownError(error, res)) next(error);
   }

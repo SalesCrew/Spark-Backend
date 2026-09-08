@@ -7,7 +7,9 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { aggregateHighVolumeLoad, logAction, logger, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
+import { toYmdInTimezone } from "../lib/day-session.js";
 import { selectEffectiveFlexCampaigns } from "../lib/flex-campaign-selection.js";
+import { normalizeCrossDomainMarketIdentity } from "../market-identity.shared.js";
 import { resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
 import {
   campaignMarketAssignments,
@@ -15,6 +17,8 @@ import {
   marketKuehlerUnits,
   markets,
   photoTags,
+  smAssignments,
+  smMarkets,
   specialArthurFilter,
   visitAnswerPhotos,
   visitAnswers,
@@ -209,6 +213,70 @@ async function getCurrentRedPeriodBounds(now = new Date()): Promise<{ startYmd: 
     startYmd: toYmd(period.start),
     endYmd: toYmd(period.end),
   };
+}
+
+const NEXT_SM_ASSIGNMENT_STATUSES: Array<(typeof smAssignments.$inferSelect)["status"]> = [
+  "planned",
+  "confirmed",
+  "open",
+  "in_progress",
+];
+
+async function resolveNextSmVisitDatesByGmMarketId(
+  marketRows: Array<typeof markets.$inferSelect>,
+  now = new Date(),
+): Promise<Map<string, string>> {
+  const identityByGmMarketId = new Map<string, string>();
+  const wantedIdentities = new Set<string>();
+  for (const market of marketRows) {
+    const identity = normalizeCrossDomainMarketIdentity(market.cokeMasterNumber)
+      ?? normalizeCrossDomainMarketIdentity(market.kuehlerStammnr);
+    if (!identity) continue;
+    identityByGmMarketId.set(market.id, identity);
+    wantedIdentities.add(identity);
+  }
+  if (wantedIdentities.size === 0) return new Map();
+
+  const activeSmMarkets = await db
+    .select({ id: smMarkets.id, internalMarketId: smMarkets.internalMarketId })
+    .from(smMarkets)
+    .where(and(eq(smMarkets.isDeleted, false), eq(smMarkets.isActive, true), isNotNull(smMarkets.internalMarketId)));
+
+  const identityBySmMarketId = new Map<string, string>();
+  for (const market of activeSmMarkets) {
+    const identity = normalizeCrossDomainMarketIdentity(market.internalMarketId);
+    if (!identity || !wantedIdentities.has(identity)) continue;
+    identityBySmMarketId.set(market.id, identity);
+  }
+  const matchedSmMarketIds = Array.from(identityBySmMarketId.keys());
+  if (matchedSmMarketIds.length === 0) return new Map();
+
+  const effectiveMarketId = sql<string>`coalesce(${smAssignments.replacementSmMarketId}, ${smAssignments.originalSmMarketId})`;
+  const effectiveWorkDate = sql<string>`coalesce(${smAssignments.replacementWorkDate}, ${smAssignments.originalWorkDate})`;
+  const upcomingAssignments = await db
+    .select({ smMarketId: effectiveMarketId, workDate: effectiveWorkDate })
+    .from(smAssignments)
+    .where(and(
+      eq(smAssignments.isDeleted, false),
+      inArray(smAssignments.status, NEXT_SM_ASSIGNMENT_STATUSES),
+      gte(effectiveWorkDate, toYmdInTimezone(now, "Europe/Vienna")),
+      inArray(effectiveMarketId, matchedSmMarketIds),
+    ))
+    .orderBy(asc(effectiveWorkDate), asc(smAssignments.createdAt));
+
+  const nextDateByIdentity = new Map<string, string>();
+  for (const assignment of upcomingAssignments) {
+    const identity = identityBySmMarketId.get(assignment.smMarketId);
+    if (!identity || nextDateByIdentity.has(identity)) continue;
+    nextDateByIdentity.set(identity, assignment.workDate);
+  }
+
+  const nextDateByGmMarketId = new Map<string, string>();
+  for (const [marketId, identity] of identityByGmMarketId) {
+    const nextDate = nextDateByIdentity.get(identity);
+    if (nextDate) nextDateByGmMarketId.set(marketId, nextDate);
+  }
+  return nextDateByGmMarketId;
 }
 
 const universumImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; required: boolean; isIdentity: boolean }> = [
@@ -1538,11 +1606,15 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
       }
     }
 
-    const gmNamesByMarketId = await resolveActiveStandardGmNamesByMarketIds(rows.map((row) => row.id));
+    const [gmNamesByMarketId, nextSmVisitDateByMarketId] = await Promise.all([
+      resolveActiveStandardGmNamesByMarketIds(rows.map((row) => row.id)),
+      resolveNextSmVisitDatesByGmMarketId(rows),
+    ]);
     res.status(200).json({
       markets: rows.map((row) => ({
         ...mapMarketRow(row),
         plannedByActiveStandardGmName: gmNamesByMarketId.get(row.id) ?? null,
+        nextSmVisitDate: nextSmVisitDateByMarketId.get(row.id) ?? null,
         activeNowCampaigns: activeNowByMarketId.get(row.id) ?? [],
       })),
     });
