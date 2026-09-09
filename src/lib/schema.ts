@@ -471,6 +471,7 @@ export const smMarkets = pgTable(
     ),
     shelfMerchandiserName: text("shelf_merchandiser_name").notNull().default(""),
     assignedSmUserId: uuid("assigned_sm_user_id").references(() => users.id, { onDelete: "restrict" }),
+    fieldServiceManagerUserId: uuid("field_service_manager_user_id").references(() => users.id, { onDelete: "restrict" }),
     fieldServiceManagerName: text("field_service_manager_name").notNull().default(""),
     sourceInfo: text("source_info").notNull().default(""),
     adminInfoNote: text("admin_info_note").notNull().default(""),
@@ -495,6 +496,9 @@ export const smMarkets = pgTable(
     index("sm_markets_assigned_sm_user_active_idx")
       .on(table.assignedSmUserId)
       .where(sql`${table.isDeleted} = false AND ${table.assignedSmUserId} IS NOT NULL`),
+    index("sm_markets_field_service_manager_active_idx")
+      .on(table.fieldServiceManagerUserId)
+      .where(sql`${table.isDeleted} = false AND ${table.fieldServiceManagerUserId} IS NOT NULL`),
     check(
       "sm_markets_internal_market_id_normalized_ck",
       sql`${table.internalMarketId} IS NULL OR (${table.internalMarketId} = btrim(${table.internalMarketId}) AND ${table.internalMarketId} <> '')`,

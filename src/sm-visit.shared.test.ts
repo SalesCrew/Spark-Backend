@@ -185,3 +185,18 @@ test("resolves questionnaire show/hide rules from published answer values", () =
   );
   assert.deepEqual([...computeHiddenQuestionIds(questions, new Map([["trigger", branchValue]]))], []);
 });
+
+test("a show rule for Nein keeps its target hidden for Ja", () => {
+  const questions = [
+    { id: "frage-1", rules: [
+      { triggerQuestionId: "frage-1", operator: "equals", triggerValue: "Nein", action: "show", targetQuestionIds: ["frage-3"] },
+    ] },
+    { id: "frage-3" },
+  ];
+  const options = [{ code: "yes", label: "Ja" }, { code: "no", label: "Nein" }];
+  const yes = smVisitAnswerToRuleValue({ kind: "choice", optionCode: "yes" }, options);
+  const no = smVisitAnswerToRuleValue({ kind: "choice", optionCode: "no" }, options);
+
+  assert.deepEqual([...computeHiddenQuestionIds(questions, new Map([["frage-1", yes]]))], ["frage-3"]);
+  assert.deepEqual([...computeHiddenQuestionIds(questions, new Map([["frage-1", no]]))], []);
+});

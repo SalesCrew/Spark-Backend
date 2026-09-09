@@ -62,6 +62,7 @@ const createSmMarketSchema = z
     region: z.string().trim().min(1).max(200),
     adminInfoNote: z.string().trim().max(10_000).optional(),
     assignedSmUserId: z.string().uuid().nullable().optional(),
+    fieldServiceManagerUserId: z.string().uuid().nullable().optional(),
     isActive: z.boolean().optional(),
   })
   .strict();
@@ -165,6 +166,7 @@ function mapSmMarketRow(row: typeof smMarkets.$inferSelect) {
     weeklyHours: Number(row.weeklyHours),
     shelfMerchandiserName: row.shelfMerchandiserName,
     assignedSmUserId: row.assignedSmUserId,
+    fieldServiceManagerUserId: row.fieldServiceManagerUserId,
     fieldServiceManagerName: row.fieldServiceManagerName,
     sourceInfo: row.sourceInfo,
     importSourceFileName: row.importSourceFileName,
@@ -224,17 +226,21 @@ async function loadSmMarkets() {
 }
 
 async function isAssignableSmUser(userId: string): Promise<boolean> {
+  return Boolean(await loadAssignableUser(userId, "sm"));
+}
+
+async function loadAssignableUser(userId: string, role: "sm" | "gm") {
   const [user] = await db
-    .select({ id: users.id })
+    .select({ id: users.id, firstName: users.firstName, lastName: users.lastName })
     .from(users)
     .where(and(
       eq(users.id, userId),
-      eq(users.role, "sm"),
+      eq(users.role, role),
       eq(users.isActive, true),
       sql`${users.deletedAt} is null`,
     ))
     .limit(1);
-  return Boolean(user);
+  return user;
 }
 
 function smUserDisplayName(user: { firstName: string; lastName: string }): string {
@@ -747,8 +753,14 @@ adminSmMarketsRouter.post("/", async (req, res, next) => {
       return;
     }
     const input = parsed.data;
-    if (input.assignedSmUserId && !(await isAssignableSmUser(input.assignedSmUserId))) {
+    const assignedSmUser = input.assignedSmUserId ? await loadAssignableUser(input.assignedSmUserId, "sm") : null;
+    if (input.assignedSmUserId && !assignedSmUser) {
       res.status(400).json({ error: "Der ausgewählte Shelf Merchandiser ist nicht aktiv oder kein SM-Account." });
+      return;
+    }
+    const fieldServiceManager = input.fieldServiceManagerUserId ? await loadAssignableUser(input.fieldServiceManagerUserId, "gm") : null;
+    if (input.fieldServiceManagerUserId && !fieldServiceManager) {
+      res.status(400).json({ error: "Der ausgewählte Field Service Gebietsleiter ist nicht aktiv oder kein GM-Account." });
       return;
     }
     const [created] = await db.insert(smMarkets).values({
@@ -763,6 +775,9 @@ adminSmMarketsRouter.post("/", async (req, res, next) => {
       region: input.region,
       adminInfoNote: input.adminInfoNote ?? "",
       assignedSmUserId: input.assignedSmUserId ?? null,
+      shelfMerchandiserName: assignedSmUser ? smUserDisplayName(assignedSmUser) : "",
+      fieldServiceManagerUserId: input.fieldServiceManagerUserId ?? null,
+      fieldServiceManagerName: fieldServiceManager ? smUserDisplayName(fieldServiceManager) : "",
       isActive: input.isActive ?? true,
       isDeleted: false,
     }).returning();
@@ -811,8 +826,38 @@ adminSmMarketsRouter.patch("/:id", async (req, res, next) => {
       return;
     }
     const input = parsed.data;
-    if (input.assignedSmUserId && !(await isAssignableSmUser(input.assignedSmUserId))) {
+    const [existingMarket] = await db
+      .select({
+        assignedSmUserId: smMarkets.assignedSmUserId,
+        fieldServiceManagerUserId: smMarkets.fieldServiceManagerUserId,
+      })
+      .from(smMarkets)
+      .where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false)))
+      .limit(1);
+    if (!existingMarket) {
+      res.status(404).json({ error: "SM-Markt nicht gefunden." });
+      return;
+    }
+    const assignedSmChanged = input.assignedSmUserId !== undefined
+      && input.assignedSmUserId !== existingMarket.assignedSmUserId;
+    const fieldServiceManagerChanged = input.fieldServiceManagerUserId !== undefined
+      && input.fieldServiceManagerUserId !== existingMarket.fieldServiceManagerUserId;
+    const assignedSmUser = !assignedSmChanged
+      ? undefined
+      : input.assignedSmUserId
+        ? await loadAssignableUser(input.assignedSmUserId, "sm")
+        : null;
+    if (assignedSmChanged && input.assignedSmUserId && !assignedSmUser) {
       res.status(400).json({ error: "Der ausgewählte Shelf Merchandiser ist nicht aktiv oder kein SM-Account." });
+      return;
+    }
+    const fieldServiceManager = !fieldServiceManagerChanged
+      ? undefined
+      : input.fieldServiceManagerUserId
+        ? await loadAssignableUser(input.fieldServiceManagerUserId, "gm")
+        : null;
+    if (fieldServiceManagerChanged && input.fieldServiceManagerUserId && !fieldServiceManager) {
+      res.status(400).json({ error: "Der ausgewählte Field Service Gebietsleiter ist nicht aktiv oder kein GM-Account." });
       return;
     }
     const updated = await db.transaction(async (tx) => {
@@ -830,7 +875,14 @@ adminSmMarketsRouter.patch("/:id", async (req, res, next) => {
       ...(input.city === undefined ? {} : { city: input.city }),
       ...(input.region === undefined ? {} : { region: input.region }),
       ...(input.adminInfoNote === undefined ? {} : { adminInfoNote: input.adminInfoNote }),
-      ...(input.assignedSmUserId === undefined ? {} : { assignedSmUserId: input.assignedSmUserId }),
+      ...(!assignedSmChanged ? {} : {
+        assignedSmUserId: input.assignedSmUserId,
+        shelfMerchandiserName: assignedSmUser ? smUserDisplayName(assignedSmUser) : "",
+      }),
+      ...(!fieldServiceManagerChanged ? {} : {
+        fieldServiceManagerUserId: input.fieldServiceManagerUserId,
+        fieldServiceManagerName: fieldServiceManager ? smUserDisplayName(fieldServiceManager) : "",
+      }),
       ...(input.isActive === undefined ? {} : { isActive: input.isActive }),
       updatedAt: new Date(),
       }).where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false))).returning();
