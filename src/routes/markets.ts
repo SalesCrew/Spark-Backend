@@ -11,6 +11,7 @@ import { toYmdInTimezone } from "../lib/day-session.js";
 import { selectEffectiveFlexCampaigns } from "../lib/flex-campaign-selection.js";
 import { normalizeCrossDomainMarketIdentity } from "../market-identity.shared.js";
 import { resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
+import { resolveBillaGmFilterEnrollment } from "../billa-gm-market-filter.shared.js";
 import {
   campaignMarketAssignments,
   campaigns,
@@ -142,6 +143,62 @@ async function loadSpecialArthurFilterValues(gmUserId: string): Promise<string[]
     .from(specialArthurFilter)
     .where(and(eq(specialArthurFilter.gmUserId, gmUserId), eq(specialArthurFilter.isDeleted, false)));
   return rows.map((row) => row.matchValue).filter((value) => value.length > 0);
+}
+
+type MarketWriteTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+type BillaGmFilterEnrollmentResult = {
+  gmUserId: string;
+  matchValue: string;
+  inserted: boolean;
+} | null;
+
+async function ensureAssignedBillaGmFilterEntry(
+  tx: MarketWriteTransaction,
+  market: typeof markets.$inferSelect,
+  createdByUserId: string | null,
+): Promise<BillaGmFilterEnrollmentResult> {
+  const candidateRows = await tx
+    .select({
+      id: users.id,
+      firstName: users.firstName,
+      lastName: users.lastName,
+    })
+    .from(users)
+    .innerJoin(
+      specialArthurFilter,
+      and(
+        eq(specialArthurFilter.gmUserId, users.id),
+        eq(specialArthurFilter.isDeleted, false),
+      ),
+    )
+    .where(
+      and(
+        eq(users.role, "gm"),
+        eq(users.isBillaGm, true),
+        eq(users.isActive, true),
+        isNull(users.deletedAt),
+        isNull(users.anonymizedAt),
+      ),
+    );
+
+  const enrollment = resolveBillaGmFilterEnrollment(market, candidateRows);
+  if (!enrollment) return null;
+
+  const insertedRows = await tx
+    .insert(specialArthurFilter)
+    .values({
+      gmUserId: enrollment.gmUserId,
+      matchValue: enrollment.matchValue,
+      createdByUserId,
+    })
+    .onConflictDoNothing()
+    .returning({ id: specialArthurFilter.id });
+
+  return {
+    ...enrollment,
+    inserted: insertedRows.length > 0,
+  };
 }
 
 function marketMatchesSpecialArthurFilter(
@@ -4664,7 +4721,12 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
         updated,
         now,
       );
-      return { updated, identifierPropagation };
+      const billaGmFilterEnrollment = await ensureAssignedBillaGmFilterEntry(
+        tx,
+        updated,
+        req.authUser?.appUserId ?? null,
+      );
+      return { updated, identifierPropagation, billaGmFilterEnrollment };
     });
 
     const updated = transactionResult?.updated;
@@ -4692,6 +4754,7 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       details: {
         marketId: updated.id,
         identifierPropagation: transactionResult.identifierPropagation,
+        billaGmFilterEnrollment: transactionResult.billaGmFilterEnrollment,
       },
     });
   } catch (err) {
@@ -4801,34 +4864,45 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
       });
       return;
     }
-    const [created] = await db
-      .insert(markets)
-      .values({
-        standardMarketNumber: normalizedIdentities.standardMarketNumber,
-        cokeMasterNumber: normalizedIdentities.stammnr,
-        flexNumber: normalizedIdentities.flexNumber,
-        name: payload.name,
-        dbName: normalizeOptionalText(payload.dbName) ?? "",
-        address: payload.address,
-        postalCode: payload.postalCode,
-        city: payload.city,
-        region: normalizedRegion.canonical,
-        emEh: normalizeOptionalText(payload.emEh) ?? "",
-        employee: normalizeOptionalText(payload.employee) ?? "",
-        currentGmName: normalizeOptionalText(payload.currentGmName) ?? "",
-        visitFrequencyPerYear: payload.visitFrequencyPerYear,
-        infoFlag: payload.infoFlag,
-        infoNote: payload.infoNote,
-        universeMarket: resolvedUniverseMarket,
-        marketType: resolvedMarketType,
-        kuehlerStammnr: resolvedMarketType === "universum" ? null : resolvedStammnr,
-        isActive: payload.isActive,
-        importSourceFileName: payload.importSourceFileName,
-        importedAt: payload.importedAt ? new Date(payload.importedAt) : new Date(),
-        plannedToId: payload.plannedToId ?? null,
-        isDeleted: false,
-      })
-      .returning();
+    const creationResult = await db.transaction(async (tx) => {
+      const [createdMarket] = await tx
+        .insert(markets)
+        .values({
+          standardMarketNumber: normalizedIdentities.standardMarketNumber,
+          cokeMasterNumber: normalizedIdentities.stammnr,
+          flexNumber: normalizedIdentities.flexNumber,
+          name: payload.name,
+          dbName: normalizeOptionalText(payload.dbName) ?? "",
+          address: payload.address,
+          postalCode: payload.postalCode,
+          city: payload.city,
+          region: normalizedRegion.canonical,
+          emEh: normalizeOptionalText(payload.emEh) ?? "",
+          employee: normalizeOptionalText(payload.employee) ?? "",
+          currentGmName: normalizeOptionalText(payload.currentGmName) ?? "",
+          visitFrequencyPerYear: payload.visitFrequencyPerYear,
+          infoFlag: payload.infoFlag,
+          infoNote: payload.infoNote,
+          universeMarket: resolvedUniverseMarket,
+          marketType: resolvedMarketType,
+          kuehlerStammnr: resolvedMarketType === "universum" ? null : resolvedStammnr,
+          isActive: payload.isActive,
+          importSourceFileName: payload.importSourceFileName,
+          importedAt: payload.importedAt ? new Date(payload.importedAt) : new Date(),
+          plannedToId: payload.plannedToId ?? null,
+          isDeleted: false,
+        })
+        .returning();
+      if (!createdMarket) return null;
+
+      const billaGmFilterEnrollment = await ensureAssignedBillaGmFilterEntry(
+        tx,
+        createdMarket,
+        req.authUser?.appUserId ?? null,
+      );
+      return { createdMarket, billaGmFilterEnrollment };
+    });
+    const created = creationResult?.createdMarket;
     if (!created) {
       logAction("error", "market_create_failed_no_row", {
         req,
@@ -4855,7 +4929,10 @@ adminMarketsRouter.post("/", async (req: AuthedRequest, res, next) => {
       statusCode: 201,
       requestClass: "success",
       startedAtNs,
-      details: { marketId: created.id },
+      details: {
+        marketId: created.id,
+        billaGmFilterEnrollment: creationResult.billaGmFilterEnrollment,
+      },
     });
   } catch (err) {
     if (isIdentityConstraintViolation(err)) {
