@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, gt, gte, ilike, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Router } from "express";
-import { buildKuehlerVisitSlots } from "../lib/kuehler-repeat-visits.js";
+import { kuehlerProgressKey } from "../lib/kuehler-assignment-progress.js";
+import { loadKuehlerAssignmentProgress } from "../lib/kuehler-assignment-progress-query.js";
 import { z } from "zod";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
@@ -1621,6 +1622,8 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
 
     const activeCampaignIds = Array.from(new Set(activeNowCampaignRows.map((row) => row.campaignId)));
     const activeMarketIds = Array.from(new Set(activeNowCampaignRows.map((row) => row.marketId)));
+    const kuehlerProgress = await loadKuehlerAssignmentProgress(activeNowCampaignRows
+      .filter((row) => row.section === "kuehler").map((row) => ({ ...row, gmUserId })));
     if (activeCampaignIds.length > 0 && activeMarketIds.length > 0) {
       const redPeriod = await resolveCurrentRedPeriod();
       const redEndExclusive = redPeriodEndExclusive(redPeriod.end);
@@ -1660,6 +1663,16 @@ marketsRouter.get("/gm/assigned-active", async (req: AuthedRequest, res, next) =
         const targetVisitCount = Math.max(1, Number(summary.targetVisitCount ?? 1));
         summary.submittedVisitCount = submittedVisitCount;
         summary.isComplete = submittedVisitCount >= targetVisitCount;
+      }
+    }
+
+    for (const [marketId, summaries] of activeNowByMarketId) {
+      for (const summary of summaries) {
+        if (summary.section !== "kuehler") continue;
+        const slots = kuehlerProgress.get(kuehlerProgressKey(summary.campaignId, marketId, gmUserId)) ?? [];
+        summary.targetVisitCount = slots.length;
+        summary.submittedVisitCount = slots.filter((slot) => slot.submission).length;
+        summary.isComplete = slots.length > 0 && summary.submittedVisitCount >= slots.length;
       }
     }
 
@@ -1941,15 +1954,20 @@ marketsRouter.get("/gm/:marketId/detail", async (req: AuthedRequest, res, next) 
       submittedByCampaign.set(row.campaignId, bucket);
     }
 
+    const kuehlerProgress = await loadKuehlerAssignmentProgress(Array.from(activeByCampaignId.values())
+      .filter((row) => row.section === "kuehler")
+      .map((row) => ({ campaignId: row.campaignId, marketId, gmUserId, visitTargetCount: row.targetVisitCount })));
     const activeCampaigns: GmMarketDetailCampaign[] = Array.from(activeByCampaignId.values())
       .map((row) => {
-        const submittedVisitCount = submittedByCampaign.get(row.campaignId)?.size ?? 0;
-        const isComplete = submittedVisitCount >= row.targetVisitCount;
+        const slots = row.section === "kuehler" ? kuehlerProgress.get(kuehlerProgressKey(row.campaignId, marketId, gmUserId)) : undefined;
+        const submittedVisitCount = slots ? slots.filter((slot) => slot.submission).length : submittedByCampaign.get(row.campaignId)?.size ?? 0;
+        const targetVisitCount = slots ? slots.length : row.targetVisitCount;
+        const isComplete = submittedVisitCount >= targetVisitCount;
         return {
           campaignId: row.campaignId,
           campaignName: row.campaignName,
           section: row.section,
-          targetVisitCount: row.targetVisitCount,
+          targetVisitCount,
           submittedVisitCount,
           isComplete,
           isStartable: Boolean(row.currentFragebogenId),
@@ -2265,35 +2283,8 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
       dateRangeBySection.set(section, currentRange);
     }
 
-    const kuehlerMarketIds = Array.from(
-      new Set(
-        Array.from(assignmentKeys.values())
-          .filter((row) => row.section === "kuehler")
-          .map((row) => row.marketId),
-      ),
-    );
-    const kuehlerUnitRows =
-      kuehlerMarketIds.length === 0
-        ? []
-        : await db
-            .select({
-              id: marketKuehlerUnits.id,
-              marketId: marketKuehlerUnits.marketId,
-              kuehlerInternalId: marketKuehlerUnits.kuehlerInternalId,
-              kuehlerTechnicalIdentNo: marketKuehlerUnits.kuehlerTechnicalIdentNo,
-              kuehlerSerialNumber: marketKuehlerUnits.kuehlerSerialNumber,
-              kuehlerModel: marketKuehlerUnits.kuehlerModel,
-              createdAt: marketKuehlerUnits.createdAt,
-            })
-            .from(marketKuehlerUnits)
-            .where(and(inArray(marketKuehlerUnits.marketId, kuehlerMarketIds), eq(marketKuehlerUnits.isDeleted, false)))
-            .orderBy(asc(marketKuehlerUnits.kuehlerInternalId), asc(marketKuehlerUnits.createdAt));
-    const kuehlerUnitsByMarketId = new Map<string, typeof kuehlerUnitRows>();
-    for (const unit of kuehlerUnitRows) {
-      const current = kuehlerUnitsByMarketId.get(unit.marketId) ?? [];
-      current.push(unit);
-      kuehlerUnitsByMarketId.set(unit.marketId, current);
-    }
+    const kuehlerProgress = await loadKuehlerAssignmentProgress(Array.from(assignmentKeys.values())
+      .filter((row) => row.section === "kuehler").map((row) => ({ ...row, gmUserId })));
 
     const assignedCampaignIds = Array.from(new Set(Array.from(assignmentKeys.values()).map((row) => row.campaignId)));
     const completionRows =
@@ -2323,14 +2314,10 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
             .orderBy(desc(visitSessions.submittedAt));
 
     const completedByKey = new Map<string, string>();
-    const completionsByKey = new Map<string, typeof completionRows>();
     for (const row of completionRows) {
       if (!row.submittedAt) continue;
       const key = `${row.marketId}__${row.campaignId}`;
       if (!assignmentKeys.has(key)) continue;
-      const bucket = completionsByKey.get(key) ?? [];
-      bucket.push(row);
-      completionsByKey.set(key, bucket);
       if (!completedByKey.has(key)) completedByKey.set(key, row.submittedAt.toISOString());
     }
 
@@ -2339,8 +2326,7 @@ marketsRouter.get("/gm/kuehler-mhd-progress", async (req: AuthedRequest, res, ne
       const markets = rows.flatMap<ProgressMarketRow>((row) => {
         const key = `${row.marketId}__${row.campaignId}`;
         if (section === "kuehler") {
-          const units = kuehlerUnitsByMarketId.get(row.marketId) ?? [];
-          return buildKuehlerVisitSlots(units, row.visitTargetCount, completionsByKey.get(key) ?? []).map(({ unit, visitNumber, submission }) => {
+          return (kuehlerProgress.get(kuehlerProgressKey(row.campaignId, row.marketId, gmUserId)) ?? []).map(({ unit, visitNumber, submission }) => {
             const doneAt = submission?.submittedAt?.toISOString() ?? null;
             return {
               marketId: row.marketId,

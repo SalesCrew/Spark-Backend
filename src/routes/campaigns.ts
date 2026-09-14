@@ -2,7 +2,9 @@ import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { type Response, Router } from "express";
 import { z } from "zod";
 import { isFullAdminRole } from "../lib/admin-role.js";
-import { buildKuehlerVisitSlots, kuehlerSubmissionInDateRange, planKuehlerMarketAddition } from "../lib/kuehler-repeat-visits.js";
+import { kuehlerSubmissionInDateRange, planKuehlerMarketAddition } from "../lib/kuehler-repeat-visits.js";
+import { kuehlerProgressKey } from "../lib/kuehler-assignment-progress.js";
+import { loadKuehlerAssignmentProgress } from "../lib/kuehler-assignment-progress-query.js";
 import { finalizeBonusForSubmittedVisitSessionTx, recomputeBonusWaveTx } from "../lib/bonus-finalizer.js";
 import { recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
@@ -531,6 +533,9 @@ async function buildCampaignMarketVisitStatusBatch(
     return uniqueCampaignIds.map((campaignId) => ({ campaignId, markets: [] }));
   }
 
+  const kuehlerProgress = await loadKuehlerAssignmentProgress(
+    assignmentRows.filter((row) => campaignSectionById.get(row.campaignId) === "kuehler"),
+  );
   const submittedRows = await db
     .select({
       campaignId: visitSessionSections.campaignId,
@@ -547,6 +552,7 @@ async function buildCampaignMarketVisitStatusBatch(
     .where(
       and(
         inArray(visitSessionSections.campaignId, uniqueCampaignIds),
+        ne(visitSessionSections.section, "kuehler"),
         eq(visitSessionSections.isDeleted, false),
         eq(visitSessions.isDeleted, false),
         eq(visitSessions.status, "submitted"),
@@ -562,7 +568,6 @@ async function buildCampaignMarketVisitStatusBatch(
 
   const submittedCountByCampaignMarket = new Map<string, number>();
   const latestByCampaignMarket = new Map<string, (typeof submittedRows)[number]>();
-  const kuehlerSubmissionsByGm = new Map<string, typeof submittedRows>();
   const seenSubmittedSession = new Set<string>();
   for (const row of submittedRows) {
     const key = `${row.campaignId}:${row.marketId}`;
@@ -572,35 +577,6 @@ async function buildCampaignMarketVisitStatusBatch(
     seenSubmittedSession.add(sessionKey);
     submittedCountByCampaignMarket.set(key, (submittedCountByCampaignMarket.get(key) ?? 0) + 1);
     if (!latestByCampaignMarket.has(key)) latestByCampaignMarket.set(key, row);
-    if (campaignSectionById.get(row.campaignId) === "kuehler") {
-      const gmKey = `${key}:${row.gmUserId}`;
-      const bucket = kuehlerSubmissionsByGm.get(gmKey) ?? [];
-      bucket.push(row);
-      kuehlerSubmissionsByGm.set(gmKey, bucket);
-    }
-  }
-
-  const kuehlerMarketIds = normalizeUnique(
-    Array.from(targetByCampaignMarket.keys())
-      .map((key) => {
-        const [campaignId, marketId] = key.split(":");
-        if (!campaignId || !marketId) return null;
-        return campaignSectionById.get(campaignId) === "kuehler" ? marketId : null;
-      })
-      .filter((entry): entry is string => Boolean(entry)),
-  );
-  const kuehlerUnitsByMarketId = new Map<string, Array<typeof marketKuehlerUnits.$inferSelect>>();
-  if (kuehlerMarketIds.length > 0) {
-    const kuehlerUnitRows = await db
-      .select()
-      .from(marketKuehlerUnits)
-      .where(and(inArray(marketKuehlerUnits.marketId, kuehlerMarketIds), eq(marketKuehlerUnits.isDeleted, false)))
-      .orderBy(asc(marketKuehlerUnits.kuehlerInternalId), asc(marketKuehlerUnits.createdAt));
-    for (const unit of kuehlerUnitRows) {
-      const bucket = kuehlerUnitsByMarketId.get(unit.marketId) ?? [];
-      bucket.push(unit);
-      kuehlerUnitsByMarketId.set(unit.marketId, bucket);
-    }
   }
 
   const gmUserIds = normalizeUnique(
@@ -628,9 +604,8 @@ async function buildCampaignMarketVisitStatusBatch(
         const key = `${campaignId}:${marketId}`;
         const targetVisitCount = targetByCampaignMarket.get(key) ?? 0;
         if (isKuehlerCampaign) {
-          const units = kuehlerUnitsByMarketId.get(marketId) ?? [];
-          return [...(targetsByCampaignMarketGm.get(key) ?? new Map<string | null, number>())].flatMap(([gmUserId, target]) =>
-            buildKuehlerVisitSlots(units, target, kuehlerSubmissionsByGm.get(`${key}:${gmUserId}`) ?? []).map(({ unit, visitNumber, submission }) => {
+          return [...(targetsByCampaignMarketGm.get(key) ?? new Map<string | null, number>())].flatMap(([gmUserId]) =>
+            (kuehlerProgress.get(kuehlerProgressKey(campaignId, marketId, gmUserId)) ?? []).map(({ unit, visitNumber, submission }) => {
             // Assign occurrence numbers before date filtering so a later visit never masquerades as visit 1.
             const latest = submission && kuehlerSubmissionInDateRange(submission.submittedAt, dateRange) ? submission : null;
             const submittedVisitCount = latest ? 1 : 0;
