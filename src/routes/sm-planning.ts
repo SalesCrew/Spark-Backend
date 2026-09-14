@@ -1308,34 +1308,57 @@ adminSmPlanningRouter.post("/assignments/:id/reassign", async (req: AuthedReques
   }
 });
 
+export async function cancelSmPlanningOccurrence(tx: DbTx, assignmentId: string, input: z.infer<typeof cancelSchema>, actorUserId: string) {
+  const before = await loadAssignmentForUpdate(tx, assignmentId);
+  assertExpectedUpdatedAt(before, input.expectedUpdatedAt);
+  assertPlanningMutable(before);
+  const [updatedRow] = await tx.update(smAssignments).set({
+    status: "cancelled",
+    statusBeforeCancellation: before.status,
+    cancelledAt: new Date(),
+    cancelledByUserId: actorUserId,
+    cancellationReason: input.reason,
+    updatedAt: new Date(),
+    updatedByUserId: actorUserId,
+  }).where(eq(smAssignments.id, before.id)).returning();
+  const updated = requireWrittenRow(updatedRow);
+  await writeEvent(tx, { before, after: updated, eventType: "cancelled", actorUserId, reason: input.reason });
+  return updated;
+}
+
 adminSmPlanningRouter.post("/assignments/:id/cancel", async (req: AuthedRequest, res, next) => {
   try {
     const id = z.string().uuid().safeParse(req.params.id);
     const parsed = cancelSchema.safeParse(req.body);
     if (!id.success || !parsed.success) throw new SmPlanningError(400, "sm_assignment_invalid", "Die Absage ist ungültig.");
     const actorUserId = req.authUser!.appUserId;
-    const after = await db.transaction(async (tx) => {
-      const before = await loadAssignmentForUpdate(tx, id.data);
-      assertExpectedUpdatedAt(before, parsed.data.expectedUpdatedAt);
-      assertPlanningMutable(before);
-      const [updatedRow] = await tx.update(smAssignments).set({
-        status: "cancelled",
-        statusBeforeCancellation: before.status,
-        cancelledAt: new Date(),
-        cancelledByUserId: actorUserId,
-        cancellationReason: parsed.data.reason,
-        updatedAt: new Date(),
-        updatedByUserId: actorUserId,
-      }).where(eq(smAssignments.id, before.id)).returning();
-      const updated = requireWrittenRow(updatedRow);
-      await writeEvent(tx, { before, after: updated, eventType: "cancelled", actorUserId, reason: parsed.data.reason });
-      return updated;
-    });
+    const after = await db.transaction((tx) => cancelSmPlanningOccurrence(tx, id.data, parsed.data, actorUserId));
     res.status(200).json({ assignmentId: after.id, updatedAt: after.updatedAt.toISOString() });
   } catch (error) {
     if (!sendKnownError(error, res)) next(error);
   }
 });
+
+export async function restoreSmPlanningOccurrence(tx: DbTx, assignmentId: string, input: z.infer<typeof restoreSchema>, actorUserId: string) {
+  const before = await loadAssignmentForUpdate(tx, assignmentId);
+  assertExpectedUpdatedAt(before, input.expectedUpdatedAt);
+  if (before.status !== "cancelled") throw new SmPlanningError(409, "sm_assignment_not_cancelled", "Der Einsatz ist nicht abgesagt.");
+  await loadActiveMarket(tx, resolveSmAssignmentValues(before).smMarketId);
+  const [updatedRow] = await tx.update(smAssignments).set({
+    status: before.statusBeforeCancellation ?? "planned",
+    statusBeforeCancellation: null,
+    cancelledAt: null,
+    cancelledByUserId: null,
+    cancellationReason: null,
+    updatedAt: new Date(),
+    updatedByUserId: actorUserId,
+  }).where(eq(smAssignments.id, before.id)).returning();
+  const updated = requireWrittenRow(updatedRow);
+  await writeEvent(tx, { before, after: updated, eventType: "restored", actorUserId, reason: input.reason });
+  await adjustSmHolidayAssignments(tx, { actorUserId, assignmentIds: [updated.id] });
+  const [final] = await tx.select().from(smAssignments).where(eq(smAssignments.id, updated.id));
+  return requireWrittenRow(final);
+}
 
 adminSmPlanningRouter.post("/assignments/:id/restore", async (req: AuthedRequest, res, next) => {
   try {
@@ -1343,26 +1366,7 @@ adminSmPlanningRouter.post("/assignments/:id/restore", async (req: AuthedRequest
     const parsed = restoreSchema.safeParse(req.body);
     if (!id.success || !parsed.success) throw new SmPlanningError(400, "sm_assignment_invalid", "Die Wiederherstellung ist ungültig.");
     const actorUserId = req.authUser!.appUserId;
-    const after = await db.transaction(async (tx) => {
-      const before = await loadAssignmentForUpdate(tx, id.data);
-      assertExpectedUpdatedAt(before, parsed.data.expectedUpdatedAt);
-      if (before.status !== "cancelled") throw new SmPlanningError(409, "sm_assignment_not_cancelled", "Der Einsatz ist nicht abgesagt.");
-      await loadActiveMarket(tx, resolveSmAssignmentValues(before).smMarketId);
-      const [updatedRow] = await tx.update(smAssignments).set({
-        status: before.statusBeforeCancellation ?? "planned",
-        statusBeforeCancellation: null,
-        cancelledAt: null,
-        cancelledByUserId: null,
-        cancellationReason: null,
-        updatedAt: new Date(),
-        updatedByUserId: actorUserId,
-      }).where(eq(smAssignments.id, before.id)).returning();
-      const updated = requireWrittenRow(updatedRow);
-      await writeEvent(tx, { before, after: updated, eventType: "restored", actorUserId, reason: parsed.data.reason });
-      await adjustSmHolidayAssignments(tx, { actorUserId, assignmentIds: [updated.id] });
-      const [final] = await tx.select().from(smAssignments).where(eq(smAssignments.id, updated.id));
-      return requireWrittenRow(final);
-    });
+    const after = await db.transaction((tx) => restoreSmPlanningOccurrence(tx, id.data, parsed.data, actorUserId));
     res.status(200).json({ assignmentId: after.id, updatedAt: after.updatedAt.toISOString() });
   } catch (error) {
     if (!sendKnownError(error, res)) next(error);

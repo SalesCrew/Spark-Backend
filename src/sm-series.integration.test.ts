@@ -4,12 +4,13 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
-import { eq, sql } from "drizzle-orm";
+import { eq, sql, getTableColumns } from "drizzle-orm";
 import * as schema from "./lib/schema.js";
 
 // Never connect this suite to Supabase. All SQL runs inside disposable in-memory Postgres.
 Object.assign(process.env, { NODE_ENV: "test", DATABASE_URL: "postgresql://test:test@127.0.0.1:1/disabled", SUPABASE_URL: "http://127.0.0.1:1", SUPABASE_ANON_KEY: "test", SUPABASE_SERVICE_ROLE_KEY: "test", JWT_SECRET: "local-series-test-only" });
 const { applySmSeriesChange, previewSmSeriesChange, getSmSeriesDetails, SmSeriesError, smSeriesChangeSchema } = await import("./sm-series-management.js");
+const { cancelSmPlanningOccurrence, restoreSmPlanningOccurrence } = await import("./routes/sm-planning.js");
 const { smAssignments: assignments, smAssignmentSeries: series, smAssignmentSeriesVersions: versions, smAssignmentEvents: events } = schema;
 const actor = randomUUID(), oldSm = randomUUID(), newSm = randomUUID(), market = randomUUID();
 const today = "2026-09-14";
@@ -25,6 +26,12 @@ test("SM series persistence against the actual planning migration (no production
     create function sm_sync_soft_delete_fields() returns trigger language plpgsql as $$ begin new.deleted_at := case when new.is_deleted then coalesce(new.deleted_at,now()) else null end; return new; end $$;
     create function sm_reject_hard_delete() returns trigger language plpgsql as $$ begin raise exception 'SM hard delete forbidden'; end $$;`);
   await pg.exec(await readFile(new URL("../drizzle/0093_sm_planning.sql", import.meta.url), "utf8"));
+  // Restore validates the complete market row; extend the local stub, never production.
+  for (const column of Object.values(getTableColumns(schema.smMarkets))) {
+    if (!["id", "internal_market_id", "is_active", "is_deleted"].includes(column.name)) {
+      await pg.exec(`alter table sm_markets add column "${column.name}" ${column.getSQLType()};`);
+    }
+  }
   await pg.query("insert into users(id,role) values ($1,'sm_admin'),($2,'sm'),($3,'sm');", [actor, oldSm, newSm]);
   await pg.query("insert into sm_markets(id,internal_market_id) values ($1,'SM-LOCAL-123')", [market]);
   const txRun = async <T,>(fn: (tx: Parameters<typeof applySmSeriesChange>[0]) => Promise<T>) => database.transaction((tx) => fn(tx as unknown as Parameters<typeof applySmSeriesChange>[0]));
@@ -40,6 +47,56 @@ test("SM series persistence against the actual planning migration (no production
     return txRun((tx) => applySmSeriesChange(tx, id, { change, previewToken: preview.previewToken, reason: "Lokaler Regressionstest" }, actor, today));
   };
   try {
+    await t.test("removing one mistaken occurrence preserves the market, series and original values; restore reuses its ID", async () => {
+      const fixture = await seed();
+      const first = fixture.rows[0]!;
+      const cancelled = await txRun((tx) => cancelSmPlanningOccurrence(tx, first.id, { expectedUpdatedAt: first.updatedAt.toISOString(), reason: "Markt versehentlich verplant" }, actor));
+      assert.equal(cancelled.status, "cancelled");
+      assert.equal(cancelled.isDeleted, false);
+      assert.equal(cancelled.originalSmMarketId, first.originalSmMarketId);
+      assert.equal(cancelled.originalPlannedMinutes, first.originalPlannedMinutes);
+      assert.equal((await txRun((tx) => getSmSeriesDetails(tx, fixture.id))).status, "active");
+      const siblings = (await database.select().from(assignments).where(eq(assignments.seriesId, fixture.id))).filter((row) => row.id !== first.id);
+      assert.ok(siblings.every((row) => row.status === "planned"));
+      assert.equal((await database.select().from(schema.smMarkets)).length, 1);
+      const history = await database.select().from(events).where(eq(events.assignmentId, first.id));
+      assert.equal(history.length, 1); assert.equal(history[0]!.eventType, "cancelled");
+      assert.equal(history[0]!.reason, "Markt versehentlich verplant");
+      const restored = await txRun((tx) => restoreSmPlanningOccurrence(tx, first.id, { expectedUpdatedAt: cancelled.updatedAt.toISOString(), reason: "Termin wieder einplanen" }, actor));
+      assert.equal(restored.id, first.id); assert.equal(restored.status, "planned");
+      assert.equal(restored.cancelledAt, null); assert.equal(restored.cancellationReason, null);
+      assert.equal((await database.select().from(events).where(eq(events.assignmentId, first.id))).length, 2);
+    });
+    await t.test("occurrence cancellation rejects stale changes and protected statuses without writes", async () => {
+      const fixture = await seed();
+      const first = fixture.rows[0]!;
+      await assert.rejects(txRun((tx) => cancelSmPlanningOccurrence(tx, first.id, { expectedUpdatedAt: "2000-01-01T00:00:00Z", reason: "Veraltete Ansicht" }, actor)), /zwischenzeitlich geändert/);
+      for (const status of ["in_progress", "completed", "missed"] as const) {
+        const [row] = await database.update(assignments).set({ status }).where(eq(assignments.id, first.id)).returning();
+        await assert.rejects(txRun((tx) => cancelSmPlanningOccurrence(tx, first.id, { expectedUpdatedAt: row!.updatedAt.toISOString(), reason: "Darf nicht entfernen" }, actor)), /kann nicht mehr verplant/);
+      }
+      assert.equal((await database.select().from(events).where(eq(events.seriesId, fixture.id))).length, 0);
+    });
+    await t.test("single occurrence restore does not restart a stopped series; repeated removal is rejected", async () => {
+      const fixture = await seed();
+      await apply(fixture.id, { action: "stop", effectiveFromDate: today });
+      const [row] = await database.select().from(assignments).where(eq(assignments.id, fixture.rows[0]!.id));
+      await assert.rejects(txRun((tx) => cancelSmPlanningOccurrence(tx, row!.id, { expectedUpdatedAt: row!.updatedAt.toISOString(), reason: "Noch einmal entfernen" }, actor)), /zuerst wiederhergestellt/);
+      await txRun((tx) => restoreSmPlanningOccurrence(tx, row!.id, { expectedUpdatedAt: row!.updatedAt.toISOString(), reason: "Einzelne Ausnahme" }, actor));
+      assert.equal((await txRun((tx) => getSmSeriesDetails(tx, fixture.id))).status, "ended");
+      const rows = await database.select().from(assignments).where(eq(assignments.seriesId, fixture.id));
+      assert.equal(rows.filter((entry) => entry.status === "cancelled").length, 2);
+    });
+    await t.test("a failed cancellation audit rolls back the entire removal", async () => {
+      const fixture = await seed();
+      const first = fixture.rows[0]!;
+      await pg.exec(`create function reject_removal_audit() returns trigger language plpgsql as $$ begin raise exception 'Injected removal audit failure'; end $$; create trigger reject_removal_audit before insert on sm_assignment_events for each row execute function reject_removal_audit();`);
+      try {
+        await assert.rejects(txRun((tx) => cancelSmPlanningOccurrence(tx, first.id, { expectedUpdatedAt: first.updatedAt.toISOString(), reason: "Rollback Test" }, actor)));
+      } finally { await pg.exec("drop trigger reject_removal_audit on sm_assignment_events; drop function reject_removal_audit();"); }
+      const [row] = await database.select().from(assignments).where(eq(assignments.id, first.id));
+      assert.equal(row!.status, "planned"); assert.equal(row!.cancelledAt, null);
+    });
     await t.test("edit is versioned, original IDs/values survive, new dates are materialized and audited", async () => {
       const fixture = await seed();
       const result = await apply(fixture.id, edit);
