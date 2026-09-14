@@ -59,6 +59,7 @@ export function buildSmSeriesDates(input: {
   validTo: string;
   weekdays: number[];
   frequency: SmPlanningFrequency;
+  anchorDate?: string;
   maxOccurrences?: number;
 }): string[] {
   const startDay = isoDateToEpochDay(input.validFrom);
@@ -72,8 +73,8 @@ export function buildSmSeriesDates(input: {
 
   const maxOccurrences = input.maxOccurrences ?? 1_000;
   const dates: string[] = [];
-  const startWeekday = isoWeekday(input.validFrom);
-  const firstWeekMonday = startDay - (startWeekday - 1);
+  const anchorDate = input.anchorDate ?? input.validFrom;
+  const firstWeekMonday = isoDateToEpochDay(anchorDate) - (isoWeekday(anchorDate) - 1);
   const weekInterval = input.frequency === "biweekly" ? 2 : 1;
 
   for (let day = startDay; day <= endDay; day += 1) {

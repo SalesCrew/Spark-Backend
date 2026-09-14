@@ -29,6 +29,7 @@ import {
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { assertSmVisitTimeAvailable, lockSmVisitTimes, SmTimeOverlapError } from "../sm-time-overlap.js";
 import { lockSmPlanning } from "../sm-planning-lock.js";
+import { smSeriesManagementRouter } from "../sm-series-management.js";
 import { adjustSmHolidayAssignments, loadSmHolidayStates } from "../sm-holiday-planning.js";
 import {
   buildSmSeriesDates,
@@ -367,13 +368,13 @@ async function loadAssignments(from: string, to: string, smUserId?: string) {
   if (rows.length === 0) return [];
   const userIds = [...new Set(rows.flatMap((row) => [row.originalSmUserId, row.replacementSmUserId].filter((value): value is string => Boolean(value))))];
   const marketIds = [...new Set(rows.flatMap((row) => [row.originalSmMarketId, row.replacementSmMarketId].filter((value): value is string => Boolean(value))))];
-  const seriesVersionIds = [...new Set(rows.map((row) => row.seriesVersionId).filter((value): value is string => Boolean(value)))];
+  const seriesIds = [...new Set(rows.map((row) => row.seriesId).filter((value): value is string => Boolean(value)))];
   const assignmentIds = rows.map((row) => row.id);
 
-  const [userRows, marketRows, seriesVersionRows, timeRows, submissionRows, requestRows, holidayStates] = await Promise.all([
+  const [userRows, marketRows, seriesVersionRows, timeRows, submissionRows, requestRows, holidayStates, seriesRows] = await Promise.all([
     userIds.length ? db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName }).from(users).where(inArray(users.id, userIds)) : [],
     marketIds.length ? db.select({ id: smMarkets.id, name: smMarkets.name, address: smMarkets.address, postalCode: smMarkets.postalCode, city: smMarkets.city, region: smMarkets.region, internalMarketId: smMarkets.internalMarketId }).from(smMarkets).where(inArray(smMarkets.id, marketIds)) : [],
-    seriesVersionIds.length ? db.select().from(smAssignmentSeriesVersions).where(inArray(smAssignmentSeriesVersions.id, seriesVersionIds)) : [],
+    seriesIds.length ? db.select().from(smAssignmentSeriesVersions).where(and(inArray(smAssignmentSeriesVersions.seriesId, seriesIds), eq(smAssignmentSeriesVersions.isDeleted, false))).orderBy(desc(smAssignmentSeriesVersions.versionNumber)) : [],
     db.select().from(smAssignmentTimeSubmissions).where(and(
       inArray(smAssignmentTimeSubmissions.assignmentId, assignmentIds),
       eq(smAssignmentTimeSubmissions.isDeleted, false),
@@ -400,6 +401,7 @@ async function loadAssignments(from: string, to: string, smUserId?: string) {
       eq(smAssignmentTimeChangeRequests.status, "pending"),
     )),
     loadSmHolidayStates(db, assignmentIds),
+    seriesIds.length ? db.select().from(smAssignmentSeries).where(inArray(smAssignmentSeries.id, seriesIds)) : [],
   ]);
 
   const userById = new Map(userRows.map((row) => [row.id, `${row.firstName} ${row.lastName}`.trim()]));
@@ -413,7 +415,8 @@ async function loadAssignments(from: string, to: string, smUserId?: string) {
     const effective = resolveSmAssignmentValues(row);
     const originalMarket = marketById.get(row.originalSmMarketId);
     const effectiveMarket = marketById.get(effective.smMarketId) ?? originalMarket;
-    const seriesVersion = row.seriesVersionId ? seriesVersionById.get(row.seriesVersionId) : undefined;
+    const seriesVersion = seriesVersionRows.find((version) => version.seriesId === row.seriesId && version.effectiveFromDate <= effective.workDate)
+      ?? (row.seriesVersionId ? seriesVersionById.get(row.seriesVersionId) : undefined);
     const time = timeByAssignmentId.get(row.id);
     const visit = submissionByAssignmentId.get(row.id);
     return {
@@ -449,6 +452,7 @@ async function loadAssignments(from: string, to: string, smUserId?: string) {
         region: effectiveMarket?.region ?? "",
       },
       series: seriesVersion ? {
+        status: seriesRows.find((series) => series.id === row.seriesId)?.status ?? "active",
         frequency: seriesVersion.frequency,
         weekdays: seriesVersion.weekdays,
         validFrom: seriesVersion.validFrom,
@@ -652,6 +656,8 @@ adminSmPlanningRouter.use((req, res, next) => {
   }));
   next();
 });
+
+adminSmPlanningRouter.use(smSeriesManagementRouter);
 
 adminSmPlanningRouter.get("/questionnaire-assignment", async (_req, res, next) => {
   try {
@@ -1231,6 +1237,8 @@ adminSmPlanningRouter.post("/assignments/:id/reassign", async (req: AuthedReques
       }
 
       if (!before.seriesId) throw new SmPlanningError(400, "sm_assignment_not_series", "Dieser Einsatz gehört zu keiner Serie.");
+      const [series] = await tx.select().from(smAssignmentSeries).where(and(eq(smAssignmentSeries.id, before.seriesId), eq(smAssignmentSeries.isDeleted, false)));
+      if (!series || series.status !== "active") throw new SmPlanningError(409, "sm_series_ended", "Diese Serie wurde bereits gestoppt.");
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_series_update:${before.seriesId}`}, 0))`);
       const [latestVersion] = await tx.select().from(smAssignmentSeriesVersions).where(and(
         eq(smAssignmentSeriesVersions.seriesId, before.seriesId),
