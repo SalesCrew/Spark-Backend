@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
+import { smCommentMissing } from "../sm-comment.shared.js";
 
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { db } from "../lib/db.js";
@@ -93,6 +94,11 @@ function questionSnapshot(question: typeof smQuestionnaireSubmissionQuestions.$i
 }
 
 function answerSummary(answer: SmVisitAnswerPayload, options: Array<{ code: string; label: string }>): string {
+  const base = answerSummaryValue(answer, options);
+  return answer.kind !== "empty" && answer.comment ? `${base}\nKommentar: ${answer.comment}` : base;
+}
+
+function answerSummaryValue(answer: SmVisitAnswerPayload, options: Array<{ code: string; label: string }>): string {
   const label = (code: string) => options.find((option) => option.code === code)?.label ?? code;
   if (answer.kind === "empty") return "Antwort entfernen";
   if (answer.kind === "choice") return label(answer.optionCode);
@@ -153,7 +159,7 @@ async function validateConditionalResult(executor: DbExecutor, submissionId: str
     question.id,
     smVisitAnswerToRuleValue(valueByQuestion.get(question.id), optionSnapshot(question.answerOptionsSnapshot)),
   ])));
-  const missingRequired = questions.filter((question) => !hidden.has(question.id) && question.requiredSnapshot && !isCompleteSmVisitAnswer(questionSnapshot(question), valueByQuestion.get(question.id)));
+  const missingRequired = questions.filter((question) => !hidden.has(question.id) && (smCommentMissing(questionSnapshot(question), valueByQuestion.get(question.id)) || question.requiredSnapshot && !isCompleteSmVisitAnswer(questionSnapshot(question), valueByQuestion.get(question.id))));
   return { questions, hidden, missingRequired };
 }
 

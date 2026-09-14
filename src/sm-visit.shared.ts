@@ -1,25 +1,30 @@
 import { z } from "zod";
+import { smCommentMissing, smCommentTriggerKey, SM_COMMENT_MAX_LENGTH } from "./sm-comment.shared.js";
+
+const comment = z.string().trim().max(SM_COMMENT_MAX_LENGTH).optional();
 
 export const smVisitAnswerSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("empty") }).strict(),
-  z.object({ kind: z.literal("choice"), optionCode: z.string().trim().min(1).max(300) }).strict(),
-  z.object({ kind: z.literal("multi"), optionCodes: z.array(z.string().trim().min(1).max(300)).max(500) }).strict(),
+  z.object({ kind: z.literal("choice"), optionCode: z.string().trim().min(1).max(300), comment }).strict(),
+  z.object({ kind: z.literal("multi"), optionCodes: z.array(z.string().trim().min(1).max(300)).max(500), comment }).strict(),
   z.object({
     kind: z.literal("yesnomulti"),
+    comment,
     optionCode: z.string().trim().min(1).max(300),
     subOptions: z.array(z.string().trim().min(1).max(1_000)).max(500),
   }).strict(),
-  z.object({ kind: z.literal("text"), value: z.string().max(20_000) }).strict(),
-  z.object({ kind: z.literal("number"), value: z.number().finite() }).strict(),
+  z.object({ kind: z.literal("text"), value: z.string().max(20_000), comment }).strict(),
+  z.object({ kind: z.literal("number"), value: z.number().finite(), comment }).strict(),
   z.object({
     kind: z.literal("matrix"),
+    comment,
     cells: z.array(z.object({
       rowCode: z.string().trim().min(1).max(300),
       columnCode: z.string().trim().min(1).max(300),
       selected: z.boolean(),
     }).strict()).max(4_000),
   }).strict(),
-  z.object({ kind: z.literal("photo"), fileIds: z.array(z.string().uuid()).min(1).max(20) }).strict(),
+  z.object({ kind: z.literal("photo"), fileIds: z.array(z.string().uuid()).min(1).max(20), comment }).strict(),
 ]);
 
 export type SmVisitAnswerPayload = z.infer<typeof smVisitAnswerSchema>;
@@ -51,6 +56,19 @@ function matrixCodes(config: Record<string, unknown>, key: "rows" | "columns"): 
 }
 
 export function normalizeSmVisitAnswer(
+  snapshot: SmVisitQuestionSnapshot,
+  raw: unknown,
+): SmVisitAnswerPayload {
+  const parsed = smVisitAnswerSchema.safeParse(raw);
+  if (!parsed.success) throw new SmVisitAnswerValidationError("Die Antwort hat ein ungültiges Format.");
+  const normalized = normalizeSmVisitAnswerValue(snapshot, parsed.data);
+  if (normalized.kind === "empty") return normalized;
+  const { comment: _discard, ...base } = normalized;
+  const text = parsed.data.kind === "empty" ? "" : parsed.data.comment?.trim();
+  return text && smCommentTriggerKey(snapshot, base) ? { ...base, comment: text } : base;
+}
+
+function normalizeSmVisitAnswerValue(
   snapshot: SmVisitQuestionSnapshot,
   raw: unknown,
 ): SmVisitAnswerPayload {
@@ -169,6 +187,7 @@ export function isCompleteSmVisitAnswer(
   answer: SmVisitAnswerPayload | null | undefined,
 ): boolean {
   if (!isAnsweredSmVisitPayload(answer)) return false;
+  if (smCommentMissing(snapshot, answer)) return false;
   if (snapshot.type !== "matrix" || answer?.kind !== "matrix") return true;
 
   const requiredRows = matrixCodes(snapshot.config, "rows");

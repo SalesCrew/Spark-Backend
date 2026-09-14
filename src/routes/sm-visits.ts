@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
+import { smAnswerComment, smCommentMissing } from "../sm-comment.shared.js";
 
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { db } from "../lib/db.js";
@@ -926,6 +927,7 @@ smVisitsRouter.post("/:assignmentId/photos/commit", async (req: AuthedRequest, r
         submissionId: smQuestionAnswers.submissionId,
         submissionQuestionId: smQuestionAnswers.submissionQuestionId,
         answerVersion: smQuestionAnswers.answerVersion,
+        valueJson: smQuestionAnswers.valueJson,
       }).from(smQuestionAnswers)
         .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smQuestionAnswers.submissionId))
         .innerJoin(smQuestionnaireSubmissionQuestions, eq(smQuestionnaireSubmissionQuestions.id, smQuestionAnswers.submissionQuestionId))
@@ -967,7 +969,7 @@ smVisitsRouter.post("/:assignmentId/photos/commit", async (req: AuthedRequest, r
       const now = new Date();
       await tx.update(smQuestionAnswers).set({
         answerState: allFiles.length ? "answered" : "unanswered",
-        valueJson: { kind: "photo", fileIds: allFiles.map((photo) => photo.id) },
+        valueJson: { kind: "photo", fileIds: allFiles.map((photo) => photo.id), ...(smAnswerComment(answer.valueJson) ? { comment: smAnswerComment(answer.valueJson) } : {}) },
         answeredAt: allFiles.length ? now : null,
         answeredByUserId: actor.appUserId,
         updatedAt: now,
@@ -1048,6 +1050,7 @@ smVisitsRouter.delete("/:assignmentId/photos/:fileId", async (req: AuthedRequest
         storagePath: smQuestionAnswerFiles.storagePath,
         submissionId: smQuestionAnswers.submissionId,
         answerVersion: smQuestionAnswers.answerVersion,
+        valueJson: smQuestionAnswers.valueJson,
       }).from(smQuestionAnswerFiles)
         .innerJoin(smQuestionAnswers, eq(smQuestionAnswers.id, smQuestionAnswerFiles.answerId))
         .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smQuestionAnswers.submissionId))
@@ -1069,7 +1072,7 @@ smVisitsRouter.delete("/:assignmentId/photos/:fileId", async (req: AuthedRequest
       ));
       await tx.update(smQuestionAnswers).set({
         answerState: remaining.length ? "answered" : "unanswered",
-        valueJson: { kind: "photo", fileIds: remaining.map((photo) => photo.id) },
+        valueJson: { kind: "photo", fileIds: remaining.map((photo) => photo.id), ...(remaining.length && smAnswerComment(file.valueJson) ? { comment: smAnswerComment(file.valueJson) } : {}) },
         answeredAt: remaining.length ? now : null,
         updatedAt: now,
       }).where(eq(smQuestionAnswers.id, file.answerId));
@@ -1140,7 +1143,6 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
         config: question.configSnapshot,
         options,
       } satisfies SmVisitQuestionSnapshot, input.answer);
-      if (normalized.kind === "photo") throw new SmVisitError(501, "sm_visit_photo_upload_required", "Fotos müssen zuerst über den geschützten Foto-Upload gespeichert werden.");
       const [current] = await tx.select().from(smQuestionAnswers).where(and(
         eq(smQuestionAnswers.submissionQuestionId, question.id),
         eq(smQuestionAnswers.isDeleted, false),
@@ -1157,6 +1159,24 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
         });
       }
       const now = new Date();
+      if (question.questionTypeSnapshot === "photo") {
+        // Comment-only update: never create, remove, replace or move uploaded files.
+        const files = current ? await tx.select({ id: smQuestionAnswerFiles.id }).from(smQuestionAnswerFiles).where(and(
+          eq(smQuestionAnswerFiles.answerId, current.id), eq(smQuestionAnswerFiles.isDeleted, false),
+        )) : [];
+        if (!current || normalized.kind !== "photo" || files.length !== normalized.fileIds.length || files.some((file) => !normalized.fileIds.includes(file.id))) {
+          throw new SmVisitError(409, "sm_visit_photo_upload_required", "Bitte speichere zuerst alle Fotos, bevor du den Kommentar ergänzt.");
+        }
+        const version = currentVersion + 1;
+        await tx.update(smQuestionAnswers).set({ valueJson: normalized, answerVersion: version, updatedAt: now }).where(eq(smQuestionAnswers.id, current.id));
+        await tx.insert(smQuestionAnswerEvents).values({
+          answerId: current.id, submissionId: submission.id, eventType: "set", answerVersion: version,
+          payload: { clientMutationToken: input.clientMutationToken, changeKind: "comment", before: current.valueJson, after: normalized },
+          actorUserId: actor.appUserId,
+        });
+        await recomputeApplicability(tx, submission.id, actor.appUserId);
+        return { saved: true, answerVersion: version };
+      }
       if (current) await tx.update(smQuestionAnswers).set({ isCurrent: false, updatedAt: now }).where(eq(smQuestionAnswers.id, current.id));
       const answerId = randomUUID();
       const isAnswered = isAnsweredSmVisitPayload(normalized);
@@ -1299,15 +1319,16 @@ smVisitsRouter.post("/:assignmentId/submit", async (req: AuthedRequest, res, nex
       ));
       const currentAnswerByQuestionId = new Map(currentAnswers.map((answer) => [answer.submissionQuestionId, answer]));
       const missing = applicableQuestions.filter((question) => {
-        if (!question.requiredSnapshot) return false;
         const answer = currentAnswerByQuestionId.get(question.id);
+        const snapshot = { type: question.questionTypeSnapshot, config: question.configSnapshot, options: optionSnapshot(question.answerOptionsSnapshot) };
+        if (!question.requiredSnapshot) return smCommentMissing(snapshot, answer?.valueJson as SmVisitAnswerPayload | undefined);
         return !isCompleteSmVisitAnswer({
           type: question.questionTypeSnapshot,
           config: question.configSnapshot,
           options: optionSnapshot(question.answerOptionsSnapshot),
         }, answer?.valueJson as SmVisitAnswerPayload | null | undefined);
       });
-      if (missing.length) throw new SmVisitError(409, "sm_visit_required_answers_missing", "Bitte beantworte alle Pflichtfragen.", {
+      if (missing.length) throw new SmVisitError(409, "sm_visit_required_answers_missing", "Bitte ergänze alle Pflichtantworten und erforderlichen Kommentare.", {
         questionIds: missing.map((question) => question.id),
       });
       const now = new Date();

@@ -62,6 +62,10 @@ const smOosQuestionTypes: ReadonlySet<string> = new Set(["yesno", "yesnomulti", 
 const smOosDetectionOutcomes: ReadonlySet<string> = new Set(["oos_present", "oos_absent", "not_applicable"]);
 const smOosRemediationOutcomes: ReadonlySet<string> = new Set(["resolved", "partially_resolved", "not_resolved", "not_applicable"]);
 const SM_SUBHEADING_MAX_LENGTH = 500;
+const commentTriggerSchema = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("answered") }).strict(),
+  z.object({ mode: z.literal("options"), optionCodes: z.array(z.string().max(300)).min(1).max(500) }).strict(),
+]);
 
 const conditionalRuleSchema = z.object({
   id: z.string().max(200),
@@ -202,6 +206,18 @@ function validateModule(input: SmModuleInput): void {
     ids.add(question.id);
     questionsById.set(question.id, question);
     questionIndex.set(question.id, index);
+    if (question.config.commentTrigger !== undefined) {
+      const parsed = commentTriggerSchema.safeParse(question.config.commentTrigger);
+      if (!parsed.success) throw new SmQuestionnaireDomainError(400, `Bitte konfiguriere den Kommentar bei „${question.text}“ vollständig.`);
+      if (parsed.data.mode === "options") {
+        const allowedCodes = question.type === "matrix"
+          ? (Array.isArray(question.config.columns) ? question.config.columns : []).flatMap((label, columnIndex) => typeof label === "string" && label.trim() ? [`column_${columnIndex + 1}`] : [])
+          : optionsForQuestion(question).map((_, optionIndex) => `option_${optionIndex + 1}`);
+        if (parsed.data.optionCodes.some((code) => !allowedCodes.includes(code))) {
+          throw new SmQuestionnaireDomainError(400, `Der Kommentar bei „${question.text}“ verweist auf eine unbekannte Antwort.`);
+        }
+      }
+    }
     if (question.config.subheading !== undefined && (typeof question.config.subheading !== "string" || question.config.subheading.length > SM_SUBHEADING_MAX_LENGTH)) {
       throw new SmQuestionnaireDomainError(400, `Die Unterzeile bei „${question.text}“ darf höchstens ${SM_SUBHEADING_MAX_LENGTH} Zeichen enthalten.`);
     }
