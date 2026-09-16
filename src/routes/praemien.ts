@@ -1042,7 +1042,7 @@ async function replaceQualityScoresTx(tx: Tx, waveId: string, qualityScores: z.i
     ? await tx
         .select({ id: users.id, role: users.role })
         .from(users)
-        .where(and(inArray(users.id, gmIds), eq(users.isActive, true), eq(users.role, "gm"), sql`${users.deletedAt} is null`))
+        .where(and(inArray(users.id, gmIds), eq(users.role, "gm"), sql`${users.deletedAt} is null`))
     : [];
   const validGmIdSet = new Set(gmUsers.map((entry) => entry.id));
   for (const entry of qualityScores) {
@@ -1082,7 +1082,7 @@ async function replaceFlexScoresTx(tx: Tx, waveId: string, flexScores: z.infer<t
     ? await tx
         .select({ id: users.id, role: users.role })
         .from(users)
-        .where(and(inArray(users.id, gmIds), eq(users.isActive, true), eq(users.role, "gm"), sql`${users.deletedAt} is null`))
+        .where(and(inArray(users.id, gmIds), eq(users.role, "gm"), sql`${users.deletedAt} is null`))
     : [];
   const validGmIdSet = new Set(gmUsers.map((entry) => entry.id));
   for (const entry of flexScores) {
@@ -1140,7 +1140,6 @@ async function replacePillarOverridesTx(
           .from(users)
           .where(and(
             inArray(users.id, gmIds),
-            eq(users.isActive, true),
             eq(users.role, "gm"),
             sql`${users.deletedAt} is null`,
           ))

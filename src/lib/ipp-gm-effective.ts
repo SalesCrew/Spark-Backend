@@ -4,6 +4,7 @@ import { db, sql as pgSql } from "./db.js";
 import { redMonthPeriods, users } from "./schema.js";
 import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 import { redMonthPeriodToYmd, resolveCurrentRedPeriod } from "./red-month-periods.js";
+import { includeGmIppPeriod } from "../gm-historical-visibility.shared.js";
 
 export type IppPeriodMeta = {
   id: string;
@@ -272,9 +273,9 @@ export async function loadEffectiveGmIppPeriods(input: {
   const samples = await loadMarketSamples(catalog);
   const requestedGmIds = input.gmUserIds ? new Set(input.gmUserIds) : null;
   const gmRows = await db
-    .select({ id: users.id, firstName: users.firstName, lastName: users.lastName, region: users.region })
+    .select({ id: users.id, firstName: users.firstName, lastName: users.lastName, region: users.region, isActive: users.isActive })
     .from(users)
-    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt)));
+    .where(and(eq(users.role, "gm"), isNull(users.deletedAt)));
   const eligibleGms = gmRows.filter((gm) => !requestedGmIds || requestedGmIds.has(gm.id));
   const gmById = new Map(eligibleGms.map((gm) => [gm.id, gm]));
   const samplesByKey = new Map<string, MarketSample[]>();
@@ -296,7 +297,12 @@ export async function loadEffectiveGmIppPeriods(input: {
       const key = `${gm.id}::${period.id}`;
       const gmSamples = samplesByKey.get(key) ?? [];
       const latestEvent = latestEvents.get(key) ?? null;
-      if (!input.includeEmptyGms && gmSamples.length === 0 && !latestEvent) continue;
+      if (!includeGmIppPeriod({
+        isActive: gm.isActive,
+        includeEmptyGms: Boolean(input.includeEmptyGms),
+        hasSamples: gmSamples.length > 0,
+        hasAdjustment: Boolean(latestEvent),
+      })) continue;
       const positive = gmSamples.filter((sample) => sample.marketIpp > 0);
       const calculatedIpp = positive.length > 0
         ? roundIpp(positive.reduce((sum, sample) => sum + sample.marketIpp, 0) / positive.length)

@@ -20,7 +20,7 @@ import {
 } from "../lib/schema.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { generatePassword } from "../services/password.js";
-import { smAuthBanDurationForStatus } from "../sm-user-status.shared.js";
+import { authBanDurationForStatus, canToggleAccountStatus } from "../sm-user-status.shared.js";
 
 const createUserSchema = z.object({
   role: z.enum(["admin", "sm_admin", "gm", "sm"]),
@@ -394,7 +394,7 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
       app_metadata: {
         role: payload.role,
       },
-      ...(payload.role === "sm" ? { ban_duration: smAuthBanDurationForStatus(isActive) } : {}),
+      ...(payload.role === "sm" ? { ban_duration: authBanDurationForStatus(isActive) } : {}),
     });
 
     if (authError || !authCreated.user) {
@@ -548,27 +548,27 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       });
       return;
     }
-    if (payload.isActive !== undefined && existing.role !== "sm") {
-      res.status(400).json({ error: "Der Aktivstatus kann hier nur für Shelf-Merchandiser geändert werden." });
+    if (payload.isActive !== undefined && !canToggleAccountStatus(existing.role)) {
+      res.status(400).json({ error: "Der Aktivstatus kann hier nur für Shelf-Merchandiser und Gebietsmanager geändert werden." });
       return;
     }
     if (payload.isActive === true && (existing.deletedAt || existing.anonymizedAt)) {
       res.status(409).json({
         error: "Ein gelöschter oder anonymisierter Account kann nicht reaktiviert werden.",
-        code: "sm_account_reactivation_not_allowed",
+        code: existing.role === "sm" ? "sm_account_reactivation_not_allowed" : "account_reactivation_not_allowed",
       });
       return;
     }
 
-    const statusChanged = existing.role === "sm"
+    const statusChanged = canToggleAccountStatus(existing.role)
       && payload.isActive !== undefined
       && payload.isActive !== existing.isActive;
     if (statusChanged) {
       const { error: authStatusError } = await supabaseAdmin.auth.admin.updateUserById(existing.supabaseAuthId, {
-        ban_duration: smAuthBanDurationForStatus(Boolean(payload.isActive)),
+        ban_duration: authBanDurationForStatus(Boolean(payload.isActive)),
       });
       if (authStatusError) {
-        logAction("error", "admin_sm_user_auth_status_update_failed", {
+        logAction("error", "admin_user_auth_status_update_failed", {
           req,
           action: "admin_user_update",
           result: "failure",
@@ -577,7 +577,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
           startedAtNs,
           details: { targetUserId: id, requestedIsActive: payload.isActive, reason: authStatusError.message },
         });
-        res.status(502).json({ error: "Der SM-Loginstatus konnte nicht geändert werden. Es wurde nichts gespeichert." });
+        res.status(502).json({ error: "Der Loginstatus konnte nicht geändert werden. Es wurde nichts gespeichert." });
         return;
       }
     }
@@ -596,7 +596,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
           postalCode: existing.role === "sm" ? undefined : payload.postalCode,
           region: existing.role === "sm" ? undefined : payload.region,
           travelTimeEnabled: existing.role === "sm" ? payload.travelTimeEnabled : undefined,
-          isActive: existing.role === "sm" ? payload.isActive : undefined,
+          isActive: canToggleAccountStatus(existing.role) ? payload.isActive : undefined,
           ipp: payload.ipp != null ? payload.ipp.toFixed(1) : undefined,
           isBillaGm: existing.role === "gm" ? payload.isBillaGm : undefined,
           updatedAt: new Date(),
@@ -606,7 +606,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
     } catch (dbError) {
       if (statusChanged) {
         await supabaseAdmin.auth.admin.updateUserById(existing.supabaseAuthId, {
-          ban_duration: smAuthBanDurationForStatus(existing.isActive),
+          ban_duration: authBanDurationForStatus(existing.isActive),
         });
       }
       throw dbError;
@@ -615,7 +615,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
     if (!updated) {
       if (statusChanged) {
         await supabaseAdmin.auth.admin.updateUserById(existing.supabaseAuthId, {
-          ban_duration: smAuthBanDurationForStatus(existing.isActive),
+          ban_duration: authBanDurationForStatus(existing.isActive),
         });
       }
       logAction("warn", "admin_user_update_not_found_after_update", {

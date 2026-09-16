@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import {
   buildDaySessionPayload,
   resolvePrimaryQuestionnaireType,
@@ -50,7 +50,7 @@ async function loadZeiterfassungDaySessions(input: ZeiterfassungDaySessionsInput
 
   const whereClauses = [
     eq(gmDaySessions.isDeleted, false),
-    eq(users.isActive, true),
+    isNull(users.deletedAt),
     eq(users.role, "gm"),
     inArray(gmDaySessions.status, statuses),
     gte(gmDaySessions.workDate, input.from),

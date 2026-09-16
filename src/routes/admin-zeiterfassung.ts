@@ -449,7 +449,7 @@ async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayloa
 
   const whereClauses = [
     eq(gmDaySessions.isDeleted, false),
-    eq(users.isActive, true),
+    isNull(users.deletedAt),
     eq(users.role, "gm"),
     inArray(gmDaySessions.status, statuses),
     gte(gmDaySessions.workDate, input.from),
