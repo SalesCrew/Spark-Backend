@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
 
@@ -352,7 +352,7 @@ async function writeEvent(tx: DbTx, input: {
   });
 }
 
-async function loadAssignments(from: string, to: string, smUserId?: string) {
+async function loadAssignments(from: string, to: string, smUserId?: string, employeeView = false) {
   const effectiveDate = sql<string>`coalesce(${smAssignments.replacementWorkDate}, ${smAssignments.originalWorkDate})`;
   const effectiveSmUserId = sql<string>`coalesce(${smAssignments.replacementSmUserId}, ${smAssignments.originalSmUserId})`;
   const filters = [
@@ -361,6 +361,7 @@ async function loadAssignments(from: string, to: string, smUserId?: string) {
     lte(effectiveDate, to),
   ];
   if (smUserId) filters.push(eq(effectiveSmUserId, smUserId));
+  if (employeeView) filters.push(ne(smAssignments.status, "cancelled"));
 
   const rows = await db.select().from(smAssignments).where(and(...filters))
     .orderBy(asc(effectiveDate), asc(smAssignments.createdAt));
@@ -519,7 +520,7 @@ smPlanningRouter.get("/assignments", async (req: AuthedRequest, res, next) => {
   try {
     const range = parseAssignmentRange(req.query);
     const smUserId = req.authUser!.appUserId;
-    res.status(200).json({ assignments: await loadAssignments(range.from, range.to, smUserId) });
+    res.status(200).json({ assignments: await loadAssignments(range.from, range.to, smUserId, true) });
   } catch (error) {
     if (!sendKnownError(error, res)) next(error);
   }

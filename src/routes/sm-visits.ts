@@ -629,6 +629,7 @@ smVisitsRouter.get("/:assignmentId", async (req: AuthedRequest, res, next) => {
     const actor = requireAuthUser(req);
     const assignmentId = assignmentIdSchema.parse(param(req, "assignmentId"));
     const assignment = await loadOwnedAssignment(db, assignmentId, actor.appUserId);
+    if (assignment.status === "cancelled") throw new SmVisitError(409, "sm_visit_assignment_cancelled", "Dieser Einsatz wurde abgesagt. Bitte kehre zur Übersicht zurück.");
     res.json(await loadVisitPayload(assignment, actor.appUserId));
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: "Ungültige Einsatz-ID.", code: "sm_visit_assignment_id_invalid" });

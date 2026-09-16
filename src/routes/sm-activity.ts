@@ -3,6 +3,7 @@ import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
 import { smCommentMissing } from "../sm-comment.shared.js";
+import { adminSmManagementRouter } from "./sm-management.js";
 
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { db } from "../lib/db.js";
@@ -521,6 +522,7 @@ smActivityRouter.post("/submissions/:submissionId/delete-requests", async (req: 
 
 export const adminSmActivityRouter = Router();
 adminSmActivityRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSmActivityRouter.use("/completed", adminSmManagementRouter);
 
 adminSmActivityRouter.get("/requests", async (_req, res, next) => {
   try {
