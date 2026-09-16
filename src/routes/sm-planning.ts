@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
 
@@ -29,6 +29,7 @@ import {
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { assertSmVisitTimeAvailable, lockSmVisitTimes, SmTimeOverlapError } from "../sm-time-overlap.js";
 import { lockSmPlanning } from "../sm-planning-lock.js";
+import { smProfileWeek, summarizeSmProfileWeek } from "../sm-profile.shared.js";
 import { smSeriesManagementRouter } from "../sm-series-management.js";
 import { adjustSmHolidayAssignments, loadSmHolidayStates } from "../sm-holiday-planning.js";
 import {
@@ -515,6 +516,43 @@ function viennaDate(value: Date): string {
 
 export const smPlanningRouter = Router();
 smPlanningRouter.use(requireAuth(["sm"]));
+
+smPlanningRouter.get("/profile", async (req: AuthedRequest, res, next) => {
+  try {
+    const smUserId = req.authUser!.appUserId;
+    const week = smProfileWeek(viennaDate(new Date()));
+    const [userRows, marketRows, assignments] = await Promise.all([
+      db.select({
+        id: users.id,
+        firstName: users.firstName,
+        lastName: users.lastName,
+        email: users.email,
+        isActive: users.isActive,
+      }).from(users).where(and(eq(users.id, smUserId), eq(users.role, "sm"), isNull(users.deletedAt))).limit(1),
+      db.select({ count: count() }).from(smMarkets).where(and(
+        eq(smMarkets.assignedSmUserId, smUserId),
+        eq(smMarkets.isDeleted, false),
+        eq(smMarkets.isActive, true),
+      )),
+      loadAssignments(week.from, week.to, smUserId, true),
+    ]);
+    const user = userRows[0];
+    if (!user || !user.isActive) {
+      res.status(404).json({ error: "SM-Profil nicht gefunden." });
+      return;
+    }
+    res.status(200).json({
+      user,
+      week,
+      summary: {
+        assignedMarketCount: marketRows[0]?.count ?? 0,
+        ...summarizeSmProfileWeek(assignments),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 
 smPlanningRouter.get("/assignments", async (req: AuthedRequest, res, next) => {
   try {
