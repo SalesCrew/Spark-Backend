@@ -15,6 +15,7 @@ import * as dashboardShared from "./sm-dashboard.shared.js";
 import * as conditionalVisibility from "./lib/conditional-visibility.js";
 import * as comments from "./sm-comment.shared.js";
 import * as planningLock from "./sm-planning-lock.js";
+import * as profileShared from "./sm-profile.shared.js";
 import * as timeOverlap from "./sm-time-overlap.js";
 import * as holidaysShared from "./sm-holidays.shared.js";
 import { isRoleAllowedForEndpoint } from "./lib/admin-role.js";
@@ -201,6 +202,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     const planningRoute = await isolatedModule<typeof import("./routes/sm-planning.js")>(new URL("./routes/sm-planning.ts", import.meta.url), {
       "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": authMock,
       "../sm-planning.shared.js": planning, "../sm-planning-lock.js": planningLock, "../sm-time-overlap.js": timeOverlap,
+      "../sm-profile.shared.js": profileShared,
       "../sm-holiday-planning.js": holidays, "../sm-series-management.js": { smSeriesManagementRouter: express.Router() },
     });
     const visitRoute = await isolatedModule<typeof import("./routes/sm-visits.js")>(new URL("./routes/sm-visits.ts", import.meta.url), {
@@ -220,6 +222,54 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
         ...(status === "cancelled" ? { cancelledAt: new Date(), cancelledByUserId: admin, cancellationReason: "Lokaler Absagetest", statusBeforeCancellation: "planned" as const } : {}), ...extra }).returning();
       return row!;
     };
+
+    await t.test("SM admin directly corrects visit stamps and duration with history, guards and no GM access", async () => {
+      const originalStart = "2026-08-31T09:00:00.000Z", originalEnd = "2026-08-31T10:00:00.000Z";
+      const scheduled = await assignment("completed", { originalWorkDate: "2026-08-31", startedAt: new Date(originalStart), completedAt: new Date(originalEnd) });
+      const fixture = await seed();
+      await database.update(schema.smQuestionnaireSubmissions).set({ assignmentId: scheduled.id, visitTimeMode: "manual", manualVisitMinutes: 60 }).where(eq(schema.smQuestionnaireSubmissions.id, fixture.submission.id));
+      const [originalTime] = await database.insert(schema.smAssignmentTimeSubmissions).values({ assignmentId: scheduled.id, revisionNumber: 1, actualMinutes: 60, submittedByUserId: employee }).returning();
+      const endpoint = `/admin-planning/assignments/${scheduled.id}/visit-time`;
+      const payload = { expectedVisitId: fixture.submission.id, expectedStartedAt: originalStart, expectedCompletedAt: originalEnd,
+        visitStartedAt: "2026-08-31T09:05:00.000Z", visitCompletedAt: "2026-08-31T10:15:00.000Z", reason: "Start vor Ort falsch erfasst" };
+      await request(app).patch(endpoint).set("x-local-role", "sm").set("x-local-actor", employee).send(payload).expect(403);
+      await request(app).patch(endpoint).set("x-local-role", "gm").send(payload).expect(403);
+      await request(app).patch(endpoint).set("x-local-role", "sm_admin").send({ ...payload, visitCompletedAt: payload.visitStartedAt }).expect(400);
+      await request(app).patch(endpoint).set("x-local-role", "sm_admin").send({ ...payload, expectedVisitId: randomUUID() }).expect(409);
+      const updated = await request(app).patch(endpoint).set("x-local-role", "sm_admin").send(payload).expect(200);
+      assert.equal(updated.body.actualMinutes, 70); assert.equal(updated.body.revisionNumber, 2); assert.equal(updated.body.replayed, false);
+      const [visit] = await database.select().from(schema.smQuestionnaireSubmissions).where(eq(schema.smQuestionnaireSubmissions.id, fixture.submission.id));
+      assert.equal(visit!.visitStartedAt?.toISOString(), payload.visitStartedAt);
+      assert.equal(visit!.visitCompletedAt?.toISOString(), payload.visitCompletedAt);
+      assert.equal(visit!.manualVisitMinutes, 70);
+      assert.equal(visit!.submittedAt?.toISOString(), originalEnd, "submission time remains an audit event, not the corrected end");
+      const versions = await database.select().from(schema.smAssignmentTimeSubmissions).where(eq(schema.smAssignmentTimeSubmissions.assignmentId, scheduled.id));
+      assert.deepEqual(versions.map(row => [row.revisionNumber, row.actualMinutes, row.isCurrent]), [[1, 60, false], [2, 70, true]]);
+      assert.equal(versions[1]!.supersedesSubmissionId, originalTime!.id);
+      const [event] = await database.select().from(schema.smAssignmentEvents).where(eq(schema.smAssignmentEvents.assignmentId, scheduled.id));
+      assert.equal(event!.beforeState.startedAt, originalStart); assert.equal(event!.afterState.completedAt, payload.visitCompletedAt);
+      const replay = await request(app).patch(endpoint).set("x-local-role", "sm_admin").send(payload).expect(200);
+      assert.equal(replay.body.replayed, true);
+      await request(app).patch(endpoint).set("x-local-role", "sm_admin").send({ ...payload, visitStartedAt: "2026-08-31T09:10:00.000Z" }).expect(409);
+      const otherAssignment = await assignment("completed", { originalWorkDate: "2026-08-31" });
+      const other = await seed();
+      await database.update(schema.smQuestionnaireSubmissions).set({ assignmentId: otherAssignment.id,
+        visitStartedAt: new Date("2026-08-31T10:20:00.000Z"), visitCompletedAt: new Date("2026-08-31T10:40:00.000Z") }).where(eq(schema.smQuestionnaireSubmissions.id, other.submission.id));
+      await database.insert(schema.smAssignmentTimeSubmissions).values({ assignmentId: otherAssignment.id, revisionNumber: 1, actualMinutes: 20, submittedByUserId: employee });
+      const currentPayload = { ...payload, expectedStartedAt: payload.visitStartedAt, expectedCompletedAt: payload.visitCompletedAt,
+        visitCompletedAt: "2026-08-31T10:30:00.000Z" };
+      const overlap = await request(app).patch(endpoint).set("x-local-role", "sm_admin").send(currentPayload).expect(409);
+      assert.equal(overlap.body.code, "sm_visit_time_overlap");
+      const [pending] = await database.insert(schema.smAssignmentTimeChangeRequests).values({ assignmentId: scheduled.id, smUserId: employee,
+        sourceTimeSubmissionId: versions[1]!.id, requestKind: "time_change", originalMinutes: 70, requestedMinutes: 75,
+        originalStartedAt: new Date(payload.visitStartedAt), originalCompletedAt: new Date(payload.visitCompletedAt),
+        requestedStartedAt: new Date(payload.visitStartedAt), requestedCompletedAt: new Date("2026-08-31T10:20:00.000Z"),
+        requestReason: "Offene SM Anfrage", clientRequestToken: randomUUID() }).returning();
+      const blocked = await request(app).patch(endpoint).set("x-local-role", "sm_admin").send(currentPayload).expect(409);
+      assert.equal(blocked.body.code, "sm_visit_time_correction_pending_request");
+      await database.update(schema.smAssignmentTimeChangeRequests).set({ status: "cancelled" }).where(eq(schema.smAssignmentTimeChangeRequests.id, pending!.id));
+      assert.equal((await database.select().from(schema.smAssignmentTimeSubmissions).where(eq(schema.smAssignmentTimeSubmissions.assignmentId, scheduled.id))).length, 2);
+    });
 
     await t.test("employee planning hides cancelled only; admin retains it; restored and moved dates are visible", async () => {
       const cancelled = await assignment("cancelled"), visible = await assignment(), missed = await assignment("missed");

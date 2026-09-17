@@ -29,7 +29,7 @@ export async function assertSmVisitTimeAvailable(tx: DbTx, input: {
   smUserId: string; assignmentId: string; startedAt: Date; completedAt: Date;
 }) {
   await lockSmVisitTimes(tx, input.smUserId);
-  const rows = await tx.execute<SmTimeConflict>(sql`
+  const result = await tx.execute<SmTimeConflict>(sql`
     select s.id as "submissionId", s.assignment_id as "assignmentId",
       s.market_name_snapshot as "marketName",
       concat_ws(', ', nullif(s.market_address_snapshot, ''), nullif(concat_ws(' ', nullif(s.market_postal_code_snapshot, ''), nullif(s.market_city_snapshot, '')), '')) as "marketAddress",
@@ -44,6 +44,8 @@ export async function assertSmVisitTimeAvailable(tx: DbTx, input: {
         where t.assignment_id = s.assignment_id and t.is_current and not t.is_deleted)
     order by s.visit_started_at, s.id
   `);
+  // postgres-js returns rows directly; the isolated PGlite harness returns a { rows } result.
+  const rows = Array.isArray(result) ? result : (result as unknown as { rows: SmTimeConflict[] }).rows;
   if (rows.length) throw new SmTimeOverlapError({
     proposedStartedAt: input.startedAt.toISOString(), proposedCompletedAt: input.completedAt.toISOString(),
     conflicts: rows.map((row) => ({ ...row, startedAt: new Date(row.startedAt).toISOString(), completedAt: new Date(row.completedAt).toISOString() })),

@@ -109,6 +109,20 @@ const actualTimeSchema = z.object({
   correctionReason: z.string().trim().min(3).max(2_000).optional(),
 }).strict();
 
+const adminVisitTimeSchema = z.object({
+  expectedVisitId: z.string().uuid(),
+  expectedStartedAt: z.string().datetime({ offset: true }),
+  expectedCompletedAt: z.string().datetime({ offset: true }),
+  visitStartedAt: z.string().datetime({ offset: true }),
+  visitCompletedAt: z.string().datetime({ offset: true }),
+  reason: z.string().trim().min(3).max(2_000),
+}).strict().superRefine((value, context) => {
+  const elapsed = new Date(value.visitCompletedAt).getTime() - new Date(value.visitStartedAt).getTime();
+  if (elapsed < 60_000 || elapsed > 86_400_000 || !Number.isFinite(elapsed)) {
+    context.addIssue({ code: "custom", path: ["visitCompletedAt"], message: "Die Endzeit muss mindestens eine Minute nach der Startzeit und höchstens 24 Stunden später liegen." });
+  }
+});
+
 const timeChangeRequestSchema = z.object({
   kind: z.enum(["time_change", "deletion"]),
   requestedStartedAt: z.string().datetime({ offset: true }).nullable(),
@@ -1457,6 +1471,86 @@ adminSmPlanningRouter.post("/assignments/:id/time", async (req: AuthedRequest, r
       return { submissionId: created.id, revisionNumber: created.revisionNumber, actualMinutes: created.actualMinutes, replayed: false };
     });
     res.status(result.replayed ? 200 : 201).json(result);
+  } catch (error) {
+    if (!sendKnownError(error, res)) next(error);
+  }
+});
+
+adminSmPlanningRouter.patch("/assignments/:id/visit-time", async (req: AuthedRequest, res, next) => {
+  try {
+    const id = z.string().uuid().safeParse(req.params.id);
+    const parsed = adminVisitTimeSchema.safeParse(req.body);
+    if (!id.success || !parsed.success) throw new SmPlanningError(400, "sm_visit_time_correction_invalid", "Bitte prüfe Start, Ende und Begründung der Zeitkorrektur.");
+    const input = parsed.data;
+    const startedAt = new Date(input.visitStartedAt);
+    const completedAt = new Date(input.visitCompletedAt);
+    const actualMinutes = timestampPairMinutes(startedAt, completedAt)!;
+    const actorUserId = req.authUser!.appUserId;
+    const result = await db.transaction(async (tx) => {
+      // Use the same lock order as SM time requests so a pending request cannot be approved concurrently.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_time_request:${id.data}`}, 0))`);
+      const assignment = await loadAssignmentForUpdate(tx, id.data);
+      if (assignment.status !== "completed") throw new SmPlanningError(409, "sm_visit_time_correction_not_completed", "Nur ein abgeschlossener SM-Besuch kann korrigiert werden.");
+      const [visit] = await tx.select().from(smQuestionnaireSubmissions).where(and(
+        eq(smQuestionnaireSubmissions.id, input.expectedVisitId),
+        eq(smQuestionnaireSubmissions.assignmentId, assignment.id),
+        eq(smQuestionnaireSubmissions.status, "submitted"),
+        eq(smQuestionnaireSubmissions.isCurrent, true),
+        eq(smQuestionnaireSubmissions.isDeleted, false),
+      )).limit(1).for("update");
+      if (!visit || !visit.visitStartedAt || !visit.visitCompletedAt) throw new SmPlanningError(409, "sm_visit_time_correction_missing_visit", "Der abgeschlossene Besuch mit Start und Ende wurde nicht gefunden. Bitte neu laden.");
+      const [currentTime] = await tx.select().from(smAssignmentTimeSubmissions).where(and(
+        eq(smAssignmentTimeSubmissions.assignmentId, assignment.id),
+        eq(smAssignmentTimeSubmissions.isCurrent, true),
+        eq(smAssignmentTimeSubmissions.isDeleted, false),
+      )).limit(1).for("update");
+      if (!currentTime) throw new SmPlanningError(409, "sm_visit_time_correction_missing_time", "Die Ist-Zeit des Besuchs wurde nicht gefunden. Bitte neu laden.");
+      const [pending] = await tx.select({ id: smAssignmentTimeChangeRequests.id }).from(smAssignmentTimeChangeRequests).where(and(
+        eq(smAssignmentTimeChangeRequests.assignmentId, assignment.id),
+        eq(smAssignmentTimeChangeRequests.status, "pending"),
+        eq(smAssignmentTimeChangeRequests.isDeleted, false),
+      )).limit(1);
+      if (pending) throw new SmPlanningError(409, "sm_visit_time_correction_pending_request", "Für diesen Besuch ist noch eine Zeitkorrekturanfrage offen. Bitte bearbeite sie zuerst.");
+      if (sameInstant(visit.visitStartedAt, startedAt) && sameInstant(visit.visitCompletedAt, completedAt)) {
+        return { replayed: true, actualMinutes: currentTime.actualMinutes, revisionNumber: currentTime.revisionNumber };
+      }
+      if (!sameInstant(visit.visitStartedAt, new Date(input.expectedStartedAt)) || !sameInstant(visit.visitCompletedAt, new Date(input.expectedCompletedAt))) {
+        throw new SmPlanningError(409, "sm_visit_time_correction_stale", "Start oder Ende wurde zwischenzeitlich geändert. Bitte neu laden.");
+      }
+      await assertSmVisitTimeAvailable(tx, { smUserId: visit.smUserId, assignmentId: assignment.id, startedAt, completedAt });
+      const now = new Date();
+      await tx.update(smAssignmentTimeSubmissions).set({ isCurrent: false, updatedAt: now }).where(eq(smAssignmentTimeSubmissions.id, currentTime.id));
+      const [created] = await tx.insert(smAssignmentTimeSubmissions).values({
+        assignmentId: assignment.id,
+        revisionNumber: currentTime.revisionNumber + 1,
+        actualMinutes,
+        isCurrent: true,
+        supersedesSubmissionId: currentTime.id,
+        submittedByUserId: actorUserId,
+        submittedAt: now,
+        correctionReason: input.reason,
+      }).returning();
+      const time = requireWrittenRow(created);
+      await tx.update(smQuestionnaireSubmissions).set({
+        visitStartedAt: startedAt,
+        visitCompletedAt: completedAt,
+        ...(visit.visitTimeMode === "manual" ? { manualVisitMinutes: actualMinutes } : {}),
+        lastSavedAt: now,
+        updatedAt: now,
+      }).where(eq(smQuestionnaireSubmissions.id, visit.id));
+      await tx.update(smAssignments).set({ startedAt, completedAt, updatedByUserId: actorUserId, updatedAt: now }).where(eq(smAssignments.id, assignment.id));
+      await tx.insert(smAssignmentEvents).values({
+        assignmentId: assignment.id,
+        seriesId: assignment.seriesId,
+        eventType: "updated",
+        actorUserId,
+        reason: `SM-Besuchszeit korrigiert: ${input.reason}`,
+        beforeState: { visitId: visit.id, timeSubmissionId: currentTime.id, startedAt: visit.visitStartedAt.toISOString(), completedAt: visit.visitCompletedAt.toISOString(), actualMinutes: currentTime.actualMinutes },
+        afterState: { visitId: visit.id, timeSubmissionId: time.id, startedAt: startedAt.toISOString(), completedAt: completedAt.toISOString(), actualMinutes },
+      });
+      return { replayed: false, actualMinutes, revisionNumber: time.revisionNumber };
+    });
+    res.status(200).json(result);
   } catch (error) {
     if (!sendKnownError(error, res)) next(error);
   }
