@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, ilike, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { kuehlerProgressKey } from "../lib/kuehler-assignment-progress.js";
@@ -13,6 +14,8 @@ import { selectEffectiveFlexCampaigns } from "../lib/flex-campaign-selection.js"
 import { normalizeCrossDomainMarketIdentity } from "../market-identity.shared.js";
 import { resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
 import { resolveBillaGmFilterEnrollment } from "../billa-gm-market-filter.shared.js";
+import { planGmMarketSnapshot, planKuehlerMarketSnapshot } from "../gm-market-snapshot.shared.js";
+import { classifyUniversumImportRow } from "../universum-import.shared.js";
 import {
   campaignMarketAssignments,
   campaigns,
@@ -64,7 +67,7 @@ type MarketDraft = Partial<
     string | number | boolean
   >
 >;
-type ImportDatasetType = "universum" | "kuehler" | "kuehler_update" | "update";
+type ImportDatasetType = "universum" | "kuehler" | "kuehler_update" | "kuehler_snapshot" | "update";
 type KuehlerUpdateIdentifier =
   | "kuehlerInternalId"
   | "kuehlerSerialNumber"
@@ -339,15 +342,15 @@ async function resolveNextSmVisitDatesByGmMarketId(
 
 const universumImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; required: boolean; isIdentity: boolean }> = [
   { key: "standardMarketNumber", label: "Standardmarkt Nr", required: false, isIdentity: false },
-  { key: "cokeMasterNumber", label: "Stammnr. von Coke", required: true, isIdentity: true },
+  { key: "cokeMasterNumber", label: "Stammnr. von Coke", required: false, isIdentity: false },
   { key: "flexNumber", label: "Flex-Nummer", required: true, isIdentity: true },
   { key: "name", label: "Name", required: false, isIdentity: false },
-  { key: "address", label: "Adresse", required: true, isIdentity: false },
-  { key: "postalCode", label: "Postleitzahl", required: true, isIdentity: false },
-  { key: "city", label: "Ort", required: true, isIdentity: false },
+  { key: "address", label: "Adresse", required: false, isIdentity: false },
+  { key: "postalCode", label: "Postleitzahl", required: false, isIdentity: false },
+  { key: "city", label: "Ort", required: false, isIdentity: false },
   { key: "dbName", label: "Name f. DB", required: false, isIdentity: false },
   { key: "emEh", label: "EM/EH", required: false, isIdentity: false },
-  { key: "region", label: "Region", required: true, isIdentity: false },
+  { key: "region", label: "Region", required: false, isIdentity: false },
   { key: "employee", label: "Mitarbeiter", required: false, isIdentity: false },
   { key: "universeMarket", label: "Universums-Markt", required: false, isIdentity: false },
   { key: "visitFrequencyPerYear", label: "Besuchsrhythmus", required: false, isIdentity: false },
@@ -404,7 +407,7 @@ const updateImportFieldSpecs: Array<{ key: ImportFieldKey; label: string; requir
 ];
 
 function getImportFieldSpecs(importType: ImportDatasetType) {
-  if (importType === "kuehler") return kuehlerImportFieldSpecs;
+  if (importType === "kuehler" || importType === "kuehler_snapshot") return kuehlerImportFieldSpecs;
   if (importType === "kuehler_update") return kuehlerUpdateImportFieldSpecs;
   if (importType === "update") return updateImportFieldSpecs;
   return universumImportFieldSpecs;
@@ -442,7 +445,7 @@ const mappingSchema = z
 
 const importMarketsSchema = z
   .object({
-    importType: z.enum(["universum", "kuehler", "kuehler_update", "update"]).optional().default("universum"),
+    importType: z.enum(["universum", "kuehler", "kuehler_update", "kuehler_snapshot", "update"]).optional().default("universum"),
     kuehlerUpdateIdentifier: z
       .enum(["kuehlerInternalId", "kuehlerSerialNumber", "kuehlerTechnicalIdentNo"])
       .optional(),
@@ -451,6 +454,8 @@ const importMarketsSchema = z
     sheetName: z.string().min(1),
     rows: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))).min(1),
     mapping: mappingSchema,
+    snapshotToken: z.string().length(64).optional(),
+    confirmSnapshot: z.boolean().optional(),
   })
   .strict();
 
@@ -590,6 +595,10 @@ function normalizeOptionalText(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const normalized = value.trim();
   return normalized.length > 0 ? normalized : null;
+}
+
+function hasImportValue(value: unknown): boolean {
+  return value != null && (typeof value !== "string" || value.trim().length > 0);
 }
 
 function deriveUniverseMarketFromType(type: MarketType): boolean {
@@ -970,7 +979,7 @@ function isValidColLetter(s: string): boolean {
   return /^[A-Za-z]{1,3}$/.test(s.trim());
 }
 
-function mapRowToDraft(
+export function mapRowToDraft(
   row: string[],
   mapping: z.infer<typeof mappingSchema>,
   importType: ImportDatasetType,
@@ -1075,7 +1084,7 @@ function getMappedUpdateFields(mapping: z.infer<typeof mappingSchema>): ImportFi
   return updateImportPatchKeys.filter((key) => isValidColLetter(mapping[key] ?? ""));
 }
 
-function buildUpdateOnlyMarketPatch(
+export function buildUpdateOnlyMarketPatch(
   draft: MarketDraft,
   mappedFields: ImportFieldKey[],
   normalizedRegion: RegionNormalizationResult | null,
@@ -1083,44 +1092,44 @@ function buildUpdateOnlyMarketPatch(
   const mapped = new Set(mappedFields);
   const patch: Partial<typeof markets.$inferInsert> = {};
 
-  if (mapped.has("standardMarketNumber") && draft.standardMarketNumber != null) {
+  if (mapped.has("standardMarketNumber") && hasImportValue(draft.standardMarketNumber)) {
     patch.standardMarketNumber = normalizeIdentity(String(draft.standardMarketNumber));
   }
-  if (mapped.has("cokeMasterNumber") && draft.cokeMasterNumber != null) {
+  if (mapped.has("cokeMasterNumber") && hasImportValue(draft.cokeMasterNumber)) {
     patch.cokeMasterNumber = normalizeIdentity(String(draft.cokeMasterNumber));
   }
-  if (mapped.has("name") && draft.name != null) patch.name = String(draft.name);
-  if (mapped.has("dbName") && draft.dbName != null) {
+  if (mapped.has("name") && hasImportValue(draft.name)) patch.name = String(draft.name);
+  if (mapped.has("dbName") && hasImportValue(draft.dbName)) {
     patch.dbName = normalizeOptionalText(String(draft.dbName)) ?? "";
   }
-  if (mapped.has("address") && draft.address != null) patch.address = String(draft.address);
-  if (mapped.has("postalCode") && draft.postalCode != null) patch.postalCode = String(draft.postalCode);
-  if (mapped.has("city") && draft.city != null) patch.city = String(draft.city);
-  if (mapped.has("region") && draft.region != null && normalizedRegion?.ok) {
+  if (mapped.has("address") && hasImportValue(draft.address)) patch.address = String(draft.address);
+  if (mapped.has("postalCode") && hasImportValue(draft.postalCode)) patch.postalCode = String(draft.postalCode);
+  if (mapped.has("city") && hasImportValue(draft.city)) patch.city = String(draft.city);
+  if (mapped.has("region") && hasImportValue(draft.region) && normalizedRegion?.ok) {
     patch.region = normalizedRegion.canonical;
   }
-  if (mapped.has("emEh") && draft.emEh != null) {
+  if (mapped.has("emEh") && hasImportValue(draft.emEh)) {
     patch.emEh = normalizeOptionalText(String(draft.emEh)) ?? "";
   }
-  if (mapped.has("employee") && draft.employee != null) {
+  if (mapped.has("employee") && hasImportValue(draft.employee)) {
     patch.employee = normalizeOptionalText(String(draft.employee)) ?? "";
   }
-  if (mapped.has("currentGmName") && draft.currentGmName != null) {
+  if (mapped.has("currentGmName") && hasImportValue(draft.currentGmName)) {
     patch.currentGmName = normalizeOptionalText(String(draft.currentGmName)) ?? "";
   }
-  if (mapped.has("universeMarket") && draft.universeMarket != null) {
+  if (mapped.has("universeMarket") && hasImportValue(draft.universeMarket)) {
     patch.universeMarket = Boolean(draft.universeMarket);
   }
-  if (mapped.has("visitFrequencyPerYear") && draft.visitFrequencyPerYear != null) {
+  if (mapped.has("visitFrequencyPerYear") && hasImportValue(draft.visitFrequencyPerYear)) {
     patch.visitFrequencyPerYear = Number(draft.visitFrequencyPerYear);
   }
-  if (mapped.has("infoFlag") && draft.infoFlag != null) {
+  if (mapped.has("infoFlag") && hasImportValue(draft.infoFlag)) {
     patch.infoFlag = Boolean(draft.infoFlag);
   }
-  if (mapped.has("infoNote") && draft.infoNote != null) {
+  if (mapped.has("infoNote") && hasImportValue(draft.infoNote)) {
     patch.infoNote = normalizeOptionalText(String(draft.infoNote)) ?? "";
   }
-  if (mapped.has("isActive") && draft.isActive != null) {
+  if (mapped.has("isActive") && hasImportValue(draft.isActive)) {
     patch.isActive = Boolean(draft.isActive);
   }
 
@@ -1162,28 +1171,28 @@ export function buildKuehlerUpdatePatch(
   const mapped = new Set(mappedFields);
   const patch: Partial<typeof marketKuehlerUnits.$inferInsert> = {};
 
-  if (mapped.has("kuehlerInternalId") && draft.kuehlerInternalId != null) {
+  if (mapped.has("kuehlerInternalId") && hasImportValue(draft.kuehlerInternalId)) {
     patch.kuehlerInternalId = normalizeIdentity(draft.kuehlerInternalId);
   }
-  if (mapped.has("kuehlerTechnicalIdentNo") && draft.kuehlerTechnicalIdentNo != null) {
+  if (mapped.has("kuehlerTechnicalIdentNo") && hasImportValue(draft.kuehlerTechnicalIdentNo)) {
     patch.kuehlerTechnicalIdentNo = normalizeIdentity(draft.kuehlerTechnicalIdentNo);
   }
-  if (mapped.has("kuehlerSerialNumber") && draft.kuehlerSerialNumber != null) {
+  if (mapped.has("kuehlerSerialNumber") && hasImportValue(draft.kuehlerSerialNumber)) {
     patch.kuehlerSerialNumber = normalizeOptionalText(draft.kuehlerSerialNumber);
   }
-  if (mapped.has("kuehlerBd") && draft.kuehlerBd != null) {
+  if (mapped.has("kuehlerBd") && hasImportValue(draft.kuehlerBd)) {
     patch.kuehlerBd = normalizeOptionalText(draft.kuehlerBd);
   }
-  if (mapped.has("kuehlerAnzahlKsAmStandort") && draft.kuehlerAnzahlKsAmStandort != null) {
+  if (mapped.has("kuehlerAnzahlKsAmStandort") && hasImportValue(draft.kuehlerAnzahlKsAmStandort)) {
     patch.kuehlerAnzahlKsAmStandort = Number(draft.kuehlerAnzahlKsAmStandort);
   }
-  if (mapped.has("kuehlerModel") && draft.kuehlerModel != null) {
+  if (mapped.has("kuehlerModel") && hasImportValue(draft.kuehlerModel)) {
     patch.kuehlerModel = normalizeOptionalText(draft.kuehlerModel);
   }
-  if (mapped.has("name") && draft.name != null) {
+  if (mapped.has("name") && hasImportValue(draft.name)) {
     patch.name = normalizeOptionalText(draft.name) ?? "";
   }
-  if (mapped.has("employee") && draft.employee != null) {
+  if (mapped.has("employee") && hasImportValue(draft.employee)) {
     patch.employee = normalizeOptionalText(draft.employee) ?? "";
   }
 
@@ -1201,6 +1210,14 @@ function kuehlerUnitPatchHasChanges(
     const currentText = current == null ? "" : String(current);
     return currentText !== nextText;
   });
+}
+
+export function kuehlerSnapshotUnitNeedsUpdate(
+  unit: typeof marketKuehlerUnits.$inferSelect,
+  marketId: string,
+  patch: Partial<typeof marketKuehlerUnits.$inferInsert>,
+): boolean {
+  return unit.marketId !== marketId || kuehlerUnitPatchHasChanges(unit, patch);
 }
 
 function getKuehlerUpdateIdentifierValue(
@@ -1227,6 +1244,258 @@ async function updateMarketIdsInChunks(
     if (batch.length === 0) continue;
     await tx.update(markets).set(patch).where(inArray(markets.id, batch));
   }
+}
+
+type MarketImportPayload = z.infer<typeof importMarketsSchema>;
+type MarketRow = typeof markets.$inferSelect;
+type SnapshotIssue = { row: number; reason: string };
+
+function buildGmUpdateSnapshotPreview(payload: MarketImportPayload, existingMarkets: MarketRow[]) {
+  const rows = payload.rows.map((row) => row.map((cell) => (cell == null ? "" : String(cell))));
+  const dataRows = rows.slice(1);
+  const inputRows = dataRows.flatMap((row, index) => row.every((cell) => !cell.trim())
+    ? []
+    : [{ row: index + 2, flexNumber: getMappedRawCell(row, payload.mapping, "flexNumber") }]);
+  const plan = planGmMarketSnapshot(existingMarkets, inputRows, { deactivateSharedMarkets: true });
+  const issues: SnapshotIssue[] = [...plan.errors];
+  const addIssue = (row: number, reason: string) => { issues.push({ row, reason }); };
+  if (inputRows.length === 0) addIssue(0, "Die Datei enthält keine Marktzeilen. Es wird nichts inaktiv gesetzt.");
+
+  const matchedByRow = new Map(plan.matched.map((entry) => [entry.row, entry.market.id]));
+  const newRowNumbers = new Set(plan.newRows.map((entry) => entry.row));
+  const marketById = new Map(existingMarkets.map((market) => [market.id, market]));
+  const mappedUpdateFields = getMappedUpdateFields(payload.mapping);
+  const identityFields = [
+    { key: "standardMarketNumber" as const, label: "Standardmarkt Nr." },
+    { key: "cokeMasterNumber" as const, label: "Stammnr. von Coke" },
+  ];
+  const identityOwners = new Map<string, string>();
+  for (const market of existingMarkets) {
+    for (const field of identityFields) {
+      const value = normStr(normalizeIdentity(market[field.key]) ?? "");
+      if (value) identityOwners.set(`${field.key}:${value}`, market.id);
+    }
+  }
+
+  let wouldUpdate = 0;
+  let unchanged = 0;
+  let wouldReactivate = 0;
+  for (let index = 0; index < dataRows.length; index += 1) {
+    const row = dataRows[index];
+    if (!row || row.every((cell) => !cell.trim())) continue;
+    const rowNumber = index + 2;
+    const marketId = matchedByRow.get(rowNumber);
+    if (!marketId && !newRowNumbers.has(rowNumber)) continue;
+    const draft = mapRowToDraft(row, payload.mapping, "update");
+    const invalidBoolean = findInvalidBooleanUpdateValue(row, payload.mapping, mappedUpdateFields);
+    if (invalidBoolean) addIssue(rowNumber, `Ungültiger Ja/Nein-Wert für ${invalidBoolean.key}: ${invalidBoolean.raw}`);
+    const normalizedRegion = draft.region != null ? normalizeRegionValue(String(draft.region)) : null;
+    if (normalizedRegion && !normalizedRegion.ok) {
+      addIssue(rowNumber, `Region konnte nicht normalisiert werden: ${normalizedRegion.raw || "leer"}.`);
+    }
+
+    if (newRowNumbers.has(rowNumber)) {
+      const missing = (["name", "address", "postalCode", "city", "region"] as const)
+        .filter((key) => !String(draft[key] ?? "").trim());
+      if (missing.length > 0) {
+        addIssue(rowNumber, `Neuer Markt mit Flex ${String(draft.flexNumber ?? "?")}: Pflichtfelder fehlen (${missing.join(", ")}).`);
+      }
+    }
+
+    for (const field of identityFields) {
+      const value = normStr(normalizeIdentity(draft[field.key]) ?? "");
+      if (!value) continue;
+      const key = `${field.key}:${value}`;
+      const owner = identityOwners.get(key);
+      if (owner && owner !== (marketId ?? `new:${rowNumber}`)) {
+        addIssue(rowNumber, `${field.label} ${String(draft[field.key])} gehört bereits zu einem anderen Markt oder einer anderen Excel-Zeile.`);
+      } else {
+        identityOwners.set(key, marketId ?? `new:${rowNumber}`);
+      }
+    }
+
+    if (marketId) {
+      const market = marketById.get(marketId);
+      if (!market) continue;
+      const patch = buildUpdateOnlyMarketPatch(draft, mappedUpdateFields, normalizedRegion);
+      if (draft.isActive == null && !market.isActive) patch.isActive = true;
+      if (!market.isActive && patch.isActive === true) wouldReactivate += 1;
+      if (marketPatchHasChanges(market, patch)) wouldUpdate += 1;
+      else unchanged += 1;
+    }
+  }
+
+  const sourceState = existingMarkets
+    .map((market) => [market.id, market.flexNumber, market.marketType, market.isActive, market.updatedAt?.toISOString() ?? null])
+    .sort((left, right) => String(left[0]).localeCompare(String(right[0])));
+  const snapshotToken = createHash("sha256")
+    .update(JSON.stringify({ fileName: payload.fileName, sheetName: payload.sheetName, rows: payload.rows, mapping: payload.mapping, sourceState }))
+    .digest("hex");
+  const newLabels = plan.newRows.slice(0, 12).map((entry) => ({
+    row: entry.row,
+    flexNumber: entry.flexNumber ?? "",
+    name: String(mapRowToDraft(dataRows[entry.row - 2] ?? [], payload.mapping, "update").name ?? "Neuer Markt"),
+  }));
+
+  return {
+    snapshotToken,
+    canApply: issues.length === 0,
+    issueCount: issues.length,
+    issues: issues.slice(0, 50),
+    sourceRows: inputRows.length,
+    existingGmMarkets: existingMarkets.filter((market) => market.marketType !== "kuehler" && market.isActive).length,
+    matched: plan.matched.length,
+    wouldUpdate,
+    unchanged,
+    wouldCreate: plan.newRows.length,
+    wouldDeactivate: plan.toDeactivate.length,
+    wouldReactivate,
+    sharedLeftActive: plan.sharedLeftActive.length,
+    deactivatedMarkets: plan.toDeactivate.slice(0, 12).map((market) => ({
+      id: market.id, flexNumber: market.flexNumber ?? "", name: market.name,
+    })),
+    createdMarkets: newLabels,
+  };
+}
+
+function buildKuehlerSnapshotPreview(
+  payload: MarketImportPayload,
+  existingMarkets: MarketRow[],
+  existingUnits: Array<typeof marketKuehlerUnits.$inferSelect>,
+) {
+  const rows = payload.rows.map((row) => row.map((cell) => (cell == null ? "" : String(cell))));
+  const dataRows = rows.slice(1);
+  const inputRows = dataRows.flatMap((row, index) => row.every((cell) => !cell.trim()) ? [] : [{
+    row: index + 2,
+    stammnr: normalizeStammnrForMatch(getMappedRawCell(row, payload.mapping, "kuehlerStammnr")),
+    flexNumber: normalizeIdentity(getMappedRawCell(row, payload.mapping, "flexNumber")),
+  }]);
+  const plan = planKuehlerMarketSnapshot(existingMarkets, inputRows);
+  const issues: SnapshotIssue[] = [...plan.errors];
+  if (inputRows.length === 0) issues.push({ row: 0, reason: "Die Datei enthält keine Kühlerzeilen. Es wird nichts inaktiv gesetzt." });
+  const matchedByRow = new Map(plan.matched.map((item) => [item.row, item.market.id]));
+  const matchedMarketByRow = new Map(plan.matched.map((item) => [item.row, item.market]));
+  const newMarketRows = new Set(plan.newRows.map((item) => item.row));
+  const existingInternalIds = new Map<string, typeof marketKuehlerUnits.$inferSelect>();
+  const existingTechnicalIds = new Map<string, typeof marketKuehlerUnits.$inferSelect>();
+  const duplicateInternalIds = new Set<string>();
+  const duplicateTechnicalIds = new Set<string>();
+  for (const unit of existingUnits) {
+    const internalKey = normStr(unit.kuehlerInternalId ?? "");
+    const technicalKey = normStr(unit.kuehlerTechnicalIdentNo ?? "");
+    if (internalKey) {
+      if (existingInternalIds.has(internalKey)) duplicateInternalIds.add(internalKey);
+      existingInternalIds.set(internalKey, unit);
+    }
+    if (technicalKey) {
+      if (existingTechnicalIds.has(technicalKey)) duplicateTechnicalIds.add(technicalKey);
+      existingTechnicalIds.set(technicalKey, unit);
+    }
+  }
+  const seenInternal = new Map<string, number>();
+  const seenTechnical = new Map<string, number>();
+  const marketFieldsByStammnr = new Map<string, { row: number; values: Record<string, string> }>();
+  let existingUnitsMatched = 0;
+  let newUnits = 0;
+  let unchangedUnits = 0;
+  for (let index = 0; index < dataRows.length; index += 1) {
+    const row = dataRows[index];
+    if (!row || row.every((cell) => !cell.trim())) continue;
+    const rowNumber = index + 2;
+    const draft = mapRowToDraft(row, payload.mapping, "kuehler_snapshot");
+    const matchedMarket = matchedMarketByRow.get(rowNumber);
+    const stammnrKey = normalizeStammnrKey(
+      draft.kuehlerStammnr ?? matchedMarket?.kuehlerStammnr ?? matchedMarket?.cokeMasterNumber,
+    );
+    const marketValues = Object.fromEntries(
+      (["name", "address", "postalCode", "city", "region", "flexNumber"] as const)
+        .map((key) => [key, normStr(String(draft[key] ?? ""))]),
+    );
+    const previousMarketFields = stammnrKey ? marketFieldsByStammnr.get(stammnrKey) : undefined;
+    if (previousMarketFields) {
+      for (const [key, value] of Object.entries(marketValues)) {
+        if (value && previousMarketFields.values[key] && value !== previousMarketFields.values[key]) {
+          issues.push({ row: rowNumber, reason: `${key} widerspricht Zeile ${previousMarketFields.row} für dieselbe Stammnr.` });
+        }
+        if (value && !previousMarketFields.values[key]) previousMarketFields.values[key] = value;
+      }
+    } else if (stammnrKey) {
+      marketFieldsByStammnr.set(stammnrKey, { row: rowNumber, values: marketValues });
+    }
+    const internalKey = normStr(normalizeIdentity(draft.kuehlerInternalId) ?? "");
+    const technicalKey = normStr(normalizeIdentity(draft.kuehlerTechnicalIdentNo) ?? "");
+    if (duplicateInternalIds.has(internalKey) || duplicateTechnicalIds.has(technicalKey)) {
+      issues.push({ row: rowNumber, reason: "Kühler-Geräte-ID ist in der Datenbank nicht eindeutig." });
+    }
+    if (!internalKey && !technicalKey) {
+      issues.push({ row: rowNumber, reason: "Für jeden Kühler ist internal_id oder Tech. Ident. No. erforderlich." });
+    }
+    for (const [key, seen, label] of [
+      [internalKey, seenInternal, "internal_id"],
+      [technicalKey, seenTechnical, "Tech. Ident. No."],
+    ] as const) {
+      if (!key) continue;
+      const previous = seen.get(key);
+      if (previous != null) issues.push({ row: rowNumber, reason: `${label} steht bereits in Zeile ${previous}.` });
+      else seen.set(key, rowNumber);
+    }
+    const internalOwner = internalKey ? existingInternalIds.get(internalKey) : undefined;
+    const technicalOwner = technicalKey ? existingTechnicalIds.get(technicalKey) : undefined;
+    if (internalOwner && technicalOwner && internalOwner.id !== technicalOwner.id) {
+      issues.push({ row: rowNumber, reason: "internal_id und Tech. Ident. No. gehören zu verschiedenen Kühlern." });
+    }
+    const owner = internalOwner ?? technicalOwner;
+    const targetMarketId = matchedByRow.get(rowNumber);
+    if (owner && (!targetMarketId || owner.marketId !== targetMarketId)) {
+      issues.push({ row: rowNumber, reason: "Der Kühler gehört zu einem anderen Markt. Verschieben bitte separat prüfen." });
+    }
+    if (owner) {
+      existingUnitsMatched += 1;
+      if (targetMarketId && !kuehlerSnapshotUnitNeedsUpdate(
+        owner,
+        targetMarketId,
+        buildKuehlerUpdatePatch(draft, getMappedKuehlerUpdateFields(payload.mapping)),
+      )) unchangedUnits += 1;
+    } else newUnits += 1;
+    const normalizedRegion = draft.region != null ? normalizeRegionValue(String(draft.region)) : null;
+    if (normalizedRegion && !normalizedRegion.ok) issues.push({ row: rowNumber, reason: `Region konnte nicht normalisiert werden: ${normalizedRegion.raw || "leer"}.` });
+    if (newMarketRows.has(rowNumber)) {
+      const missing = (["name", "address", "postalCode", "city", "region"] as const)
+        .filter((key) => !String(draft[key] ?? "").trim());
+      if (missing.length > 0) issues.push({ row: rowNumber, reason: `Neuer Kühler-Markt: Pflichtfelder fehlen (${missing.join(", ")}).` });
+    }
+  }
+  const sourceState = existingMarkets.map((market) => [
+    market.id, market.flexNumber, market.cokeMasterNumber, market.kuehlerStammnr,
+    market.marketType, market.isActive, market.updatedAt?.toISOString() ?? null,
+  ]).sort((left, right) => String(left[0]).localeCompare(String(right[0])));
+  const unitState = existingUnits.map((unit) => [
+    unit.id, unit.marketId, unit.kuehlerInternalId, unit.kuehlerTechnicalIdentNo, unit.updatedAt?.toISOString() ?? null,
+  ]).sort((left, right) => String(left[0]).localeCompare(String(right[0])));
+  const snapshotToken = createHash("sha256").update(JSON.stringify({
+    fileName: payload.fileName, sheetName: payload.sheetName, rows: payload.rows, mapping: payload.mapping, sourceState, unitState,
+  })).digest("hex");
+  return {
+    snapshotToken,
+    canApply: issues.length === 0,
+    issueCount: issues.length,
+    issues: issues.slice(0, 50),
+    sourceRows: inputRows.length,
+    existingGmMarkets: existingMarkets.filter((market) => market.marketType !== "universum" && market.isActive).length,
+    matched: new Set(plan.matched.map((item) => item.market.id)).size,
+    wouldUpdate: new Set(plan.matched.map((item) => item.market.id)).size,
+    unchanged: unchangedUnits,
+    wouldCreate: plan.newRows.length,
+    wouldDeactivate: plan.toDeactivate.length,
+    wouldReactivate: new Set(plan.matched.filter((item) => !item.market.isActive).map((item) => item.market.id)).size,
+    sharedLeftActive: 0,
+    existingUnitsMatched,
+    newUnits,
+    deactivatedMarkets: plan.toDeactivate.slice(0, 12).map((market) => ({ id: market.id, flexNumber: market.kuehlerStammnr ?? "", name: market.name })),
+    createdMarkets: plan.newRows.slice(0, 12).map((item) => ({
+      row: item.row, flexNumber: item.stammnr ?? "", name: String(mapRowToDraft(dataRows[item.row - 2] ?? [], payload.mapping, "kuehler_snapshot").name ?? "Neuer Markt"),
+    })),
+  };
 }
 
 function mapMarketRow(row: typeof markets.$inferSelect) {
@@ -2714,6 +2983,37 @@ adminMarketsRouter.use((req, res, next) => {
   next();
 });
 
+adminMarketsRouter.post("/import/preview", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = importMarketsSchema.safeParse(req.body);
+    if (!parsed.success || (parsed.data.importType !== "update" && parsed.data.importType !== "kuehler_snapshot")) {
+      res.status(400).json({ error: "Für diese Vorschau muss eine Marktlisten-Aktualisierung ausgewählt sein." });
+      return;
+    }
+    const payload = parsed.data;
+    if (payload.importType === "update") {
+      if (!isValidColLetter(payload.mapping.flexNumber ?? "") || getMappedUpdateFields(payload.mapping).length === 0) {
+        res.status(400).json({ error: "Flex-Nummer und mindestens ein Aktualisierungsfeld müssen gemappt sein." });
+        return;
+      }
+      const existingMarkets = await db.select().from(markets).where(eq(markets.isDeleted, false));
+      res.status(200).json({ preview: buildGmUpdateSnapshotPreview(payload, existingMarkets) });
+      return;
+    }
+    if (!isValidColLetter(payload.mapping.kuehlerStammnr ?? "") && !isValidColLetter(payload.mapping.flexNumber ?? "")) {
+      res.status(400).json({ error: "Für die Kühler-Marktliste muss Stammnr oder Flex-Nummer gemappt sein." });
+      return;
+    }
+    const [existingMarkets, existingUnits] = await Promise.all([
+      db.select().from(markets).where(eq(markets.isDeleted, false)),
+      db.select().from(marketKuehlerUnits).where(eq(marketKuehlerUnits.isDeleted, false)),
+    ]);
+    res.status(200).json({ preview: buildKuehlerSnapshotPreview(payload, existingMarkets, existingUnits) });
+  } catch (error) {
+    next(error);
+  }
+});
+
 adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
   const startedAtNs = startActionTimer();
   const activeUpdateRowContextRef: {
@@ -2743,6 +3043,10 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
     const importType: ImportDatasetType = payload.importType ?? "universum";
     const allowMissingCokeMasterNumber =
       importType === "universum" && Boolean(payload.allowMissingCokeMasterNumber);
+    if (importType === "universum" && !isValidColLetter(payload.mapping.flexNumber ?? "")) {
+      res.status(400).json({ error: "Für Universumsmärkte muss 'Flex-Nummer' gemappt sein." });
+      return;
+    }
     if (importType === "kuehler" && !isValidColLetter(payload.mapping.kuehlerStammnr ?? "") && !isValidColLetter(payload.mapping.flexNumber ?? "")) {
       res.status(400).json({ error: "Für Kühlermärkte muss 'Stammnr' oder 'Flex-Nummer' gemappt sein." });
       return;
@@ -2770,6 +3074,20 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         res.status(400).json({ error: "Bitte mindestens ein Feld zum Aktualisieren mappen." });
         return;
       }
+      if (!payload.confirmSnapshot || !payload.snapshotToken) {
+        res.status(428).json({ error: "Bitte zuerst die Vorschau prüfen und die Änderungen ausdrücklich bestätigen." });
+        return;
+      }
+    }
+    if (importType === "kuehler_snapshot") {
+      if (!isValidColLetter(payload.mapping.kuehlerStammnr ?? "") && !isValidColLetter(payload.mapping.flexNumber ?? "")) {
+        res.status(400).json({ error: "Für die Kühler-Marktliste muss Stammnr oder Flex-Nummer gemappt sein." });
+        return;
+      }
+      if (!payload.confirmSnapshot || !payload.snapshotToken) {
+        res.status(428).json({ error: "Bitte zuerst die Kühler-Vorschau prüfen und ausdrücklich bestätigen." });
+        return;
+      }
     }
     const rowsAsStrings = payload.rows.map((row) => row.map((cell) => (cell == null ? "" : String(cell))));
     const summary: {
@@ -2780,6 +3098,11 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       totalParsedRows: number;
       created: number;
       updated: number;
+      existingMatchesSkipped: number;
+      duplicateInputRowsSkipped: number;
+      deactivated: number;
+      reactivated: number;
+      sharedLeftActive: number;
       skipped: number;
       unchanged: number;
       duplicateInputRowsMerged: number;
@@ -2796,6 +3119,8 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         missingFieldKeys?: ImportFieldKey[];
         fetchedFields?: Array<{ label: string; value: string }>;
       }>;
+      deactivatedMarkets: Array<{ id: string; flexNumber: string; name: string }>;
+      createdMarkets: Array<{ row: number; flexNumber: string; name: string }>;
     } = {
       fileName: payload.fileName,
       sheetName: payload.sheetName,
@@ -2804,6 +3129,11 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       totalParsedRows: Math.max(rowsAsStrings.length - 1, 0),
       created: 0,
       updated: 0,
+      existingMatchesSkipped: 0,
+      duplicateInputRowsSkipped: 0,
+      deactivated: 0,
+      reactivated: 0,
+      sharedLeftActive: 0,
       skipped: 0,
       unchanged: 0,
       duplicateInputRowsMerged: 0,
@@ -2812,6 +3142,8 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       kuehlerUnitsSkipped: 0,
       matchedBy: { standardMarketNumber: 0, cokeMasterNumber: 0, flexNumber: 0, namePLZ: 0 },
       skippedReasons: [],
+      deactivatedMarkets: [],
+      createdMarkets: [],
     };
 
     const importedAt = new Date();
@@ -2844,6 +3176,17 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         }
 
         const existingMarkets = await tx.select().from(markets).where(eq(markets.isDeleted, false));
+        const snapshotPreview = buildGmUpdateSnapshotPreview(payload, existingMarkets);
+        if (!snapshotPreview.canApply) {
+          throw new Error(`SNAPSHOT_INVALID:${snapshotPreview.issues[0]?.reason ?? "Ungültige Excel-Daten"}`);
+        }
+        if (snapshotPreview.snapshotToken !== payload.snapshotToken) {
+          throw new Error("SNAPSHOT_STALE");
+        }
+        summary.sharedLeftActive = snapshotPreview.sharedLeftActive;
+        summary.deactivatedMarkets = snapshotPreview.deactivatedMarkets;
+        summary.createdMarkets = snapshotPreview.createdMarkets;
+        summary.reactivated = snapshotPreview.wouldReactivate;
         const byFlex = new Map<string, Array<typeof markets.$inferSelect>>();
         const updateIdentityFields = [
           {
@@ -2873,6 +3216,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         }
 
         const universeMarketUpdatesByMarketId = new Map<string, boolean>();
+        const pendingCreates: Array<typeof markets.$inferInsert> = [];
         let recognizedUniverseMarketTrueRows = 0;
         let recognizedUniverseMarketFalseRows = 0;
 
@@ -2898,85 +3242,56 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           }
 
           const draft = mapRowToDraft(row, payload.mapping, importType);
-          const sampleText = String(draft.name ?? draft.city ?? row.find((cell) => cell?.trim()) ?? "");
           const invalidBoolean = findInvalidBooleanUpdateValue(row, payload.mapping, mappedUpdateFields);
           if (invalidBoolean) {
-            summary.skipped += 1;
-            if (summary.skippedReasons.length < 50) {
-              summary.skippedReasons.push({
-                row: rowNum,
-                reason: `Ungültiger Ja/Nein-Wert für ${invalidBoolean.key}: ${invalidBoolean.raw}`,
-                sample: sampleText,
-                draft,
-              });
-            }
-            continue;
+            throw new Error(`SNAPSHOT_INVALID:Zeile ${rowNum}: Ungültiger Ja/Nein-Wert für ${invalidBoolean.key}: ${invalidBoolean.raw}`);
           }
           const flexIdentity = normalizeIdentity(draft.flexNumber);
           const flexKey = normStr(flexIdentity ?? "");
           if (!flexKey) {
-            summary.skipped += 1;
-            if (summary.skippedReasons.length < 50) {
-              const { missingFields, missingFieldKeys, fetchedFields } = buildSkipMeta(
-                draft,
-                payload.mapping,
-                importType,
-              );
-              summary.skippedReasons.push({
-                row: rowNum,
-                reason: "Flex-Nummer fehlt oder ist leer",
-                sample: sampleText,
-                draft,
-                missingFields,
-                missingFieldKeys,
-                fetchedFields,
-              });
-            }
-            continue;
+            throw new Error(`SNAPSHOT_INVALID:Zeile ${rowNum}: Flex-Nummer fehlt oder ist leer.`);
           }
 
           const matches = byFlex.get(flexKey) ?? [];
-          if (matches.length === 0) {
-            summary.skipped += 1;
-            if (summary.skippedReasons.length < 50) {
-              summary.skippedReasons.push({
-                row: rowNum,
-                reason: `Kein bestehender Markt mit Flex-Nummer ${String(draft.flexNumber ?? flexIdentity)} gefunden`,
-                sample: sampleText,
-                draft,
-              });
-            }
-            continue;
-          }
           if (matches.length > 1) {
-            summary.skipped += 1;
-            if (summary.skippedReasons.length < 50) {
-              summary.skippedReasons.push({
-                row: rowNum,
-                reason: `Flex-Nummer ${String(draft.flexNumber ?? flexIdentity)} ist nicht eindeutig`,
-                sample: sampleText,
-                draft,
-              });
-            }
-            continue;
+            throw new Error(`SNAPSHOT_INVALID:Zeile ${rowNum}: Flex-Nummer ${flexIdentity} ist nicht eindeutig.`);
           }
 
           const normalizedDraftRegion =
             draft.region != null ? normalizeRegionValue(String(draft.region)) : null;
           if (normalizedDraftRegion && !normalizedDraftRegion.ok) {
-            summary.skipped += 1;
-            if (summary.skippedReasons.length < 50) {
-              summary.skippedReasons.push({
-                row: rowNum,
-                reason: `Region konnte nicht normalisiert werden (${normalizedDraftRegion.raw || "leer"})`,
-                sample: sampleText,
-                draft,
-              });
-            }
+            throw new Error(`SNAPSHOT_INVALID:Zeile ${rowNum}: Region konnte nicht normalisiert werden (${normalizedDraftRegion.raw || "leer"}).`);
+          }
+
+          if (matches.length === 0) {
+            pendingCreates.push({
+              standardMarketNumber: normalizeIdentity(draft.standardMarketNumber),
+              cokeMasterNumber: normalizeIdentity(draft.cokeMasterNumber),
+              flexNumber: flexIdentity,
+              name: String(draft.name ?? ""),
+              dbName: normalizeOptionalText(draft.dbName) ?? "",
+              address: String(draft.address ?? ""),
+              postalCode: String(draft.postalCode ?? ""),
+              city: String(draft.city ?? ""),
+              region: normalizedDraftRegion?.ok ? normalizedDraftRegion.canonical : "",
+              emEh: normalizeOptionalText(draft.emEh) ?? "",
+              employee: normalizeOptionalText(draft.employee) ?? "",
+              currentGmName: normalizeOptionalText(draft.currentGmName) ?? "",
+              universeMarket: draft.universeMarket == null ? true : Boolean(draft.universeMarket),
+              marketType: "universum",
+              isActive: draft.isActive == null ? true : Boolean(draft.isActive),
+              visitFrequencyPerYear: Number(draft.visitFrequencyPerYear ?? 0),
+              infoFlag: Boolean(draft.infoFlag ?? false),
+              infoNote: normalizeOptionalText(draft.infoNote) ?? "",
+              importSourceFileName: payload.fileName,
+              importedAt,
+              isDeleted: false,
+            });
             continue;
           }
 
           const patch = buildUpdateOnlyMarketPatch(draft, mappedUpdateFields, normalizedDraftRegion);
+          if (draft.isActive == null && matches[0]?.isActive === false) patch.isActive = true;
           if (Object.keys(patch).length === 0) {
             summary.unchanged += 1;
             continue;
@@ -2988,8 +3303,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
 
           const matched = matches[0];
           if (!matched) {
-            summary.skipped += 1;
-            continue;
+            throw new Error(`SNAPSHOT_INVALID:Zeile ${rowNum}: Markt konnte nicht eindeutig erkannt werden.`);
           }
 
           const identityConflict = updateIdentityFields
@@ -3004,41 +3318,14 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             .find((conflict) => conflict != null);
 
           if (identityConflict) {
-            summary.skipped += 1;
-            if (summary.skippedReasons.length < 50) {
-              const ownerLocation = [
-                identityConflict.owner.address,
-                [identityConflict.owner.postalCode, identityConflict.owner.city].filter(Boolean).join(" "),
-              ]
-                .filter(Boolean)
-                .join(", ");
-              summary.skippedReasons.push({
-                row: rowNum,
-                reason:
-                  `${identityConflict.label} ${identityConflict.value} gehört bereits zu ` +
-                  `„${identityConflict.owner.name}“` +
-                  `${identityConflict.owner.flexNumber ? ` (Flex ${identityConflict.owner.flexNumber})` : ""}` +
-                  `${ownerLocation ? `, ${ownerLocation}` : ""}. Diese Zeile wurde nicht geändert.`,
-                sample: sampleText,
-                draft,
-                fetchedFields: [
-                  { label: "Flex-Nummer der Excel-Zeile", value: String(draft.flexNumber ?? flexIdentity) },
-                  { label: identityConflict.label, value: identityConflict.value },
-                  {
-                    label: "Bereits zugeordnet zu",
-                    value: `${identityConflict.owner.name}${identityConflict.owner.flexNumber ? ` / Flex ${identityConflict.owner.flexNumber}` : ""}`,
-                  },
-                ],
-              });
-            }
-            continue;
+            throw new Error(`SNAPSHOT_INVALID:Zeile ${rowNum}: ${identityConflict.label} ${identityConflict.value} gehört bereits zu „${identityConflict.owner.name}“. Import nicht angewendet.`);
           }
 
           if (!marketPatchHasChanges(matched, patch)) {
             summary.unchanged += 1;
             continue;
           }
-          if (bulkUniverseMarketOnly) {
+          if (bulkUniverseMarketOnly && patch.universeMarket != null) {
             const value = Boolean(patch.universeMarket);
             universeMarketUpdatesByMarketId.set(matched.id, value);
             continue;
@@ -3085,6 +3372,13 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           }
         }
 
+        for (let offset = 0; offset < pendingCreates.length; offset += 250) {
+          const batch = pendingCreates.slice(offset, offset + 250);
+          if (batch.length === 0) continue;
+          await tx.insert(markets).values(batch);
+          summary.created += batch.length;
+        }
+
         if (bulkUniverseMarketOnly) {
           const now = new Date();
           const trueIds: string[] = [];
@@ -3095,12 +3389,14 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           }
           await updateMarketIdsInChunks(tx, trueIds, {
             universeMarket: true,
+            isActive: true,
             importSourceFileName: payload.fileName,
             importedAt,
             updatedAt: now,
           });
           await updateMarketIdsInChunks(tx, falseIds, {
             universeMarket: false,
+            isActive: true,
             importSourceFileName: payload.fileName,
             importedAt,
             updatedAt: now,
@@ -3121,6 +3417,20 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             },
           });
         }
+
+        const snapshotPlan = planGmMarketSnapshot(existingMarkets, dataRows.flatMap((row, index) =>
+          row && !row.every((cell) => !cell.trim())
+            ? [{ row: index + 2, flexNumber: getMappedRawCell(row, payload.mapping, "flexNumber") }]
+            : [],
+        ), { deactivateSharedMarkets: true });
+        const deactivateIds = snapshotPlan.toDeactivate.map((market) => market.id);
+        await updateMarketIdsInChunks(tx, deactivateIds, {
+          isActive: false,
+          importSourceFileName: payload.fileName,
+          importedAt,
+          updatedAt: new Date(),
+        });
+        summary.deactivated = deactivateIds.length;
       });
 
       const fresh = await db
@@ -3139,6 +3449,9 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           importType,
           created: summary.created,
           updated: summary.updated,
+          deactivated: summary.deactivated,
+          reactivated: summary.reactivated,
+          sharedLeftActive: summary.sharedLeftActive,
           skipped: summary.skipped,
           unchanged: summary.unchanged,
         },
@@ -3353,7 +3666,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       return;
     }
 
-    if (importType === "kuehler") {
+    if (importType === "kuehler" || importType === "kuehler_snapshot") {
       await db.transaction(async (tx) => {
         await tx.execute(sql`set local lock_timeout = '5s'`);
         await tx.execute(sql`set local statement_timeout = '90s'`);
@@ -3369,6 +3682,18 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           .select()
           .from(marketKuehlerUnits)
           .where(eq(marketKuehlerUnits.isDeleted, false));
+        const isKuehlerSnapshot = importType === "kuehler_snapshot";
+        const snapshotPresentMarketIds = new Set<string>();
+        if (isKuehlerSnapshot) {
+          const snapshotPreview = buildKuehlerSnapshotPreview(payload, existingMarkets, existingUnits);
+          if (!snapshotPreview.canApply) {
+            throw new Error(`SNAPSHOT_INVALID:${snapshotPreview.issues[0]?.reason ?? "Ungültige Kühler-Daten"}`);
+          }
+          if (snapshotPreview.snapshotToken !== payload.snapshotToken) throw new Error("SNAPSHOT_STALE");
+          summary.deactivatedMarkets = snapshotPreview.deactivatedMarkets;
+          summary.createdMarkets = snapshotPreview.createdMarkets;
+          summary.reactivated = snapshotPreview.wouldReactivate;
+        }
 
         const marketByCanonicalStammnr = new Map<string, typeof markets.$inferSelect>();
         const marketsByCanonicalFlex = new Map<string, Array<typeof markets.$inferSelect>>();
@@ -3438,8 +3763,10 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           if (!row) continue;
           const rowNum = i + 2;
           if (row.every((cell) => !cell || !cell.trim())) {
-            summary.skipped += 1;
-            summary.kuehlerUnitsSkipped += 1;
+            if (!isKuehlerSnapshot) {
+              summary.skipped += 1;
+              summary.kuehlerUnitsSkipped += 1;
+            }
             continue;
           }
 
@@ -3563,7 +3890,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
               .values({
                 standardMarketNumber: null,
                 cokeMasterNumber: stammnr,
-                flexNumber: null,
+                flexNumber: isKuehlerSnapshot ? normalizeIdentity(seedDraft.flexNumber) : null,
                 name: String(seedDraft.name ?? ""),
                 dbName: "",
                 address: String(seedDraft.address ?? ""),
@@ -3598,14 +3925,29 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             const nextMarketType: MarketType =
               resolvedMarket.marketType === "universum" ? "both" : resolvedMarket.marketType;
             const nextUniverseMarket = deriveUniverseMarketFromType(nextMarketType);
+            const preserveGmCokeIdentity = isKuehlerSnapshot && resolvedMarket.marketType !== "kuehler";
+            const snapshotMarketPatch: Partial<typeof markets.$inferInsert> = isKuehlerSnapshot
+              ? {
+                  ...(draft.name != null ? { name: String(draft.name) } : {}),
+                  ...(draft.address != null ? { address: String(draft.address) } : {}),
+                  ...(draft.postalCode != null ? { postalCode: String(draft.postalCode) } : {}),
+                  ...(draft.city != null ? { city: String(draft.city) } : {}),
+                  ...(normalizedDraftRegion?.ok ? { region: normalizedDraftRegion.canonical } : {}),
+                  ...(resolvedMarket.marketType === "kuehler" && draft.flexNumber != null
+                    ? { flexNumber: normalizeIdentity(draft.flexNumber) }
+                    : {}),
+                  isActive: true,
+                }
+              : {};
             const shouldUpdateMarket =
               nextMarketType !== resolvedMarket.marketType ||
               nextUniverseMarket !== resolvedMarket.universeMarket ||
+              (isKuehlerSnapshot && marketPatchHasChanges(resolvedMarket, snapshotMarketPatch)) ||
               Boolean(
                 canonicalStammnr &&
                 (
                   normalizeStammnrForMatch(resolvedMarket.kuehlerStammnr) !== stammnr ||
-                  normalizeStammnrForMatch(resolvedMarket.cokeMasterNumber) !== stammnr
+                  (!preserveGmCokeIdentity && normalizeStammnrForMatch(resolvedMarket.cokeMasterNumber) !== stammnr)
                 ),
               );
 
@@ -3613,9 +3955,13 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
               const [updatedMarket] = await tx
                 .update(markets)
                 .set({
+                  ...snapshotMarketPatch,
                   marketType: nextMarketType,
                   universeMarket: nextUniverseMarket,
-                  ...(canonicalStammnr ? { kuehlerStammnr: stammnr, cokeMasterNumber: stammnr } : {}),
+                  ...(canonicalStammnr ? {
+                    kuehlerStammnr: stammnr,
+                    ...(!preserveGmCokeIdentity ? { cokeMasterNumber: stammnr } : {}),
+                  } : {}),
                   importSourceFileName: payload.fileName,
                   importedAt,
                   updatedAt: new Date(),
@@ -3645,6 +3991,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             summary.kuehlerUnitsSkipped += 1;
             continue;
           }
+          if (isKuehlerSnapshot) snapshotPresentMarketIds.add(resolvedMarket.id);
 
           const normalizedInternalId = normalizeIdentity(draft.kuehlerInternalId);
           const canonicalInternalId = normStr(normalizedInternalId ?? "");
@@ -3685,18 +4032,27 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           }
           const existingUnit = existingUnitByInternalId ?? existingUnitByTechnicalIdentNo;
           if (existingUnit) {
+              const snapshotUnitPatch = isKuehlerSnapshot
+                ? buildKuehlerUpdatePatch(draft, getMappedKuehlerUpdateFields(payload.mapping))
+                : null;
+              if (isKuehlerSnapshot && !kuehlerSnapshotUnitNeedsUpdate(existingUnit, resolvedMarket.id, snapshotUnitPatch ?? {})) {
+                summary.unchanged += 1;
+                continue;
+              }
               const [updatedUnit] = await tx
                 .update(marketKuehlerUnits)
                 .set({
+                  ...(snapshotUnitPatch ?? {
+                    name: unitName,
+                    employee: unitEmployee,
+                    kuehlerInternalId: normalizedInternalId,
+                    kuehlerBd: unitBd,
+                    kuehlerAnzahlKsAmStandort: unitCount,
+                    kuehlerSerialNumber: unitSerial,
+                    kuehlerTechnicalIdentNo: normalizedTechnicalIdentNo,
+                    kuehlerModel: unitModel,
+                  }),
                   marketId: resolvedMarket.id,
-                  name: unitName,
-                  employee: unitEmployee,
-                  kuehlerInternalId: normalizedInternalId,
-                  kuehlerBd: unitBd,
-                  kuehlerAnzahlKsAmStandort: unitCount,
-                  kuehlerSerialNumber: unitSerial,
-                  kuehlerTechnicalIdentNo: normalizedTechnicalIdentNo,
-                  kuehlerModel: unitModel,
                   importSourceFileName: payload.fileName,
                   importedAt,
                   isDeleted: false,
@@ -3745,6 +4101,21 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             summary.kuehlerUnitsSkipped += 1;
           }
         }
+        if (isKuehlerSnapshot) {
+          if (summary.kuehlerUnitsSkipped > 0 || summary.skipped > 0) {
+            throw new Error("SNAPSHOT_INVALID:Mindestens eine Kühlerzeile konnte nicht verarbeitet werden. Keine Änderung wurde gespeichert.");
+          }
+          const missingIds = existingMarkets
+            .filter((market) => market.isActive && (market.marketType === "kuehler" || market.marketType === "both") && !snapshotPresentMarketIds.has(market.id))
+            .map((market) => market.id);
+          await updateMarketIdsInChunks(tx, missingIds, {
+            isActive: false,
+            importSourceFileName: payload.fileName,
+            importedAt,
+            updatedAt: new Date(),
+          });
+          summary.deactivated = missingIds.length;
+        }
       });
 
       const fresh = await db
@@ -3774,73 +4145,6 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       return;
     }
 
-    const rowDecisionByIndex = new Map<number, { kind: "accepted" | "duplicate" | "conflict"; reason?: string }>();
-    const cokeByFlex = new Map<string, string>();
-    const flexByCoke = new Map<string, string>();
-    const firstRowByPair = new Map<string, number>();
-    const pairByStandard = new Map<string, string>();
-    const firstRowByStandard = new Map<string, number>();
-    for (let i = 0; i < dataRows.length; i += 1) {
-      const row = dataRows[i];
-      if (!row) continue;
-      const draft = mapRowToDraft(row, payload.mapping, importType);
-      const stdKey = normStr(normalizeIdentity(draft.standardMarketNumber)?.toString());
-      const cokeKey = normStr(normalizeIdentity(draft.cokeMasterNumber)?.toString());
-      const flexKey = normStr(normalizeIdentity(draft.flexNumber)?.toString());
-      if (!flexKey || !cokeKey) {
-        rowDecisionByIndex.set(i, { kind: "accepted" });
-        continue;
-      }
-
-      const pairKey = `${flexKey}|${cokeKey}`;
-      const firstPairRow = firstRowByPair.get(pairKey);
-      if (firstPairRow != null) {
-        summary.duplicateInputRowsMerged += 1;
-        rowDecisionByIndex.set(i, { kind: "duplicate" });
-        continue;
-      }
-
-      const existingCokeForFlex = cokeByFlex.get(flexKey);
-      if (existingCokeForFlex && existingCokeForFlex !== cokeKey) {
-        const existingPairRow = firstRowByPair.get(`${flexKey}|${existingCokeForFlex}`);
-        rowDecisionByIndex.set(i, {
-          kind: "conflict",
-          reason: `Identitätskonflikt: Flex-Nummer ${String(draft.flexNumber ?? flexKey)} ist bereits mit Stammnr. von Coke ${existingCokeForFlex} verknüpft (erste Zeile ${(existingPairRow ?? i) + 2}).`,
-        });
-        continue;
-      }
-
-      const existingFlexForCoke = flexByCoke.get(cokeKey);
-      if (existingFlexForCoke && existingFlexForCoke !== flexKey) {
-        const existingPairRow = firstRowByPair.get(`${existingFlexForCoke}|${cokeKey}`);
-        rowDecisionByIndex.set(i, {
-          kind: "conflict",
-          reason: `Identitätskonflikt: Stammnr. von Coke ${String(draft.cokeMasterNumber ?? cokeKey)} ist bereits mit Flex-Nummer ${existingFlexForCoke} verknüpft (erste Zeile ${(existingPairRow ?? i) + 2}).`,
-        });
-        continue;
-      }
-
-      if (stdKey) {
-        const existingPairForStandard = pairByStandard.get(stdKey);
-        if (existingPairForStandard && existingPairForStandard !== pairKey) {
-          rowDecisionByIndex.set(i, {
-            kind: "conflict",
-            reason: `Identitätskonflikt: Standardmarkt Nr ${String(draft.standardMarketNumber ?? stdKey)} verweist auf mehrere Flex/Stammnr-Paare (erste Zeile ${(firstRowByStandard.get(stdKey) ?? i) + 2}).`,
-          });
-          continue;
-        }
-      }
-
-      rowDecisionByIndex.set(i, { kind: "accepted" });
-      firstRowByPair.set(pairKey, i);
-      cokeByFlex.set(flexKey, cokeKey);
-      flexByCoke.set(cokeKey, flexKey);
-      if (stdKey && !pairByStandard.has(stdKey)) {
-        pairByStandard.set(stdKey, pairKey);
-        firstRowByStandard.set(stdKey, i);
-      }
-    }
-
     await db.transaction(async (tx) => {
       await tx.execute(sql`set local lock_timeout = '5s'`);
       await tx.execute(sql`set local statement_timeout = '90s'`);
@@ -3854,11 +4158,11 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       const byStandard = new Map<string, typeof markets.$inferSelect>();
       const byCoke = new Map<string, typeof markets.$inferSelect>();
       const byFlex = new Map<string, typeof markets.$inferSelect>();
-      const byNamePlz = new Map<string, typeof markets.$inferSelect>();
-      const pendingByStandard = new Map<string, number>();
-      const pendingByCoke = new Map<string, number>();
-      const pendingByFlex = new Map<string, number>();
-      const pendingByNamePlz = new Map<string, number>();
+      const ambiguousFlex = new Set<string>();
+      const seenFlex = new Set<string>();
+      const pendingByStandard = new Map<string, { id: string }>();
+      const pendingByCoke = new Map<string, { id: string }>();
+      const pendingByFlex = new Map<string, { id: string }>();
       const pendingCreates: Array<typeof markets.$inferInsert> = [];
 
       const registerPending = (idx: number) => {
@@ -3867,12 +4171,10 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         const std = normStr((row.standardMarketNumber as string | null | undefined) ?? "");
         const coke = normStr((row.cokeMasterNumber as string | null | undefined) ?? "");
         const flex = normStr((row.flexNumber as string | null | undefined) ?? "");
-        const name = normStr((row.name as string | undefined) ?? "");
-        const plz = normStr((row.postalCode as string | undefined) ?? "");
-        if (std) pendingByStandard.set(std, idx);
-        if (coke) pendingByCoke.set(coke, idx);
-        if (flex) pendingByFlex.set(flex, idx);
-        pendingByNamePlz.set(`${name}|${plz}`, idx);
+        const owner = { id: `pending:${idx}` };
+        if (std) pendingByStandard.set(std, owner);
+        if (coke) pendingByCoke.set(coke, owner);
+        if (flex) pendingByFlex.set(flex, owner);
       };
 
       for (const market of existing) {
@@ -3881,8 +4183,11 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           const cokeKey = normStr(market.cokeMasterNumber);
           if (cokeKey) byCoke.set(cokeKey, market);
         }
-        if (market.flexNumber) byFlex.set(normStr(market.flexNumber), market);
-        byNamePlz.set(`${normStr(market.name)}|${normStr(market.postalCode)}`, market);
+        if (market.flexNumber) {
+          const flexKey = normStr(market.flexNumber);
+          if (byFlex.has(flexKey)) ambiguousFlex.add(flexKey);
+          else byFlex.set(flexKey, market);
+        }
       }
 
       for (let i = 0; i < dataRows.length; i += 1) {
@@ -3916,20 +4221,37 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         const stdKey = normStr(stdIdentity ?? "");
         const cokeKey = normStr(cokeIdentity ?? "");
         const flexKey = normStr(flexIdentity ?? "");
-        const rowDecision = rowDecisionByIndex.get(i);
-        if (rowDecision?.kind === "duplicate") {
-          continue;
-        }
-        if (rowDecision?.kind === "conflict") {
+        if (!flexKey) {
           summary.skipped += 1;
           if (summary.skippedReasons.length < 50) {
-            summary.skippedReasons.push({
-              row: rowNum,
-              reason: rowDecision.reason ?? "Identitätskonflikt im Import",
-              sample: sampleText,
-              draft,
-            });
+            summary.skippedReasons.push({ row: rowNum, reason: "Flex-Nummer fehlt oder ist leer", sample: sampleText, draft, missingFields: ["Flex-Nummer (leer)"], missingFieldKeys: ["flexNumber"] });
           }
+          continue;
+        }
+        if (seenFlex.has(flexKey) || pendingByFlex.has(flexKey)) {
+          summary.duplicateInputRowsSkipped += 1;
+          continue;
+        }
+        if (ambiguousFlex.has(flexKey)) {
+          summary.skipped += 1;
+          if (summary.skippedReasons.length < 50) summary.skippedReasons.push({ row: rowNum, reason: `Flex-Nummer ${flexIdentity} ist in der Datenbank nicht eindeutig`, sample: sampleText, draft });
+          continue;
+        }
+        const classification = classifyUniversumImportRow(
+          { standard: stdKey, coke: cokeKey, flex: flexKey },
+          { byStandard, byCoke, byFlex },
+          { byStandard: pendingByStandard, byCoke: pendingByCoke, byFlex: pendingByFlex },
+        );
+        if (classification.kind === "identity-conflict") {
+          summary.skipped += 1;
+          if (summary.skippedReasons.length < 50) {
+            const label = classification.field === "standardMarketNumber" ? "Standardmarkt Nr" : "Stammnr. von Coke";
+            summary.skippedReasons.push({ row: rowNum, reason: `${label} ${classification.value} gehört bereits zu einem anderen Markt`, sample: sampleText, draft });
+          }
+          continue;
+        }
+        if (classification.kind === "duplicate-in-file") {
+          summary.duplicateInputRowsSkipped += 1;
           continue;
         }
 
@@ -3945,9 +4267,51 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
           }
           continue;
         }
+        const invalidBoolean = findInvalidBooleanUpdateValue(row, payload.mapping, getMappedUpdateFields(payload.mapping));
+        if (invalidBoolean) {
+          summary.skipped += 1;
+          if (summary.skippedReasons.length < 50) summary.skippedReasons.push({ row: rowNum, reason: `Ungültiger Ja/Nein-Wert für ${invalidBoolean.key}: ${invalidBoolean.raw}`, sample: sampleText, draft });
+          continue;
+        }
+        if (classification.kind === "existing") {
+          const matched = classification.value;
+          const patch = buildUpdateOnlyMarketPatch(draft, getMappedUpdateFields(payload.mapping), normalizedDraftRegion);
+          if (matched.marketType === "kuehler") {
+            patch.marketType = "both";
+            patch.universeMarket = true;
+          }
+          seenFlex.add(flexKey);
+          summary.matchedBy.flexNumber += 1;
+          if (!marketPatchHasChanges(matched, patch)) {
+            summary.unchanged += 1;
+            continue;
+          }
+          const [updated] = await tx.update(markets).set({
+            ...patch,
+            importSourceFileName: payload.fileName,
+            importedAt,
+            updatedAt: new Date(),
+          }).where(eq(markets.id, matched.id)).returning();
+          if (updated) {
+            if (stdKey && stdKey !== normStr(matched.standardMarketNumber ?? "")) {
+              const oldKey = normStr(matched.standardMarketNumber ?? "");
+              if (oldKey && byStandard.get(oldKey)?.id === matched.id) byStandard.delete(oldKey);
+              byStandard.set(stdKey, updated);
+            }
+            if (cokeKey && cokeKey !== normStr(matched.cokeMasterNumber ?? "")) {
+              const oldKey = normStr(matched.cokeMasterNumber ?? "");
+              if (oldKey && byCoke.get(oldKey)?.id === matched.id) byCoke.delete(oldKey);
+              byCoke.set(cokeKey, updated);
+            }
+            byFlex.set(flexKey, updated);
+            summary.updated += 1;
+          }
+          continue;
+        }
         const hasRequiredUniversumFields = Boolean(
           flexIdentity &&
           (allowMissingCokeMasterNumber || cokeIdentity) &&
+          draft.name &&
           draft.address &&
           draft.postalCode &&
           draft.city &&
@@ -3956,166 +4320,25 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         if (!hasRequiredUniversumFields) {
           summary.skipped += 1;
           if (summary.skippedReasons.length < 50) {
-            const skipMeta = buildSkipMeta(
-              draft,
-              payload.mapping,
-              importType,
-            );
-            const filteredMissingFieldKeys = allowMissingCokeMasterNumber
-              ? skipMeta.missingFieldKeys.filter((key) => key !== "cokeMasterNumber")
-              : skipMeta.missingFieldKeys;
-            const filteredMissingFields = allowMissingCokeMasterNumber
-              ? skipMeta.missingFields.filter((_, index) => skipMeta.missingFieldKeys[index] !== "cokeMasterNumber")
-              : skipMeta.missingFields;
+            const skipMeta = buildSkipMeta(draft, payload.mapping, importType);
+            const requiredKeys: ImportFieldKey[] = ["flexNumber", "name", "address", "postalCode", "city", "region"];
+            if (!allowMissingCokeMasterNumber) requiredKeys.splice(1, 0, "cokeMasterNumber");
+            const labels: Record<string, string> = {
+              flexNumber: "Flex-Nummer", cokeMasterNumber: "Stammnr. von Coke", name: "Name",
+              address: "Adresse", postalCode: "PLZ", city: "Ort", region: "Region",
+            };
+            const missingFieldKeys = requiredKeys.filter((key) => !hasImportValue(draft[key]));
             summary.skippedReasons.push({
               row: rowNum,
               reason: allowMissingCokeMasterNumber
-                ? "Universum-Markt ohne Pflichtfelder (Flex-Nummer, Adresse, PLZ, Ort, Region)"
-                : "Universum-Markt ohne Pflichtfelder (Flex-Nummer, Stammnr. von Coke, Adresse, PLZ, Ort, Region)",
+                ? "Neuer Universum-Markt ohne Pflichtfelder (Flex-Nummer, Name, Adresse, PLZ, Ort, Region)"
+                : "Neuer Universum-Markt ohne Pflichtfelder (Flex-Nummer, Stammnr. von Coke, Name, Adresse, PLZ, Ort, Region)",
               sample: sampleText,
               draft,
-              missingFields: filteredMissingFields,
-              missingFieldKeys: filteredMissingFieldKeys,
+              missingFields: missingFieldKeys.map((key) => `${labels[key]} (${isValidColLetter(payload.mapping[key] ?? "") ? "leer" : "nicht gemappt"})`),
+              missingFieldKeys,
               fetchedFields: skipMeta.fetchedFields,
             });
-          }
-          continue;
-        }
-
-        let matched: typeof markets.$inferSelect | undefined;
-        let matchedPendingIndex: number | undefined;
-        let matchKey: keyof typeof summary.matchedBy | null = null;
-        const namePlzKey = `${normStr(String(draft.name ?? ""))}|${normStr(String(draft.postalCode ?? ""))}`;
-        const allowNamePlzFallback = !(importType === "universum" && flexKey);
-
-        if (stdKey && byStandard.has(stdKey)) {
-          matched = byStandard.get(stdKey);
-          matchKey = "standardMarketNumber";
-        } else if (stdKey && pendingByStandard.has(stdKey)) {
-          matchedPendingIndex = pendingByStandard.get(stdKey);
-          matchKey = "standardMarketNumber";
-        } else if (cokeKey && byCoke.has(cokeKey)) {
-          matched = byCoke.get(cokeKey);
-          matchKey = "cokeMasterNumber";
-        } else if (cokeKey && pendingByCoke.has(cokeKey)) {
-          matchedPendingIndex = pendingByCoke.get(cokeKey);
-          matchKey = "cokeMasterNumber";
-        } else if (flexKey && byFlex.has(flexKey)) {
-          matched = byFlex.get(flexKey);
-          matchKey = "flexNumber";
-        } else if (flexKey && pendingByFlex.has(flexKey)) {
-          matchedPendingIndex = pendingByFlex.get(flexKey);
-          matchKey = "flexNumber";
-        } else if (allowNamePlzFallback && namePlzKey && byNamePlz.has(namePlzKey)) {
-          matched = byNamePlz.get(namePlzKey);
-          matchKey = "namePLZ";
-        } else if (allowNamePlzFallback && namePlzKey && pendingByNamePlz.has(namePlzKey)) {
-          matchedPendingIndex = pendingByNamePlz.get(namePlzKey);
-          matchKey = "namePLZ";
-        }
-
-        if (matched) {
-          const nextMarketType: MarketType = matched.marketType === "kuehler" ? "both" : matched.marketType;
-          const nextUniverseMarket = deriveUniverseMarketFromType(nextMarketType);
-          const [updated] = await tx
-            .update(markets)
-            .set({
-              standardMarketNumber:
-                draft.standardMarketNumber != null
-                  ? normalizeIdentity(String(draft.standardMarketNumber))
-                  : matched.standardMarketNumber,
-              cokeMasterNumber:
-                draft.cokeMasterNumber != null
-                  ? normalizeIdentity(String(draft.cokeMasterNumber))
-                  : matched.cokeMasterNumber,
-              flexNumber:
-                draft.flexNumber != null ? normalizeIdentity(String(draft.flexNumber)) : matched.flexNumber,
-              name: draft.name != null ? String(draft.name) : matched.name,
-              dbName:
-                draft.dbName != null ? (normalizeOptionalText(String(draft.dbName)) ?? "") : matched.dbName,
-              address: draft.address != null ? String(draft.address) : matched.address,
-              postalCode: draft.postalCode != null ? String(draft.postalCode) : matched.postalCode,
-              city: draft.city != null ? String(draft.city) : matched.city,
-              region:
-                draft.region != null && normalizedDraftRegion?.ok
-                  ? normalizedDraftRegion.canonical
-                  : matched.region,
-              emEh:
-                draft.emEh != null ? (normalizeOptionalText(String(draft.emEh)) ?? "") : matched.emEh,
-              employee:
-                draft.employee != null
-                  ? (normalizeOptionalText(String(draft.employee)) ?? "")
-                  : matched.employee,
-              universeMarket: nextUniverseMarket,
-              marketType: nextMarketType,
-              kuehlerStammnr: matched.kuehlerStammnr,
-              visitFrequencyPerYear:
-                draft.visitFrequencyPerYear != null
-                  ? Number(draft.visitFrequencyPerYear)
-                  : matched.visitFrequencyPerYear,
-              infoFlag: draft.infoFlag != null ? Boolean(draft.infoFlag) : matched.infoFlag,
-              importSourceFileName: payload.fileName,
-              importedAt,
-              updatedAt: new Date(),
-            })
-            .where(eq(markets.id, matched.id))
-            .returning();
-
-          if (updated) {
-            summary.updated += 1;
-            if (matchKey) summary.matchedBy[matchKey] += 1;
-            if (updated.standardMarketNumber) byStandard.set(normStr(updated.standardMarketNumber), updated);
-            if (updated.cokeMasterNumber) {
-              const nextCokeKey = normStr(updated.cokeMasterNumber);
-              if (nextCokeKey) byCoke.set(nextCokeKey, updated);
-            }
-            if (updated.flexNumber) byFlex.set(normStr(updated.flexNumber), updated);
-            byNamePlz.set(`${normStr(updated.name)}|${normStr(updated.postalCode)}`, updated);
-          }
-          continue;
-        }
-
-        if (matchedPendingIndex != null) {
-          const pending = pendingCreates[matchedPendingIndex];
-          if (pending) {
-            pending.standardMarketNumber =
-              draft.standardMarketNumber != null
-                ? normalizeIdentity(String(draft.standardMarketNumber))
-                : pending.standardMarketNumber;
-            pending.cokeMasterNumber =
-              draft.cokeMasterNumber != null
-                ? normalizeIdentity(String(draft.cokeMasterNumber))
-                : pending.cokeMasterNumber;
-            pending.flexNumber =
-              draft.flexNumber != null ? normalizeIdentity(String(draft.flexNumber)) : pending.flexNumber;
-            pending.name = draft.name != null ? String(draft.name) : pending.name;
-            pending.dbName =
-              draft.dbName != null ? (normalizeOptionalText(String(draft.dbName)) ?? "") : pending.dbName;
-            pending.address = draft.address != null ? String(draft.address) : pending.address;
-            pending.postalCode = draft.postalCode != null ? String(draft.postalCode) : pending.postalCode;
-            pending.city = draft.city != null ? String(draft.city) : pending.city;
-            pending.region =
-              draft.region != null && normalizedDraftRegion?.ok
-                ? normalizedDraftRegion.canonical
-                : pending.region;
-            pending.emEh = draft.emEh != null ? (normalizeOptionalText(String(draft.emEh)) ?? "") : pending.emEh;
-            pending.employee =
-              draft.employee != null ? (normalizeOptionalText(String(draft.employee)) ?? "") : pending.employee;
-            const pendingType = (pending.marketType as MarketType | null | undefined) ?? "universum";
-            const nextPendingType: MarketType = pendingType === "kuehler" ? "both" : pendingType;
-            pending.marketType = nextPendingType;
-            pending.universeMarket = deriveUniverseMarketFromType(nextPendingType);
-            pending.isActive = pending.isActive ?? true;
-            pending.visitFrequencyPerYear =
-              draft.visitFrequencyPerYear != null
-                ? Number(draft.visitFrequencyPerYear)
-                : pending.visitFrequencyPerYear;
-            pending.infoFlag = draft.infoFlag != null ? Boolean(draft.infoFlag) : pending.infoFlag;
-            pending.importSourceFileName = payload.fileName;
-            pending.importedAt = importedAt;
-            registerPending(matchedPendingIndex);
-            summary.updated += 1;
-            if (matchKey) summary.matchedBy[matchKey] += 1;
           }
           continue;
         }
@@ -4137,7 +4360,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             visitFrequencyPerYear: Number(draft.visitFrequencyPerYear ?? 0),
             infoFlag: Boolean(draft.infoFlag ?? false),
             infoNote: "",
-            universeMarket: true,
+            universeMarket: draft.universeMarket == null ? true : Boolean(draft.universeMarket),
             marketType: "universum",
             kuehlerStammnr: null,
             isActive: true,
@@ -4146,6 +4369,7 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
             isDeleted: false,
           }) - 1;
         summary.created += 1;
+        seenFlex.add(flexKey);
         registerPending(pendingIndex);
       }
 
@@ -4174,12 +4398,22 @@ adminMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
         importType,
         created: summary.created,
         updated: summary.updated,
+        existingMatchesSkipped: summary.existingMatchesSkipped,
+        duplicateInputRowsSkipped: summary.duplicateInputRowsSkipped,
         skipped: summary.skipped,
         duplicateInputRowsMerged: summary.duplicateInputRowsMerged,
       },
     });
     res.status(200).json({ markets: fresh.map(mapMarketRow), summary });
   } catch (err) {
+    if (err instanceof Error && err.message === "SNAPSHOT_STALE") {
+      res.status(409).json({ error: "Die Marktdaten haben sich seit der Vorschau geändert. Bitte die Vorschau erneut laden und prüfen." });
+      return;
+    }
+    if (err instanceof Error && err.message.startsWith("SNAPSHOT_INVALID:")) {
+      res.status(422).json({ error: err.message.slice("SNAPSHOT_INVALID:".length) });
+      return;
+    }
     if (err instanceof Error && err.message === "IMPORT_IN_PROGRESS") {
       logAction("warn", "market_import_in_progress", {
         req,

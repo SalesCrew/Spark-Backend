@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildKuehlerUpdatePatch } from "./routes/markets.js";
+import { buildKuehlerUpdatePatch, kuehlerSnapshotUnitNeedsUpdate } from "./routes/markets.js";
 
 test("Kühler update import patches only explicitly mapped non-empty values", () => {
   const patch = buildKuehlerUpdatePatch(
@@ -46,4 +46,15 @@ test("Kühler update import can patch several selected datasets together", () =>
     kuehlerAnzahlKsAmStandort: 3,
     kuehlerModel: "CCH-500",
   });
+});
+
+test("Kühler snapshot does not rewrite an unchanged device but applies real differences", () => {
+  const unit = {
+    marketId: "market-1",
+    kuehlerSerialNumber: "SERIAL-OLD",
+  } as Parameters<typeof kuehlerSnapshotUnitNeedsUpdate>[0];
+  assert.equal(kuehlerSnapshotUnitNeedsUpdate(unit, "market-1", {}), false);
+  assert.equal(kuehlerSnapshotUnitNeedsUpdate(unit, "market-1", { kuehlerSerialNumber: "SERIAL-OLD" }), false);
+  assert.equal(kuehlerSnapshotUnitNeedsUpdate(unit, "market-1", { kuehlerSerialNumber: "SERIAL-NEW" }), true);
+  assert.equal(kuehlerSnapshotUnitNeedsUpdate(unit, "market-2", {}), true);
 });
