@@ -40,6 +40,7 @@ import { resolveSmAssignmentValues } from "../sm-planning.shared.js";
 import { assertSmVisitTimeAvailable, SmTimeOverlapError } from "../sm-time-overlap.js";
 import { lockSmPlanning } from "../sm-planning-lock.js";
 import { smDeactivationToday } from "../sm-market-deactivation.js";
+import { buildSmAssignmentCompletionUpdate } from "../sm-visit-time.shared.js";
 import {
   isCompleteSmVisitAnswer,
   isAnsweredSmVisitPayload,
@@ -1372,12 +1373,12 @@ smVisitsRouter.post("/:assignmentId/submit", async (req: AuthedRequest, res, nex
         lastSavedAt: now,
         updatedAt: now,
       }).where(eq(smQuestionnaireSubmissions.id, submission.id));
-      await tx.update(smAssignments).set({
-        status: "completed",
-        completedAt: effectiveVisitCompletedAt ?? now,
-        updatedByUserId: actor.appUserId,
+      await tx.update(smAssignments).set(buildSmAssignmentCompletionUpdate({
+        visitStartedAt: effectiveVisitStartedAt,
+        visitCompletedAt: effectiveVisitCompletedAt,
+        actorUserId: actor.appUserId,
         updatedAt: now,
-      }).where(eq(smAssignments.id, assignmentId));
+      })).where(eq(smAssignments.id, assignmentId));
       await tx.insert(smAssignmentEvents).values({
         assignmentId,
         seriesId: assignment.seriesId,
