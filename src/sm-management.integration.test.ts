@@ -11,6 +11,7 @@ import { isolatedModule } from "../tests/isolated-module.js";
 import * as management from "./sm-management.js";
 import * as planning from "./sm-planning.shared.js";
 import * as visitShared from "./sm-visit.shared.js";
+import * as visitTimeShared from "./sm-visit-time.shared.js";
 import * as dashboardShared from "./sm-dashboard.shared.js";
 import * as conditionalVisibility from "./lib/conditional-visibility.js";
 import * as comments from "./sm-comment.shared.js";
@@ -208,6 +209,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     const visitRoute = await isolatedModule<typeof import("./routes/sm-visits.js")>(new URL("./routes/sm-visits.ts", import.meta.url), {
       "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": authMock,
       "../lib/conditional-visibility.js": conditionalVisibility, "../sm-comment.shared.js": comments, "../sm-visit.shared.js": visitShared,
+      "../sm-visit-time.shared.js": visitTimeShared,
       "../sm-planning.shared.js": planning, "../sm-planning-lock.js": planningLock, "../sm-time-overlap.js": timeOverlap,
       "../sm-market-deactivation.js": { smDeactivationToday: () => "2026-09-15" },
       "../lib/supabase.js": { supabaseAdmin: { storage: { from: () => ({ createSignedUrl: async () => ({ data: { signedUrl: "https://local-storage.invalid/photo" }, error: null }) }) } } },
@@ -269,6 +271,30 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       assert.equal(blocked.body.code, "sm_visit_time_correction_pending_request");
       await database.update(schema.smAssignmentTimeChangeRequests).set({ status: "cancelled" }).where(eq(schema.smAssignmentTimeChangeRequests.id, pending!.id));
       assert.equal((await database.select().from(schema.smAssignmentTimeSubmissions).where(eq(schema.smAssignmentTimeSubmissions.assignmentId, scheduled.id))).length, 2);
+
+      const legacyAssignment = await assignment("completed", { originalWorkDate: "2026-08-30" });
+      const legacy = await seed();
+      await database.update(schema.smQuestionnaireSubmissions).set({
+        assignmentId: legacyAssignment.id,
+        visitTimeMode: "manual",
+        visitStartedAt: null,
+        visitCompletedAt: null,
+        manualVisitMinutes: 45,
+      }).where(eq(schema.smQuestionnaireSubmissions.id, legacy.submission.id));
+      await database.insert(schema.smAssignmentTimeSubmissions).values({ assignmentId: legacyAssignment.id, revisionNumber: 1, actualMinutes: 45, submittedByUserId: employee });
+      const legacyPayload = {
+        expectedVisitId: legacy.submission.id,
+        expectedStartedAt: null,
+        expectedCompletedAt: null,
+        visitStartedAt: "2026-08-30T07:00:00.000Z",
+        visitCompletedAt: "2026-08-30T07:45:00.000Z",
+        reason: "Fehlende Zeitstempel nachgetragen",
+      };
+      const legacyUpdated = await request(app).patch(`/admin-planning/assignments/${legacyAssignment.id}/visit-time`).set("x-local-role", "sm_admin").send(legacyPayload).expect(200);
+      assert.equal(legacyUpdated.body.actualMinutes, 45);
+      const [legacyVisit] = await database.select().from(schema.smQuestionnaireSubmissions).where(eq(schema.smQuestionnaireSubmissions.id, legacy.submission.id));
+      assert.equal(legacyVisit!.visitStartedAt?.toISOString(), legacyPayload.visitStartedAt);
+      assert.equal(legacyVisit!.visitCompletedAt?.toISOString(), legacyPayload.visitCompletedAt);
     });
 
     await t.test("employee planning hides cancelled only; admin retains it; restored and moved dates are visible", async () => {

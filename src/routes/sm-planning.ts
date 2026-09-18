@@ -111,12 +111,15 @@ const actualTimeSchema = z.object({
 
 const adminVisitTimeSchema = z.object({
   expectedVisitId: z.string().uuid(),
-  expectedStartedAt: z.string().datetime({ offset: true }),
-  expectedCompletedAt: z.string().datetime({ offset: true }),
+  expectedStartedAt: z.string().datetime({ offset: true }).nullable(),
+  expectedCompletedAt: z.string().datetime({ offset: true }).nullable(),
   visitStartedAt: z.string().datetime({ offset: true }),
   visitCompletedAt: z.string().datetime({ offset: true }),
   reason: z.string().trim().min(3).max(2_000),
 }).strict().superRefine((value, context) => {
+  if ((value.expectedStartedAt === null) !== (value.expectedCompletedAt === null)) {
+    context.addIssue({ code: "custom", path: ["expectedStartedAt"], message: "Die bisherigen Start- und Endzeiten müssen gemeinsam angegeben werden." });
+  }
   const elapsed = new Date(value.visitCompletedAt).getTime() - new Date(value.visitStartedAt).getTime();
   if (elapsed < 60_000 || elapsed > 86_400_000 || !Number.isFinite(elapsed)) {
     context.addIssue({ code: "custom", path: ["visitCompletedAt"], message: "Die Endzeit muss mindestens eine Minute nach der Startzeit und höchstens 24 Stunden später liegen." });
@@ -435,6 +438,12 @@ async function loadAssignments(from: string, to: string, smUserId?: string, empl
       ?? (row.seriesVersionId ? seriesVersionById.get(row.seriesVersionId) : undefined);
     const time = timeByAssignmentId.get(row.id);
     const visit = submissionByAssignmentId.get(row.id);
+    const recordedVisitStartedAt = visit?.visitStartedAt && visit.visitCompletedAt
+      ? visit.visitStartedAt
+      : row.startedAt && row.completedAt ? row.startedAt : null;
+    const recordedVisitCompletedAt = visit?.visitStartedAt && visit.visitCompletedAt
+      ? visit.visitCompletedAt
+      : row.startedAt && row.completedAt ? row.completedAt : null;
     return {
       id: row.id,
       sourceType: row.sourceType,
@@ -490,8 +499,8 @@ async function loadAssignments(from: string, to: string, smUserId?: string, empl
         questionnaireName: visit.questionnaireName,
         visitTimeMode: visit.visitTimeMode,
         travelMinutes: visit.travelMinutes,
-        visitStartedAt: visit.visitStartedAt?.toISOString() ?? null,
-        visitCompletedAt: visit.visitCompletedAt?.toISOString() ?? null,
+        visitStartedAt: recordedVisitStartedAt?.toISOString() ?? null,
+        visitCompletedAt: recordedVisitCompletedAt?.toISOString() ?? null,
         submittedAt: visit.submittedAt?.toISOString() ?? null,
       } : null,
       pendingTimeChangeRequest: requestByAssignmentId.has(row.id) ? publicTimeChangeRequest(requestByAssignmentId.get(row.id)!) : null,
@@ -1498,7 +1507,7 @@ adminSmPlanningRouter.patch("/assignments/:id/visit-time", async (req: AuthedReq
         eq(smQuestionnaireSubmissions.isCurrent, true),
         eq(smQuestionnaireSubmissions.isDeleted, false),
       )).limit(1).for("update");
-      if (!visit || !visit.visitStartedAt || !visit.visitCompletedAt) throw new SmPlanningError(409, "sm_visit_time_correction_missing_visit", "Der abgeschlossene Besuch mit Start und Ende wurde nicht gefunden. Bitte neu laden.");
+      if (!visit) throw new SmPlanningError(409, "sm_visit_time_correction_missing_visit", "Der abgeschlossene Besuch wurde nicht gefunden. Bitte neu laden.");
       const [currentTime] = await tx.select().from(smAssignmentTimeSubmissions).where(and(
         eq(smAssignmentTimeSubmissions.assignmentId, assignment.id),
         eq(smAssignmentTimeSubmissions.isCurrent, true),
@@ -1511,10 +1520,18 @@ adminSmPlanningRouter.patch("/assignments/:id/visit-time", async (req: AuthedReq
         eq(smAssignmentTimeChangeRequests.isDeleted, false),
       )).limit(1);
       if (pending) throw new SmPlanningError(409, "sm_visit_time_correction_pending_request", "Für diesen Besuch ist noch eine Zeitkorrekturanfrage offen. Bitte bearbeite sie zuerst.");
-      if (sameInstant(visit.visitStartedAt, startedAt) && sameInstant(visit.visitCompletedAt, completedAt)) {
+      const currentStartedAt = visit.visitStartedAt && visit.visitCompletedAt
+        ? visit.visitStartedAt
+        : assignment.startedAt && assignment.completedAt ? assignment.startedAt : null;
+      const currentCompletedAt = visit.visitStartedAt && visit.visitCompletedAt
+        ? visit.visitCompletedAt
+        : assignment.startedAt && assignment.completedAt ? assignment.completedAt : null;
+      const expectedStartedAt = input.expectedStartedAt ? new Date(input.expectedStartedAt) : null;
+      const expectedCompletedAt = input.expectedCompletedAt ? new Date(input.expectedCompletedAt) : null;
+      if (sameInstant(currentStartedAt, startedAt) && sameInstant(currentCompletedAt, completedAt)) {
         return { replayed: true, actualMinutes: currentTime.actualMinutes, revisionNumber: currentTime.revisionNumber };
       }
-      if (!sameInstant(visit.visitStartedAt, new Date(input.expectedStartedAt)) || !sameInstant(visit.visitCompletedAt, new Date(input.expectedCompletedAt))) {
+      if (!sameInstant(currentStartedAt, expectedStartedAt) || !sameInstant(currentCompletedAt, expectedCompletedAt)) {
         throw new SmPlanningError(409, "sm_visit_time_correction_stale", "Start oder Ende wurde zwischenzeitlich geändert. Bitte neu laden.");
       }
       await assertSmVisitTimeAvailable(tx, { smUserId: visit.smUserId, assignmentId: assignment.id, startedAt, completedAt });
@@ -1545,7 +1562,7 @@ adminSmPlanningRouter.patch("/assignments/:id/visit-time", async (req: AuthedReq
         eventType: "updated",
         actorUserId,
         reason: `SM-Besuchszeit korrigiert: ${input.reason}`,
-        beforeState: { visitId: visit.id, timeSubmissionId: currentTime.id, startedAt: visit.visitStartedAt.toISOString(), completedAt: visit.visitCompletedAt.toISOString(), actualMinutes: currentTime.actualMinutes },
+        beforeState: { visitId: visit.id, timeSubmissionId: currentTime.id, startedAt: currentStartedAt?.toISOString() ?? null, completedAt: currentCompletedAt?.toISOString() ?? null, actualMinutes: currentTime.actualMinutes },
         afterState: { visitId: visit.id, timeSubmissionId: time.id, startedAt: startedAt.toISOString(), completedAt: completedAt.toISOString(), actualMinutes },
       });
       return { replayed: false, actualMinutes, revisionNumber: time.revisionNumber };
