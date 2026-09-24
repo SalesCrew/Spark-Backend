@@ -2,6 +2,7 @@ import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { type Response, Router } from "express";
 import { z } from "zod";
 import { isFullAdminRole } from "../lib/admin-role.js";
+import { CampaignVisitReassignmentError, loadCampaignVisitProgress, reassignCampaignVisitTarget } from "../campaign-visit-reassignment.js";
 import { kuehlerSubmissionInDateRange, planKuehlerMarketAddition } from "../lib/kuehler-repeat-visits.js";
 import { kuehlerProgressKey } from "../lib/kuehler-assignment-progress.js";
 import { loadKuehlerAssignmentProgress } from "../lib/kuehler-assignment-progress-query.js";
@@ -64,6 +65,12 @@ const campaignAssignmentSchema = z
     visitTargetCount: z.coerce.number().int().min(1).optional(),
   })
   .strict();
+const reassignCampaignVisitSchema = z.object({
+  toGmUserId: z.string().uuid(),
+  expectedGmUserId: z.string().uuid().nullable(),
+  expectedVisitTargetCount: z.number().int().min(1),
+  visitNumber: z.number().int().min(1),
+}).strict();
 const campaignVisitExportBatchSchema = z
   .object({
     visits: z.array(z.object({
@@ -203,6 +210,8 @@ class CampaignDomainError extends Error {
     | "invalid_addition"
     | "addition_conflict"
     | "assignment_not_found"
+    | "assignment_changed"
+    | "visit_already_completed"
     | "addition_in_use"
     | "invalid_id"
     | "invalid_payload"
@@ -1060,6 +1069,7 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
   if (rows.length === 0) return [];
   const campaignIds = rows.map((row) => row.id);
   let assignments: Array<{
+    id: string;
     campaignId: string;
     marketId: string;
     gmUserId: string | null;
@@ -1071,6 +1081,7 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
   try {
     assignments = await db
       .select({
+        id: campaignMarketAssignments.id,
         campaignId: campaignMarketAssignments.campaignId,
         marketId: campaignMarketAssignments.marketId,
         gmUserId: campaignMarketAssignments.gmUserId,
@@ -1086,6 +1097,7 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
     if (!isMissingAssignmentSlotColumnError(error)) throw error;
     const legacyAssignments = await db
       .select({
+        id: campaignMarketAssignments.id,
         campaignId: campaignMarketAssignments.campaignId,
         marketId: campaignMarketAssignments.marketId,
         gmUserId: campaignMarketAssignments.gmUserId,
@@ -1112,6 +1124,7 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
   const assignmentRowsByCampaign = new Map<
     string,
     Array<{
+      id: string;
       marketId: string;
       gmUserId: string | null;
       assignmentSlot: number;
@@ -1125,6 +1138,7 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
     marketIdsByCampaign.set(row.campaignId, current);
     const assignmentRows = assignmentRowsByCampaign.get(row.campaignId) ?? [];
     assignmentRows.push({
+      id: row.id,
       marketId: row.marketId,
       gmUserId: row.gmUserId ?? null,
       assignmentSlot: row.assignmentSlot,
@@ -1254,6 +1268,7 @@ async function mapCampaignRows(rows: Array<typeof campaigns.$inferSelect>) {
     endDate: row.endDate ? String(row.endDate) : null,
     marketIds: normalizeUnique(marketIdsByCampaign.get(row.id) ?? []),
     assignments: (assignmentRowsByCampaign.get(row.id) ?? []).map((assignment) => ({
+      id: assignment.id,
       marketId: assignment.marketId,
       gmUserId: assignment.gmUserId,
       gmName: assignment.gmUserId ? (gmNameById.get(assignment.gmUserId) ?? null) : null,
@@ -3875,43 +3890,8 @@ adminCampaignsRouter.post("/campaigns", async (req: AuthedRequest, res, next) =>
       return { campaign: created, historyRow, assignments };
     });
 
-    const campaign = {
-      id: createResult.campaign.id,
-      name: createResult.campaign.name,
-      section: createResult.campaign.section,
-      currentFragebogenId: createResult.campaign.currentFragebogenId,
-      currentFragebogenName: null,
-      status: deriveEffectiveCampaignStatus({
-        status: createResult.campaign.status,
-        scheduleType: createResult.campaign.scheduleType,
-        startDate: createResult.campaign.startDate,
-        endDate: createResult.campaign.endDate,
-      }),
-      scheduleType: createResult.campaign.scheduleType,
-      startDate: createResult.campaign.startDate ? String(createResult.campaign.startDate) : null,
-      endDate: createResult.campaign.endDate ? String(createResult.campaign.endDate) : null,
-      marketIds: normalizeUnique(createResult.assignments.map((assignment) => assignment.marketId)),
-      assignments: createResult.assignments.map((assignment) => ({
-        marketId: assignment.marketId,
-        gmUserId: assignment.gmUserId,
-        gmName: null,
-        assignmentSlot: assignment.assignmentSlot,
-        visitTargetCount: assignment.visitTargetCount,
-        currentVisitsCount: 0,
-      })),
-      history: createResult.historyRow
-        ? [
-            {
-              id: createResult.historyRow.id,
-              fromFragebogenId: createResult.historyRow.fromFragebogenId,
-              toFragebogenId: createResult.historyRow.toFragebogenId,
-              changedAt: createResult.historyRow.changedAt.toISOString(),
-            },
-          ]
-        : [],
-      createdAt: createResult.campaign.createdAt.toISOString(),
-      updatedAt: createResult.campaign.updatedAt.toISOString(),
-    };
+    // Return persisted assignment IDs so the per-visit editor also works immediately after creation.
+    const [campaign] = await mapCampaignRows([createResult.campaign]);
     res.status(201).json({ campaign });
     logAction("info", "campaign_create_success", {
       req,
@@ -4707,6 +4687,72 @@ adminCampaignsRouter.post("/campaigns/:id/markets/migrate", async (req: AuthedRe
       error,
     });
     markErrorAsLogged(error);
+    next(error);
+  }
+});
+
+adminCampaignsRouter.get("/campaigns/:id/assignment-visits", async (req: AuthedRequest, res, next) => {
+  try {
+    const campaignId = String(req.params.id ?? "");
+    if (!isUuid(campaignId)) throw new CampaignDomainError("invalid_id", 400, "Ungültige Kampagnen-ID.");
+    const progress = await db.transaction((tx) => loadCampaignVisitProgress(tx, campaignId));
+    res.json({
+      completedByAssignmentId: Object.fromEntries(progress.completedByAssignmentId),
+      startedByAssignmentId: Object.fromEntries(progress.startedByAssignmentId),
+    });
+  } catch (error) {
+    if (error instanceof CampaignVisitReassignmentError) return void res.status(error.status).json({ error: error.message, code: error.code });
+    if (error instanceof CampaignDomainError) return void respondDomainError(res, error);
+    next(error);
+  }
+});
+
+adminCampaignsRouter.patch("/campaigns/:id/assignment-visits/:assignmentId", async (req: AuthedRequest, res, next) => {
+  const startedAtNs = startActionTimer();
+  try {
+    const campaignId = String(req.params.id ?? "");
+    const assignmentId = String(req.params.assignmentId ?? "");
+    if (!isUuid(campaignId) || !isUuid(assignmentId)) {
+      throw new CampaignDomainError("invalid_id", 400, "Ungültige Kampagnen- oder Besuchs-ID.");
+    }
+    const parsed = reassignCampaignVisitSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new CampaignDomainError("invalid_payload", 400, "Ungültige Besuchsumplanung.");
+    }
+    const input = parsed.data;
+    await ensureGmUsersExist([input.toGmUserId]);
+    const auditUserId = await resolveAuditUserId(req.authUser?.appUserId);
+    const now = new Date();
+
+    await db.transaction((tx) => reassignCampaignVisitTarget(tx, {
+      campaignId,
+      assignmentId,
+      toGmUserId: input.toGmUserId,
+      expectedGmUserId: input.expectedGmUserId,
+      expectedVisitTargetCount: input.expectedVisitTargetCount,
+      visitNumber: input.visitNumber,
+      auditUserId,
+      now,
+    }));
+
+    const [row] = await db.select().from(campaigns)
+      .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false))).limit(1);
+    const [campaign] = await mapCampaignRows(row ? [row] : []);
+    res.status(200).json({ campaign });
+    logAction("info", "campaign_visit_reassign_success", {
+      req, action: "campaign_visit_reassign", result: "success", statusCode: 200,
+      requestClass: "success", startedAtNs,
+      details: { campaignId, assignmentId, visitNumber: input.visitNumber },
+    });
+  } catch (error) {
+    if (error instanceof CampaignVisitReassignmentError) {
+      res.status(error.status).json({ error: error.message, code: error.code });
+      return;
+    }
+    if (error instanceof CampaignDomainError) {
+      respondDomainError(res, error);
+      return;
+    }
     next(error);
   }
 });
