@@ -3807,6 +3807,58 @@ test("campaign create blocks same-section overlapping market assignment with 409
   await request(app).patch(`/admin/markets/${marketId}/delete`).send({});
 });
 
+test("standard campaign can append and safely undo one more visit for an assigned GM", async (t) => {
+  enableTestAuthBypass();
+  if (!(await ensureDbReadyForCampaignTests())) {
+    t.skip("Campaign tables are not present in the configured test database.");
+    return;
+  }
+  const [gmUser] = await db.select({ id: users.id }).from(users)
+    .where(and(eq(users.role, "gm"), eq(users.isActive, true), isNull(users.deletedAt))).limit(1);
+  if (!gmUser?.id) {
+    t.skip("No active GM user available in the test database.");
+    return;
+  }
+  const app = createApp();
+  const marketsRes = await request(app).get("/markets");
+  assert.equal(marketsRes.status, 200);
+  const marketId = marketsRes.body.markets?.[0]?.id as string | undefined;
+  if (!marketId) {
+    t.skip("No market available in the test database.");
+    return;
+  }
+
+  const createRes = await request(app).post("/admin/campaigns").send({
+    name: `Campaign Additional Visit ${Date.now()}`,
+    section: "standard",
+    status: "inactive",
+    scheduleType: "always",
+    assignments: [{ marketId, gmUserId: gmUser.id }],
+  });
+  assert.equal(createRes.status, 201);
+  const campaignId = createRes.body.campaign.id as string;
+  const initialAssignmentId = createRes.body.campaign.assignments[0].id as string;
+  const additionId = randomUUID();
+  const payload = { additionId, assignments: [{ marketId, gmUserId: gmUser.id }] };
+
+  const addRes = await request(app).post(`/admin/campaigns/${campaignId}/markets`).send(payload);
+  assert.equal(addRes.status, 200);
+  const repeatRes = await request(app).post(`/admin/campaigns/${campaignId}/markets`).send(payload);
+  assert.equal(repeatRes.status, 200);
+  const assignmentsAfterAdd = repeatRes.body.campaign.assignments.filter(
+    (assignment: { marketId: string }) => assignment.marketId === marketId,
+  );
+  assert.deepEqual(assignmentsAfterAdd.map((assignment: { assignmentSlot: number }) => assignment.assignmentSlot).sort(), [1, 2]);
+  assert.equal(assignmentsAfterAdd.reduce((sum: number, assignment: { visitTargetCount: number }) => sum + assignment.visitTargetCount, 0), 2);
+  assert.equal(assignmentsAfterAdd.some((assignment: { id: string }) => assignment.id === initialAssignmentId), true);
+  assert.equal(assignmentsAfterAdd.some((assignment: { id: string }) => assignment.id === additionId), true);
+
+  const undoRes = await request(app).patch(`/admin/campaigns/${campaignId}/markets/${marketId}/delete`).send({ additionId });
+  assert.equal(undoRes.status, 200);
+  assert.deepEqual(undoRes.body.campaign.assignments.map((assignment: { id: string }) => assignment.id), [initialAssignmentId]);
+  await request(app).patch(`/admin/campaigns/${campaignId}/delete`).send({});
+});
+
 test("campaign create allows a completed Kühler market in a Zweitbesuch campaign", async (t) => {
   enableTestAuthBypass();
   if (!(await ensureDbReadyForCampaignTests()) || !(await ensureDbReadyForVisitSessionTests())) {

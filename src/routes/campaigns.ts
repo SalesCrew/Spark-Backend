@@ -4,6 +4,7 @@ import { z } from "zod";
 import { isFullAdminRole } from "../lib/admin-role.js";
 import { CampaignVisitReassignmentError, loadCampaignVisitProgress, reassignCampaignVisitTarget } from "../campaign-visit-reassignment.js";
 import { kuehlerSubmissionInDateRange, planKuehlerMarketAddition } from "../lib/kuehler-repeat-visits.js";
+import { planAdditionalMarketVisit } from "../lib/campaign-repeat-visits.js";
 import { kuehlerProgressKey } from "../lib/kuehler-assignment-progress.js";
 import { loadKuehlerAssignmentProgress } from "../lib/kuehler-assignment-progress-query.js";
 import { finalizeBonusForSubmittedVisitSessionTx, recomputeBonusWaveTx } from "../lib/bonus-finalizer.js";
@@ -4333,8 +4334,8 @@ adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, r
     if (!campaignForValidation) {
       throw new CampaignDomainError("campaign_not_found", 404, "Kampagne nicht gefunden.");
     }
-    if (parsed.data.additionId && (campaignForValidation.section !== "kuehler" || parsed.data.assignments?.length !== 1 || parsed.data.marketIds.length > 0)) {
-      throw new CampaignDomainError("invalid_addition", 400, "Ein weiterer Marktbesuch ist nur für eine einzelne Kühler-Marktzuweisung möglich.");
+    if (parsed.data.additionId && (campaignForValidation.section === "flex" || parsed.data.assignments?.length !== 1 || parsed.data.marketIds.length > 0)) {
+      throw new CampaignDomainError("invalid_addition", 400, "Ein weiterer Marktbesuch benötigt genau eine GM-Marktzuweisung außerhalb von Flex.");
     }
     const assignments = normalizeAssignments({
       section: campaignForValidation.section,
@@ -4385,12 +4386,23 @@ adminCampaignsRouter.post("/campaigns/:id/markets", async (req: AuthedRequest, r
         const previous = await tx.select().from(campaignMarketAssignments).where(and(
           eq(campaignMarketAssignments.campaignId, campaignId),
           eq(campaignMarketAssignments.marketId, assignment.marketId),
-          eq(campaignMarketAssignments.gmUserId, assignment.gmUserId!),
+          assignment.gmUserId
+            ? eq(campaignMarketAssignments.gmUserId, assignment.gmUserId)
+            : isNull(campaignMarketAssignments.gmUserId),
         ));
-        const units = await tx.select({ id: marketKuehlerUnits.id }).from(marketKuehlerUnits).where(and(
-          eq(marketKuehlerUnits.marketId, assignment.marketId), eq(marketKuehlerUnits.isDeleted, false),
-        ));
-        const planned = planKuehlerMarketAddition(previous, units.length);
+        let planned: { assignmentSlot: number; visitTargetCount: number };
+        if (campaignForValidation.section === "kuehler") {
+          const units = await tx.select({ id: marketKuehlerUnits.id }).from(marketKuehlerUnits).where(and(
+            eq(marketKuehlerUnits.marketId, assignment.marketId), eq(marketKuehlerUnits.isDeleted, false),
+          ));
+          planned = planKuehlerMarketAddition(previous, units.length);
+        } else {
+          const nextVisit = planAdditionalMarketVisit(previous);
+          if (!nextVisit) {
+            throw new CampaignDomainError("assignment_not_found", 409, "Für einen weiteren Besuch muss der Markt diesem GM bereits zugewiesen sein.");
+          }
+          planned = nextVisit;
+        }
         await tx.insert(campaignMarketAssignments).values({
           id: parsed.data.additionId, campaignId, marketId: assignment.marketId, gmUserId: assignment.gmUserId,
           ...planned, assignedAt: now, assignedByUserId: auditUserId, createdAt: now, updatedAt: now,
@@ -5086,9 +5098,7 @@ adminCampaignsRouter.patch("/campaigns/:id/markets/:marketId/delete", async (req
     const removed = additionId ? await db.transaction(async (tx) => {
       const [campaign] = await tx.select().from(campaigns)
         .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false))).for("update").limit(1);
-      if (!campaign || campaign.section !== "kuehler") {
-        throw new CampaignDomainError("invalid_addition", 400, "Einzelne Besuchszuweisungen können nur bei Kühlerinventur rückgängig gemacht werden.");
-      }
+      if (!campaign) throw new CampaignDomainError("campaign_not_found", 404, "Kampagne nicht gefunden.");
       const [addition] = await tx.select().from(campaignMarketAssignments).where(and(
         eq(campaignMarketAssignments.id, additionId), eq(campaignMarketAssignments.campaignId, campaignId),
         eq(campaignMarketAssignments.marketId, marketId),
