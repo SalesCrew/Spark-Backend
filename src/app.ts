@@ -34,6 +34,7 @@ import { adminSmDashboardRouter, smHomeDashboardRouter } from "./routes/sm-dashb
 import { smVisitsRouter } from "./routes/sm-visits.js";
 import { adminKurtiRouter } from "./routes/admin-kurti.js";
 import { adminIppRouter } from "./routes/ipp.js";
+import { adminGmDashboardRouter } from "./routes/admin-gm-dashboard.js";
 import { kundenUsersRouter } from "./routes/kunden-users.js";
 import { adminMarketsRouter, marketsRouter } from "./routes/markets.js";
 import { adminPhotosRouter } from "./routes/admin-photos.js";
@@ -195,6 +196,7 @@ function createApp() {
   app.use("/admin", adminCampaignsRouter);
   app.use("/admin", adminPhotosRouter);
   app.use("/admin", adminIppRouter);
+  app.use("/admin/gm-dashboard", adminGmDashboardRouter);
   app.use("/admin/praemien", adminPraemienRouter);
   app.use("/admin", adminRedMonthRouter);
   app.use("/admin/zeiterfassung", adminZeiterfassungRouter);

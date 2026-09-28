@@ -128,6 +128,7 @@ export function resolveKundeAdminRequirement(req: Request): {
     const sharedPage = resolveSharedQuestionnairePage(req);
     return { pageKey: sharedPage ?? "fotoarchiv", action };
   }
+  if (routeStartsWith(pathname, "/gm-dashboard") || routeStartsWith(originalPath, "/admin/gm-dashboard")) return { pageKey: "gm_dashboard", action: "read" };
   if (routeStartsWith(pathname, "/ipp") || routeStartsWith(originalPath, "/admin/ipp")) return { pageKey: "ipp_berechnung", action };
   if (routeStartsWith(pathname, "/praemien") || routeStartsWith(originalPath, "/admin/praemien")) return { pageKey: "praemien", action };
   if (routeStartsWith(pathname, "/zeiterfassung") || routeStartsWith(originalPath, "/admin/zeiterfassung")) return { pageKey: "zeiterfassung", action, allowAnyPagePermission: isExportRequest };

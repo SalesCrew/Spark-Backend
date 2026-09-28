@@ -29,10 +29,13 @@ import {
   users,
 } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
+import { createPraemienDashboardReadRouter } from "./praemien-dashboard-read.js";
+import { modelDatabase } from "../lib/praemien-workspace.js";
 
 const adminPraemienRouter = Router();
 adminPraemienRouter.use(requireAuth(["admin", "kunde"]));
 adminPraemienRouter.use(requireKundeAdminPermission);
+adminPraemienRouter.use("/workspace", createPraemienDashboardReadRouter(modelDatabase(db)));
 adminPraemienRouter.use((req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {
