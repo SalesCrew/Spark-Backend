@@ -1,7 +1,8 @@
-import { and, desc, eq, gte, inArray, isNotNull, lt } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { db, sql as pgSql } from "./db.js";
 import { loadEffectiveGmIppPeriods, loadIppPeriodCatalog } from "./ipp-gm-effective.js";
 import { gmKpiCache, visitSessions } from "./schema.js";
+import { managedCumulative, modelDatabase } from "./praemien-workspace.js";
 
 export type GmKpiSummary = {
   ippAllTimeAvg: number;
@@ -75,15 +76,22 @@ async function loadIppAggregateForGm(gmUserId: string): Promise<{ avg: number; c
 }
 
 async function loadBonusCumulativeForGm(gmUserId: string): Promise<number> {
-  if (!(await ensureBonusTotalsTableReady())) {
-    return 0;
-  }
-  const rows = await pgSql<{ bonus_total: string | number | null }[]>`
-    select coalesce(sum(current_reward_eur), 0) as bonus_total
-    from praemien_gm_wave_totals
-    where gm_user_id = ${gmUserId}
-  `;
-  return normalizeNumber(rows[0]?.bonus_total);
+  const values = await loadBonusCumulatives([gmUserId]);
+  return values.get(gmUserId) ?? 0;
+}
+
+async function loadBonusCumulatives(gmUserIds: string[]): Promise<Map<string, number>> {
+  const database = modelDatabase(db);
+  const managed = await managedCumulative(database, gmUserIds);
+  const result = new Map(managed.totals);
+  if (!(await ensureBonusTotalsTableReady())) return result;
+  const rows = await database.query<{ gmId: string; total: number | string }>(sql`
+    select gm_user_id as "gmId", coalesce(sum(current_reward_eur),0) as total
+    from praemien_gm_wave_totals where gm_user_id in (${sql.join(gmUserIds.map(id => sql`${id}::uuid`),sql`,`)})
+      ${managed.waveIds.length ? sql`and wave_id not in (${sql.join(managed.waveIds.map(id => sql`${id}::uuid`),sql`,`)})` : sql``}
+    group by gm_user_id`);
+  for (const row of rows) result.set(row.gmId, Number(((result.get(row.gmId) ?? 0) + normalizeNumber(row.total)).toFixed(2)));
+  return result;
 }
 
 export async function readGmKpiCache(gmUserId: string): Promise<GmKpiSummary | null> {
@@ -97,7 +105,7 @@ export async function readGmKpiCache(gmUserId: string): Promise<GmKpiSummary | n
   return normalizeSummary({
     ippAllTimeAvg: normalizeNumber(row.ippAllTimeAvg),
     ippSampleCount: row.ippSampleCount,
-    bonusCumulativeEur: normalizeNumber(row.bonusCumulativeEur),
+    bonusCumulativeEur: await loadBonusCumulativeForGm(gmUserId),
     lastComputedAt: row.lastComputedAt,
   });
 }
@@ -111,12 +119,13 @@ export async function readGmKpiCaches(gmUserIds: string[]): Promise<Map<string, 
     .select()
     .from(gmKpiCache)
     .where(and(inArray(gmKpiCache.gmUserId, uniqueIds), eq(gmKpiCache.isDeleted, false)));
+  const bonuses = await loadBonusCumulatives(uniqueIds);
 
   for (const row of rows) {
     result.set(row.gmUserId, normalizeSummary({
       ippAllTimeAvg: normalizeNumber(row.ippAllTimeAvg),
       ippSampleCount: row.ippSampleCount,
-      bonusCumulativeEur: normalizeNumber(row.bonusCumulativeEur),
+      bonusCumulativeEur: bonuses.get(row.gmUserId) ?? 0,
       lastComputedAt: row.lastComputedAt,
     }));
   }

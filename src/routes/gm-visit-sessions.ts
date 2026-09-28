@@ -8,6 +8,7 @@ import {
 import { ensureAndGetGmKpiCache, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { db } from "../lib/db.js";
+import { managedQuarterQuestionIds, modelDatabase } from "../lib/praemien-workspace.js";
 import { DEFAULT_TIMEZONE, ensureGmSubmissionGate, gmSubmissionGateError } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { planGmPhotoCommit } from "../lib/gm-photo-commit.js";
@@ -872,7 +873,10 @@ async function loadReusableSubmittedAnswersByQuestionId(input: {
         eq(praemienWavePillars.isDeleted, false),
       ),
     );
-  const quarterQuestionIds = normalizeUnique(quarterPersistentQuestionIds(waveQuestionRows));
+  const quarterQuestionIds = normalizeUnique([
+    ...quarterPersistentQuestionIds(waveQuestionRows),
+    ...await managedQuarterQuestionIds(modelDatabase(db), overlappingWaveIds, questionIds),
+  ]);
   if (quarterQuestionIds.length === 0) {
     return loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({ ...input, questionIds });
   }

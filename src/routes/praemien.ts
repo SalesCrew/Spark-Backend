@@ -29,13 +29,13 @@ import {
   users,
 } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
-import { createPraemienDashboardReadRouter } from "./praemien-dashboard-read.js";
-import { modelDatabase } from "../lib/praemien-workspace.js";
+import { createPraemienWorkspaceRouter } from './praemien-workspace.js';
+import { modelDatabase, workspaceReady } from '../lib/praemien-workspace.js';
 
 const adminPraemienRouter = Router();
 adminPraemienRouter.use(requireAuth(["admin", "kunde"]));
 adminPraemienRouter.use(requireKundeAdminPermission);
-adminPraemienRouter.use("/workspace", createPraemienDashboardReadRouter(modelDatabase(db)));
+adminPraemienRouter.use('/workspace', createPraemienWorkspaceRouter(modelDatabase(db)));
 adminPraemienRouter.use((req, res, next) => {
   const startedAtNs = startActionTimer();
   res.on("finish", () => {
@@ -680,11 +680,16 @@ function parseDateish(value: unknown): Date | null {
 }
 
 async function lockWaveTx(tx: Tx, waveId: string, expectedUpdatedAt?: string) {
-  const lockRows = await tx.execute<{ id: string; updatedAt: Date | string }>(
-    sql`select id, updated_at as "updatedAt" from praemien_waves where id = ${waveId} and is_deleted = false for update`,
+  const lockRows = await tx.execute<{ id: string; updatedAt: Date | string; status: string }>(
+    sql`select id, status, updated_at as "updatedAt" from praemien_waves where id = ${waveId} and is_deleted = false for update`,
   );
   const locked = lockRows[0];
   if (!locked) throw new PraemienDomainError("wave_not_found", 404, "Prämien-Welle nicht gefunden.");
+  if (locked.status === 'archived') throw new PraemienDomainError('wave_archived',409,'Abgeschlossene Quartale sind eingefroren.');
+  if (await workspaceReady(modelDatabase(tx))) {
+    const modern = await tx.execute(sql`select wave_id from praemien_wave_settings where wave_id=${waveId}`);
+    if (modern.length) throw new PraemienDomainError('wave_managed',409,'Diese Welle bitte im neuen Prämienbereich bearbeiten.');
+  }
   if (expectedUpdatedAt) {
     const current = parseDateish(locked.updatedAt);
     const expected = parseDateish(expectedUpdatedAt);
@@ -1727,11 +1732,14 @@ adminPraemienRouter.patch("/waves/:waveId/delete", async (req: AuthedRequest, re
       return;
     }
     const now = new Date();
-    const [updated] = await db
-      .update(praemienWaves)
-      .set({ isDeleted: true, deletedAt: now, updatedAt: now })
-      .where(and(eq(praemienWaves.id, waveId), eq(praemienWaves.isDeleted, false)))
-      .returning({ id: praemienWaves.id });
+    const updated = await db.transaction(async tx => {
+      await lockWaveTx(tx,waveId);
+      const [row] = await tx.update(praemienWaves)
+        .set({ isDeleted: true, deletedAt: now, updatedAt: now })
+        .where(and(eq(praemienWaves.id, waveId), eq(praemienWaves.isDeleted, false)))
+        .returning({ id: praemienWaves.id });
+      return row;
+    });
     if (!updated) {
       res.status(404).json({ error: "Prämien-Welle nicht gefunden.", code: "wave_not_found" });
       return;
@@ -1739,6 +1747,7 @@ adminPraemienRouter.patch("/waves/:waveId/delete", async (req: AuthedRequest, re
     logMutation(req, "delete_wave", { waveId });
     res.status(200).json({ ok: true, waveId });
   } catch (error) {
+    if (error instanceof PraemienDomainError) { sendDomainError(res,error); return; }
     next(error);
   }
 });

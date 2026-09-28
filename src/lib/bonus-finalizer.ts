@@ -4,6 +4,7 @@ import { DEFAULT_TIMEZONE, toYmdInTimezone } from "./day-session.js";
 import { recomputeGmKpiCache } from "./gm-kpi-cache.js";
 import { logAction, logger, serializeError, startActionTimer } from "./logger.js";
 import { calculateWaveReward, type PraemienPillarRewardInput } from "./praemien-rewards.js";
+import { isManagedWave, managedGmSummary, modelDatabase } from './praemien-workspace.js';
 import { redMonthPeriodToYmd, resolveCurrentRedPeriod, resolveRedPeriodForDate } from "./red-month-periods.js";
 import {
   markets,
@@ -41,6 +42,7 @@ export type BonusWaveRecomputeResult = {
 };
 
 type BonusDbExecutor = {
+  execute: typeof db.execute;
   select: typeof db.select;
   insert: typeof db.insert;
   update: typeof db.update;
@@ -641,6 +643,9 @@ async function finalizeBonusForSubmittedVisitSessionWithExecutor(
     fallbackTimezone: redPeriod.timezone || DEFAULT_TIMEZONE,
   });
   if (!wave) return { applied: false, waveId: null };
+  // Managed waves read committed answers on demand. No reward configuration can
+  // make a valid visit fail, and time/answer corrections need no stale cache job.
+  if (await isManagedWave(modelDatabase(executor),wave.id)) return { applied: false, waveId: wave.id };
 
   return finalizeBonusForSubmittedVisitSessionForWaveWithExecutor(executor, wave, redPeriod, input);
 }
@@ -814,6 +819,10 @@ export async function recomputeBonusWaveTx(
     return { applied: false, waveId, processedSessions: 0, affectedGmUserIds: [], skippedReason: "wave_not_active" };
   }
 
+  if (await isManagedWave(modelDatabase(executor),waveId)) {
+    return { applied: false, waveId, processedSessions: 0, affectedGmUserIds: [] };
+  }
+
   const previousGmRows = await executor
     .select({ gmUserId: praemienGmWaveTotals.gmUserId })
     .from(praemienGmWaveTotals)
@@ -974,6 +983,7 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
     };
   }
 
+  if (await isManagedWave(modelDatabase(db),wave.id)) return managedGmSummary(modelDatabase(db),wave.id,gmUserId);
   const [pillars, sources, thresholds, metrics, tiers, tierConditions, pillarRows, qualityRows, flexRows, overrideRows] = await Promise.all([
     db
       .select()

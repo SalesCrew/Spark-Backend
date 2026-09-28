@@ -130,7 +130,7 @@ export function resolveKundeAdminRequirement(req: Request): {
   }
   if (routeStartsWith(pathname, "/gm-dashboard") || routeStartsWith(originalPath, "/admin/gm-dashboard")) return { pageKey: "gm_dashboard", action: "read" };
   if (routeStartsWith(pathname, "/ipp") || routeStartsWith(originalPath, "/admin/ipp")) return { pageKey: "ipp_berechnung", action };
-  if (routeStartsWith(pathname, "/praemien") || routeStartsWith(originalPath, "/admin/praemien")) return { pageKey: "praemien", action };
+  if (routeStartsWith(pathname, "/praemien") || routeStartsWith(originalPath, "/admin/praemien")) return { pageKey: "praemien", action: req.method === "POST" && /^\/admin\/praemien\/workspace\/waves\/[^/]+\/preview$/.test(originalPath) ? "read" : action };
   if (routeStartsWith(pathname, "/zeiterfassung") || routeStartsWith(originalPath, "/admin/zeiterfassung")) return { pageKey: "zeiterfassung", action, allowAnyPagePermission: isExportRequest };
   if (routeStartsWith(pathname, "/markets") || originalUrl === "/markets" || originalUrl.startsWith("/markets?")) {
     const requestedPageKey = resolveKundePageKeyHeader(req);
