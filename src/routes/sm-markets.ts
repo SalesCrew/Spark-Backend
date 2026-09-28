@@ -7,6 +7,7 @@ import { smMarkets, users } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { resolveAutomaticSmNameMatch } from "../sm-market-user-sync.shared.js";
 import { lockSmPlanning } from "../sm-planning-lock.js";
+import { smMarketWeekdayColumns, smMarketWeekdayHoursSchema } from "../sm-market-weekly-planning.shared.js";
 import { deactivateSmMarket, loadSmMarketDeactivationPreview, smMarketDeactivationSchema, SmMarketDeactivationError } from "../sm-market-deactivation.js";
 
 export const adminSmMarketsRouter = Router();
@@ -71,9 +72,12 @@ const updateSmMarketSchema = createSmMarketSchema
   .omit({ internalMarketId: true })
   .extend({
     internalMarketId: z.string().trim().min(1).max(200).optional(),
+    weekdayHours: smMarketWeekdayHoursSchema.optional(),
+    expectedUpdatedAt: z.string().datetime().optional(),
   })
   .partial()
-  .strict();
+  .strict()
+  .refine((input) => input.expectedUpdatedAt === undefined || input.weekdayHours !== undefined);
 
 const manualSmUserMatchSchema = z
   .object({
@@ -863,6 +867,10 @@ adminSmMarketsRouter.patch("/:id", async (req, res, next) => {
     const updated = await db.transaction(async (tx) => {
       await lockSmPlanning(tx);
       const [current] = await tx.select().from(smMarkets).where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false))).limit(1).for("update");
+      if (!current) return undefined;
+      if (input.expectedUpdatedAt && current.updatedAt.toISOString() !== input.expectedUpdatedAt) {
+        throw new SmMarketDeactivationError(409, "sm_market_plan_changed", "Der Markt wurde inzwischen geändert. Bitte die Seite neu laden und die Wochenplanung erneut bearbeiten.");
+      }
       if (current?.isActive && input.isActive === false) throw new SmMarketDeactivationError(409, "sm_market_deactivation_required", "Bitte öffne die Deaktivierungsvorschau und entscheide zuerst über betroffene Einsätze.");
       const [saved] = await tx.update(smMarkets).set({
       ...(input.internalMarketId === undefined ? {} : { internalMarketId: input.internalMarketId }),
@@ -884,6 +892,7 @@ adminSmMarketsRouter.patch("/:id", async (req, res, next) => {
         fieldServiceManagerName: fieldServiceManager ? smUserDisplayName(fieldServiceManager) : "",
       }),
       ...(input.isActive === undefined ? {} : { isActive: input.isActive }),
+      ...(input.weekdayHours === undefined ? {} : smMarketWeekdayColumns(input.weekdayHours)),
       updatedAt: new Date(),
       }).where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false))).returning();
       return saved;
