@@ -55,6 +55,9 @@ import {
   questionScoring,
 } from "../lib/schema.js";
 import { filterFragebogenModuleLinksByActiveModuleIds } from "../lib/fragebogen-module-links.js";
+import { readModuleCatalogState } from "../lib/module-catalog-state.js";
+import { modelDatabase } from "../lib/praemien-workspace.js";
+import { createModuleCatalogStateRouter } from "./module-catalog-state.js";
 
 const adminFragebogenRouter = Router();
 adminFragebogenRouter.use(requireAuth(["admin", "kunde"]));
@@ -198,6 +201,7 @@ const moduleSchema = z
     createdAt: z.string().optional(),
     usedInCount: z.number().optional(),
     revision: z.number().int().positive().optional(),
+    catalogInactive: z.boolean().optional(),
     mutationToken: z.string().uuid().optional(),
   })
   .strict();
@@ -1758,6 +1762,8 @@ export async function fetchModulesUi(scope: Scope, ids?: string[]): Promise<UiMo
     .orderBy(desc((cfg.moduleTable as AnyTable).createdAt));
   if (moduleRows.length === 0) return [];
 
+  const catalogStates = await readModuleCatalogState(modelDatabase(db), scope);
+
   const moduleIds = moduleRows.map((row) => row.id);
   const links = await db
     .select()
@@ -1834,6 +1840,7 @@ export async function fetchModulesUi(scope: Scope, ids?: string[]): Promise<UiMo
     name: row.name,
     description: row.description ?? "",
     revision: Number(row.revision ?? 1),
+    catalogInactive: catalogStates.get(row.id) ?? false,
     createdAt: row.createdAt.toISOString(),
     usedInCount: usageMap.get(row.id) ?? 0,
     sectionKeywords: scope === "main" ? ((row as typeof moduleMain.$inferSelect).sectionKeywords ?? ["standard"]) : undefined,
@@ -2153,6 +2160,8 @@ adminFragebogenRouter.patch("/questions/:id", async (req, res, next) => {
     next(error);
   }
 });
+
+adminFragebogenRouter.use(createModuleCatalogStateRouter(modelDatabase(db)));
 
 adminFragebogenRouter.get("/modules/:scope", async (req, res, next) => {
   try {

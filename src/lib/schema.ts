@@ -2584,6 +2584,21 @@ export const questionPhotoTags = pgTable(
   ],
 );
 
+// Presentation metadata only: never filters questionnaire or visit execution.
+export const moduleCatalogState = pgTable(
+  "module_catalog_state",
+  {
+    scope: text("scope").$type<"main" | "kuehler" | "mhd" | "durcharbeit">().notNull(),
+    moduleId: uuid("module_id").notNull(),
+    inactive: boolean("inactive").notNull().default(false),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.scope, table.moduleId] }),
+    check("module_catalog_state_scope_check", sql`${table.scope} in ('main','kuehler','mhd','durcharbeit')`),
+  ],
+).enableRLS();
+
 export const moduleMain = pgTable("module_main", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: text("name").notNull(),
