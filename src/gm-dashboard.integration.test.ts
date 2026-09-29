@@ -4,7 +4,7 @@ import express from "express";
 import request from "supertest";
 import { praemienFixture } from "./lib/praemien-test-fixture.js";
 import { installDashboardFixture } from "./lib/gm-dashboard-test-fixture.js";
-import { loadDashboard, availabilityCategory } from "./lib/gm-dashboard.js";
+import { loadDashboard, dashboardFacets, availabilityCategory } from "./lib/gm-dashboard.js";
 import { createGmDashboardRouter } from "./routes/gm-dashboard.js";
 import type { DashboardScope } from "./gm-dashboard.shared.js";
 
@@ -128,6 +128,7 @@ test("real local PostgreSQL + HTTP: answer weights, all-visit means/splits, dedu
       .get("/admin/gm-dashboard/facets")
       .set("Authorization", "Bearer local");
     assert.equal(facets.status, 200);
+    assert.equal(facets.body.firstEntryDate, "2026-08-18");
     assert.equal(facets.body.markets.length, 1);
     assert.match(
       facets.body.gms.find((gm: any) => gm.id === f.ids.inactive).label,
@@ -217,6 +218,25 @@ test("real local PostgreSQL + HTTP: answer weights, all-visit means/splits, dedu
     const zero = (await loadDashboard(f.database, months, scope)).points[1]!;
     assert.equal(zero.placements, 0);
     assert.equal(zero.ipp, 0); // real zero != missing.
+  } finally {
+    await f.pg.close();
+  }
+});
+
+test("first visible entry comes from submitted history in Vienna, not creation dates/drafts/deleted visits; empty history is null", async () => {
+  const f = await praemienFixture();
+  try {
+    const fixture = await installDashboardFixture(f);
+    await fixture.seedVisit({ when: "2024-01-01T08:00:00Z", category: "Top", status: "draft" });
+    await fixture.seedVisit({ when: "2024-02-01T08:00:00Z", category: "Top", deleted: true });
+    await fixture.seedVisit({ when: "2099-01-01T08:00:00Z", category: "Top" });
+    assert.equal((await dashboardFacets(f.database)).firstEntryDate, "2026-08-18");
+    await fixture.seedVisit({ when: "2026-07-05T22:15:00Z", category: "Bad" });
+    const before = (await f.pg.query(`select count(*)::int as n from visit_sessions`)).rows[0];
+    assert.equal((await dashboardFacets(f.database)).firstEntryDate, "2026-07-06");
+    assert.deepEqual((await f.pg.query(`select count(*)::int as n from visit_sessions`)).rows[0], before);
+    await f.pg.exec(`update visit_sessions set is_deleted=true`);
+    assert.equal((await dashboardFacets(f.database)).firstEntryDate, null);
   } finally {
     await f.pg.close();
   }
