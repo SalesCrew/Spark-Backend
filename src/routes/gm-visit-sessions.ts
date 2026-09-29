@@ -8,16 +8,11 @@ import {
 import { ensureAndGetGmKpiCache, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { db } from "../lib/db.js";
-import { managedQuarterQuestionIds, modelDatabase } from "../lib/praemien-workspace.js";
+import { copyReusableAnswer, loadReusableSubmittedAnswers } from "../lib/visit-answer-reuse.js";
 import { DEFAULT_TIMEZONE, ensureGmSubmissionGate, gmSubmissionGateError } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { planGmPhotoCommit } from "../lib/gm-photo-commit.js";
 import { logAction, logger, startActionTimer } from "../lib/logger.js";
-import {
-  calendarQuarterDateWindow,
-  quarterPersistentQuestionIds,
-  revalidateReusableAnswer,
-} from "../lib/praemien-answer-persistence.js";
 import { addDays, startOfDay } from "../lib/red-monat.js";
 import { resolveCurrentRedPeriod, resolveRedPeriodForDate } from "../lib/red-month-periods.js";
 import { selectMissingSpezialfragenForSession } from "../lib/spezialfragen-session-sync.js";
@@ -39,9 +34,6 @@ import {
   marketKuehlerUnits,
   markets,
   photoTags,
-  praemienWavePillars,
-  praemienWaveSources,
-  praemienWaves,
   users,
   visitAnswerChangeRequests,
   visitAnswerMatrixCells,
@@ -598,20 +590,6 @@ async function verifyStorageObjectExists(bucket: string, storagePath: string): P
   return Array.isArray(data) && data.some((row) => row.name === fileName);
 }
 
-type ReusableSourceAnswer = {
-  reuseScope: "red-month" | "calendar-quarter";
-  answer: typeof visitAnswers.$inferSelect;
-  options: Array<typeof visitAnswerOptions.$inferSelect>;
-  matrixCells: Array<typeof visitAnswerMatrixCells.$inferSelect>;
-  photos: Array<typeof visitAnswerPhotos.$inferSelect>;
-  tagsByPhotoId: Map<string, Array<typeof visitAnswerPhotoTags.$inferSelect>>;
-  commentText: string | null;
-};
-
-type AnswerReuseWindow =
-  | { kind: "timestamp"; start: Date; endExclusive: Date }
-  | { kind: "local-date"; startDate: string; endDate: string; timezone: string };
-
 function rewritePhotoStoragePathForAnswer(inputPath: string, sessionId: string, answerId: string): string {
   const normalized = inputPath.replace(/^\/+/, "");
   const segments = normalized.split("/").filter((segment) => segment.length > 0);
@@ -658,250 +636,13 @@ async function loadSiblingSessionQuestions(
   }));
 }
 
-async function loadLatestSubmittedAnswersByQuestionId(input: {
-  gmUserId: string;
-  marketId: string;
-  questionIds: string[];
-  window: AnswerReuseWindow;
-  reuseScope: ReusableSourceAnswer["reuseScope"];
-  requireAnswered?: boolean;
-}): Promise<Map<string, ReusableSourceAnswer>> {
-  const questionIds = normalizeUnique(input.questionIds.filter((id) => isUuid(id)));
-  if (questionIds.length === 0) return new Map();
-
-  const submittedAtWindow = input.window.kind === "timestamp"
-    ? and(
-        gte(visitSessions.submittedAt, input.window.start),
-        lt(visitSessions.submittedAt, input.window.endExclusive),
-      )
-    : and(
-        sql`${visitSessions.submittedAt} >= (${input.window.startDate}::date::timestamp at time zone ${input.window.timezone})`,
-        sql`${visitSessions.submittedAt} < (((${input.window.endDate}::date + 1)::timestamp) at time zone ${input.window.timezone})`,
-      );
-
-  const candidates = await db
-    .select({
-      answer: visitAnswers,
-      submittedAt: visitSessions.submittedAt,
-    })
-    .from(visitAnswers)
-    .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
-    .where(
-      and(
-        inArray(visitAnswers.questionId, questionIds),
-        eq(visitAnswers.isDeleted, false),
-        input.requireAnswered ? eq(visitAnswers.answerStatus, "answered") : undefined,
-        input.requireAnswered ? eq(visitAnswers.isValid, true) : undefined,
-        eq(visitSessions.isDeleted, false),
-        eq(visitSessions.status, "submitted"),
-        eq(visitSessions.gmUserId, input.gmUserId),
-        eq(visitSessions.marketId, input.marketId),
-        isNotNull(visitSessions.submittedAt),
-        submittedAtWindow,
-      ),
-    )
-    .orderBy(
-      desc(visitSessions.submittedAt),
-      desc(visitAnswers.changedAt),
-      desc(visitAnswers.updatedAt),
-      desc(visitAnswers.createdAt),
-    );
-
-  const selectedByQuestionId = new Map<string, typeof candidates[number]>();
-  for (const row of candidates) {
-    if (!selectedByQuestionId.has(row.answer.questionId)) {
-      selectedByQuestionId.set(row.answer.questionId, row);
-    }
-  }
-  if (selectedByQuestionId.size === 0) return new Map();
-
-  const selectedAnswers = Array.from(selectedByQuestionId.values()).map((row) => row.answer);
-  const selectedAnswerIds = selectedAnswers.map((row) => row.id);
-  const selectedVisitQuestionIds = selectedAnswers.map((row) => row.visitSessionQuestionId);
-
-  const [options, matrixCells, photos, comments] = await Promise.all([
-    selectedAnswerIds.length === 0
-      ? Promise.resolve([])
-      : db
-          .select()
-          .from(visitAnswerOptions)
-          .where(and(inArray(visitAnswerOptions.visitAnswerId, selectedAnswerIds), eq(visitAnswerOptions.isDeleted, false)))
-          .orderBy(asc(visitAnswerOptions.orderIndex)),
-    selectedAnswerIds.length === 0
-      ? Promise.resolve([])
-      : db
-          .select()
-          .from(visitAnswerMatrixCells)
-          .where(and(inArray(visitAnswerMatrixCells.visitAnswerId, selectedAnswerIds), eq(visitAnswerMatrixCells.isDeleted, false)))
-          .orderBy(asc(visitAnswerMatrixCells.orderIndex)),
-    selectedAnswerIds.length === 0
-      ? Promise.resolve([])
-      : db
-          .select()
-          .from(visitAnswerPhotos)
-          .where(and(inArray(visitAnswerPhotos.visitAnswerId, selectedAnswerIds), eq(visitAnswerPhotos.isDeleted, false)))
-          .orderBy(asc(visitAnswerPhotos.createdAt)),
-    selectedVisitQuestionIds.length === 0
-      ? Promise.resolve([])
-      : db
-          .select()
-          .from(visitQuestionComments)
-          .where(and(inArray(visitQuestionComments.visitSessionQuestionId, selectedVisitQuestionIds), eq(visitQuestionComments.isDeleted, false))),
-  ]);
-
-  const photoIds = photos.map((row) => row.id);
-  const photoTags =
-    photoIds.length === 0
-      ? []
-      : await db
-          .select()
-          .from(visitAnswerPhotoTags)
-          .where(and(inArray(visitAnswerPhotoTags.visitAnswerPhotoId, photoIds), eq(visitAnswerPhotoTags.isDeleted, false)))
-          .orderBy(asc(visitAnswerPhotoTags.createdAt));
-
-  const optionsByAnswerId = new Map<string, Array<typeof visitAnswerOptions.$inferSelect>>();
-  for (const row of options) {
-    const bucket = optionsByAnswerId.get(row.visitAnswerId) ?? [];
-    bucket.push(row);
-    optionsByAnswerId.set(row.visitAnswerId, bucket);
-  }
-  const matrixByAnswerId = new Map<string, Array<typeof visitAnswerMatrixCells.$inferSelect>>();
-  for (const row of matrixCells) {
-    const bucket = matrixByAnswerId.get(row.visitAnswerId) ?? [];
-    bucket.push(row);
-    matrixByAnswerId.set(row.visitAnswerId, bucket);
-  }
-  const photosByAnswerId = new Map<string, Array<typeof visitAnswerPhotos.$inferSelect>>();
-  for (const row of photos) {
-    const bucket = photosByAnswerId.get(row.visitAnswerId) ?? [];
-    bucket.push(row);
-    photosByAnswerId.set(row.visitAnswerId, bucket);
-  }
-  const tagsByPhotoId = new Map<string, Array<typeof visitAnswerPhotoTags.$inferSelect>>();
-  for (const row of photoTags) {
-    const bucket = tagsByPhotoId.get(row.visitAnswerPhotoId) ?? [];
-    bucket.push(row);
-    tagsByPhotoId.set(row.visitAnswerPhotoId, bucket);
-  }
-  const commentByVisitQuestionId = new Map<string, string>();
-  for (const row of comments) {
-    if (!commentByVisitQuestionId.has(row.visitSessionQuestionId)) {
-      commentByVisitQuestionId.set(row.visitSessionQuestionId, row.commentText);
-    }
-  }
-
-  const output = new Map<string, ReusableSourceAnswer>();
-  for (const row of selectedAnswers) {
-    output.set(row.questionId, {
-      reuseScope: input.reuseScope,
-      answer: row,
-      options: optionsByAnswerId.get(row.id) ?? [],
-      matrixCells: matrixByAnswerId.get(row.id) ?? [],
-      photos: photosByAnswerId.get(row.id) ?? [],
-      tagsByPhotoId,
-      commentText: commentByVisitQuestionId.get(row.visitSessionQuestionId) ?? null,
-    });
-  }
-  return output;
-}
-
-async function loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(input: {
-  gmUserId: string;
-  marketId: string;
-  questionIds: string[];
-  now: Date;
-}): Promise<Map<string, ReusableSourceAnswer>> {
-  const period = await resolveCurrentRedPeriod(input.now);
-  return loadLatestSubmittedAnswersByQuestionId({
-    gmUserId: input.gmUserId,
-    marketId: input.marketId,
-    questionIds: input.questionIds,
-    reuseScope: "red-month",
-    window: {
-      kind: "timestamp",
-      start: startOfDay(period.start),
-      endExclusive: addDays(startOfDay(period.end), 1),
-    },
-  });
-}
-
 async function loadReusableSubmittedAnswersByQuestionId(input: {
   gmUserId: string;
   marketId: string;
   questionIds: string[];
   now: Date;
-}): Promise<Map<string, ReusableSourceAnswer>> {
-  const questionIds = normalizeUnique(input.questionIds.filter((id) => isUuid(id)));
-  if (questionIds.length === 0) return new Map();
-
-  const quarterWindow = calendarQuarterDateWindow(input.now, DEFAULT_TIMEZONE);
-  const overlappingWaves = await db
-    .select({ id: praemienWaves.id })
-    .from(praemienWaves)
-    .where(
-      and(
-        eq(praemienWaves.isDeleted, false),
-        ne(praemienWaves.status, "archived"),
-        lte(praemienWaves.startDate, quarterWindow.endDate),
-        gte(praemienWaves.endDate, quarterWindow.startDate),
-      ),
-    );
-  const overlappingWaveIds = normalizeUnique(overlappingWaves.map((row) => row.id));
-  if (overlappingWaveIds.length === 0) {
-    return loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({ ...input, questionIds });
-  }
-
-  const waveQuestionRows = await db
-    .select({
-      questionId: praemienWaveSources.questionId,
-      pillarName: praemienWavePillars.name,
-      carryAnswersForWave: praemienWavePillars.carryAnswersForWave,
-    })
-    .from(praemienWaveSources)
-    .innerJoin(
-      praemienWavePillars,
-      and(
-        eq(praemienWavePillars.id, praemienWaveSources.pillarId),
-        eq(praemienWavePillars.waveId, praemienWaveSources.waveId),
-      ),
-    )
-    .where(
-      and(
-        inArray(praemienWaveSources.waveId, overlappingWaveIds),
-        inArray(praemienWaveSources.questionId, questionIds),
-        eq(praemienWaveSources.isDeleted, false),
-        eq(praemienWavePillars.isDeleted, false),
-      ),
-    );
-  const quarterQuestionIds = normalizeUnique([
-    ...quarterPersistentQuestionIds(waveQuestionRows),
-    ...await managedQuarterQuestionIds(modelDatabase(db), overlappingWaveIds, questionIds),
-  ]);
-  if (quarterQuestionIds.length === 0) {
-    return loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({ ...input, questionIds });
-  }
-
-  const quarterQuestionIdSet = new Set(quarterQuestionIds);
-  const redMonthQuestionIds = questionIds.filter((questionId) => !quarterQuestionIdSet.has(questionId));
-  const [redMonthAnswers, quarterAnswers] = await Promise.all([
-    loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth({
-      ...input,
-      questionIds: redMonthQuestionIds,
-    }),
-    loadLatestSubmittedAnswersByQuestionId({
-      gmUserId: input.gmUserId,
-      marketId: input.marketId,
-      questionIds: quarterQuestionIds,
-      reuseScope: "calendar-quarter",
-      requireAnswered: true,
-      window: {
-        kind: "local-date",
-        ...quarterWindow,
-      },
-    }),
-  ]);
-
-  return new Map([...redMonthAnswers, ...quarterAnswers]);
+}) {
+  return loadReusableSubmittedAnswers(db, input, resolveCurrentRedPeriod);
 }
 
 type RedMonthHistoryPhoto = {
@@ -2405,103 +2146,13 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
 
           const reusableSource = latestReusableAnswersByQuestionId.get(question.questionId);
           if (reusableSource) {
-            const sourceAnswer = reusableSource.answer;
-            const isQuarterReuse = reusableSource.reuseScope === "calendar-quarter";
-            const quarterValidation = isQuarterReuse
-              ? revalidateReusableAnswer(sourceAnswer, {
-                  questionType: question.type,
-                  config: question.config,
-                })
-              : null;
-            if (isQuarterReuse && !quarterValidation) {
-              withIds.push({ ...question, visitQuestionId: qRow.id });
-              continue;
-            }
-            const isPhotoAnswer = !isQuarterReuse && sourceAnswer.questionType === "photo";
-            const answerOptions = quarterValidation?.options ?? reusableSource.options;
-            const answerMatrixCells = quarterValidation?.matrixCells ?? reusableSource.matrixCells;
-            const [insertedAnswer] = await tx
-              .insert(visitAnswers)
-                .values({
-                  visitSessionId: sessionRow.id,
-                  visitSessionSectionId: sectionRow.id,
-                  visitSessionQuestionId: qRow.id,
-                  questionId: question.questionId,
-                  questionType: isQuarterReuse ? question.type : sourceAnswer.questionType,
-                  answerStatus: isQuarterReuse
-                    ? quarterValidation!.answerStatus
-                    : (isPhotoAnswer ? "unanswered" : sourceAnswer.answerStatus),
-                  valueText: isQuarterReuse
-                    ? quarterValidation!.valueText
-                    : (isPhotoAnswer ? null : sourceAnswer.valueText),
-                  valueNumber: isQuarterReuse
-                    ? quarterValidation!.valueNumber
-                    : (isPhotoAnswer || sourceAnswer.valueNumber == null ? null : String(sourceAnswer.valueNumber)),
-                  valueJson: isQuarterReuse
-                    ? quarterValidation!.valueJson
-                    : (isPhotoAnswer ? { storage: [] } : (sourceAnswer.valueJson as Record<string, unknown> | null)),
-                  isValid: isQuarterReuse ? quarterValidation!.isValid : (isPhotoAnswer ? true : sourceAnswer.isValid),
-                  validationError: isQuarterReuse
-                    ? quarterValidation!.validationError
-                    : (isPhotoAnswer ? null : sourceAnswer.validationError),
-                  answeredAt: isQuarterReuse
-                    ? now
-                    : (isPhotoAnswer ? null : (sourceAnswer.answeredAt ? now : null)),
-                changedAt: now,
-                version: 1,
-                isDeleted: false,
-                deletedAt: null,
-                createdAt: now,
-                updatedAt: now,
-              })
-              .returning();
-            if (!insertedAnswer) throw new Error("Vorbelegte Antwort konnte nicht erstellt werden.");
-
-            if (answerOptions.length > 0) {
-              await tx.insert(visitAnswerOptions).values(
-                answerOptions.map((option, idx) => ({
-                  visitAnswerId: insertedAnswer.id,
-                  optionRole: option.optionRole,
-                  optionValue: option.optionValue,
-                  orderIndex: option.orderIndex ?? idx,
-                  isDeleted: false,
-                  deletedAt: null,
-                  createdAt: now,
-                  updatedAt: now,
-                })),
-              );
-            }
-
-            if (answerMatrixCells.length > 0) {
-              await tx.insert(visitAnswerMatrixCells).values(
-                answerMatrixCells.map((cell, idx) => ({
-                  visitAnswerId: insertedAnswer.id,
-                  rowKey: cell.rowKey,
-                  columnKey: cell.columnKey,
-                  cellValueText: cell.cellValueText,
-                  cellValueDate: cell.cellValueDate,
-                  cellSelected: cell.cellSelected,
-                  orderIndex: cell.orderIndex ?? idx,
-                  isDeleted: false,
-                  deletedAt: null,
-                  createdAt: now,
-                  updatedAt: now,
-                })),
-              );
-            }
-
-            const sourceComment = reusableSource.commentText?.trim() ?? "";
-            if (sourceComment.length > 0) {
-              await tx.insert(visitQuestionComments).values({
-                visitSessionQuestionId: qRow.id,
-                commentText: sourceComment,
-                commentedAt: now,
-                isDeleted: false,
-                deletedAt: null,
-                createdAt: now,
-                updatedAt: now,
-              });
-            }
+            await copyReusableAnswer(tx, {
+              sessionId: sessionRow.id,
+              sectionId: sectionRow.id,
+              visitQuestionId: qRow.id,
+              question: { questionId: question.questionId, type: question.type, config: question.config },
+              now,
+            }, reusableSource);
           }
 
           withIds.push({ ...question, visitQuestionId: qRow.id });

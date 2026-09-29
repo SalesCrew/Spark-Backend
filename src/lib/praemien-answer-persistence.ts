@@ -11,12 +11,13 @@ function normalizePillarSemanticName(value: string): string {
 }
 
 export function isQuarterAnswerPersistencePillarName(name: string): boolean {
-  return normalizePillarSemanticName(name) === "distributionsziel";
+  const normalized = normalizePillarSemanticName(name);
+  return normalized === "distributionsziel" || normalized === "flexziel";
 }
 
 export function isWaveAnswerPersistencePillarName(name: string): boolean {
   const normalized = normalizePillarSemanticName(name);
-  if (normalized === "distributionsziel") return true;
+  if (isQuarterAnswerPersistencePillarName(name)) return true;
   const isDisplayPillar = normalized.includes("display");
   const isSchaettenPillar = normalized.includes("schutten") || normalized.includes("schuetten");
   return isDisplayPillar && isSchaettenPillar;
@@ -74,7 +75,10 @@ export function quarterPersistentQuestionIds(
 ): string[] {
   return Array.from(new Set(
     rows
-      .filter((row) => row.carryAnswersForWave && isQuarterAnswerPersistencePillarName(row.pillarName))
+      // Existing Flexziel mappings predate the carry flag. The explicit source
+      // linkage opts them in without rewriting configuration or historical data.
+      .filter((row) => isQuarterAnswerPersistencePillarName(row.pillarName)
+        && (row.carryAnswersForWave || normalizePillarSemanticName(row.pillarName) === "flexziel"))
       .map((row) => row.questionId.trim())
       .filter((questionId) => questionId.length > 0),
   ));

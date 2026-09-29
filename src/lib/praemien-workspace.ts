@@ -616,7 +616,7 @@ export async function managedQuarterQuestionIds(
       rows
         .flatMap((row) =>
           row.model.pillars
-            .filter((p) => p.kind === "distribution")
+            .filter((p) => p.kind === "distribution" || p.kind === "flex")
             .flatMap((p) =>
               p.metrics.flatMap((m) => m.sources.map((s) => s.questionId)),
             ),

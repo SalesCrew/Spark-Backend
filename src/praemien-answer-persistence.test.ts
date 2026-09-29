@@ -9,23 +9,26 @@ import {
   revalidateReusableAnswer,
 } from "./lib/praemien-answer-persistence.js";
 
-test("quarter answer persistence recognizes only Distributionsziel", () => {
+test("quarter answer persistence recognizes Distributionsziel and explicit Flexziel", () => {
   assert.equal(isQuarterAnswerPersistencePillarName("Distributionsziel"), true);
   assert.equal(isQuarterAnswerPersistencePillarName("Distributions-Ziel"), true);
   assert.equal(isQuarterAnswerPersistencePillarName("  DISTRIBUTIONSZIEL  "), true);
+  assert.equal(isQuarterAnswerPersistencePillarName("Flexziel"), true);
+  assert.equal(isQuarterAnswerPersistencePillarName("  FLEX-ZIEL  "), true);
 });
 
 test("quarter answer persistence does not leak into other premium pillars", () => {
   assert.equal(isQuarterAnswerPersistencePillarName("Schütten / Displays"), false);
-  assert.equal(isQuarterAnswerPersistencePillarName("Flexziel"), false);
+  assert.equal(isQuarterAnswerPersistencePillarName("Flex"), false);
+  assert.equal(isQuarterAnswerPersistencePillarName("Flex Reporting"), false);
   assert.equal(isQuarterAnswerPersistencePillarName("Qualitätsziele"), false);
   assert.equal(isQuarterAnswerPersistencePillarName("Distribution Reporting"), false);
 });
 
-test("legacy wave marker recognition remains unchanged for premium configuration compatibility", () => {
+test("legacy marker also recognizes new Flexziel source configurations", () => {
   assert.equal(isWaveAnswerPersistencePillarName("Distributionsziel"), true);
   assert.equal(isWaveAnswerPersistencePillarName("Schütten / Displays"), true);
-  assert.equal(isWaveAnswerPersistencePillarName("Flexziel"), false);
+  assert.equal(isWaveAnswerPersistencePillarName("Flexziel"), true);
 });
 
 test("calendar quarter uses Vienna local time and resets exactly at the boundary", () => {
@@ -61,16 +64,20 @@ test("wave overlap only identifies configuration; the reuse window remains the c
   assert.equal(dateWindowsOverlap(quarter, { startDate: "2026-07-01", endDate: "2026-09-30" }), false);
 });
 
-test("only explicitly marked Distributionsziel mappings opt questions into quarter reuse", () => {
+test("only linked distribution and Flexziel questions opt into quarter reuse, including existing Flex mappings", () => {
   assert.deepEqual(
     quarterPersistentQuestionIds([
       { questionId: "distribution-a", pillarName: "Distributionsziel", carryAnswersForWave: true },
       { questionId: "distribution-a", pillarName: "Distributionsziel", carryAnswersForWave: true },
       { questionId: "distribution-disabled", pillarName: "Distributionsziel", carryAnswersForWave: false },
+      { questionId: "flex-existing", pillarName: "Flexziel", carryAnswersForWave: false },
+      { questionId: "flex-new", pillarName: "Flexziel", carryAnswersForWave: true },
+      { questionId: "flex-existing", pillarName: "Flex-Ziel", carryAnswersForWave: false },
+      { questionId: "not-a-goal", pillarName: "Flex", carryAnswersForWave: true },
       { questionId: "display", pillarName: "Schütten / Displays", carryAnswersForWave: true },
       { questionId: "quality", pillarName: "Qualitätsziele", carryAnswersForWave: true },
     ]),
-    ["distribution-a"],
+    ["distribution-a", "flex-existing", "flex-new"],
   );
 });
 
@@ -121,4 +128,16 @@ test("yes/no multi answers remain filled when their current options are still va
   );
   assert.equal(validation?.valueText, "Ja");
   assert.deepEqual(validation?.options.map((option) => option.optionValue), ["Ja", "Produkt A"]);
+});
+
+test("numeric cumulative totals including zero survive, but changed ranges and photos do not", () => {
+  const source = {
+    questionType: "numeric", answerStatus: "answered", valueText: null,
+    valueNumber: "3", valueJson: { raw: 3 }, isValid: true,
+  };
+  assert.equal(revalidateReusableAnswer(source, { questionType: "numeric", config: {} })?.valueNumber, "3");
+  assert.equal(revalidateReusableAnswer({ ...source, valueNumber: "0", valueJson: { raw: 0 } }, { questionType: "numeric", config: { min: 0 } })?.valueNumber, "0");
+  assert.equal(revalidateReusableAnswer(source, { questionType: "numeric", config: { max: 2 } }), null);
+  assert.equal(revalidateReusableAnswer({ ...source, isValid: false }, { questionType: "numeric", config: {} }), null);
+  assert.equal(revalidateReusableAnswer({ ...source, questionType: "photo", valueJson: { storage: ["old.jpg"] } }, { questionType: "photo", config: {} }), null);
 });
