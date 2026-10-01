@@ -34,6 +34,7 @@ const scope = z.object({
   chain: z.string().max(120).nullable(),
   chainGroups: z.array(z.enum(["rewe", "spar", "other"])).max(3).optional(),
   marketId: z.string().uuid().nullable(),
+  marketIds: z.array(z.string().uuid()).optional(),
   stc: z.enum(["gold", "silver", "bronze"]).nullable(),
 });
 export function createGmDashboardRouter(

@@ -218,7 +218,7 @@ export async function dashboardFacets(
 // A bounded, parameterised read. The submitted-period index and question/scoring
 // indexes are used; no Supabase REST page limit and no query per answer/interval.
 export function canUseWholeGmIpp(scope: DashboardScope): boolean {
-  return !scope.region && !scope.chain && !scope.chainGroups?.length && !scope.marketId;
+  return !scope.region && !scope.chain && !scope.chainGroups?.length && !scope.marketId && !scope.marketIds?.length;
 }
 
 export async function loadDashboard(
@@ -237,6 +237,9 @@ export async function loadDashboard(
       where s.is_deleted=false and s.status='submitted'
         and (${scope.gmId}::uuid is null or s.gm_user_id=${scope.gmId}::uuid)
         and (${scope.marketId}::uuid is null or m.id=${scope.marketId}::uuid)
+        and (${!scope.marketIds?.length} or m.id in (
+          select jsonb_array_elements_text(${JSON.stringify(scope.marketIds ?? [])}::jsonb)::uuid
+        ))
         and (${scope.region}::text is null or coalesce(nullif(m.region,''),'Unbekannt')=${scope.region})
         and (${scope.chain}::text is null or m.db_name=${scope.chain})
         and (${!(scope.chainGroups?.length)} or (

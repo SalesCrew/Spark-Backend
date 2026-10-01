@@ -6,6 +6,7 @@ export type DashboardScope = {
   chain: string | null;
   chainGroups?: DashboardChainGroup[] | undefined;
   marketId: string | null;
+  marketIds?: string[] | undefined;
   stc: "gold" | "silver" | "bronze" | null;
 };
 export type DashboardInterval = {

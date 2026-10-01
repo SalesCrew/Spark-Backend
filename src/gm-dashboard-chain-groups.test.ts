@@ -12,7 +12,7 @@ import type { DashboardScope, DashboardChainGroup } from "./gm-dashboard.shared.
 const scope: DashboardScope = { region: null, gmId: null, chain: null, marketId: null, stc: null };
 const intervals = [{ id: "sep", label: "September", shortLabel: "Sep", start: "2026-09-01", end: "2026-09-30" }];
 
-test("HTTP + PostgreSQL: multi-chain unions, exact mapping, combined filters, validation and legacy requests", async () => {
+test("HTTP + PostgreSQL: multi-chain and multi-market unions, exact mapping, combined filters, validation and legacy requests", async () => {
   const f = await praemienFixture();
   try {
     const fixture = await installDashboardFixture(f);
@@ -52,6 +52,27 @@ test("HTTP + PostgreSQL: multi-chain unions, exact mapping, combined filters, va
     assert.equal((await query({ chainGroups: ["spar"], marketId: markets[0] })).body.points[0].visits, 0);
     assert.equal((await query({ chainGroups: ["rewe"], marketId: markets[0] })).body.points[0].visits, 1);
     assert.equal((await query({ chain: "Billa" })).body.points[0].visits, 1);
+    const both = await query({ chainGroups: ["rewe", "spar"], marketIds: [markets[0]!, markets[5]!] });
+    assert.equal(both.status, 200);
+    assert.equal(both.body.points[0].visits, 2);
+    // IPP counts positive scoring markets; the Spar visit has a zero score.
+    assert.equal(both.body.points[0].ippMarketCount, 1);
+    assert.equal(both.body.points[0].availability.Cooler.total, 2);
+    assert.equal(both.body.points[0].availability.Cooler.average, 75);
+    assert.equal(both.body.points[0].placements, 2);
+    assert.equal(both.body.points[0].ipp, 2);
+    assert.deepEqual(both.body.scope.marketIds, [markets[0], markets[5]]);
+    assert.equal((await query({ marketIds: [markets[0]!, markets[5]!, markets[0]!] })).body.points[0].visits, 2);
+    assert.equal((await query({ chainGroups: ["rewe"], marketIds: [markets[0]!, markets[5]!] })).body.points[0].visits, 1);
+    assert.equal((await query({ chainGroups: ["other"], marketIds: [markets[0]!, markets[5]!] })).body.points[0].visits, 0);
+    assert.equal((await query({ marketIds: [markets[0]!, markets[5]!], region: "Süd" })).body.points[0].visits, 1);
+    assert.equal((await query({ marketIds: [markets[0]!, markets[5]!], gmId: f.ids.gm })).body.points[0].visits, 1);
+    assert.equal((await query({ marketIds: [] })).body.points[0].visits, 13);
+    assert.equal((await query({ marketIds: [randomUUID()] })).body.points[0].visits, 0);
+    for (const marketIds of [["invalid"], markets[0], null, [42]]) {
+      const result = await request(app).post("/query").send({ intervals, scope: { ...scope, marketIds } });
+      assert.equal(result.status, 400);
+    }
     for (const chainGroups of [["invalid"], "rewe", ["rewe", "spar", "other", "rewe"]]) {
       const result = await request(app).post("/query").send({ intervals, scope: { ...scope, chainGroups } });
       assert.equal(result.status, 400);
@@ -60,7 +81,7 @@ test("HTTP + PostgreSQL: multi-chain unions, exact mapping, combined filters, va
   } finally { await f.pg.close(); }
 });
 
-test("chain subsets cannot be replaced with whole-GM archived IPP", () => {
+test("chain and market subsets cannot be replaced with whole-GM archived IPP", () => {
   assert.equal(canUseWholeGmIpp(scope), true);
   assert.equal(canUseWholeGmIpp({ ...scope, chainGroups: [] }), true);
   assert.equal(canUseWholeGmIpp({ ...scope, gmId: randomUUID() }), true);
@@ -69,5 +90,7 @@ test("chain subsets cannot be replaced with whole-GM archived IPP", () => {
   }
   assert.equal(canUseWholeGmIpp({ ...scope, region: "Nord" }), false);
   assert.equal(canUseWholeGmIpp({ ...scope, marketId: randomUUID() }), false);
+  assert.equal(canUseWholeGmIpp({ ...scope, marketIds: [randomUUID(), randomUUID()] }), false);
+  assert.equal(canUseWholeGmIpp({ ...scope, marketIds: [] }), true);
   assert.equal(canUseWholeGmIpp({ ...scope, chain: "Billa" }), false);
 });
