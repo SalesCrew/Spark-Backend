@@ -4,6 +4,7 @@ export type DashboardScope = {
   region: string | null;
   gmId: string | null;
   chain: string | null;
+  chains?: string[] | undefined;
   chainGroups?: DashboardChainGroup[] | undefined;
   marketId: string | null;
   marketIds?: string[] | undefined;

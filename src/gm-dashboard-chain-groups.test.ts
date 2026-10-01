@@ -52,6 +52,19 @@ test("HTTP + PostgreSQL: multi-chain and multi-market unions, exact mapping, com
     assert.equal((await query({ chainGroups: ["spar"], marketId: markets[0] })).body.points[0].visits, 0);
     assert.equal((await query({ chainGroups: ["rewe"], marketId: markets[0] })).body.points[0].visits, 1);
     assert.equal((await query({ chain: "Billa" })).body.points[0].visits, 1);
+    const individual = await query({ chains: ["Billa", "Spar"], marketIds: [markets[0]!, markets[5]!] });
+    assert.equal(individual.status, 200);
+    assert.equal(individual.body.points[0].visits, 2);
+    assert.equal(individual.body.points[0].availability.Cooler.average, 75);
+    assert.deepEqual(individual.body.scope.chains, ["Billa", "Spar"]);
+    assert.equal((await query({ chains: ["Billa"] })).body.points[0].visits, 1);
+    assert.equal((await query({ chains: ["ISP", "ESP"] })).body.points[0].visits, 2);
+    assert.equal((await query({ chains: ["Billa", "Billa"] })).body.points[0].visits, 1);
+    assert.equal((await query({ chains: ["", "Billa Corso"] })).body.points[0].visits, 3);
+    assert.equal((await query({ chains: [] })).body.points[0].visits, 13);
+    for (const chains of ["Billa", null, [42], ["x".repeat(121)]]) {
+      assert.equal((await request(app).post("/query").send({ intervals, scope: { ...scope, chains } })).status, 400);
+    }
     const both = await query({ chainGroups: ["rewe", "spar"], marketIds: [markets[0]!, markets[5]!] });
     assert.equal(both.status, 200);
     assert.equal(both.body.points[0].visits, 2);
@@ -93,4 +106,6 @@ test("chain and market subsets cannot be replaced with whole-GM archived IPP", (
   assert.equal(canUseWholeGmIpp({ ...scope, marketIds: [randomUUID(), randomUUID()] }), false);
   assert.equal(canUseWholeGmIpp({ ...scope, marketIds: [] }), true);
   assert.equal(canUseWholeGmIpp({ ...scope, chain: "Billa" }), false);
+  assert.equal(canUseWholeGmIpp({ ...scope, chains: ["Billa", "Spar"] }), false);
+  assert.equal(canUseWholeGmIpp({ ...scope, chains: [] }), true);
 });
