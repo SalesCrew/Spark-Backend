@@ -28,6 +28,7 @@ export async function installDashboardFixture(
     when: string;
     category: string;
     gm?: string;
+    market?: string;
     deleted?: boolean;
     status?: string;
     mixed?: boolean;
@@ -42,7 +43,7 @@ export async function installDashboardFixture(
       [
         session,
         options.gm ?? f.ids.gm,
-        f.ids.market,
+        options.market ?? f.ids.market,
         options.status ?? "submitted",
         options.when,
         options.deleted ?? false,

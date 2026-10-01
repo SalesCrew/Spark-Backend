@@ -217,6 +217,10 @@ export async function dashboardFacets(
 
 // A bounded, parameterised read. The submitted-period index and question/scoring
 // indexes are used; no Supabase REST page limit and no query per answer/interval.
+export function canUseWholeGmIpp(scope: DashboardScope): boolean {
+  return !scope.region && !scope.chain && !scope.chainGroups?.length && !scope.marketId;
+}
+
 export async function loadDashboard(
   database: ModelDatabase,
   intervals: DashboardInterval[],
@@ -235,6 +239,13 @@ export async function loadDashboard(
         and (${scope.marketId}::uuid is null or m.id=${scope.marketId}::uuid)
         and (${scope.region}::text is null or coalesce(nullif(m.region,''),'Unbekannt')=${scope.region})
         and (${scope.chain}::text is null or m.db_name=${scope.chain})
+        and (${!(scope.chainGroups?.length)} or (
+          case
+            when upper(regexp_replace(coalesce(m.db_name,''), '\\s+', '', 'g')) in ('BILLA','BILLA+','BILLAPLUS','ISP','ESP') then 'rewe'
+            when upper(regexp_replace(coalesce(m.db_name,''), '\\s+', '', 'g'))='SPAR' then 'spar'
+            else 'other'
+          end
+        ) in (select jsonb_array_elements_text(${JSON.stringify(scope.chainGroups ?? [])}::jsonb)))
     )
     select s.interval_id as "intervalId",s.id as "sessionId",s.market_id as "marketId",s.gm_user_id as "gmId",
       q.question_id as "questionId",s.submitted_at::text as "submittedAt",a.changed_at::text as "changedAt",a.id as "answerId",sec.section,

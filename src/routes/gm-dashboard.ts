@@ -32,6 +32,7 @@ const scope = z.object({
   region: z.string().max(120).nullable(),
   gmId: z.string().uuid().nullable(),
   chain: z.string().max(120).nullable(),
+  chainGroups: z.array(z.enum(["rewe", "spar", "other"])).max(3).optional(),
   marketId: z.string().uuid().nullable(),
   stc: z.enum(["gold", "silver", "bronze"]).nullable(),
 });

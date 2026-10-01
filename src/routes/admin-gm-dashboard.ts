@@ -4,6 +4,7 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { db } from "../lib/db.js";
 import { modelDatabase } from "../lib/praemien-workspace.js";
 import { loadEffectiveGmIppPeriods } from "../lib/ipp-gm-effective.js";
+import { canUseWholeGmIpp } from "../lib/gm-dashboard.js";
 import { createGmDashboardRouter } from "./gm-dashboard.js";
 export const adminGmDashboardRouter = Router();
 adminGmDashboardRouter.use(
@@ -14,7 +15,7 @@ adminGmDashboardRouter.use(
   createGmDashboardRouter(modelDatabase(db), async (intervals, scope, data) => {
     // Whole-GM RED views use the existing archived/corrected IPP service. A
     // correction for an entire GM must not be spread arbitrarily across markets.
-    if (scope.region || scope.chain || scope.marketId) return;
+    if (!canUseWholeGmIpp(scope)) return;
     const ids = intervals
       .filter((i) => /^[0-9a-f-]{36}$/i.test(i.id))
       .map((i) => i.id);
