@@ -122,8 +122,15 @@ test("real local PostgreSQL + HTTP: answer weights, all-visit means/splits, dedu
       intervals: months,
       scope: { ...scope, stc: "gold" },
     });
-    assert.equal(stc.body.stcApplied, false);
-    assert.deepEqual(stc.body.points, result.body.points);
+    assert.equal(stc.body.stcApplied, true);
+    assert.equal(stc.body.points[1].visits, 0); // Fixture market frequency is 8, not Gold.
+    const silver = await query().send({
+      intervals: months,
+      scope: { ...scope, stc: "silver" },
+    });
+    assert.equal(silver.body.stcApplied, true);
+    assert.deepEqual(silver.body.points, result.body.points);
+    assert.equal(result.body.stcApplied, false);
     const facets = await request(app)
       .get("/admin/gm-dashboard/facets")
       .set("Authorization", "Bearer local");

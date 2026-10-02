@@ -34,6 +34,12 @@ export type DashboardObservation = {
   competitor: number | null;
 };
 const round = (n: number) => Math.round(n * 10000) / 10000;
+// STC uses the market's configured annual frequency, not completed visit counts.
+const stcFrequencyRanges = {
+  gold: [12, 24],
+  silver: [8, 10],
+  bronze: [6, 7],
+} as const;
 function selectedAnswer(row: DashboardObservation): string {
   return (row.selectedAnswer === undefined ? row.category : row.selectedAnswer)?.trim().toLocaleLowerCase("de-AT") ?? "";
 }
@@ -216,7 +222,7 @@ export function aggregateDashboard(
     scope,
     calculatedAt: new Date().toISOString(),
     timezone: "Europe/Vienna",
-    stcApplied: false,
+    stcApplied: scope.stc !== null,
   };
 }
 
@@ -246,7 +252,7 @@ export async function dashboardFacets(
 // A bounded, parameterised read. The submitted-period index and question/scoring
 // indexes are used; no Supabase REST page limit and no query per answer/interval.
 export function canUseWholeGmIpp(scope: DashboardScope): boolean {
-  return !scope.region && !scope.chain && !scope.chains?.length && !scope.chainGroups?.length && !scope.marketId && !scope.marketIds?.length;
+  return !scope.region && !scope.chain && !scope.chains?.length && !scope.chainGroups?.length && !scope.marketId && !scope.marketIds?.length && !scope.stc;
 }
 
 export async function loadDashboard(
@@ -254,6 +260,7 @@ export async function loadDashboard(
   intervals: DashboardInterval[],
   scope: DashboardScope,
 ): Promise<DashboardData> {
+  const stcFrequency = scope.stc ? stcFrequencyRanges[scope.stc] : null;
   const rows = await database.query<DashboardObservation>(sql`
     with periods as (
       select id,start::date::timestamp at time zone 'Europe/Vienna' as lo,
@@ -263,6 +270,7 @@ export async function loadDashboard(
       select p.id as interval_id,s.* from periods p join visit_sessions s on s.submitted_at>=p.lo and s.submitted_at<p.hi
       join markets m on m.id=s.market_id
       where s.is_deleted=false and s.status='submitted'
+        and (${scope.stc}::text is null or m.visit_frequency_per_year between ${stcFrequency?.[0] ?? 0} and ${stcFrequency?.[1] ?? 0})
         and (${scope.gmId}::uuid is null or s.gm_user_id=${scope.gmId}::uuid)
         and (${scope.marketId}::uuid is null or m.id=${scope.marketId}::uuid)
         and (${!scope.marketIds?.length} or m.id in (

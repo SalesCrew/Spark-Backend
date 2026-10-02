@@ -108,4 +108,7 @@ test("chain and market subsets cannot be replaced with whole-GM archived IPP", (
   assert.equal(canUseWholeGmIpp({ ...scope, chain: "Billa" }), false);
   assert.equal(canUseWholeGmIpp({ ...scope, chains: ["Billa", "Spar"] }), false);
   assert.equal(canUseWholeGmIpp({ ...scope, chains: [] }), true);
+  for (const stc of ["gold", "silver", "bronze"] as const) {
+    assert.equal(canUseWholeGmIpp({ ...scope, gmId: randomUUID(), stc }), false);
+  }
 });

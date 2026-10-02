@@ -64,7 +64,7 @@ export type DashboardData = {
   scope: DashboardScope;
   calculatedAt: string;
   timezone: "Europe/Vienna";
-  stcApplied: false;
+  stcApplied: boolean;
 };
 export type DashboardFacets = {
   firstEntryDate: string | null;
