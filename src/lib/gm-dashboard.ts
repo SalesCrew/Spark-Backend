@@ -26,11 +26,17 @@ export type DashboardObservation = {
   red: boolean;
   answered: boolean;
   category: string | null;
+  selectedAnswer?: string | null;
+  questionText?: string | null;
+  moduleName?: string | null;
   ipp: number | null;
   placements: number | null;
   competitor: number | null;
 };
 const round = (n: number) => Math.round(n * 10000) / 10000;
+function selectedAnswer(row: DashboardObservation): string {
+  return (row.selectedAnswer === undefined ? row.category : row.selectedAnswer)?.trim().toLocaleLowerCase("de-AT") ?? "";
+}
 export function availabilityCategory(
   value: string | null,
 ): "top" | "mediocre" | "bad" | null {
@@ -86,7 +92,6 @@ export function aggregateDashboard(
         red: false,
       };
       if (row.section) session.sections.add(row.section);
-      session.red ||= row.red && row.answered;
       sessions.set(row.sessionId, session);
       if (!row.questionId) continue;
       const visitKey = `${row.sessionId}:${row.questionId}`,
@@ -101,6 +106,10 @@ export function aggregateDashboard(
     let availabilityExpected = 0,
       availabilityAnswered = 0;
     for (const row of visitQuestions.values()) {
+      // Apply the latest answer to each question before counting the visit.
+      // A completed answer, a sub-option or an earlier Ja is not sufficient.
+      if (row.red && row.answered && selectedAnswer(row) === "ja")
+        sessions.get(row.sessionId)!.red = true;
       if (
         !row.available ||
         !availabilityTypes.includes(row.availabilityType as AvailabilityType)
@@ -120,6 +129,7 @@ export function aggregateDashboard(
         : null;
     }
     const marketIpp = new Map<string, number>();
+    const competitorQuestions = new Map<string, NonNullable<DashboardPoint["competitorQuestions"]>[number]>();
     let placements: number | null = null,
       competitor: number | null = null;
     for (const row of marketQuestions.values()) {
@@ -130,8 +140,23 @@ export function aggregateDashboard(
         );
       if (row.placements != null)
         placements = (placements ?? 0) + Number(row.placements);
-      if (row.competitor != null)
+      if (row.competitor != null) {
         competitor = (competitor ?? 0) + Number(row.competitor);
+        const detail = competitorQuestions.get(row.questionId!) ?? {
+          questionId: row.questionId!,
+          questionText: row.questionText ?? "",
+          moduleName: row.moduleName ?? "",
+          points: 0,
+          marketCount: 0,
+          yesCount: 0,
+          noCount: 0,
+        };
+        detail.points += Number(row.competitor);
+        detail.marketCount++;
+        if (selectedAnswer(row) === "ja") detail.yesCount++;
+        if (selectedAnswer(row) === "nein") detail.noCount++;
+        competitorQuestions.set(row.questionId!, detail);
+      }
     }
     const positive = [...marketIpp.values()].filter((n) => n > 0);
     const durations: number[] = [];
@@ -169,6 +194,9 @@ export function aggregateDashboard(
         : null,
       placements: placements == null ? null : round(placements),
       competitor: competitor == null ? null : round(competitor),
+      competitorQuestions: [...competitorQuestions.values()]
+        .map((detail) => ({ ...detail, points: round(detail.points) }))
+        .sort((a, b) => a.moduleName.localeCompare(b.moduleName, "de") || a.questionText.localeCompare(b.questionText, "de") || a.questionId.localeCompare(b.questionId)),
       availability,
       availabilityExpected,
       availabilityAnswered,
@@ -258,13 +286,23 @@ export async function loadDashboard(
       extract(epoch from (s.submitted_at-s.started_at))/60.0 as duration,
       coalesce(q.single_choice_availability_snapshot,false) as available,q.single_choice_availability_type_snapshot as "availabilityType",
       coalesce(q.red_survey_snapshot,false) as red,(a.id is not null) as answered,
+      coalesce(nullif(q.question_text_snapshot,''),qb.text,'') as "questionText",
+      coalesce(q.module_name_snapshot,'') as "moduleName",
+      coalesce(nullif(btrim(a.value_text),''),
+        case jsonb_typeof(a.value_json->'raw')
+          when 'string' then nullif(btrim(a.value_json->>'raw'),'')
+          when 'object' then nullif(btrim(a.value_json->'raw'->>'sel'),'')
+        end, opts.top_value) as "selectedAnswer",
       coalesce(nullif(a.value_text,''),a.value_json->>'raw',opts.values->>0) as category,
       weights.ipp,weights.placements,weights.competitor
     from selected_sessions s
     left join visit_session_sections sec on sec.visit_session_id=s.id and sec.is_deleted=false
     left join visit_session_questions q on q.visit_session_section_id=sec.id and q.is_deleted=false and q.applies_to_market_chain_snapshot=true
+    left join question_bank_shared qb on qb.id=q.question_id
     left join visit_answers a on a.visit_session_question_id=q.id and a.visit_session_id=s.id and a.is_deleted=false and a.is_valid=true and a.answer_status='answered'
-    left join lateral (select jsonb_agg(o.option_value) as values from visit_answer_options o where o.visit_answer_id=a.id and o.is_deleted=false) opts on true
+    left join lateral (select jsonb_agg(o.option_value) as values,
+      min(o.option_value) filter (where o.option_role='top') as top_value
+      from visit_answer_options o where o.visit_answer_id=a.id and o.is_deleted=false) opts on true
     left join lateral (
       select sum(case when sc.ipp is not null then sc.ipp * k.factor end) as ipp,
         sum(case when sc.zweitplatzierung is not null then sc.zweitplatzierung * k.factor end) as placements,

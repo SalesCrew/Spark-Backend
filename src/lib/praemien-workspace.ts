@@ -6,6 +6,7 @@ import {
   validateModel,
   type GmResult,
   type MetricEntry,
+  type ModelMetric,
   type Observation,
   type WaveModel,
 } from "../praemien-model.shared.js";
@@ -54,23 +55,31 @@ export const modelSchema = z.object({
         kind: z.enum(["displays", "distribution", "flex", "quality", "custom"]),
         color: z.string().regex(/^#[0-9a-fA-F]{6}$/),
         maxRewardEur: nonnegative,
-        payoutMode: z.enum(["highest", "groups"]),
+        payoutMode: z.enum(["highest", "groups", "manual"]),
         metrics: z
           .array(
             z.object({
               key,
               label: z.string().trim().min(1).max(160),
-              unit: z.enum(["percent", "points", "count"]),
+              unit: z.enum(["percent", "points", "count", "eur"]),
               method: z.enum([
                 "manual",
                 "answer_sum",
                 "availability",
+                "weighted_sum",
                 "sum",
                 "difference",
                 "average",
                 "ratio",
                 "steps",
               ]),
+              goal: z.object({ halfAt: number, fullAt: number }).optional(),
+              weights: z.record(z.string(), positive).optional(),
+              hint: z.string().max(1000).optional(),
+              readOnly: z.boolean().optional(),
+              minValue: number.optional(), maxValue: number.optional(),
+              integerOnly: z.boolean().optional(), confirmation: z.boolean().optional(),
+              manualRewardCap: positive.optional(),
               inputs: z.array(key).max(40),
               target: positive.nullable(),
               steps: z.array(z.object({ at: number, value: number })).max(30),
@@ -355,6 +364,18 @@ async function validateSources(database: ModelDatabase, model: WaveModel) {
       );
   }
 }
+function validateEntryValue(metric: ModelMetric, entry: MetricEntry) {
+  if (metric.readOnly && (entry.value !== null || entry.target !== null))
+    throw new ModelError(400, `${metric.label}: wird aus den Eingaben berechnet und kann nicht überschrieben werden.`);
+  const value = entry.value;
+  if (value === null) return;
+  if ((metric.minValue !== undefined && value < metric.minValue) ||
+      (metric.maxValue !== undefined && value > metric.maxValue) ||
+      (metric.manualRewardCap !== undefined && (value < 0 || value > metric.manualRewardCap)) ||
+      (metric.integerOnly && !Number.isInteger(value)) ||
+      (metric.confirmation && value !== 0 && value !== 1))
+    throw new ModelError(400, `${metric.label}: Wert außerhalb des zulässigen Bereichs.`);
+}
 export async function mutateWorkspace(
   database: ModelDatabase,
   id: string,
@@ -431,6 +452,7 @@ export async function mutateWorkspace(
             .find((p) => p.key === e.pillarKey)
             ?.metrics.find((m) => m.key === e.metricKey);
           if (!metric) throw new ModelError(400, "Unbekannte Messgröße.");
+          validateEntryValue(metric, e);
           if (
             e.value !== null &&
             metric.unit === "percent" &&
@@ -450,7 +472,7 @@ export async function mutateWorkspace(
             );
         }
       } else if (command.type === "activate") {
-        if (config.model.pillars.some((p) => !p.tiers.length))
+        if (config.model.pillars.some((p) => p.payoutMode !== "manual" && !p.tiers.length))
           throw new ModelError(
             400,
             "Jede Säule braucht bestätigte Stufen. Fehlende Qualitäts-/Q3-Regeln zuerst einrichten.",
@@ -523,6 +545,7 @@ export async function simulateWorkspace(
         .find((p) => p.key === entry.pillarKey)
         ?.metrics.find((m) => m.key === entry.metricKey);
       if (!metric) throw new ModelError(400, "Unbekannte Messgröße.");
+      validateEntryValue(metric, entry);
       if (
         metric.unit === "percent" &&
         entry.value !== null &&

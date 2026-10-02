@@ -39,6 +39,15 @@ export type DashboardPoint = DashboardInterval & {
   ippPlacement: number | null;
   placements: number | null;
   competitor: number | null;
+  competitorQuestions?: {
+    questionId: string;
+    questionText: string;
+    moduleName: string;
+    points: number;
+    marketCount: number;
+    yesCount: number;
+    noCount: number;
+  }[];
   availability: Record<AvailabilityType, AvailabilityCounts>;
   availabilityAnswered: number;
   availabilityExpected: number;

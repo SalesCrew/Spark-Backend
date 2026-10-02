@@ -39,7 +39,7 @@ export function createPraemienWorkspaceRouter(database: ModelDatabase) {
   });
   router.get("/templates/:template", (req, res) => {
     const template = z
-      .enum(["empty", "q1", "q2", "q3"])
+      .enum(["empty", "q1", "q2", "q3", "xmas"])
       .parse(req.params.template);
     res.json({ model: modelTemplate(template) });
   });
@@ -61,7 +61,7 @@ export function createPraemienWorkspaceRouter(database: ModelDatabase) {
           name: z.string().trim().min(1).max(120),
           year: z.number().int().min(2020).max(2100),
           quarter: z.number().int().min(1).max(4),
-          template: z.enum(["empty", "q1", "q2", "q3"]),
+          template: z.enum(["empty", "q1", "q2", "q3", "xmas"]),
           model: modelSchema.optional(),
         })
         .parse(req.body);

@@ -9,8 +9,9 @@ export async function installDashboardFixture(
     alter table markets add column name text default 'Sparmarkt Test',add column address text default 'Testgasse 1',add column city text default 'Wien',add column postal_code text default '1010',add column region text default 'Nord',add column flex_number text default 'S-TEST',add column standard_market_number text,add column coke_master_number text,add column is_deleted boolean default false;
     alter table visit_sessions add column started_at timestamptz;
     alter table visit_session_sections add column visit_session_id uuid;
-    alter table visit_session_questions add column visit_session_section_id uuid,add column question_id uuid,add column single_choice_availability_snapshot boolean default false,add column single_choice_availability_type_snapshot text,add column red_survey_snapshot boolean default false;
+    alter table visit_session_questions add column visit_session_section_id uuid,add column question_id uuid,add column single_choice_availability_snapshot boolean default false,add column single_choice_availability_type_snapshot text,add column red_survey_snapshot boolean default false,add column question_text_snapshot text default '',add column module_name_snapshot text default '';
     alter table visit_answers add column changed_at timestamptz default now(),add column question_type text default 'single_choice',add column value_json jsonb;
+    alter table visit_answer_options add column option_role text default 'top';
     alter table question_scoring add column ipp numeric,add column zweitplatzierung numeric,add column mitbewerberabfrage numeric;
   `);
   const qAvailability = randomUUID(),

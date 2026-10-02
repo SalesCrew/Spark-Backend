@@ -39,7 +39,7 @@ test("HTTP + PostgreSQL: multi-chain and multi-market unions, exact mapping, com
     for (const [chainGroups, visits, average] of expected) {
       const result = await query({ chainGroups }); assert.equal(result.status, 200, JSON.stringify(result.body));
       const p = result.body.points[0];
-      assert.equal(p.visits, visits); assert.equal(p.redSurveys, visits); assert.equal(p.availability.Cooler.total, visits);
+      assert.equal(p.visits, visits); assert.equal(p.redSurveys, chainGroups.length === 0 || chainGroups.includes("rewe") ? 5 : 0); assert.equal(p.availability.Cooler.total, visits);
       assert.equal(p.availability.Cooler.average, Math.round(average * 10000) / 10000);
       assert.equal(p.placements, chainGroups.length === 0 || chainGroups.includes("rewe") ? 10 : 0);
       assert.equal(p.competitor, visits * 3);

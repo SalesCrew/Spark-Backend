@@ -1,10 +1,11 @@
 import { calculateTieredPillarReward } from "./lib/praemien-rewards.js";
 
-export type MetricUnit = "percent" | "points" | "count";
+export type MetricUnit = "percent" | "points" | "count" | "eur";
 export type MetricMethod =
   | "manual"
   | "answer_sum"
   | "availability"
+  | "weighted_sum"
   | "sum"
   | "difference"
   | "average"
@@ -30,6 +31,15 @@ export type ModelMetric = {
   target: number | null;
   sources: ModelSource[];
   steps: { at: number; value: number }[];
+  goal?: { halfAt: number; fullAt: number } | undefined;
+  weights?: Record<string, number> | undefined;
+  hint?: string | undefined;
+  readOnly?: boolean | undefined;
+  minValue?: number | undefined;
+  maxValue?: number | undefined;
+  integerOnly?: boolean | undefined;
+  confirmation?: boolean | undefined;
+  manualRewardCap?: number | undefined;
 };
 export type ModelTier = {
   key: string;
@@ -48,7 +58,7 @@ export type ModelPillar = {
   kind: "displays" | "distribution" | "flex" | "quality" | "custom";
   color: string;
   maxRewardEur: number;
-  payoutMode: "highest" | "groups";
+  payoutMode: "highest" | "groups" | "manual";
   metrics: ModelMetric[];
   tiers: ModelTier[];
 };
@@ -187,6 +197,18 @@ export function validateModel(model: WaveModel): string[] {
           );
         sourceOwners.set(identity, owner);
       }
+      if (m.goal && (!Number.isFinite(m.goal.halfAt) || !Number.isFinite(m.goal.fullAt) || m.goal.halfAt >= m.goal.fullAt))
+        errors.push(`${m.label}: 100-%-Ziel muss über dem 50-%-Ziel liegen.`);
+      if (m.minValue !== undefined && m.maxValue !== undefined && m.minValue > m.maxValue)
+        errors.push(`${m.label}: Wertebereich ungültig.`);
+      if (m.confirmation && (m.method !== "manual" || m.unit !== "count"))
+        errors.push(`${m.label}: Bestätigung muss manuell erfasst werden.`);
+      if (m.method === "weighted_sum" && (!m.inputs.length || m.unit !== "points" ||
+        m.inputs.some(k => p.metrics.find(x => x.key === k)?.unit !== "count" || !Number.isFinite(m.weights?.[k]) || (m.weights?.[k] ?? 0) <= 0) ||
+        Object.keys(m.weights ?? {}).some(k => !m.inputs.includes(k))))
+        errors.push(`${m.label}: Stückzahlen und positive Punktegewichte für jede Eingabe erforderlich.`);
+      if (m.manualRewardCap !== undefined && (m.unit !== "eur" || m.method !== "manual" || m.manualRewardCap <= 0))
+        errors.push(`${m.label}: Manuelle Auszahlung benötigt Euro und eine positive Obergrenze.`);
       available.add(m.key);
     }
     for (const t of p.tiers) {
@@ -199,6 +221,15 @@ export function validateModel(model: WaveModel): string[] {
         );
       if (p.payoutMode === "groups" && !t.group.trim())
         errors.push(`${p.name}/${t.label}: Teilzielgruppe fehlt.`);
+    }
+    if (p.payoutMode === "manual") {
+      const payable = p.metrics.filter(m => m.manualRewardCap !== undefined);
+      if (p.metrics.some(m => m.unit === "eur" && m.method === "manual" && m.manualRewardCap === undefined)) errors.push(`${p.name}: Für jede Euro-Teilprämie eine maximale Auszahlung festlegen.`);
+      if (!payable.length || p.tiers.length) errors.push(`${p.name}: Manuelle Auszahlung benötigt Euro-Teilprämien ohne automatische Stufen.`);
+      if (money(payable.reduce((sum, m) => sum + (m.manualRewardCap ?? 0), 0)) > p.maxRewardEur)
+        errors.push(`${p.name}: Teilprämien überschreiten die Maximalprämie.`);
+    } else if (p.metrics.some(m => m.manualRewardCap !== undefined)) {
+      errors.push(`${p.name}: Euro-Teilprämien benötigen den manuellen Auszahlungsmodus.`);
     }
     const groupMax = new Map<string, number>();
     for (const t of p.tiers)
@@ -310,7 +341,7 @@ function automaticValue(
     };
   if (m.method === "difference")
     return { value: numbers[0]! - numbers[1]!, counted, excluded };
-  const sum = numbers.reduce((s, n) => s + n, 0);
+  const sum = numbers.reduce((s, n, i) => s + n * (m.method === "weighted_sum" ? m.weights?.[m.inputs[i]!] ?? 0 : 1), 0);
   return {
     value: m.method === "average" ? sum / numbers.length : sum,
     counted,
@@ -343,7 +374,10 @@ export function evaluateModel(
             results,
             target,
           );
-          const value = entry?.value ?? auto.value;
+          const manualValue = m.readOnly ? null : entry?.value;
+          const rawValue = manualValue ?? auto.value;
+          const value = rawValue !== null && manualValue == null &&
+            ((m.minValue !== undefined && rawValue < m.minValue) || (m.maxValue !== undefined && rawValue > m.maxValue) || (m.integerOnly && !Number.isInteger(rawValue))) ? null : rawValue;
           results.set(m.key, {
             key: m.key,
             label: m.label,
@@ -352,7 +386,7 @@ export function evaluateModel(
             automatic: auto.value,
             target,
             origin:
-              entry?.value != null
+              manualValue != null
                 ? "manual"
                 : value === null
                   ? "pending"
@@ -373,10 +407,12 @@ export function evaluateModel(
           p.payoutMode === "groups"
             ? [...new Set(p.tiers.map((t) => t.group))]
             : ["all"];
-        let earned = 0;
+        let earned = p.payoutMode === "manual"
+          ? p.metrics.filter(m => m.manualRewardCap !== undefined).reduce((sum, m) => sum + Math.max(0, Math.min(results.get(m.key)?.value ?? 0, m.manualRewardCap!)), 0)
+          : 0;
         const achieved: string[] = [];
         let next: string | null = null;
-        for (const group of groups) {
+        for (const group of p.payoutMode === "manual" ? [] : groups) {
           const tiers = p.tiers.filter(
             (t) => p.payoutMode !== "groups" || t.group === group,
           );
@@ -419,9 +455,9 @@ export function evaluateModel(
           color: p.color,
           earned: money(Math.min(earned, p.maxRewardEur)),
           maximum: p.maxRewardEur,
-          pending:
-            p.tiers.length === 0 ||
-            [...used].some((k) => results.get(k)?.value === null),
+          pending: p.payoutMode === "manual"
+            ? p.metrics.some(m => m.manualRewardCap !== undefined && results.get(m.key)?.value === null)
+            : p.tiers.length === 0 || [...used].some((k) => results.get(k)?.value === null),
           metrics: [...results.values()],
           achieved,
           next,
@@ -448,7 +484,7 @@ export function evaluateModel(
 }
 
 export function modelTemplate(
-  template: "empty" | "q1" | "q2" | "q3",
+  template: "empty" | "q1" | "q2" | "q3" | "xmas",
 ): WaveModel {
   const metric = (
     key: string,
@@ -511,20 +547,50 @@ export function modelTemplate(
         ),
       ],
     };
+  if (template === "xmas") {
+    // New draft only: historical templates and saved models keep their original rules.
+    const model = modelTemplate("q3");
+    model.provenance = "Kühler + X-Mas · Unterlagen vom 02.10.2026. Beide Teilziele mindestens 50 %; Auszahlung ab 25 / 30 Gesamtpunkten. Qualität: manuell festgelegte Eurobeträge.";
+    const count = (key: string, label: string, hint = ""): ModelMetric => ({ ...metric(key, label, "count"), minValue: 0, integerOnly: true, hint });
+    const derived = (key: string, label: string, unit: MetricUnit, method: MetricMethod, inputs: string[], extra: Partial<ModelMetric> = {}): ModelMetric => ({ ...metric(key, label, unit), method, inputs, readOnly: true, ...extra });
+    const categories = [
+      ["trucks", "Truck · Fahrerhaus + erster Anhänger", 3],
+      ["trailers", "Weitere Anhänger · ohne ersten Truck-Anhänger", 1],
+      ["bins", "Schütten", 1], ["fsdu", "FSDU", 1], ["sleds", "Schlittenschürzen", 1],
+      ["pallets", "Palettenschürzen", 0.5], ["standees", "Standees", 0.5],
+    ] as const;
+    const flex = model.pillars.find(p => p.key === "flex")!;
+    flex.name = "Flexziel · Kühler + X-Mas";
+    flex.metrics = [
+      count("new_coolers", "Qualifizierte Neuaufstellungen", "Alle Brands und Gerätetypen; mindestens 8 Wochen im Verkaufsraum. Wiedergefundene Geräte separat erfassen."),
+      count("recovered", "Wiedergefundene, zuvor als Lost gemeldete Kühler", "Zählen als Neuaufstellung; nicht nochmals unter Neuaufstellungen erfassen."),
+      count("returned", "Rückholungen · ohne Filialschließungen", "Nur abzugsfähige Rückholungen; Lost-Meldungen separat erfassen."),
+      count("lost", "Lost-Meldungen · ohne Filialschließungen", "Filialschließungen zählen nicht als Abzug. Keine Rückholung doppelt erfassen."),
+      derived("gross", "Neuaufstellungen inkl. Wiederfunde", "count", "sum", ["new_coolers", "recovered"]),
+      derived("deductions", "Abzugsfähige Rückholungen + Lost", "count", "sum", ["returned", "lost"]),
+      derived("net", "Kühler netto", "count", "difference", ["gross", "deductions"], { goal: { halfAt: 0, fullAt: 1 } }),
+      derived("cooler_points", "Kühlerpunkte", "points", "steps", ["net"], { steps: [{ at: 0, value: 5 }, { at: 1, value: 10 }] }),
+      ...categories.map(([key, label, weight]) => count(key, label, `Nur X-Mas-POS-Platzierungen, unabhängig von Brand/SKU · je ${weight.toLocaleString("de-AT")} Punkte.`)),
+      derived("xmas_points", "X-Mas-Aktivierungen", "points", "weighted_sum", categories.map(([key]) => key), { weights: Object.fromEntries(categories.map(([key, , weight]) => [key, weight])), goal: { halfAt: 20, fullAt: 28 } }),
+      derived("total", "Gesamtpunkte · Kühler + X-Mas", "points", "sum", ["cooler_points", "xmas_points"]),
+      { ...metric("qualified", "Standzeit & Meldungen geprüft", "count"), confirmation: true, minValue: 0, maxValue: 1, hint: "Bestätigen: Neuaufstellungen mindestens 8 Wochen im Verkaufsraum; Neuaufstellungen, Rückholungen und Lost in Execution Manager erfasst und per E-Mail mit Agentur in CC gemeldet; Filialschließungen aus Abzügen ausgeschlossen; Wiederfunde korrekt als Neuaufstellung gezählt. Diese Nachweise werden manuell geprüft." },
+    ];
+    flex.tiers = [tier("half", 25, 82.5, "total"), tier("full", 30, 165, "total")].map(t => ({ ...t, label: `${t.rewardEur === 165 ? "100" : "50"} % Auszahlung · ab ${t.conditions[0]!.value} Punkten`, conditions: [...t.conditions, { metricKey: "net", operator: "gte", value: 0 }, { metricKey: "xmas_points", operator: "gte", value: 20 }, { metricKey: "qualified", operator: "eq", value: 1 }] }));
+    const quality = model.pillars.find(p => p.key === "quality")!;
+    quality.payoutMode = "manual";
+    quality.metrics = [["reporting", "Merch Reporting", 55], ["tags", "Merch Survey / Bildertags", 55], ["time", "Merch Zeitmanagement", 110]].map(([key, label, cap]) => ({ ...metric(String(key), String(label), "eur"), manualRewardCap: Number(cap), minValue: 0, maxValue: Number(cap), hint: "Manuell festgelegte Auszahlung. Leer = Bewertung offen; 0 € = geprüft, keine Auszahlung. Keine unbestätigten Prozentgrenzen." }));
+    return model;
+  }
   const flexMetrics =
     template === "q3"
       ? [metric("coolers", "Kühler"), metric("racks", "Permanente Racks")]
       : template === "q1"
         ? [
-            metric("placements", "Neue Platzierungen", "count"),
+            metric("placements", "Neue Platzierungen · je 1 Punkt", "points"),
             {
               ...metric("placement_points", "Platzierungspunkte", "points"),
-              method: "steps" as const,
+              method: "sum" as const,
               inputs: ["placements"],
-              steps: [
-                { at: 18, value: 9 },
-                { at: 22, value: 18 },
-              ],
             },
             metric("scanning", "Kühler-Scanquote"),
             {
@@ -588,7 +654,7 @@ export function modelTemplate(
             {
               metricKey: template === "q1" ? "placement_points" : "red_points",
               operator: "gte" as const,
-              value: template === "q1" ? 9 : 5,
+              value: template === "q1" ? 18 : 5,
             },
             { metricKey: "cooler_points", operator: "gte" as const, value: 5 },
           ],
