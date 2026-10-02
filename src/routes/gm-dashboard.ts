@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { dashboardFacets, loadDashboard } from "../lib/gm-dashboard.js";
+import { dashboardFacets, dashboardMetadata, loadDashboard } from "../lib/gm-dashboard.js";
 import type { ModelDatabase } from "../lib/praemien-workspace.js";
 import type {
   DashboardData,
@@ -47,6 +47,11 @@ export function createGmDashboardRouter(
   ) => Promise<void>,
 ) {
   const router = Router();
+  router.get("/metadata", async (_req, res, next) => {
+    try {
+      res.set("Cache-Control", "private, no-store").json(await dashboardMetadata(database));
+    } catch (error) { next(error); }
+  });
   router.get("/facets", async (_req, res, next) => {
     try {
       res

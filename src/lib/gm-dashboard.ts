@@ -226,6 +226,19 @@ export function aggregateDashboard(
   };
 }
 
+export async function dashboardMetadata(database: ModelDatabase) {
+  // Match the dashboard's completed visits and Vienna calendar dates. Ordering
+  // the timestamp uses the existing submitted-period partial index.
+  const firstEntries = await database.query<{ firstEntryDate: string }>(sql`
+      select (s.submitted_at at time zone 'Europe/Vienna')::date::text as "firstEntryDate"
+      from visit_sessions s join markets m on m.id=s.market_id
+      where s.is_deleted=false and s.status='submitted' and s.submitted_at is not null
+        and s.submitted_at < (((now() at time zone 'Europe/Vienna')::date+1)::timestamp at time zone 'Europe/Vienna')
+      order by s.submitted_at limit 1
+    `);
+  return { firstEntryDate: firstEntries[0]?.firstEntryDate ?? null };
+}
+
 export async function dashboardFacets(
   database: ModelDatabase,
 ): Promise<DashboardFacets> {
@@ -236,17 +249,9 @@ export async function dashboardFacets(
     database.query<DashboardFacets["gms"][number]>(
       sql`select id,concat_ws(' ',first_name,last_name) || case when is_active=false then ' (inaktiv)' else '' end as label,coalesce(nullif(region,''),'Unbekannt') as region from users where role='gm' order by first_name,last_name,id`,
     ),
-    // Match the dashboard's completed visits and Vienna calendar dates. Ordering
-    // the timestamp uses the existing submitted-period partial index.
-    database.query<{ firstEntryDate: string }>(sql`
-      select (s.submitted_at at time zone 'Europe/Vienna')::date::text as "firstEntryDate"
-      from visit_sessions s join markets m on m.id=s.market_id
-      where s.is_deleted=false and s.status='submitted' and s.submitted_at is not null
-        and s.submitted_at < (((now() at time zone 'Europe/Vienna')::date+1)::timestamp at time zone 'Europe/Vienna')
-      order by s.submitted_at limit 1
-    `),
+    dashboardMetadata(database),
   ]);
-  return { markets, gms, firstEntryDate: firstEntries[0]?.firstEntryDate ?? null };
+  return { markets, gms, firstEntryDate: firstEntries.firstEntryDate };
 }
 
 // A bounded, parameterised read. The submitted-period index and question/scoring

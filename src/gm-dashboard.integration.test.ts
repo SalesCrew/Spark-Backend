@@ -289,3 +289,23 @@ test("annual HTTP query retains older history and distinguishes empty months (no
     await f.pg.close();
   }
 });
+
+test("small metadata read matches legacy facets and authenticated HTTP stays private/no-store without changing rows", async () => {
+  const f = await praemienFixture();
+  try {
+    await installDashboardFixture(f);
+    const app = express();
+    app.use((req, res, next) => {
+      if (req.headers.authorization !== "Bearer local") { res.sendStatus(401); return; }
+      next();
+    });
+    app.use("/admin/gm-dashboard", createGmDashboardRouter(f.database));
+    assert.equal((await request(app).get("/admin/gm-dashboard/metadata")).status, 401);
+    const before = await f.pg.query("select * from visit_sessions order by id");
+    const metadata = await request(app).get("/admin/gm-dashboard/metadata").set("Authorization", "Bearer local");
+    assert.equal(metadata.status, 200);
+    assert.equal(metadata.headers["cache-control"], "private, no-store");
+    assert.deepEqual(metadata.body, { firstEntryDate: (await dashboardFacets(f.database)).firstEntryDate });
+    assert.deepEqual(await f.pg.query("select * from visit_sessions order by id"), before);
+  } finally { await f.pg.close(); }
+});
