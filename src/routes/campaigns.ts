@@ -14,6 +14,8 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { aggregateHighVolumeLoad, logAction, logger, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { type AuthedRequest, requireAuth } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
+import { findAssignmentConflicts, type CampaignAssignmentConflict } from "../lib/campaign-assignment-conflicts.js";
+import { createCampaignExtensionRouter } from "./campaign-extension.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { buildVisitAnswerValidationResult, computeMissingRequiredQuestions } from "../lib/visit-session-answer-validation.js";
@@ -235,20 +237,6 @@ class CampaignDomainError extends Error {
     this.status = status;
   }
 }
-
-type CampaignAssignmentConflict = {
-  marketId: string;
-  marketName: string;
-  section: CampaignSection;
-  existingCampaignId: string;
-  existingCampaignName: string;
-  existingScheduleType: "always" | "scheduled";
-  existingStartDate: string | null;
-  existingEndDate: string | null;
-  existingPeriodLabel: string;
-  existingGmUserId: string | null;
-  existingGmName: string | null;
-};
 
 class CampaignOverlapConflictError extends Error {
   status = 409;
@@ -733,18 +721,6 @@ type CampaignScheduleWindow = {
   endDate: string | null;
 };
 
-function toPeriodLabel(window: CampaignScheduleWindow): string {
-  if (window.scheduleType === "always") return "Immer aktiv";
-  if (!window.startDate || !window.endDate) return "Geplant";
-  return `${window.startDate} - ${window.endDate}`;
-}
-
-function windowsOverlap(left: CampaignScheduleWindow, right: CampaignScheduleWindow): boolean {
-  if (left.scheduleType === "always" || right.scheduleType === "always") return true;
-  if (!left.startDate || !left.endDate || !right.startDate || !right.endDate) return false;
-  return !(left.endDate < right.startDate || right.endDate < left.startDate);
-}
-
 function deriveEffectiveCampaignStatus(input: {
   status: "active" | "scheduled" | "inactive";
   scheduleType: "always" | "scheduled";
@@ -896,75 +872,7 @@ async function findCampaignAssignmentConflicts(input: {
   targetWindow: CampaignScheduleWindow;
   assignments: CampaignAssignmentInput[];
 }): Promise<CampaignAssignmentConflict[]> {
-  if (input.targetStatus !== "active") return [];
-  if (input.section === "flex") return [];
-  const marketIds = Array.from(new Set(input.assignments.map((assignment) => assignment.marketId)));
-  if (marketIds.length === 0) return [];
-
-  const query = db
-    .select({
-      marketId: campaignMarketAssignments.marketId,
-      marketName: markets.name,
-      section: campaigns.section,
-      campaignId: campaigns.id,
-      campaignName: campaigns.name,
-      scheduleType: campaigns.scheduleType,
-      startDate: campaigns.startDate,
-      endDate: campaigns.endDate,
-      gmUserId: campaignMarketAssignments.gmUserId,
-      visitTargetCount: campaignMarketAssignments.visitTargetCount,
-      gmFirstName: users.firstName,
-      gmLastName: users.lastName,
-    })
-    .from(campaignMarketAssignments)
-    .innerJoin(campaigns, eq(campaigns.id, campaignMarketAssignments.campaignId))
-    .innerJoin(markets, eq(markets.id, campaignMarketAssignments.marketId))
-    .leftJoin(users, eq(users.id, campaignMarketAssignments.gmUserId))
-    .where(
-      and(
-        inArray(campaignMarketAssignments.marketId, marketIds),
-        eq(campaignMarketAssignments.isDeleted, false),
-        eq(campaigns.isDeleted, false),
-        eq(campaigns.section, input.section),
-        eq(campaigns.status, "active"),
-        input.targetCampaignId ? ne(campaigns.id, input.targetCampaignId) : sql`true`,
-      ),
-    );
-
-  const rows = await query;
-  const completedKuehlerKeys = input.section === "kuehler"
-    ? await findCompletedKuehlerCampaignMarketKeys(rows)
-    : new Set<string>();
-  const conflicts: CampaignAssignmentConflict[] = [];
-  for (const row of rows) {
-    if (completedKuehlerKeys.has(`${row.campaignId}:${row.marketId}`)) continue;
-    const existingWindow: CampaignScheduleWindow = {
-      scheduleType: row.scheduleType,
-      startDate: row.startDate ? String(row.startDate) : null,
-      endDate: row.endDate ? String(row.endDate) : null,
-    };
-    if (!windowsOverlap(input.targetWindow, existingWindow)) continue;
-    conflicts.push({
-      marketId: row.marketId,
-      marketName: row.marketName,
-      section: row.section,
-      existingCampaignId: row.campaignId,
-      existingCampaignName: row.campaignName,
-      existingScheduleType: row.scheduleType,
-      existingStartDate: existingWindow.startDate,
-      existingEndDate: existingWindow.endDate,
-      existingPeriodLabel: toPeriodLabel(existingWindow),
-      existingGmUserId: row.gmUserId ?? null,
-      existingGmName: row.gmFirstName && row.gmLastName ? `${row.gmFirstName} ${row.gmLastName}` : null,
-    });
-  }
-
-  const deduped = new Map<string, CampaignAssignmentConflict>();
-  for (const conflict of conflicts) {
-    const key = `${conflict.marketId}:${conflict.existingCampaignId}`;
-    if (!deduped.has(key)) deduped.set(key, conflict);
-  }
-  return Array.from(deduped.values());
+  return findAssignmentConflicts(db, input, findCompletedKuehlerCampaignMarketKeys);
 }
 
 async function resolveAuditUserId(rawUserId: string | undefined): Promise<string | null> {
@@ -1892,6 +1800,11 @@ adminCampaignsRouter.use("/campaigns", (req, res, next) => {
   });
   next();
 });
+
+adminCampaignsRouter.use("/campaigns", createCampaignExtensionRouter({
+  transaction: (action) => db.transaction(action),
+  checkConflicts: (tx, input) => findAssignmentConflicts(tx, { ...input, includeScheduled: true }, findCompletedKuehlerCampaignMarketKeys),
+}));
 
 adminCampaignsRouter.get("/campaigns", async (req, res, next) => {
   try {
@@ -3985,7 +3898,8 @@ adminCampaignsRouter.patch("/campaigns/:id", async (req: AuthedRequest, res, nex
         .select()
         .from(campaigns)
         .where(and(eq(campaigns.id, campaignId), eq(campaigns.isDeleted, false)))
-        .limit(1);
+        .limit(1)
+        .for("update");
       if (!existing) throw new CampaignDomainError("campaign_not_found", 404, "Kampagne nicht gefunden.");
 
       const schedule = normalizeSchedule({
