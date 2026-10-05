@@ -32,23 +32,29 @@ test("HTTP + PostgreSQL: multi-chain and multi-market unions, exact mapping, com
     const query = (extra: Partial<DashboardScope> = {}) => request(app).post("/query").send({ intervals, scope: { ...scope, ...extra } });
     const all = await query(); assert.equal(all.status, 200); assert.equal(all.body.points[0].visits, 13);
     const expected: [DashboardChainGroup[], number, number][] = [
-      [["rewe"], 5, 100], [["spar"], 2, 50], [["other"], 6, 0],
-      [["rewe", "spar"], 7, 600 / 7], [["spar", "other"], 8, 12.5],
-      [["rewe", "other"], 11, 500 / 11], [["rewe", "spar", "other"], 13, 600 / 13], [[], 13, 600 / 13],
+      [["rewe"], 4, 75], [["spar"], 4, 75], [["other"], 5, 0],
+      [["rewe", "spar"], 8, 75], [["spar", "other"], 9, 300 / 9],
+      [["rewe", "other"], 9, 300 / 9], [["rewe", "spar", "other"], 13, 600 / 13], [[], 13, 600 / 13],
     ];
     for (const [chainGroups, visits, average] of expected) {
       const result = await query({ chainGroups }); assert.equal(result.status, 200, JSON.stringify(result.body));
       const p = result.body.points[0];
-      assert.equal(p.visits, visits); assert.equal(p.redSurveys, chainGroups.length === 0 || chainGroups.includes("rewe") ? 5 : 0); assert.equal(p.availability.Cooler.total, visits);
+      const positive = !chainGroups.length ? 5 : (chainGroups.includes("rewe") ? 3 : 0) + (chainGroups.includes("spar") ? 2 : 0);
+      assert.equal(p.visits, visits); assert.equal(p.redSurveys, positive); assert.equal(p.availability.Cooler.total, visits);
       assert.equal(p.availability.Cooler.average, Math.round(average * 10000) / 10000);
-      assert.equal(p.placements, chainGroups.length === 0 || chainGroups.includes("rewe") ? 10 : 0);
+      assert.equal(p.placements, positive * 2);
       assert.equal(p.competitor, visits * 3);
-      assert.equal(p.ipp, chainGroups.length === 0 || chainGroups.includes("rewe") ? 2 : 0);
+      assert.equal(p.ipp, positive ? 2 : 0);
       assert.deepEqual(result.body.scope.chainGroups, chainGroups);
     }
-    assert.equal((await query({ chainGroups: ["rewe", "rewe"] })).body.points[0].visits, 5);
+    assert.equal((await query({ chainGroups: ["rewe", "rewe"] })).body.points[0].visits, 4);
+    for (const [index, group] of [[3, "spar"], [4, "spar"], [8, "rewe"]] as const) {
+      assert.equal((await query({ chainGroups: [group], marketId: markets[index] })).body.points[0].visits, 1, chains[index]);
+      assert.equal((await query({ chainGroups: [group === "rewe" ? "spar" : "rewe"], marketId: markets[index] })).body.points[0].visits, 0, chains[index]);
+      assert.equal((await query({ chainGroups: ["other"], marketId: markets[index] })).body.points[0].visits, 0, chains[index]);
+    }
     assert.equal((await query({ chainGroups: ["rewe", "spar"], region: "Süd" })).body.points[0].visits, 1);
-    assert.equal((await query({ chainGroups: ["rewe", "spar"], gmId: f.ids.gm })).body.points[0].visits, 6);
+    assert.equal((await query({ chainGroups: ["rewe", "spar"], gmId: f.ids.gm })).body.points[0].visits, 7);
     assert.equal((await query({ chainGroups: ["spar"], marketId: markets[0] })).body.points[0].visits, 0);
     assert.equal((await query({ chainGroups: ["rewe"], marketId: markets[0] })).body.points[0].visits, 1);
     assert.equal((await query({ chain: "Billa" })).body.points[0].visits, 1);

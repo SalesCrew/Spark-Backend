@@ -288,8 +288,8 @@ export async function loadDashboard(
         ))
         and (${!(scope.chainGroups?.length)} or (
           case
-            when upper(regexp_replace(coalesce(m.db_name,''), '\\s+', '', 'g')) in ('BILLA','BILLA+','BILLAPLUS','ISP','ESP') then 'rewe'
-            when upper(regexp_replace(coalesce(m.db_name,''), '\\s+', '', 'g'))='SPAR' then 'spar'
+            when upper(regexp_replace(coalesce(m.db_name,''), '\\s+', '', 'g')) in ('BILLA','BILLA+','BILLAPLUS','BILLACORSO') then 'rewe'
+            when upper(regexp_replace(coalesce(m.db_name,''), '\\s+', '', 'g')) in ('SPAR','ISP','ESP') then 'spar'
             else 'other'
           end
         ) in (select jsonb_array_elements_text(${JSON.stringify(scope.chainGroups ?? [])}::jsonb)))
