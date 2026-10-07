@@ -225,6 +225,7 @@ async function publicAnswerRequests(smUserId?: string) {
     moduleName: smQuestionnaireSubmissionSections.moduleNameSnapshot,
     assignmentId: smQuestionnaireSubmissions.assignmentId,
     questionnaireName: smQuestionnaireSubmissions.questionnaireNameSnapshot,
+    SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`(select case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end from sm_questionnaire_templates t where t.id = ${smQuestionnaireSubmissions.questionnaireTemplateId})`,
     questionnaireVersion: smQuestionnaireSubmissions.questionnaireVersionSnapshot,
     submittedAt: smQuestionnaireSubmissions.submittedAt,
     submissionStatus: smQuestionnaireSubmissions.status,
@@ -292,13 +293,13 @@ async function publicAnswerRequests(smUserId?: string) {
       autoApplicabilityError,
       sm: { id: row.request.smUserId, name: `${row.smFirstName} ${row.smLastName}`.trim() || row.smEmail, email: row.smEmail },
       market: { id: row.request.smMarketId, name: row.marketName, address: row.marketAddress, postalCode: row.marketPostalCode, city: row.marketCity },
-      submission: { assignmentId: row.assignmentId, questionnaireName: row.questionnaireName, questionnaireVersion: row.questionnaireVersion, submittedAt: row.submittedAt?.toISOString() ?? null, moduleName: row.moduleName },
+      submission: { SMDurcharbeitCatalogScope: row.SMDurcharbeitCatalogScope, assignmentId: row.assignmentId, questionnaireName: row.questionnaireName, questionnaireVersion: row.questionnaireVersion, submittedAt: row.submittedAt?.toISOString() ?? null, moduleName: row.moduleName },
     };
   }));
 }
 
 async function publicDeleteRequests(smUserId?: string) {
-  const rows = await db.select({ request: smQuestionnaireSubmissionDeleteRequests, smFirstName: users.firstName, smLastName: users.lastName, smEmail: users.email })
+  const rows = await db.select({ SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`(select case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end from sm_questionnaire_templates t join sm_questionnaire_submissions s on s.questionnaire_template_id = t.id where s.id = ${smQuestionnaireSubmissionDeleteRequests.submissionId})`, request: smQuestionnaireSubmissionDeleteRequests, smFirstName: users.firstName, smLastName: users.lastName, smEmail: users.email })
     .from(smQuestionnaireSubmissionDeleteRequests)
     .innerJoin(users, eq(users.id, smQuestionnaireSubmissionDeleteRequests.smUserId))
     .where(and(eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false), ...(smUserId ? [eq(smQuestionnaireSubmissionDeleteRequests.smUserId, smUserId)] : [])))
@@ -315,6 +316,7 @@ async function publicDeleteRequests(smUserId?: string) {
     submissionId: row.request.submissionId,
     requestReason: row.request.requestReason,
     questionnaireName: row.request.questionnaireNameSnapshot,
+    SMDurcharbeitCatalogScope: row.SMDurcharbeitCatalogScope,
     questionnaireVersion: row.request.questionnaireVersionSnapshot,
     market: { id: row.request.smMarketId, name: row.request.marketNameSnapshot },
     submittedAt: row.request.submittedAtSnapshot?.toISOString() ?? null,
@@ -368,7 +370,7 @@ smActivityRouter.get("/completed", async (req: AuthedRequest, res, next) => {
   try {
     const actor = authUser(req);
     const limit = listSchema.parse(req.query).limit ?? 80;
-    const rows = await db.select({ submission: smQuestionnaireSubmissions, assignment: smAssignments, market: smMarkets, actualMinutes: smAssignmentTimeSubmissions.actualMinutes })
+    const rows = await db.select({ SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`(select case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end from sm_questionnaire_templates t where t.id = ${smQuestionnaireSubmissions.questionnaireTemplateId})`, submission: smQuestionnaireSubmissions, assignment: smAssignments, market: smMarkets, actualMinutes: smAssignmentTimeSubmissions.actualMinutes })
       .from(smQuestionnaireSubmissions)
       .innerJoin(smAssignments, eq(smAssignments.id, smQuestionnaireSubmissions.assignmentId))
       .innerJoin(smMarkets, eq(smMarkets.id, smQuestionnaireSubmissions.smMarketId))
@@ -392,6 +394,7 @@ smActivityRouter.get("/completed", async (req: AuthedRequest, res, next) => {
         plannedMinutes: effective.plannedMinutes,
         actualMinutes: row.actualMinutes ?? null,
         questionnaireName: row.submission.questionnaireNameSnapshot,
+        SMDurcharbeitCatalogScope: row.SMDurcharbeitCatalogScope,
         questionnaireVersion: row.submission.questionnaireVersionSnapshot,
         market: { id: row.market.id, name: row.submission.marketNameSnapshot, internalId: row.market.internalMarketId, address: row.submission.marketAddressSnapshot, postalCode: row.submission.marketPostalCodeSnapshot, city: row.submission.marketCitySnapshot },
         visitStartedAt: row.submission.visitStartedAt?.toISOString() ?? null,

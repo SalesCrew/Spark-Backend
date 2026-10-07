@@ -37,6 +37,7 @@ const querySchema = z.object({
   chain: z.string().trim().min(1).max(500).optional(),
   smUserId: z.string().uuid().optional(),
   marketId: z.string().uuid().optional(),
+  SMDurcharbeitCatalogScope: z.enum(["standard", "SMDurcharbeit"]).optional(),
 }).strict();
 
 type VisitDbRow = {
@@ -127,6 +128,7 @@ function scopeConditions(input: z.infer<typeof querySchema>): SQL[] {
   if (input.chain) conditions.push(sql`m.chain = ${input.chain}`);
   if (input.smUserId) conditions.push(sql`s.sm_user_id = ${input.smUserId}::uuid`);
   if (input.marketId) conditions.push(sql`s.sm_market_id = ${input.marketId}::uuid`);
+  if (input.SMDurcharbeitCatalogScope) conditions.push(sql`(case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${input.SMDurcharbeitCatalogScope}`);
   return conditions;
 }
 
@@ -145,9 +147,12 @@ export async function loadSmDashboardRows(input: z.infer<typeof querySchema>, ex
         m.chain as "chain",
         m.region as "region",
         s.sm_user_id::text as "smUserId",
-        s.sm_name_snapshot as "smName"
+        s.sm_name_snapshot as "smName",
+        s.answered_question_count as "SMDurcharbeitAnsweredQuestionCount",
+        case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end as "SMDurcharbeitCatalogScope"
       from sm_questionnaire_submissions s
       inner join sm_markets m on m.id = s.sm_market_id
+      left join sm_questionnaire_templates t on t.id = s.questionnaire_template_id
       where ${scopedWhere}
       order by s.submitted_at, s.id
     `),
@@ -168,6 +173,7 @@ export async function loadSmDashboardRows(input: z.infer<typeof querySchema>, ex
         ao.metric_outcome_code_snapshot as "outcome"
       from sm_questionnaire_submissions s
       inner join sm_markets m on m.id = s.sm_market_id
+      left join sm_questionnaire_templates t on t.id = s.questionnaire_template_id
       inner join sm_questionnaire_submission_questions q
         on q.submission_id = s.id
         and q.is_deleted = false
@@ -244,6 +250,7 @@ adminSmDashboardRouter.get("/", async (req, res, next) => {
       ...(typeof req.query.chain === "string" && req.query.chain.trim() ? { chain: req.query.chain } : {}),
       ...(typeof req.query.smUserId === "string" && req.query.smUserId.trim() ? { smUserId: req.query.smUserId } : {}),
       ...(typeof req.query.marketId === "string" && req.query.marketId.trim() ? { marketId: req.query.marketId } : {}),
+      ...(typeof req.query.SMDurcharbeitCatalogScope === "string" && req.query.SMDurcharbeitCatalogScope.trim() ? { SMDurcharbeitCatalogScope: req.query.SMDurcharbeitCatalogScope } : {}),
     });
     if (!parsed.success) {
       res.status(400).json({ error: "Die Dashboard-Filter sind ungültig.", code: "sm_dashboard_query_invalid", details: parsed.error.flatten() });
@@ -274,9 +281,14 @@ adminSmDashboardRouter.get("/", async (req, res, next) => {
           chain: parsed.data.chain ?? null,
           smUserId: parsed.data.smUserId ?? null,
           marketId: parsed.data.marketId ?? null,
+          SMDurcharbeitCatalogScope: parsed.data.SMDurcharbeitCatalogScope ?? null,
         },
       },
       ...aggregateSmDashboard(visits, oosRows),
+      SMDurcharbeitBreakdown: {
+        standard: { completedVisits: visits.filter(row => row.SMDurcharbeitCatalogScope !== "SMDurcharbeit").length, answeredQuestions: visits.filter(row => row.SMDurcharbeitCatalogScope !== "SMDurcharbeit").reduce((n, row) => n + (row.SMDurcharbeitAnsweredQuestionCount ?? 0), 0) },
+        SMDurcharbeit: { completedVisits: visits.filter(row => row.SMDurcharbeitCatalogScope === "SMDurcharbeit").length, answeredQuestions: visits.filter(row => row.SMDurcharbeitCatalogScope === "SMDurcharbeit").reduce((n, row) => n + (row.SMDurcharbeitAnsweredQuestionCount ?? 0), 0) },
+      },
       filterOptions,
     });
   } catch (error) {

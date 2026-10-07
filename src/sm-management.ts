@@ -1,3 +1,5 @@
+import { smQuestionnaireCatalogScope } from "./sm-SMDurcharbeit-catalog.shared.js";
+import { smQuestionnaireTemplates } from "./lib/schema.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -221,9 +223,10 @@ export async function smManagementDetail(tx: SmManagementTx, id: string) {
   const state = await loadSmManagementState(tx, id);
   const sectionRows = await tx.select().from(sections).where(and(eq(sections.submissionId, id), eq(sections.isDeleted, false))).orderBy(asc(sections.orderIndex));
   const submission = state.submission;
+  const [SMDurcharbeitTemplate] = await tx.select({ stableCode: smQuestionnaireTemplates.stableCode }).from(smQuestionnaireTemplates).where(eq(smQuestionnaireTemplates.id, submission.questionnaireTemplateId)).limit(1);
   return {
     version: state.version,
-    visit: { id: submission.id, assignmentId: submission.assignmentId, smUserId: submission.smUserId, smName: submission.smNameSnapshot,
+    visit: { SMDurcharbeitCatalogScope: SMDurcharbeitTemplate ? smQuestionnaireCatalogScope(SMDurcharbeitTemplate.stableCode) : null, id: submission.id, assignmentId: submission.assignmentId, smUserId: submission.smUserId, smName: submission.smNameSnapshot,
       marketId: submission.smMarketId, marketName: submission.marketNameSnapshot, address: submission.marketAddressSnapshot,
       questionnaireId: submission.questionnaireTemplateId, questionnaireName: submission.questionnaireNameSnapshot, questionnaireVersion: submission.questionnaireVersionSnapshot,
       startedAt: submission.visitStartedAt?.toISOString() ?? null, completedAt: submission.visitCompletedAt?.toISOString() ?? null,

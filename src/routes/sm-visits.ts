@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { assertSMDurcharbeitOverride, loadSMDurcharbeitSelectionCatalog, resolveSMDurcharbeitSelection, SMDurcharbeitSelectionError } from "../sm-SMDurcharbeit-selection.shared.js";
 import { and, asc, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
@@ -62,6 +63,7 @@ const startSchema = z.object({
   mode: z.enum(["timer", "manual"]),
   travelMinutes: z.number().int().min(0).max(1440).nullable().optional(),
   clientSubmissionToken: z.string().trim().min(8).max(300),
+  SMDurcharbeitExpectedSelectionRevision: z.string().max(2000).optional(),
 }).strict();
 const discardSchema = z.object({ confirmation: z.literal("SOFT_DELETE_SM_VISIT") }).strict();
 const saveAnswerSchema = z.object({
@@ -166,7 +168,7 @@ function sendError(error: unknown, res: Response): boolean {
     res.status(400).json({ error: error.message, code: "sm_visit_answer_invalid" });
     return true;
   }
-  if (!(error instanceof SmVisitError)) return false;
+  if (!(error instanceof SmVisitError) && !(error instanceof SMDurcharbeitSelectionError)) return false;
   res.status(error.statusCode).json({ error: error.message, code: error.code, ...(error.details ? { details: error.details } : {}) });
   return true;
 }
@@ -210,65 +212,20 @@ async function loadContext(executor: DbExecutor, assignment: AssignmentRow, smUs
   return { effective, user, market };
 }
 
-async function effectivePublishedVersions(executor: DbExecutor, workDate: string) {
-  return executor.select({
-    id: smQuestionnaireVersions.id,
-    questionnaireTemplateId: smQuestionnaireVersions.questionnaireTemplateId,
-    versionNumber: smQuestionnaireVersions.versionNumber,
-    name: smQuestionnaireVersions.name,
-    description: smQuestionnaireVersions.description,
-    oncePerMarket: smQuestionnaireVersions.oncePerMarket,
-    timezone: smQuestionnaireVersions.timezone,
-  }).from(smQuestionnaireVersions)
-    .innerJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, smQuestionnaireVersions.questionnaireTemplateId))
-    .where(and(
-      eq(smQuestionnaireVersions.status, "published"),
-      eq(smQuestionnaireVersions.isDeleted, false),
-      eq(smQuestionnaireTemplates.status, "active"),
-      eq(smQuestionnaireTemplates.isDeleted, false),
-      or(isNull(smQuestionnaireVersions.effectiveFrom), lte(smQuestionnaireVersions.effectiveFrom, workDate)),
-      or(isNull(smQuestionnaireVersions.effectiveTo), gte(smQuestionnaireVersions.effectiveTo, workDate)),
-    ))
-    .orderBy(desc(smQuestionnaireVersions.versionNumber));
-}
-
-async function effectiveGlobalQuestionnaireVersion(executor: DbExecutor, workDate: string) {
-  const [globalAssignment] = await executor.select({
-    questionnaireTemplateId: smQuestionnaireGlobalAssignments.questionnaireTemplateId,
-  }).from(smQuestionnaireGlobalAssignments).where(and(
-    eq(smQuestionnaireGlobalAssignments.isDeleted, false),
-    isNull(smQuestionnaireGlobalAssignments.supersededAt),
-  )).limit(1);
-  if (!globalAssignment) return null;
-
-  const candidates = await effectivePublishedVersions(executor, workDate);
-  const selected = candidates.find((candidate) => candidate.questionnaireTemplateId === globalAssignment.questionnaireTemplateId);
-  if (!selected) {
-    throw new SmVisitError(409, "sm_visit_global_questionnaire_unavailable", "Der zentral ausgewählte SM-Fragebogen ist für diesen Einsatztag nicht aktiv oder veröffentlicht.");
+async function resolveQuestionnaireVersion(tx: DbTx, assignment: AssignmentRow, expectedRevision?: string) {
+  const catalog = await loadSMDurcharbeitSelectionCatalog(tx);
+  await assertSMDurcharbeitOverride(tx, assignment, catalog);
+  const resolution = resolveSMDurcharbeitSelection(catalog, assignment);
+  if (expectedRevision && resolution.selection.revision !== expectedRevision) {
+    throw new SMDurcharbeitSelectionError(409, "smdurcharbeit_selection_stale", "Der Fragebogen wurde zwischenzeitlich geändert. Bitte die Vorschau neu laden.");
   }
-  return selected;
-}
-
-async function resolveQuestionnaireVersion(tx: DbTx, assignment: AssignmentRow) {
-  const effective = resolveSmAssignmentValues(assignment);
-  const globalSelection = await effectiveGlobalQuestionnaireVersion(tx, effective.workDate);
-  if (globalSelection) {
-    if (assignment.questionnaireVersionId !== globalSelection.id) {
-      await tx.update(smAssignments).set({ questionnaireVersionId: globalSelection.id, updatedAt: new Date() }).where(eq(smAssignments.id, assignment.id));
-    }
-    return globalSelection;
+  if (!resolution.selection.available || !resolution.version) {
+    throw new SMDurcharbeitSelectionError(409, "smdurcharbeit_questionnaire_unavailable", resolution.selection.blockReason ?? "Kein Fragebogen verfügbar.");
   }
-  const candidates = await effectivePublishedVersions(tx, effective.workDate);
-  if (assignment.questionnaireVersionId) {
-    const selected = candidates.find((candidate) => candidate.id === assignment.questionnaireVersionId);
-    if (!selected) throw new SmVisitError(409, "sm_visit_questionnaire_unavailable", "Der für diesen Einsatz geplante Fragebogen ist nicht veröffentlicht oder für dieses Datum nicht gültig.");
-    return selected;
+  if (assignment.questionnaireVersionId !== resolution.version.id) {
+    await tx.update(smAssignments).set({ questionnaireVersionId: resolution.version.id, updatedAt: new Date() }).where(eq(smAssignments.id, assignment.id));
   }
-  if (candidates.length === 0) throw new SmVisitError(409, "sm_visit_questionnaire_missing", "Für diesen Einsatz ist noch kein veröffentlichter SM-Fragebogen verfügbar.");
-  if (candidates.length > 1) throw new SmVisitError(409, "sm_visit_questionnaire_ambiguous", "Für diesen Einsatz sind mehrere Fragebögen verfügbar. Bitte ordne in der Verplanung einen Fragebogen zu.");
-  const selected = candidates[0]!;
-  await tx.update(smAssignments).set({ questionnaireVersionId: selected.id, updatedAt: new Date() }).where(eq(smAssignments.id, assignment.id));
-  return selected;
+  return resolution.version;
 }
 
 async function createSubmissionGraph(tx: DbTx, input: {
@@ -445,17 +402,12 @@ async function loadVisitPayload(assignment: AssignmentRow, smUserId: string) {
     eq(smQuestionnaireSubmissions.isCurrent, true),
   )).limit(1);
   if (!submission) {
-    const globalSelection = await effectiveGlobalQuestionnaireVersion(db, context.effective.workDate);
-    const publishedCandidates = globalSelection ? [globalSelection] : await effectivePublishedVersions(db, context.effective.workDate);
-    const candidates = globalSelection
-      ? publishedCandidates
-      : assignment.questionnaireVersionId
-        ? publishedCandidates.filter((candidate) => candidate.id === assignment.questionnaireVersionId)
-        : publishedCandidates;
+    const resolved = resolveSMDurcharbeitSelection(await loadSMDurcharbeitSelectionCatalog(db), assignment);
     return {
       assignment: publicAssignment(assignment, context),
       profile: { name: `${context.user.firstName} ${context.user.lastName}`.trim(), travelTimeEnabled: context.user.travelTimeEnabled },
-      questionnaireAvailability: { count: candidates.length, names: candidates.map((candidate) => candidate.name) },
+      questionnaireAvailability: { count: resolved.count, names: resolved.selection.name ? [resolved.selection.name] : [] },
+      SMDurcharbeitQuestionnaireSelection: resolved.selection,
       submission: null,
       sections: [],
       answers: {},
@@ -515,10 +467,12 @@ async function loadVisitPayload(assignment: AssignmentRow, smUserId: string) {
   const questionsBySection = new Map<string, typeof questions>();
   for (const question of questions) questionsBySection.set(question.submissionSectionId, [...(questionsBySection.get(question.submissionSectionId) ?? []), question]);
 
+  const resolved = resolveSMDurcharbeitSelection(await loadSMDurcharbeitSelectionCatalog(db), assignment, submission);
   return {
     assignment: publicAssignment(assignment, context),
     profile: { name: `${context.user.firstName} ${context.user.lastName}`.trim(), travelTimeEnabled: context.user.travelTimeEnabled },
     questionnaireAvailability: { count: 1, names: [submission.questionnaireNameSnapshot] },
+    SMDurcharbeitQuestionnaireSelection: resolved.selection,
     submission: {
       id: submission.id,
       status: submission.status,
@@ -762,7 +716,7 @@ smVisitsRouter.post("/:assignmentId/start", async (req: AuthedRequest, res, next
       if (["cancelled", "missed", "completed"].includes(assignment.status)) {
         throw new SmVisitError(409, "sm_visit_assignment_locked", "Dieser Einsatz kann nicht mehr gestartet werden.");
       }
-      const version = await resolveQuestionnaireVersion(tx, assignment);
+      const version = await resolveQuestionnaireVersion(tx, assignment, input.SMDurcharbeitExpectedSelectionRevision);
       if (version.oncePerMarket) {
         const [completed] = await tx.select({ id: smQuestionnaireSubmissions.id }).from(smQuestionnaireSubmissions).where(and(
           eq(smQuestionnaireSubmissions.questionnaireTemplateId, version.questionnaireTemplateId),

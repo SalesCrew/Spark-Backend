@@ -21,7 +21,8 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:seed": "tsx src/scripts/seed.ts",
-    "db:verify:praemien": "tsx src/scripts/verify-praemien-migration.ts"
+    "db:verify:praemien": "tsx src/scripts/verify-praemien-migration.ts",
+    "test:SMDurcharbeit": "tsx --test src/SMDurcharbeit.integration.test.ts src/SMDurcharbeit-einsatz.integration.test.ts"
   },
   "keywords": [],
   "author": "",

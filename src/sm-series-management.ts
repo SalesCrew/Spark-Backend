@@ -1,9 +1,10 @@
+import { assertSMDurcharbeitOverride, SMDurcharbeitSelectionError } from "./sm-SMDurcharbeit-selection.shared.js";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "./lib/db.js";
-import { smAssignments, smAssignmentSeries, smAssignmentSeriesVersions, smAssignmentEvents, smAssignmentTimeSubmissions, smQuestionnaireSubmissions, smMarkets, users } from "./lib/schema.js";
+import { smAssignments, smAssignmentSeries, smAssignmentSeriesVersions, smAssignmentEvents, smAssignmentTimeSubmissions, smQuestionnaireSubmissions, smMarkets, smSMDurcharbeitMarkets, users } from "./lib/schema.js";
 import type { AuthedRequest } from "./middleware/auth.js";
 import { lockSmPlanning } from "./sm-planning-lock.js";
 import { adjustSmHolidayAssignments, smHolidayToday } from "./sm-holiday-planning.js";
@@ -53,6 +54,8 @@ async function prepare(tx: Tx, id: string, change: Change, today: string, forUpd
     if (normalizeWeekdays(change.weekdays).length !== change.weekdays.length) fail(400, "sm_series_weekdays", "Wochentage dürfen nicht doppelt gewählt werden.");
     [market] = await tx.select({ id: smMarkets.id, internalMarketId: smMarkets.internalMarketId }).from(smMarkets).where(and(eq(smMarkets.id, change.smMarketId), eq(smMarkets.isDeleted, false), eq(smMarkets.isActive, true)));
     const [sm] = await tx.select({ id: users.id }).from(users).where(and(eq(users.id, change.smUserId), eq(users.role, "sm"), eq(users.isActive, true), sql`${users.deletedAt} is null`));
+    const [SMDurcharbeitMarket] = await tx.select().from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, change.smMarketId)).limit(1);
+    if (SMDurcharbeitMarket) fail(409, "smdurcharbeit_series_not_supported", "Durcharbeit-Märkte bitte als einzelne Einsätze mit eigenem Fragebogen planen.");
     if (!market?.internalMarketId || !sm) fail(400, "sm_series_target_invalid", "Ein aktiver SM und ein aktiver SM-Markt mit Stammnummer sind erforderlich.");
   }
   const rowQuery = tx.select().from(smAssignments).where(and(eq(smAssignments.seriesId, id), eq(smAssignments.isDeleted, false))).orderBy(asc(smAssignments.id)).limit(5001);
@@ -73,6 +76,14 @@ async function prepare(tx: Tx, id: string, change: Change, today: string, forUpd
   try { plan = planSmSeriesChange(occurrences, change, version.validFrom); }
   catch { return fail(400, "sm_series_occurrence_limit", "Eine Serie darf höchstens 1.000 Termine im gewählten Zeitraum enthalten."); }
   if (change.action === "edit" && plan.desiredCount === 0) fail(400, "sm_series_empty", "Im gewählten Zeitraum liegt kein passender Termin. Zum Beenden bitte Stoppen wählen.");
+  if (change.action === "edit") {
+    const changedIds = new Set([...plan.updateIds, ...plan.restoreIds]);
+    for (const row of rows) {
+      if (changedIds.has(row.id) && row.SMDurcharbeitQuestionnaireOverrideVersionId) await assertSMDurcharbeitOverride(tx, {
+        ...row, replacementSmMarketId: change.smMarketId, replacementWorkDate: row.replacementWorkDate,
+      });
+    }
+  }
   const previewToken = createHash("sha256").update(JSON.stringify({ today, series, version, change, occurrences })).digest("hex");
   const preview = { previewToken, effectiveFromDate: change.effectiveFromDate, updateCount: plan.updateIds.length,
     cancelCount: plan.cancelIds.length, restoreCount: plan.restoreIds.length, createCount: plan.createDates.length,
@@ -131,6 +142,10 @@ export async function applySmSeriesChange(tx: Tx, id: string, input: z.infer<typ
     }))).returning() : [];
     await audit(created, "series_extended", "created");
     holidayAdjustedCount = (await adjustSmHolidayAssignments(tx, { actorUserId, today: change.effectiveFromDate, assignmentIds: [...created.map((row) => row.id), ...plan.restoreIds] })).length;
+    if (plan.restoreIds.length) {
+      const restored = await tx.select().from(smAssignments).where(inArray(smAssignments.id, plan.restoreIds));
+      for (const row of restored) await assertSMDurcharbeitOverride(tx, row);
+    }
   }
   await tx.update(smAssignmentSeries).set({ status: change.action === "stop" ? "ended" : "active", updatedAt: now }).where(eq(smAssignmentSeries.id, id));
   return { ...preview, seriesId: id, status: change.action === "stop" ? "ended" : "active", holidayAdjustedCount };
@@ -159,6 +174,7 @@ smSeriesManagementRouter.post("/series/:id/change", async (req: AuthedRequest, r
   } catch (error) { handle(error, res, next); }
 });
 function handle(error: unknown, res: import("express").Response, next: import("express").NextFunction) {
+  if (error instanceof SMDurcharbeitSelectionError) { res.status(error.statusCode).json({ error: error.message, code: error.code }); return; }
   if (error instanceof SmSeriesError) res.status(error.status).json({ code: error.code, error: error.message });
   else if (error instanceof z.ZodError) res.status(400).json({ code: "sm_series_invalid", error: "Die Serienangaben sind ungültig." });
   else next(error);

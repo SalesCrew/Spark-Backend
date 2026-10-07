@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { assertSMDurcharbeitOverride, loadSMDurcharbeitSelectionCatalog, resolveSMDurcharbeitSelection, SMDurcharbeitVersionAvailable, SMDurcharbeitSelectionError } from "../sm-SMDurcharbeit-selection.shared.js";
+import { smQuestionnaireCatalogScope } from "../sm-SMDurcharbeit-catalog.shared.js";
 import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
@@ -13,6 +15,7 @@ import {
   smAssignmentTimeChangeRequests,
   smAssignmentTimeSubmissions,
   smMarkets,
+  smSMDurcharbeitMarkets,
   smQuestionnaireGlobalAssignments,
   smQuestionnaireSubmissions,
   smQuestionnaireTemplates,
@@ -52,6 +55,7 @@ const optionalFlatRateSchema = z.number().int().min(0).max(10_000_000).nullable(
 const globalQuestionnaireAssignmentSchema = z.object({ questionnaireTemplateId: z.string().uuid() }).strict();
 
 const singleAssignmentSchema = z.object({
+  SMDurcharbeitQuestionnaireOverrideVersionId: z.string().uuid().optional(),
   smMarketId: z.string().uuid(),
   smUserId: z.string().uuid(),
   workDate: isoDateSchema,
@@ -73,11 +77,14 @@ const seriesSchema = z.object({
 }).strict();
 
 const updateOccurrenceSchema = z.object({
+  workDate: isoDateSchema.optional(),
+  smUserId: z.string().uuid().optional(),
+  SMDurcharbeitQuestionnaireOverrideVersionId: z.string().uuid().nullable().optional(),
   smMarketId: z.string().uuid().optional(),
   plannedMinutes: z.number().int().min(1).max(1440).optional(),
   expectedUpdatedAt: expectedUpdatedAtSchema,
   reason: z.string().trim().max(2_000).optional(),
-}).strict().refine((value) => value.smMarketId !== undefined || value.plannedMinutes !== undefined, {
+}).strict().refine((value) => value.smMarketId !== undefined || value.plannedMinutes !== undefined || value.workDate !== undefined || value.smUserId !== undefined || value.SMDurcharbeitQuestionnaireOverrideVersionId !== undefined, {
   message: "Mindestens eine Änderung ist erforderlich.",
 });
 
@@ -168,7 +175,7 @@ function sendKnownError(error: unknown, res: Response): boolean {
     res.status(error.statusCode).json({ error: error.message, code: error.code, details: error.details });
     return true;
   }
-  if (!(error instanceof SmPlanningError)) return false;
+  if (!(error instanceof SmPlanningError) && !(error instanceof SMDurcharbeitSelectionError)) return false;
   res.status(error.statusCode).json({ error: error.message, code: error.code });
   return true;
 }
@@ -181,6 +188,7 @@ function requireWrittenRow<T>(row: T | undefined): T {
 }
 
 type GlobalQuestionnaireOption = {
+  SMDurcharbeitCatalogScope: "standard" | "SMDurcharbeit";
   questionnaireTemplateId: string;
   latestPublishedVersionId: string;
   versionNumber: number;
@@ -195,6 +203,7 @@ async function loadGlobalQuestionnaireConfiguration(executor: DbExecutor) {
     versionNumber: smQuestionnaireVersions.versionNumber,
     name: smQuestionnaireVersions.name,
     description: smQuestionnaireVersions.description,
+    SMDurcharbeitCatalogScope: smQuestionnaireTemplates.stableCode,
   }).from(smQuestionnaireTemplates)
     .innerJoin(smQuestionnaireVersions, eq(smQuestionnaireVersions.questionnaireTemplateId, smQuestionnaireTemplates.id))
     .where(and(
@@ -207,7 +216,7 @@ async function loadGlobalQuestionnaireConfiguration(executor: DbExecutor) {
 
   const latestByTemplate = new Map<string, GlobalQuestionnaireOption>();
   for (const row of versionRows) {
-    if (!latestByTemplate.has(row.questionnaireTemplateId)) latestByTemplate.set(row.questionnaireTemplateId, row);
+    if (!latestByTemplate.has(row.questionnaireTemplateId)) latestByTemplate.set(row.questionnaireTemplateId, { ...row, SMDurcharbeitCatalogScope: smQuestionnaireCatalogScope(row.SMDurcharbeitCatalogScope) });
   }
   const options = [...latestByTemplate.values()].sort((left, right) => left.name.localeCompare(right.name, "de-AT"));
   const [assignment] = await executor.select().from(smQuestionnaireGlobalAssignments).where(and(
@@ -270,6 +279,7 @@ function assignmentState(row: AssignmentRow): Record<string, unknown> {
       plannedMinutes: row.replacementPlannedMinutes,
     },
     effective,
+    SMDurcharbeitQuestionnaireOverrideVersionId: row.SMDurcharbeitQuestionnaireOverrideVersionId,
     cancellation: row.status === "cancelled" ? {
       cancelledAt: row.cancelledAt?.toISOString() ?? null,
       cancelledByUserId: row.cancelledByUserId,
@@ -404,6 +414,9 @@ async function loadAssignments(from: string, to: string, smUserId?: string, empl
       assignmentId: smQuestionnaireSubmissions.assignmentId,
       status: smQuestionnaireSubmissions.status,
       questionnaireName: smQuestionnaireSubmissions.questionnaireNameSnapshot,
+      questionnaireNameSnapshot: smQuestionnaireSubmissions.questionnaireNameSnapshot,
+      questionnaireVersionId: smQuestionnaireSubmissions.questionnaireVersionId,
+      questionnaireVersionSnapshot: smQuestionnaireSubmissions.questionnaireVersionSnapshot,
       visitTimeMode: smQuestionnaireSubmissions.visitTimeMode,
       travelMinutes: smQuestionnaireSubmissions.travelMinutes,
       visitStartedAt: smQuestionnaireSubmissions.visitStartedAt,
@@ -430,6 +443,9 @@ async function loadAssignments(from: string, to: string, smUserId?: string, empl
   const submissionByAssignmentId = new Map(submissionRows.map((row) => [row.assignmentId, row]));
   const requestByAssignmentId = new Map(requestRows.map((row) => [row.assignmentId, row]));
 
+  const SMDurcharbeitMarketRows = await db.select().from(smSMDurcharbeitMarkets).where(inArray(smSMDurcharbeitMarkets.smMarketId, marketIds));
+  const SMDurcharbeitMarketIds = new Set(SMDurcharbeitMarketRows.map(row => row.smMarketId));
+  const SMDurcharbeitCatalog = await loadSMDurcharbeitSelectionCatalog(db);
   return rows.map((row) => {
     const effective = resolveSmAssignmentValues(row);
     const originalMarket = marketById.get(row.originalSmMarketId);
@@ -446,6 +462,9 @@ async function loadAssignments(from: string, to: string, smUserId?: string, empl
       : row.startedAt && row.completedAt ? row.completedAt : null;
     return {
       id: row.id,
+      SMDurcharbeitMarket: SMDurcharbeitMarketIds.has(effective.smMarketId),
+      SMDurcharbeitQuestionnaireOverrideVersionId: row.SMDurcharbeitQuestionnaireOverrideVersionId,
+      SMDurcharbeitQuestionnaireSelection: resolveSMDurcharbeitSelection(SMDurcharbeitCatalog, row, visit).selection,
       sourceType: row.sourceType,
       seriesId: row.seriesId,
       seriesVersionId: row.seriesVersionId,
@@ -735,6 +754,7 @@ adminSmPlanningRouter.put("/questionnaire-assignment", async (req: AuthedRequest
     if (!parsed.success) throw new SmPlanningError(400, "sm_global_questionnaire_invalid", "Bitte wähle einen gültigen SM-Fragebogen aus.");
     const actorUserId = req.authUser!.appUserId;
     const replayed = await db.transaction(async (tx) => {
+      await lockSmPlanning(tx);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended('sm_global_questionnaire_assignment', 0))`);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_questionnaire:${parsed.data.questionnaireTemplateId}`}, 0))`);
       const configuration = await loadGlobalQuestionnaireConfiguration(tx);
@@ -765,6 +785,27 @@ adminSmPlanningRouter.put("/questionnaire-assignment", async (req: AuthedRequest
     });
     res.status(200).json({ ...(await loadGlobalQuestionnaireConfiguration(db)), replayed });
   } catch (error) {
+    if (!sendKnownError(error, res)) next(error);
+  }
+});
+
+adminSmPlanningRouter.get("/SMDurcharbeit-questionnaire-options", async (req, res, next) => {
+  try {
+    const workDate = isoDateSchema.parse(req.query.workDate);
+    const catalog = await loadSMDurcharbeitSelectionCatalog(db);
+    const latest = new Map<string, typeof catalog.versions[number]>();
+    for (const row of catalog.versions) {
+      if (SMDurcharbeitVersionAvailable(row, workDate) && row.hasQuestions && !latest.has(row.questionnaireTemplateId)) latest.set(row.questionnaireTemplateId, row);
+    }
+    const options = [...latest.values()].map(row => ({
+      questionnaireTemplateId: row.questionnaireTemplateId, latestPublishedVersionId: row.id,
+      versionNumber: row.versionNumber, name: row.name, description: row.description,
+      SMDurcharbeitCatalogScope: smQuestionnaireCatalogScope(row.stableCode),
+    }));
+    const SMDurcharbeitCentralQuestionnaire = options.find(option => option.questionnaireTemplateId === catalog.centralTemplateId) ?? null;
+    res.json({ options, centralQuestionnaire: SMDurcharbeitCentralQuestionnaire?.name ?? null, SMDurcharbeitCentralQuestionnaire });
+  } catch (error) {
+    if (error instanceof z.ZodError) { res.status(400).json({ error: "Ungültiger Einsatztag.", code: "smdurcharbeit_options_date_invalid" }); return; }
     if (!sendKnownError(error, res)) next(error);
   }
 });
@@ -1102,15 +1143,27 @@ adminSmPlanningRouter.post("/assignments", async (req: AuthedRequest, res, next)
       )).limit(1);
       if (existing) return { id: existing.id, replayed: true };
 
-      await requireConfiguredGlobalQuestionnaire(tx);
+      if (!parsed.data.SMDurcharbeitQuestionnaireOverrideVersionId) {
+        const [SMDurcharbeitMarket] = await tx.select().from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, parsed.data.smMarketId)).limit(1);
+        if (SMDurcharbeitMarket) throw new SMDurcharbeitSelectionError(409, "smdurcharbeit_market_questionnaire_required", "Für diesen Durcharbeit-Markt bitte einen Durcharbeit-Fragebogen auswählen.");
+        await requireConfiguredGlobalQuestionnaire(tx);
+      }
 
       const [market] = await Promise.all([
         loadActiveMarket(tx, parsed.data.smMarketId),
         loadActiveSmUser(tx, parsed.data.smUserId),
       ]);
+      if (parsed.data.SMDurcharbeitQuestionnaireOverrideVersionId) {
+        const catalog = await loadSMDurcharbeitSelectionCatalog(tx);
+        const version = catalog.versions.find(row => row.id === parsed.data.SMDurcharbeitQuestionnaireOverrideVersionId);
+        if (!version || !SMDurcharbeitVersionAvailable(version, parsed.data.workDate) || !version.hasQuestions) {
+          throw new SMDurcharbeitSelectionError(409, "smdurcharbeit_questionnaire_unavailable", "Der ausgewählte Fragebogen ist für diesen Einsatztag nicht verfügbar.");
+        }
+      }
       const [createdRow] = await tx.insert(smAssignments).values({
         sourceType: "single",
         idempotencyKey: parsed.data.idempotencyKey,
+        SMDurcharbeitQuestionnaireOverrideVersionId: parsed.data.SMDurcharbeitQuestionnaireOverrideVersionId ?? null,
         originalWorkDate: parsed.data.workDate,
         originalSmUserId: parsed.data.smUserId,
         originalSmMarketId: market.id,
@@ -1122,8 +1175,11 @@ adminSmPlanningRouter.post("/assignments", async (req: AuthedRequest, res, next)
         updatedByUserId: actorUserId,
       }).returning();
       const created = requireWrittenRow(createdRow);
+      await assertSMDurcharbeitOverride(tx, created);
       await writeEvent(tx, { before: null, after: created, eventType: "created", actorUserId });
       const holidayChanges = await adjustSmHolidayAssignments(tx, { actorUserId, assignmentIds: [created.id] });
+      const [SMDurcharbeitFinal] = await tx.select().from(smAssignments).where(eq(smAssignments.id, created.id)).limit(1);
+      await assertSMDurcharbeitOverride(tx, requireWrittenRow(SMDurcharbeitFinal));
       return { id: created.id, replayed: false, holidayAdjustment: holidayChanges[0]?.adjustment ?? null };
     });
     res.status(result.replayed ? 200 : 201).json({ assignmentId: result.id, replayed: result.replayed, holidayAdjustment: "holidayAdjustment" in result ? result.holidayAdjustment : null });
@@ -1164,6 +1220,8 @@ adminSmPlanningRouter.post("/series", async (req: AuthedRequest, res, next) => {
         loadActiveMarket(tx, input.smMarketId),
         loadActiveSmUser(tx, input.smUserId),
       ]);
+      const [SMDurcharbeitMarket] = await tx.select().from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, market.id)).limit(1);
+      if (SMDurcharbeitMarket) throw new SMDurcharbeitSelectionError(409, "smdurcharbeit_series_not_supported", "Durcharbeit-Märkte bitte als einzelne Einsätze mit eigenem Fragebogen planen.");
       const [seriesRow] = await tx.insert(smAssignmentSeries).values({
         idempotencyKey: input.idempotencyKey,
         createdByUserId: actorUserId,
@@ -1229,6 +1287,10 @@ adminSmPlanningRouter.patch("/assignments/:id", async (req: AuthedRequest, res, 
       const before = await loadAssignmentForUpdate(tx, id.data);
       assertExpectedUpdatedAt(before, parsed.data.expectedUpdatedAt);
       assertPlanningMutable(before);
+      const [currentSubmission] = await tx.select({ id: smQuestionnaireSubmissions.id }).from(smQuestionnaireSubmissions).where(and(
+        eq(smQuestionnaireSubmissions.assignmentId, before.id), eq(smQuestionnaireSubmissions.isCurrent, true), eq(smQuestionnaireSubmissions.isDeleted, false),
+      )).limit(1);
+      if (currentSubmission) throw new SMDurcharbeitSelectionError(409, "smdurcharbeit_visit_already_started", "Der Besuch wurde bereits gestartet. Sein Fragebogen und die gespeicherten Antworten bleiben unverändert.");
       const set: Partial<typeof smAssignments.$inferInsert> = { updatedAt: new Date(), updatedByUserId: actorUserId };
       if (parsed.data.plannedMinutes !== undefined) {
         set.replacementPlannedMinutes = replacementOrNull(before.originalPlannedMinutes, parsed.data.plannedMinutes);
@@ -1243,11 +1305,21 @@ adminSmPlanningRouter.patch("/assignments/:id", async (req: AuthedRequest, res, 
           set.replacementMarketInternalId = market.internalMarketId!;
         }
       }
+      if (parsed.data.workDate !== undefined) set.replacementWorkDate = replacementOrNull(before.originalWorkDate, parsed.data.workDate);
+      if (parsed.data.smUserId !== undefined) {
+        if (!parsed.data.reason || parsed.data.reason.trim().length < 3) throw new SmPlanningError(400, "sm_assignment_reason_required", "Bitte begründe die SM-Änderung.");
+        await loadActiveSmUser(tx, parsed.data.smUserId);
+        set.replacementSmUserId = replacementOrNull(before.originalSmUserId, parsed.data.smUserId);
+      }
+      if (parsed.data.SMDurcharbeitQuestionnaireOverrideVersionId !== undefined) set.SMDurcharbeitQuestionnaireOverrideVersionId = parsed.data.SMDurcharbeitQuestionnaireOverrideVersionId;
+      await assertSMDurcharbeitOverride(tx, { ...before, ...set } as AssignmentRow);
       const [afterRow] = await tx.update(smAssignments).set(set).where(eq(smAssignments.id, before.id)).returning();
       const after = requireWrittenRow(afterRow);
-      const eventType = parsed.data.smMarketId !== undefined ? "market_replaced" : "updated";
+      const eventType = parsed.data.workDate !== undefined ? "rescheduled" : parsed.data.smUserId !== undefined ? "sm_replaced" : parsed.data.smMarketId !== undefined ? "market_replaced" : "updated";
       await writeEvent(tx, { before, after, eventType, actorUserId, reason: parsed.data.reason });
-      return after;
+      const [final] = await tx.select().from(smAssignments).where(eq(smAssignments.id, after.id));
+      await assertSMDurcharbeitOverride(tx, requireWrittenRow(final));
+      return requireWrittenRow(final);
     });
     res.status(200).json({ assignmentId: result.id, updatedAt: result.updatedAt.toISOString() });
   } catch (error) {
@@ -1266,6 +1338,7 @@ adminSmPlanningRouter.post("/assignments/:id/reschedule", async (req: AuthedRequ
       assertExpectedUpdatedAt(before, parsed.data.expectedUpdatedAt);
       assertPlanningMutable(before);
       const replacementWorkDate = replacementOrNull(before.originalWorkDate, parsed.data.workDate);
+      await assertSMDurcharbeitOverride(tx, { ...before, replacementWorkDate });
       await loadActiveMarket(tx, resolveSmAssignmentValues(before).smMarketId);
       const [updatedRow] = await tx.update(smAssignments).set({ replacementWorkDate, updatedAt: new Date(), updatedByUserId: actorUserId }).where(eq(smAssignments.id, before.id)).returning();
       const updated = requireWrittenRow(updatedRow);
@@ -1419,6 +1492,7 @@ export async function restoreSmPlanningOccurrence(tx: DbTx, assignmentId: string
   await writeEvent(tx, { before, after: updated, eventType: "restored", actorUserId, reason: input.reason });
   await adjustSmHolidayAssignments(tx, { actorUserId, assignmentIds: [updated.id] });
   const [final] = await tx.select().from(smAssignments).where(eq(smAssignments.id, updated.id));
+  await assertSMDurcharbeitOverride(tx, requireWrittenRow(final));
   return requireWrittenRow(final);
 }
 

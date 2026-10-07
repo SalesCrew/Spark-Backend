@@ -16,6 +16,8 @@ export type SmDashboardOosOutcome =
   | "not_applicable";
 
 export type SmDashboardVisitRow = {
+  SMDurcharbeitCatalogScope?: "standard" | "SMDurcharbeit";
+  SMDurcharbeitAnsweredQuestionCount?: number;
   submissionId: string;
   marketId: string;
   marketName: string;

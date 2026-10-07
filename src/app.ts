@@ -38,6 +38,7 @@ import { adminGmDashboardRouter } from "./routes/admin-gm-dashboard.js";
 import { kundenUsersRouter } from "./routes/kunden-users.js";
 import { adminMarketsRouter, marketsRouter } from "./routes/markets.js";
 import { adminPhotosRouter } from "./routes/admin-photos.js";
+import { adminSmPhotoArchiveRouter } from "./routes/sm-photo-archive.js";
 import { adminPraemienRouter } from "./routes/praemien.js";
 import { adminRedMonthRouter, redMonthRouter } from "./routes/red-month.js";
 import { timeTrackingRouter } from "./routes/time-tracking.js";
@@ -191,6 +192,7 @@ function createApp() {
   app.use("/admin/sm-messages", adminSmMessagesRouter);
   app.use("/admin/sm-questionnaires", adminSmQuestionnairesRouter);
   app.use("/admin/sm-dashboard", adminSmDashboardRouter);
+  app.use("/admin/sm-photos", adminSmPhotoArchiveRouter);
   app.use("/admin", adminLagerRouter);
   app.use("/admin", adminFragebogenRouter);
   app.use("/admin", adminCampaignsRouter);

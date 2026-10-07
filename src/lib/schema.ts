@@ -521,6 +521,12 @@ export const smMarkets = pgTable(
   ],
 );
 
+// Membership is separate from market/visit identity. No automatic reclassification of history.
+export const smSMDurcharbeitMarkets = pgTable("sm_smdurcharbeit_markets", {
+  smMarketId: uuid("sm_market_id").primaryKey().references(() => smMarkets.id, { onDelete: "restrict" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
 export const smMessages = pgTable(
   "sm_messages",
   {
@@ -981,6 +987,7 @@ export const smAssignments = pgTable(
     replacementMarketInternalId: text("replacement_market_internal_id"),
     replacementPlannedMinutes: integer("replacement_planned_minutes"),
     questionnaireVersionId: uuid("questionnaire_version_id").references(() => smQuestionnaireVersions.id, { onDelete: "restrict" }),
+    SMDurcharbeitQuestionnaireOverrideVersionId: uuid("smdurcharbeit_questionnaire_override_version_id").references(() => smQuestionnaireVersions.id, { onDelete: "restrict" }),
     flatRateCents: integer("flat_rate_cents"),
     currency: text("currency").notNull().default("EUR"),
     status: smAssignmentStatusEnum("status").notNull().default("planned"),
@@ -1008,6 +1015,7 @@ export const smAssignments = pgTable(
     index("sm_assignments_original_market_idx").on(table.originalSmMarketId),
     index("sm_assignments_replacement_market_idx").on(table.replacementSmMarketId),
     index("sm_assignments_questionnaire_idx").on(table.questionnaireVersionId),
+    index("sm_assignments_smdurcharbeit_override_version_idx").on(table.SMDurcharbeitQuestionnaireOverrideVersionId).where(sql`${table.SMDurcharbeitQuestionnaireOverrideVersionId} is not null and ${table.isDeleted} = false`),
     index("sm_assignments_cancelled_by_idx").on(table.cancelledByUserId),
     index("sm_assignments_created_by_idx").on(table.createdByUserId),
     index("sm_assignments_updated_by_idx").on(table.updatedByUserId),

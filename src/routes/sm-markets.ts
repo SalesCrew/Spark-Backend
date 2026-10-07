@@ -3,7 +3,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { db } from "../lib/db.js";
 import { logAction, startActionTimer } from "../lib/logger.js";
-import { smMarkets, users } from "../lib/schema.js";
+import { smMarkets, smSMDurcharbeitMarkets, users } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { resolveAutomaticSmNameMatch } from "../sm-market-user-sync.shared.js";
 import { lockSmPlanning } from "../sm-planning-lock.js";
@@ -221,11 +221,12 @@ function validateMapping(mapping: SmMarketColumnMapping): string | null {
   return null;
 }
 
-async function loadSmMarkets() {
+const SMDurcharbeitMembership = sql<boolean>`exists (select 1 from sm_smdurcharbeit_markets d where d.sm_market_id = ${smMarkets.id})`;
+async function loadSmMarkets(SMDurcharbeitMarketScope: "standard" | "SMDurcharbeit" | "all" = "standard") {
   return db
     .select()
     .from(smMarkets)
-    .where(eq(smMarkets.isDeleted, false))
+    .where(and(eq(smMarkets.isDeleted, false), SMDurcharbeitMarketScope === "all" ? undefined : SMDurcharbeitMarketScope === "SMDurcharbeit" ? SMDurcharbeitMembership : sql`not ${SMDurcharbeitMembership}`))
     .orderBy(asc(smMarkets.chain), asc(smMarkets.name), asc(smMarkets.postalCode));
 }
 
@@ -253,10 +254,22 @@ function smUserDisplayName(user: { firstName: string; lastName: string }): strin
 
 adminSmMarketsRouter.use(requireAuth(["admin", "sm_admin"]));
 
-adminSmMarketsRouter.get("/", async (_req, res, next) => {
+adminSmMarketsRouter.use("/:id", async (req, res, next) => {
+  if (req.method === "GET" || !z.string().uuid().safeParse(req.params.id).success) { next(); return; }
   try {
-    const rows = await loadSmMarkets();
-    res.status(200).json({ markets: rows.map(mapSmMarketRow) });
+    const [member] = await db.select().from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, req.params.id!)).limit(1);
+    if (member) { res.status(409).json({ error: "Durcharbeit-Märkte sind bis zum separaten Import nur lesbar.", code: "smdurcharbeit_market_read_only" }); return; }
+    next();
+  } catch (error) { next(error); }
+});
+
+adminSmMarketsRouter.get("/", async (req, res, next) => {
+  try {
+    const scope = req.query.SMDurcharbeitMarketScope ?? "standard";
+    if (!["standard", "SMDurcharbeit", "all"].includes(String(scope))) { res.status(400).json({ error: "Ungültiger Marktbereich." }); return; }
+    const rows = await loadSmMarkets(scope as "standard" | "SMDurcharbeit" | "all");
+    const members = scope === "all" ? new Set((await db.select().from(smSMDurcharbeitMarkets)).map(row => row.smMarketId)) : null;
+    res.status(200).json({ markets: rows.map(row => scope === "standard" ? mapSmMarketRow(row) : ({ ...mapSmMarketRow(row), SMDurcharbeitMarket: members ? members.has(row.id) : true })) });
   } catch (error) {
     next(error);
   }
@@ -271,7 +284,7 @@ adminSmMarketsRouter.post("/sync-sm-users", async (req: AuthedRequest, res, next
       const lock = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(47110334) as locked`);
       if (!lock[0]?.locked) throw new Error("SM_MARKET_SYNC_IN_PROGRESS");
 
-      const marketRows = await tx.select().from(smMarkets).where(eq(smMarkets.isDeleted, false)).orderBy(asc(smMarkets.chain), asc(smMarkets.name));
+      const marketRows = await tx.select().from(smMarkets).where(and(eq(smMarkets.isDeleted, false), sql`not ${SMDurcharbeitMembership}`)).orderBy(asc(smMarkets.chain), asc(smMarkets.name));
       const smUserRows = await tx.select({ id: users.id, firstName: users.firstName, lastName: users.lastName, email: users.email })
         .from(users)
         .where(and(eq(users.role, "sm"), eq(users.isActive, true), isNull(users.deletedAt)))
@@ -341,7 +354,7 @@ adminSmMarketsRouter.post("/sync-sm-users", async (req: AuthedRequest, res, next
       for (const [smUserId, marketIds] of plannedByUserId) {
         const updated = await tx.update(smMarkets)
           .set({ assignedSmUserId: smUserId, updatedAt: now })
-          .where(and(inArray(smMarkets.id, marketIds), eq(smMarkets.isDeleted, false), isNull(smMarkets.assignedSmUserId)))
+          .where(and(inArray(smMarkets.id, marketIds), eq(smMarkets.isDeleted, false), sql`not ${SMDurcharbeitMembership}`, isNull(smMarkets.assignedSmUserId)))
           .returning({ id: smMarkets.id });
         for (const row of updated) updatedIds.add(row.id);
       }
@@ -412,7 +425,7 @@ adminSmMarketsRouter.post("/sync-sm-users/manual", async (req: AuthedRequest, re
       if (!smUser) throw new Error("SM_USER_NOT_ASSIGNABLE");
       const updated = await tx.update(smMarkets)
         .set({ assignedSmUserId: smUser.id, updatedAt: new Date() })
-        .where(and(inArray(smMarkets.id, marketIds), eq(smMarkets.isDeleted, false), isNull(smMarkets.assignedSmUserId)))
+        .where(and(inArray(smMarkets.id, marketIds), eq(smMarkets.isDeleted, false), sql`not ${SMDurcharbeitMembership}`, isNull(smMarkets.assignedSmUserId)))
         .returning();
       return {
         matched: updated.map((market) => ({
@@ -489,7 +502,7 @@ adminSmMarketsRouter.post("/import", async (req: AuthedRequest, res, next) => {
       if (!lock[0]?.locked) throw new Error("SM_IMPORT_IN_PROGRESS");
 
       await lockSmPlanning(tx);
-      const existingRows = await tx.select().from(smMarkets).where(eq(smMarkets.isDeleted, false));
+      const existingRows = await tx.select().from(smMarkets).where(and(eq(smMarkets.isDeleted, false), sql`not ${SMDurcharbeitMembership}`));
       const assignableSmUsers = await tx
         .select({ id: users.id, firstName: users.firstName, lastName: users.lastName })
         .from(users)

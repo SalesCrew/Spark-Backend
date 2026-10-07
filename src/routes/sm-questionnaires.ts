@@ -1,3 +1,5 @@
+import { lockSmPlanning } from "../sm-planning-lock.js";
+import { hasSMDurcharbeitPendingOverride } from "../sm-SMDurcharbeit-selection.shared.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { type NextFunction, type Request, type Response, Router } from "express";
@@ -20,6 +22,7 @@ import {
   smQuestionVersions,
 } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
+import { SMDurcharbeitCatalogStableCode, smQuestionnaireCatalogScope, type SmQuestionnaireCatalogScope } from "../sm-SMDurcharbeit-catalog.shared.js";
 
 const smQuestionTypes = [
   "single",
@@ -155,6 +158,12 @@ function isUuid(value: string): boolean {
 function routeId(req: Request): string {
   const value = req.params.id;
   return Array.isArray(value) ? value[0] ?? "" : value ?? "";
+}
+
+function catalogScope(req: Request): SmQuestionnaireCatalogScope | undefined {
+  const parsed = z.enum(["standard", "SMDurcharbeit"]).optional().safeParse(req.query.scope);
+  if (!parsed.success) throw new SmQuestionnaireDomainError(400, "Ungültiger SM-Fragebogenbereich.");
+  return parsed.data;
 }
 
 function stableCode(prefix: "q" | "module" | "questionnaire", id: string): string {
@@ -480,8 +489,9 @@ async function loadCurrentModuleGraph(tx: DbTx, moduleId: string): Promise<{
   };
 }
 
-async function loadWorkspace(): Promise<{ modules: UiModule[]; questionnaires: UiQuestionnaire[] }> {
-  const moduleRoots = await db.select().from(smModules).where(eq(smModules.isDeleted, false)).orderBy(asc(smModules.createdAt));
+async function loadWorkspace(scope?: SmQuestionnaireCatalogScope): Promise<{ modules: UiModule[]; questionnaires: UiQuestionnaire[] }> {
+  const moduleRoots = (await db.select().from(smModules).where(eq(smModules.isDeleted, false)).orderBy(asc(smModules.createdAt)))
+    .filter((root) => !scope || smQuestionnaireCatalogScope(root.stableCode) === scope);
   const moduleRootIds = moduleRoots.map((row) => row.id);
   const allModuleVersions = moduleRootIds.length === 0 ? [] : await db
     .select()
@@ -631,11 +641,12 @@ async function loadWorkspace(): Promise<{ modules: UiModule[]; questionnaires: U
     modules.push({ id: root.id, name: version.name, description: version.description, questions, createdAt: root.createdAt.toISOString() });
   }
 
-  const questionnaireRoots = await db
+  const questionnaireRoots = (await db
     .select()
     .from(smQuestionnaireTemplates)
     .where(and(eq(smQuestionnaireTemplates.isDeleted, false), inArray(smQuestionnaireTemplates.status, ["active", "inactive"])))
-    .orderBy(asc(smQuestionnaireTemplates.createdAt));
+    .orderBy(asc(smQuestionnaireTemplates.createdAt)))
+    .filter((root) => !scope || smQuestionnaireCatalogScope(root.stableCode) === scope);
   const questionnaireRootIds = questionnaireRoots.map((row) => row.id);
   const questionnaireVersions = questionnaireRootIds.length === 0 ? [] : await db
     .select()
@@ -803,22 +814,23 @@ async function createQuestionGraph(
   return mapped.map(({ inputId, rootId, versionId }) => ({ inputId, rootId, versionId }));
 }
 
-async function saveModule(input: SmModuleInput, actorUserId: string): Promise<string> {
+async function saveModule(input: SmModuleInput, actorUserId: string, scope: SmQuestionnaireCatalogScope): Promise<string> {
   validateModule(input);
   return db.transaction(async (tx) => {
+    await lockSmPlanning(tx);
     let moduleId = input.id;
     let currentGraph: Awaited<ReturnType<typeof loadCurrentModuleGraph>> = null;
     if (isUuid(moduleId)) {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_module:${moduleId}`}, 0))`);
       const [existing] = await tx.select().from(smModules).where(and(eq(smModules.id, moduleId), eq(smModules.isDeleted, false))).limit(1);
-      if (!existing) throw new SmQuestionnaireDomainError(404, "SM-Modul nicht gefunden.");
+      if (!existing || smQuestionnaireCatalogScope(existing.stableCode) !== scope) throw new SmQuestionnaireDomainError(404, "SM-Modul in diesem Bereich nicht gefunden.");
       currentGraph = await loadCurrentModuleGraph(tx, moduleId);
       if (!currentGraph) throw new SmQuestionnaireDomainError(404, "SM-Modulversion nicht gefunden.");
     } else {
       moduleId = randomUUID();
       await tx.insert(smModules).values({
         id: moduleId,
-        stableCode: stableCode("module", moduleId),
+        stableCode: scope === "SMDurcharbeit" ? SMDurcharbeitCatalogStableCode("module", moduleId) : stableCode("module", moduleId),
         createdByUserId: actorUserId,
         updatedByUserId: actorUserId,
       });
@@ -863,8 +875,9 @@ async function saveModule(input: SmModuleInput, actorUserId: string): Promise<st
   });
 }
 
-async function saveQuestionnaire(input: SmQuestionnaireInput, actorUserId: string): Promise<string> {
+async function saveQuestionnaire(input: SmQuestionnaireInput, actorUserId: string, scope: SmQuestionnaireCatalogScope): Promise<string> {
   return db.transaction(async (tx) => {
+    await lockSmPlanning(tx);
     let templateId = input.id;
     let existingTemplate: typeof smQuestionnaireTemplates.$inferSelect | undefined;
     if (isUuid(templateId)) {
@@ -873,12 +886,12 @@ async function saveQuestionnaire(input: SmQuestionnaireInput, actorUserId: strin
         eq(smQuestionnaireTemplates.id, templateId),
         eq(smQuestionnaireTemplates.isDeleted, false),
       )).limit(1);
-      if (!existingTemplate) throw new SmQuestionnaireDomainError(404, "SM-Fragebogen nicht gefunden.");
+      if (!existingTemplate || smQuestionnaireCatalogScope(existingTemplate.stableCode) !== scope) throw new SmQuestionnaireDomainError(404, "SM-Fragebogen in diesem Bereich nicht gefunden.");
     } else {
       templateId = randomUUID();
       await tx.insert(smQuestionnaireTemplates).values({
         id: templateId,
-        stableCode: stableCode("questionnaire", templateId),
+        stableCode: scope === "SMDurcharbeit" ? SMDurcharbeitCatalogStableCode("questionnaire", templateId) : stableCode("questionnaire", templateId),
         status: input.status,
         createdByUserId: actorUserId,
         updatedByUserId: actorUserId,
@@ -886,6 +899,7 @@ async function saveQuestionnaire(input: SmQuestionnaireInput, actorUserId: strin
     }
 
     if (existingTemplate && input.status !== "active") {
+      if (await hasSMDurcharbeitPendingOverride(tx, templateId)) throw new SmQuestionnaireDomainError(409, "Dieser Fragebogen wird von einem geplanten Einsatz verwendet und muss aktiv bleiben.");
       const [currentAssignment] = await tx.select({ id: smQuestionnaireGlobalAssignments.id })
         .from(smQuestionnaireGlobalAssignments)
         .where(and(
@@ -903,8 +917,8 @@ async function saveQuestionnaire(input: SmQuestionnaireInput, actorUserId: strin
       inArray(smModules.id, input.moduleIds),
       eq(smModules.isDeleted, false),
     ));
-    if (moduleRoots.length !== new Set(input.moduleIds).size) {
-      throw new SmQuestionnaireDomainError(400, "Mindestens ein ausgewähltes SM-Modul wurde nicht gefunden.");
+    if (moduleRoots.length !== new Set(input.moduleIds).size || moduleRoots.some((root) => smQuestionnaireCatalogScope(root.stableCode) !== scope)) {
+      throw new SmQuestionnaireDomainError(400, "Mindestens ein ausgewähltes SM-Modul gehört nicht zu diesem Fragebogenbereich oder wurde nicht gefunden.");
     }
     const publishedModuleVersions = await tx.select().from(smModuleVersions).where(and(
       inArray(smModuleVersions.moduleId, input.moduleIds),
@@ -1004,9 +1018,9 @@ adminSmQuestionnairesRouter.use((req, res, next) => {
   next();
 });
 
-adminSmQuestionnairesRouter.get("/workspace", async (_req, res, next) => {
+adminSmQuestionnairesRouter.get("/workspace", async (req, res, next) => {
   try {
-    res.status(200).json(await loadWorkspace());
+    res.status(200).json(await loadWorkspace(catalogScope(req)));
   } catch (error) {
     next(error);
   }
@@ -1016,8 +1030,9 @@ adminSmQuestionnairesRouter.post("/modules", async (req: AuthedRequest, res, nex
   try {
     const parsed = moduleSchema.safeParse(req.body);
     if (!parsed.success) throw new SmQuestionnaireDomainError(400, "Bitte Modul, Fragen und Antwortoptionen vollständig ausfüllen.");
-    const moduleId = await saveModule(parsed.data, req.authUser!.appUserId);
-    const workspace = await loadWorkspace();
+    const scope = catalogScope(req) ?? "standard";
+    const moduleId = await saveModule(parsed.data, req.authUser!.appUserId, scope);
+    const workspace = await loadWorkspace(scope);
     const module = workspace.modules.find((row) => row.id === moduleId);
     if (!module) throw new Error("SM_MODULE_READ_AFTER_WRITE_FAILED");
     res.status(201).json({ module });
@@ -1032,8 +1047,9 @@ adminSmQuestionnairesRouter.patch("/modules/:id", async (req: AuthedRequest, res
     if (!isUuid(id)) throw new SmQuestionnaireDomainError(400, "Ungültige SM-Modul-ID.");
     const parsed = moduleSchema.safeParse({ ...req.body, id });
     if (!parsed.success) throw new SmQuestionnaireDomainError(400, "Bitte Modul, Fragen und Antwortoptionen vollständig ausfüllen.");
-    const moduleId = await saveModule(parsed.data, req.authUser!.appUserId);
-    const workspace = await loadWorkspace();
+    const scope = catalogScope(req) ?? "standard";
+    const moduleId = await saveModule(parsed.data, req.authUser!.appUserId, scope);
+    const workspace = await loadWorkspace(scope);
     const module = workspace.modules.find((row) => row.id === moduleId);
     if (!module) throw new Error("SM_MODULE_READ_AFTER_WRITE_FAILED");
     res.status(200).json({ module });
@@ -1046,6 +1062,9 @@ adminSmQuestionnairesRouter.patch("/modules/:id/delete", async (req: AuthedReque
   try {
     const id = routeId(req);
     if (!isUuid(id)) throw new SmQuestionnaireDomainError(400, "Ungültige SM-Modul-ID.");
+    const scope = catalogScope(req) ?? "standard";
+    const [root] = await db.select().from(smModules).where(and(eq(smModules.id, id), eq(smModules.isDeleted, false))).limit(1);
+    if (!root || smQuestionnaireCatalogScope(root.stableCode) !== scope) throw new SmQuestionnaireDomainError(404, "SM-Modul in diesem Bereich nicht gefunden.");
     const workspace = await loadWorkspace();
     if (workspace.questionnaires.some((questionnaire) => questionnaire.moduleIds.includes(id))) {
       throw new SmQuestionnaireDomainError(409, "Das Modul wird noch in einem Fragebogen verwendet. Entferne es dort zuerst.");
@@ -1065,8 +1084,9 @@ adminSmQuestionnairesRouter.post("/questionnaires", async (req: AuthedRequest, r
   try {
     const parsed = questionnaireSchema.safeParse(req.body);
     if (!parsed.success) throw new SmQuestionnaireDomainError(400, "Bitte Fragebogenname und mindestens ein Modul auswählen.");
-    const questionnaireId = await saveQuestionnaire(parsed.data, req.authUser!.appUserId);
-    const workspace = await loadWorkspace();
+    const scope = catalogScope(req) ?? "standard";
+    const questionnaireId = await saveQuestionnaire(parsed.data, req.authUser!.appUserId, scope);
+    const workspace = await loadWorkspace(scope);
     const questionnaire = workspace.questionnaires.find((row) => row.id === questionnaireId);
     if (!questionnaire) throw new Error("SM_QUESTIONNAIRE_READ_AFTER_WRITE_FAILED");
     res.status(201).json({ questionnaire });
@@ -1081,8 +1101,9 @@ adminSmQuestionnairesRouter.patch("/questionnaires/:id", async (req: AuthedReque
     if (!isUuid(id)) throw new SmQuestionnaireDomainError(400, "Ungültige SM-Fragebogen-ID.");
     const parsed = questionnaireSchema.safeParse({ ...req.body, id });
     if (!parsed.success) throw new SmQuestionnaireDomainError(400, "Bitte Fragebogenname und mindestens ein Modul auswählen.");
-    const questionnaireId = await saveQuestionnaire(parsed.data, req.authUser!.appUserId);
-    const workspace = await loadWorkspace();
+    const scope = catalogScope(req) ?? "standard";
+    const questionnaireId = await saveQuestionnaire(parsed.data, req.authUser!.appUserId, scope);
+    const workspace = await loadWorkspace(scope);
     const questionnaire = workspace.questionnaires.find((row) => row.id === questionnaireId);
     if (!questionnaire) throw new Error("SM_QUESTIONNAIRE_READ_AFTER_WRITE_FAILED");
     res.status(200).json({ questionnaire });
@@ -1095,8 +1116,13 @@ adminSmQuestionnairesRouter.patch("/questionnaires/:id/delete", async (req: Auth
   try {
     const id = routeId(req);
     if (!isUuid(id)) throw new SmQuestionnaireDomainError(400, "Ungültige SM-Fragebogen-ID.");
+    const scope = catalogScope(req) ?? "standard";
     const deleted = await db.transaction(async (tx) => {
+    await lockSmPlanning(tx);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_questionnaire:${id}`}, 0))`);
+      const [root] = await tx.select().from(smQuestionnaireTemplates).where(and(eq(smQuestionnaireTemplates.id, id), eq(smQuestionnaireTemplates.isDeleted, false))).limit(1);
+      if (!root || smQuestionnaireCatalogScope(root.stableCode) !== scope) throw new SmQuestionnaireDomainError(404, "SM-Fragebogen in diesem Bereich nicht gefunden.");
+      if (await hasSMDurcharbeitPendingOverride(tx, id)) throw new SmQuestionnaireDomainError(409, "Dieser Fragebogen wird von einem geplanten Einsatz verwendet. Entferne zuerst die Einsatzzuordnung.");
       const [currentAssignment] = await tx.select({ id: smQuestionnaireGlobalAssignments.id })
         .from(smQuestionnaireGlobalAssignments)
         .where(and(

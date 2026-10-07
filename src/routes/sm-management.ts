@@ -7,7 +7,7 @@ import { supabaseAdmin } from "../lib/supabase.js";
 import { env } from "../config/env.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { smQuestionnaireSubmissions as submissions, smAssignments, smQuestionAnswers as answers,
-  smQuestionAnswerFiles as files, smQuestionAnswerEvents as events, users } from "../lib/schema.js";
+  smQuestionAnswerFiles as files, smQuestionAnswerEvents as events, smQuestionnaireTemplates, users } from "../lib/schema.js";
 import { isIsoDate, isoDateToEpochDay } from "../sm-planning.shared.js";
 import { SmVisitAnswerValidationError } from "../sm-visit.shared.js";
 import { applySmAdminCorrection, loadSmManagementState, smAdminCorrectionSchema, smManagementDetail, smManagementHash,
@@ -19,6 +19,7 @@ export const smManagementListSchema = z.object({
   from: date, to: date, smUserId: uuid.optional(), marketId: uuid.optional(), questionnaireId: uuid.optional(),
   search: z.string().trim().max(200).optional(), limit: z.coerce.number().int().min(1).max(100).default(40),
   cursorDate: date.optional(), cursorId: uuid.optional(),
+  SMDurcharbeitCatalogScope: z.enum(["standard", "SMDurcharbeit"]).optional(),
 }).strict().refine(input => isoDateToEpochDay(input.to) >= isoDateToEpochDay(input.from) && isoDateToEpochDay(input.to) - isoDateToEpochDay(input.from) < 93, "Zeitraum maximal 93 Tage.")
   .refine(input => Boolean(input.cursorDate) === Boolean(input.cursorId), "Ungültiger Seitencursor.");
 
@@ -28,6 +29,7 @@ const workDate = sql<string>`coalesce((${submissions.visitStartedAt} at time zon
 export async function listSmManagedVisits(tx: SmManagementTx, input: z.infer<typeof smManagementListSchema>) {
   const scope = [eq(submissions.isDeleted, false), eq(submissions.isCurrent, true), eq(submissions.status, "submitted"),
     gte(workDate, input.from), lte(workDate, input.to)];
+  if (input.SMDurcharbeitCatalogScope) scope.push(sql`(case when starts_with(${smQuestionnaireTemplates.stableCode}, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${input.SMDurcharbeitCatalogScope}`);
   const filters = [...scope];
   if (input.smUserId) filters.push(eq(submissions.smUserId, input.smUserId));
   if (input.marketId) filters.push(eq(submissions.smMarketId, input.marketId));
@@ -40,12 +42,14 @@ export async function listSmManagedVisits(tx: SmManagementTx, input: z.infer<typ
     questionnaireId: submissions.questionnaireTemplateId, questionnaireName: submissions.questionnaireNameSnapshot,
     questionnaireVersion: submissions.questionnaireVersionSnapshot, startedAt: submissions.visitStartedAt,
     completedAt: submissions.visitCompletedAt, submittedAt: submissions.submittedAt, answeredCount: submissions.answeredQuestionCount,
-  }).from(submissions).leftJoin(smAssignments, eq(smAssignments.id, submissions.assignmentId)).where(and(...filters))
+    SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`case when starts_with(${smQuestionnaireTemplates.stableCode}, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end`,
+  }).from(submissions).leftJoin(smAssignments, eq(smAssignments.id, submissions.assignmentId)).leftJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, submissions.questionnaireTemplateId)).where(and(...filters))
     .orderBy(desc(workDate), desc(submissions.id)).limit(input.limit + 1);
   const facets = await tx.selectDistinct({ smUserId: submissions.smUserId, smName: submissions.smNameSnapshot,
     marketId: submissions.smMarketId, marketName: submissions.marketNameSnapshot,
     questionnaireId: submissions.questionnaireTemplateId, questionnaireName: submissions.questionnaireNameSnapshot,
-  }).from(submissions).leftJoin(smAssignments, eq(smAssignments.id, submissions.assignmentId)).where(and(...scope))
+    SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`case when starts_with(${smQuestionnaireTemplates.stableCode}, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end`,
+  }).from(submissions).leftJoin(smAssignments, eq(smAssignments.id, submissions.assignmentId)).leftJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, submissions.questionnaireTemplateId)).where(and(...scope))
     .orderBy(asc(submissions.smNameSnapshot), asc(submissions.marketNameSnapshot), asc(submissions.questionnaireNameSnapshot)).limit(2001);
   const items = rows.slice(0, input.limit), last = items.at(-1);
   return { visits: items, nextCursor: rows.length > input.limit && last ? { date: last.workDate, id: last.id } : null,
