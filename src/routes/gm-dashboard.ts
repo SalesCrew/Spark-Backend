@@ -77,6 +77,7 @@ export function createGmDashboardRouter(
                   3 * 366 * 86400000,
             ),
           scope,
+          includeAvailabilityAudit: z.boolean().optional(),
         })
         .safeParse(req.body);
       if (!input.success) {
@@ -89,6 +90,7 @@ export function createGmDashboardRouter(
         database,
         input.data.intervals,
         input.data.scope,
+        input.data.includeAvailabilityAudit ?? false,
       );
       if (effectiveIpp)
         await effectiveIpp(input.data.intervals, input.data.scope, data);

@@ -13,6 +13,10 @@ export async function installDashboardFixture(
     alter table visit_answers add column changed_at timestamptz default now(),add column question_type text default 'single_choice',add column value_json jsonb;
     alter table visit_answer_options add column option_role text default 'top';
     alter table question_scoring add column ipp numeric,add column zweitplatzierung numeric,add column mitbewerberabfrage numeric;
+    alter table visit_session_sections add column campaign_id uuid,add column order_index int default 0;
+    alter table visit_session_questions add column question_rules_snapshot jsonb default '[]',add column order_index int default 0;
+    alter table visit_answers add column version int default 1;
+    alter table visit_answer_options add column order_index int default 0;
   `);
   const qAvailability = randomUUID(),
     qPlacement = randomUUID(),
@@ -36,11 +40,12 @@ export async function installDashboardFixture(
     invalid?: boolean;
     hidden?: boolean;
     weight?: string;
+    startedAt?: string;
   }) => {
     const session = randomUUID(),
       section = randomUUID();
     await f.pg.query(
-      `insert into visit_sessions(id,gm_user_id,market_id,status,submitted_at,started_at,is_deleted) values($1,$2,$3,$4,$5::timestamptz,$5::timestamptz-interval '45 minutes',$6)`,
+      `insert into visit_sessions(id,gm_user_id,market_id,status,submitted_at,started_at,is_deleted) values($1,$2,$3,$4,$5::timestamptz,coalesce($7::timestamptz,$5::timestamptz-interval '45 minutes'),$6)`,
       [
         session,
         options.gm ?? f.ids.gm,
@@ -48,6 +53,7 @@ export async function installDashboardFixture(
         options.status ?? "submitted",
         options.when,
         options.deleted ?? false,
+        options.startedAt ?? null,
       ],
     );
     await f.pg.query(
@@ -62,7 +68,7 @@ export async function installDashboardFixture(
       const instance = randomUUID(),
         answer = randomUUID();
       await f.pg.query(
-        `insert into visit_session_questions(id,visit_session_section_id,question_id,single_choice_availability_snapshot,single_choice_availability_type_snapshot,red_survey_snapshot,applies_to_market_chain_snapshot) values($1,$2,$3,$4,'Cooler',true,$5)`,
+        `insert into visit_session_questions(id,visit_session_section_id,question_id,single_choice_availability_snapshot,single_choice_availability_type_snapshot,red_survey_snapshot,applies_to_market_chain_snapshot,question_text_snapshot) values($1,$2,$3,$4,'Cooler',true,$5,(select text from question_bank_shared where id=$3))`,
         [instance, section, question, available, !options.hidden],
       );
       await f.pg.query(
@@ -96,7 +102,7 @@ export async function installDashboardFixture(
         [flex, session],
       );
       await f.pg.query(
-        `insert into visit_session_questions(id,visit_session_section_id,question_id,single_choice_availability_snapshot,single_choice_availability_type_snapshot,red_survey_snapshot) values($1,$2,$3,true,'Cooler',true)`,
+        `insert into visit_session_questions(id,visit_session_section_id,question_id,single_choice_availability_snapshot,single_choice_availability_type_snapshot,red_survey_snapshot,question_text_snapshot) values($1,$2,$3,true,'Cooler',true,(select text from question_bank_shared where id=$3))`,
         [instance, flex, qAvailability],
       );
       await f.pg.query(
@@ -143,7 +149,7 @@ export async function installDashboardFixture(
     category: "Top",
     status: "draft",
   });
-  await seedVisit({ when: "2026-10-01T00:00:00+02:00", category: "Top" });
+  await seedVisit({ when: "2026-10-01T00:45:00+02:00", category: "Top" });
   // Genuine synthetic 4/4/5 local calendar, including future intervals to test
   // current selection. UUIDs never correspond to production periods.
   const calendar = [];

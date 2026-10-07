@@ -1,4 +1,5 @@
 // Shared read-only dashboard contract. No production credentials or fixtures here.
+import type { AvailabilityAudit } from "./gm-availability.shared.js";
 export type DashboardChainGroup = "rewe" | "spar" | "other";
 export type DashboardScope = {
   region: string | null;
@@ -65,6 +66,7 @@ export type DashboardData = {
   calculatedAt: string;
   timezone: "Europe/Vienna";
   stcApplied: boolean;
+  availabilityAudit?: AvailabilityAudit[];
 };
 export type DashboardFacets = {
   firstEntryDate: string | null;

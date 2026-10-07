@@ -230,7 +230,7 @@ test("real local PostgreSQL + HTTP: answer weights, all-visit means/splits, dedu
   }
 });
 
-test("first visible entry comes from submitted history in Vienna, not creation dates/drafts/deleted visits; empty history is null", async () => {
+test("first visible entry includes the visit date of submitted history in Vienna; drafts/deleted visits and empty history are excluded", async () => {
   const f = await praemienFixture();
   try {
     const fixture = await installDashboardFixture(f);
@@ -240,7 +240,7 @@ test("first visible entry comes from submitted history in Vienna, not creation d
     assert.equal((await dashboardFacets(f.database)).firstEntryDate, "2026-08-18");
     await fixture.seedVisit({ when: "2026-07-05T22:15:00Z", category: "Bad" });
     const before = (await f.pg.query(`select count(*)::int as n from visit_sessions`)).rows[0];
-    assert.equal((await dashboardFacets(f.database)).firstEntryDate, "2026-07-06");
+    assert.equal((await dashboardFacets(f.database)).firstEntryDate, "2026-07-05");
     assert.deepEqual((await f.pg.query(`select count(*)::int as n from visit_sessions`)).rows[0], before);
     await f.pg.exec(`update visit_sessions set is_deleted=true`);
     assert.equal((await dashboardFacets(f.database)).firstEntryDate, null);

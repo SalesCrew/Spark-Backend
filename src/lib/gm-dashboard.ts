@@ -1,5 +1,7 @@
 import { sql } from "drizzle-orm";
 import type { ModelDatabase } from "./praemien-workspace.js";
+import { loadAvailabilityAudit } from "./gm-availability.js";
+import { availabilityCategory as canonicalAvailabilityCategory, summarizeAvailability } from "../gm-availability.shared.js";
 import {
   availabilityTypes,
   type AvailabilityType,
@@ -46,14 +48,7 @@ function selectedAnswer(row: DashboardObservation): string {
 export function availabilityCategory(
   value: string | null,
 ): "top" | "mediocre" | "bad" | null {
-  const key = value
-    ?.trim()
-    .toLocaleLowerCase("de-AT")
-    .replace(/[\s_-]/g, "");
-  if (["top", "voll", "sehrvoll"].includes(key ?? "")) return "top";
-  if (["mediocre", "mittel", "halbvoll"].includes(key ?? "")) return "mediocre";
-  if (["bad", "leer", "nichtvoll"].includes(key ?? "")) return "bad";
-  return null;
+  return canonicalAvailabilityCategory(value);
 }
 // Availability is an observation average, while IPP/placements describe the last
 // answer to each market/question in an interval (the established IPP rule).
@@ -227,14 +222,13 @@ export function aggregateDashboard(
 }
 
 export async function dashboardMetadata(database: ModelDatabase) {
-  // Match the dashboard's completed visits and Vienna calendar dates. Ordering
-  // the timestamp uses the existing submitted-period partial index.
+  // Include early visit dates even when the corresponding submission was late.
+  // Other metrics still use submission dates; availability uses visit dates.
   const firstEntries = await database.query<{ firstEntryDate: string }>(sql`
-      select (s.submitted_at at time zone 'Europe/Vienna')::date::text as "firstEntryDate"
+      select (min(least(coalesce(s.started_at,s.submitted_at),s.submitted_at)) at time zone 'Europe/Vienna')::date::text as "firstEntryDate"
       from visit_sessions s join markets m on m.id=s.market_id
       where s.is_deleted=false and s.status='submitted' and s.submitted_at is not null
         and s.submitted_at < (((now() at time zone 'Europe/Vienna')::date+1)::timestamp at time zone 'Europe/Vienna')
-      order by s.submitted_at limit 1
     `);
   return { firstEntryDate: firstEntries[0]?.firstEntryDate ?? null };
 }
@@ -264,9 +258,10 @@ export async function loadDashboard(
   database: ModelDatabase,
   intervals: DashboardInterval[],
   scope: DashboardScope,
+  includeAvailabilityAudit = false,
 ): Promise<DashboardData> {
   const stcFrequency = scope.stc ? stcFrequencyRanges[scope.stc] : null;
-  const rows = await database.query<DashboardObservation>(sql`
+  const [rows, audit] = await Promise.all([database.query<DashboardObservation>(sql`
     with periods as (
       select id,start::date::timestamp at time zone 'Europe/Vienna' as lo,
         ("end"::date+1)::timestamp at time zone 'Europe/Vienna' as hi
@@ -332,6 +327,9 @@ export async function loadDashboard(
       ) k join question_scoring sc on sc.question_id=q.question_id and sc.score_key=k.key and sc.is_deleted=false
     ) weights on true
     order by s.interval_id,s.submitted_at,a.changed_at,a.id
-  `);
-  return aggregateDashboard(intervals, rows, scope);
+  `), loadAvailabilityAudit(database, intervals, scope)]);
+  const data = aggregateDashboard(intervals, rows, scope);
+  for (const point of data.points) Object.assign(point, summarizeAvailability(audit, point.id));
+  if (includeAvailabilityAudit) data.availabilityAudit = audit;
+  return data;
 }
