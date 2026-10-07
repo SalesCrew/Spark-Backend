@@ -16,6 +16,7 @@ import { logAction, logger, startActionTimer } from "../lib/logger.js";
 import { addDays, startOfDay } from "../lib/red-monat.js";
 import { resolveCurrentRedPeriod, resolveRedPeriodForDate } from "../lib/red-month-periods.js";
 import { selectMissingSpezialfragenForSession } from "../lib/spezialfragen-session-sync.js";
+import { isSpezialfrageActive } from "../lib/spezialfragen-period.js";
 import { readRequestedCommentChange, requestedCommentSummary } from "../lib/answer-change-request.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
@@ -333,9 +334,10 @@ function appendSpezialfragen(
   moduleQuestions: ResolvedQuestion[],
   spezialfragen: Awaited<ReturnType<typeof fetchFragebogenUi>>[number]["spezialfragen"],
   marketChain: string,
+  at: Date,
 ): ResolvedQuestion[] {
   const moduleQuestionIds = new Set(moduleQuestions.map((question) => question.questionId));
-  const resolvedSpezialfragen = resolveSpezialfragenForMarket(spezialfragen, marketChain)
+  const resolvedSpezialfragen = resolveSpezialfragenForMarket(spezialfragen, marketChain, at)
     .filter((question) => !moduleQuestionIds.has(question.questionId));
   return [...moduleQuestions, ...resolvedSpezialfragen];
 }
@@ -343,8 +345,10 @@ function appendSpezialfragen(
 function resolveSpezialfragenForMarket(
   spezialfragen: Awaited<ReturnType<typeof fetchFragebogenUi>>[number]["spezialfragen"],
   marketChain: string,
+  at: Date = new Date(),
 ): ResolvedQuestion[] {
   return (spezialfragen ?? [])
+    .filter(question => isSpezialfrageActive(question.config ?? {}, at))
     .map((question) =>
       toResolvedQuestion(
         {
@@ -860,7 +864,9 @@ async function resolveVisitSectionsForSelection(input: {
   gmUserId: string;
   marketId: string;
   campaignIds: string[];
+  selectionTime?: Date;
 }): Promise<ResolvedSection[]> {
+  const selectionTime = input.selectionTime ?? new Date();
   const liveNowCondition = sql`(
     (
       ${campaigns.status} = 'active'
@@ -1056,7 +1062,7 @@ async function resolveVisitSectionsForSelection(input: {
               Boolean(question && isQuestionApplicableToMarketChain(question.chains, marketChain)),
             );
         });
-        const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain);
+        const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain, selectionTime);
         if (!fb.id) return null;
         return {
           section: selected.section,
@@ -1096,7 +1102,7 @@ async function resolveVisitSectionsForSelection(input: {
               Boolean(question && isQuestionApplicableToMarketChain(question.chains, marketChain)),
             );
         });
-        const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain);
+        const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain, selectionTime);
         if (!fb.id) return null;
         return {
           section: selected.section,
@@ -1137,7 +1143,7 @@ async function resolveVisitSectionsForSelection(input: {
               Boolean(question && isQuestionApplicableToMarketChain(question.chains, marketChain)),
             );
         });
-        const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain);
+        const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain, selectionTime);
         if (!fb.id) return null;
         return {
           section: selected.section,
@@ -1177,7 +1183,7 @@ async function resolveVisitSectionsForSelection(input: {
             Boolean(question && isQuestionApplicableToMarketChain(question.chains, marketChain)),
           );
       });
-      const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain);
+      const questions = appendSpezialfragen(moduleQuestions, fb.spezialfragen, marketChain, selectionTime);
 
       return {
         section: selected.section as "standard" | "flex" | "billa",
@@ -2021,6 +2027,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       gmUserId,
       marketId: parsed.data.marketId,
       campaignIds,
+      selectionTime: startValidationNow,
     });
     const configuredPhotoTagIds = normalizeUnique(
       resolvedSections.flatMap((section) =>
@@ -2241,6 +2248,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/spezialfragen/sync", a
         status: visitSessions.status,
         submittedAt: visitSessions.submittedAt,
         marketDbName: markets.dbName,
+        startedAt: visitSessions.startedAt,
       })
       .from(visitSessions)
       .innerJoin(markets, eq(markets.id, visitSessions.marketId))
@@ -2309,11 +2317,13 @@ gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/spezialfragen/sync", a
     };
     const marketChain = normalizeMarketChain(session.marketDbName);
     const candidatesBySectionId = new Map<string, ResolvedQuestion[]>();
+    const syncTime = new Date();
     for (const section of sectionRowsWithFragebogen) {
       const scope = fragebogenScopeForVisitSection(section.section);
       const fragebogen = fragebogenByScope[scope].get(section.fragebogenId);
       if (!fragebogen) continue;
-      const candidates = resolveSpezialfragenForMarket(fragebogen.spezialfragen, marketChain);
+      const candidates = resolveSpezialfragenForMarket(fragebogen.spezialfragen, marketChain, syncTime)
+        .filter(question => isSpezialfrageActive(question.config, session.startedAt ?? session.submittedAt!));
       if (candidates.length > 0) candidatesBySectionId.set(section.id, candidates);
     }
     if (candidatesBySectionId.size === 0) {

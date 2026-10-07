@@ -15,6 +15,7 @@ import {
 import { enqueueIppRecalcForQuestionScoringChanges } from "../lib/ipp-finalizer.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { canonicalizeSpezialfragenIds } from "../lib/spezialfragen-persistence.js";
+import { spezialfragePeriodError } from "../lib/spezialfragen-period.js";
 import {
   createQuestionCopyIdMap,
   remapQuestionForDeepCopy,
@@ -435,6 +436,8 @@ function parseIsoDateOrThrow(value: string, fieldName: string): string {
 
 function validateQuestionDomain(question: UiQuestion) {
   const config = (question.config ?? {}) as Record<string, unknown>;
+  const periodError = spezialfragePeriodError(config);
+  if (periodError) throw new DomainValidationError(periodError);
   const scoringKeys = Object.keys(question.scoring ?? {});
   if (question.redSurvey === true && question.type !== "yesno") {
     throw new DomainValidationError("Red Survey darf nur für Ja/Nein Fragen aktiviert werden.");
@@ -635,6 +638,8 @@ function extractAnswerState(
 ): AnswerStateSnapshot {
   const answerConfig = { ...(config ?? {}) };
   delete answerConfig.images;
+  // Scheduling changes visibility for new visits, not the meaning of saved answers.
+  delete answerConfig.spezialfragePeriod;
   return {
     questionType,
     config: sortJsonValue(answerConfig) as Record<string, unknown>,

@@ -5,11 +5,19 @@ import { eq } from "drizzle-orm";
 import { createSMDurcharbeitFixture } from "./SMDurcharbeit-fixture.js";
 import { createSyntheticPhotoStorage, syntheticShelfPhoto } from "./synthetic-photo-storage.js";
 import { installSmPhotoArchivePreviewFaults } from "./sm-photo-archive-preview-faults.js";
+import { spezialfragenPeriodFixture } from "./spezialfragen-period-fixture.js";
 
 // Independent, disposable preview. Never imports the production app entry point or environment.
 const photoStorage = createSyntheticPhotoStorage();
 const f = await createSMDurcharbeitFixture({ photoStorage: photoStorage.storage });
 const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Vienna", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+const gmFixture = await spezialfragenPeriodFixture();
+await request(gmFixture.app).post("/admin/fragebogen/main").auth("synthetic-gm-admin", { type: "bearer" }).send({
+  name: "Vorschau · Spezialfragen", status: "active", moduleIds: [], spezialfragen: [
+    { id: randomUUID(), type: "yesno", text: "Ist das Premium Display noch im Markt vorhanden?", required: true, config: {}, rules: [], scoring: {} },
+    { id: randomUUID(), type: "yesno", text: "Konnte die Aktivierung umgesetzt werden?", required: false, config: { spezialfragePeriod: { startDate: today, endDate: today } }, rules: [], scoring: {} },
+  ],
+}).expect(201);
 const admin = (method: "post" | "put" | "patch", path: string) => request(f.app)[method](path).auth("synthetic-sm-admin", { type: "bearer" });
 const sm = (method: "post" | "put", path: string) => request(f.app)[method](path).auth("synthetic-sm", { type: "bearer" });
 async function seedSMDurcharbeitQuestionnaire(scope: "standard" | "SMDurcharbeit", name: string) {
@@ -68,7 +76,7 @@ preview.use((req, res, next) => {
   const origin = req.get("origin");
   if (origin && !["http://127.0.0.1:3037", "http://localhost:3037"].includes(origin)) { res.sendStatus(403); return; }
   if (origin) res.set("Access-Control-Allow-Origin", origin);
-  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-coke-spark-page-key");
   res.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
@@ -76,6 +84,8 @@ preview.use((req, res, next) => {
 preview.use(express.json());
 preview.use("/synthetic-photo-storage", photoStorage.router);
 const people = {
+  "synthetic-gm-admin": { id: gmFixture.ids.admin, role: "admin", email: "gm-admin@preview.test", firstName: "Vorschau", lastName: "GM Admin", isActive: true },
+  "synthetic-gm": { id: gmFixture.ids.gm, role: "gm", email: "gm@preview.test", firstName: "Vorschau", lastName: "GM", isActive: true },
   "synthetic-sm-admin": { id: f.admin, role: "sm_admin", email: "sm-admin@preview.test", firstName: "Vorschau", lastName: "Admin", isActive: true },
   "synthetic-sm": { id: f.employee, role: "sm", email: "sm@preview.test", firstName: "Vorschau", lastName: "SM", isActive: true, travelTimeEnabled: true },
 };
@@ -101,9 +111,10 @@ preview.get("/employee-agreement/current", (req, res) => {
   res.json({ accepted: true });
 });
 preview.get("/admin/users", (req, res) => {
-  if (tokenFor(req) !== "synthetic-sm-admin") { res.sendStatus(403); return; }
-  res.json({ users: req.query.role === "sm" ? [people["synthetic-sm"]] : [] });
+  if (!["synthetic-sm-admin", "synthetic-gm-admin"].includes(tokenFor(req))) { res.sendStatus(403); return; }
+  res.json({ users: req.query.role === "sm" ? [people["synthetic-sm"]] : [people["synthetic-gm"]] });
 });
+preview.get("/admin/campaigns", (_req, res) => res.json({ campaigns: [] }));
 preview.get("/sm/messages", (req, res) => {
   if (tokenFor(req) !== "synthetic-sm") { res.sendStatus(403); return; }
   res.json({ messages: [] });
@@ -120,5 +131,6 @@ preview.put("/admin/kurti/layout", (req, res) => {
 });
 installSmPhotoArchivePreviewFaults(preview);
 preview.use(f.app);
+preview.use(gmFixture.app);
 const server = preview.listen(4037, "127.0.0.1", () => console.log("SMDurcharbeit synthetic backend ready at http://127.0.0.1:4037 · disposable PGlite · no production environment"));
-for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => server.close(() => { void f.pg.close().then(() => process.exit(0)); }));
+for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => server.close(() => { void Promise.all([f.pg.close(), gmFixture.pg.close()]).then(() => process.exit(0)); }));
