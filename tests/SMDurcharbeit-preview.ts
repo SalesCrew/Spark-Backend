@@ -11,13 +11,27 @@ import { spezialfragenPeriodFixture } from "./spezialfragen-period-fixture.js";
 const photoStorage = createSyntheticPhotoStorage();
 const f = await createSMDurcharbeitFixture({ photoStorage: photoStorage.storage });
 const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Vienna", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
-const gmFixture = await spezialfragenPeriodFixture();
+const gmFixture = await spezialfragenPeriodFixture(undefined, true);
 await request(gmFixture.app).post("/admin/fragebogen/main").auth("synthetic-gm-admin", { type: "bearer" }).send({
   name: "Vorschau · Spezialfragen", status: "active", moduleIds: [], spezialfragen: [
     { id: randomUUID(), type: "yesno", text: "Ist das Premium Display noch im Markt vorhanden?", required: true, config: {}, rules: [], scoring: {} },
     { id: randomUUID(), type: "yesno", text: "Konnte die Aktivierung umgesetzt werden?", required: false, config: { spezialfragePeriod: { startDate: today, endDate: today } }, rules: [], scoring: {} },
   ],
 }).expect(201);
+// Reproduce the reported catalog mismatch using only disposable questionnaires and campaigns.
+for (const section of ["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"] as const) {
+  const scope = ["standard", "flex", "billa"].includes(section) ? "main" : section;
+  const create = async (name: string, status: string) => (await request(gmFixture.app).post(`/admin/fragebogen/${scope}`).auth("synthetic-gm-admin", { type: "bearer" }).send({
+    name, status, moduleIds: [], ...(scope === "main" ? { sectionKeywords: [section] } : {}),
+    spezialfragen: [{ id: randomUUID(), type: "yesno", text: `${name} · Testfrage`, required: true, config: {}, rules: [], scoring: {} }],
+  }).expect(201)).body.fragebogen.id;
+  await create(`${section} · Q3`, "active");
+  const currentFragebogenId = await create(`${section} · Q4`, "inactive");
+  await gmFixture.database.insert(gmFixture.schema.campaigns).values({ name: `${section} · Oktober`, section, status: "active", scheduleType: "always", currentFragebogenId });
+  const future = await create(`${section} · Geplant`, "inactive");
+  const startDate = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10), endDate = new Date(Date.now() + 14 * 86_400_000).toISOString().slice(0, 10);
+  await gmFixture.database.insert(gmFixture.schema.campaigns).values({ name: `${section} · Nächste Woche`, section, status: "scheduled", scheduleType: "scheduled", startDate, endDate, currentFragebogenId: future });
+}
 const admin = (method: "post" | "put" | "patch", path: string) => request(f.app)[method](path).auth("synthetic-sm-admin", { type: "bearer" });
 const sm = (method: "post" | "put", path: string) => request(f.app)[method](path).auth("synthetic-sm", { type: "bearer" });
 async function seedSMDurcharbeitQuestionnaire(scope: "standard" | "SMDurcharbeit", name: string) {
@@ -114,7 +128,6 @@ preview.get("/admin/users", (req, res) => {
   if (!["synthetic-sm-admin", "synthetic-gm-admin"].includes(tokenFor(req))) { res.sendStatus(403); return; }
   res.json({ users: req.query.role === "sm" ? [people["synthetic-sm"]] : [people["synthetic-gm"]] });
 });
-preview.get("/admin/campaigns", (_req, res) => res.json({ campaigns: [] }));
 preview.get("/sm/messages", (req, res) => {
   if (tokenFor(req) !== "synthetic-sm") { res.sendStatus(403); return; }
   res.json({ messages: [] });

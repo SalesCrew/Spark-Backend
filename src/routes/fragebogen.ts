@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import { type NextFunction, type Request, type Response, Router } from "express";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -22,6 +22,7 @@ import {
 } from "../lib/fragebogen-deep-copy.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
+  campaigns,
   fragebogenDurcharbeit,
   fragebogenDurcharbeitModule,
   fragebogenDurcharbeitSpezialQuestion,
@@ -2833,6 +2834,39 @@ adminFragebogenRouter.get("/spezialfragen", async (req, res, next) => {
         left.text.localeCompare(right.text, "de", { sensitivity: "base" }),
       ),
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Display metadata only. Campaign links, stored questionnaire statuses and visit snapshots are untouched.
+adminFragebogenRouter.get("/fragebogen/:scope/campaign-usage", async (req, res, next) => {
+  try {
+    const parsed = scopeSchema.safeParse(req.params.scope);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Ungültiger Fragebogenbereich." });
+      return;
+    }
+    const sections = parsed.data === "main"
+      ? ["standard", "flex", "billa"] as const
+      : [parsed.data];
+    const rows = await db.select({
+      id: campaigns.id,
+      name: campaigns.name,
+      section: campaigns.section,
+      currentFragebogenId: campaigns.currentFragebogenId,
+      status: campaigns.status,
+      scheduleType: campaigns.scheduleType,
+      startDate: campaigns.startDate,
+      endDate: campaigns.endDate,
+    }).from(campaigns).where(and(
+      eq(campaigns.isDeleted, false),
+      isNotNull(campaigns.currentFragebogenId),
+      inArray(campaigns.section, [...sections]),
+      inArray(campaigns.status, ["active", "scheduled"]),
+    )).orderBy(asc(campaigns.name), asc(campaigns.id));
+    res.set("Cache-Control", "no-store");
+    res.status(200).json({ campaigns: rows });
   } catch (error) {
     next(error);
   }

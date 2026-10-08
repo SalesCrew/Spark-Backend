@@ -17,7 +17,7 @@ import * as answerValidation from '../src/lib/visit-session-answer-validation.js
 import { modelDatabase } from '../src/lib/praemien-workspace.js';
 import { isolatedModule } from './isolated-module.js';
 
-export async function spezialfragenPeriodFixture(initialTime?: Date) {
+export async function spezialfragenPeriodFixture(initialTime?: Date, withCampaigns = false) {
   if (process.env.DATABASE_URL || process.env.SUPABASE_URL || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NODE_ENV === 'production') throw new Error('Production configuration is forbidden');
   const pg = new PGlite(), database = drizzle(pg, { schema }), dialect = new PgDialect();
   const quote = (v: string) => '"' + v.replaceAll('"', '""') + '"';
@@ -68,7 +68,8 @@ export async function spezialfragenPeriodFixture(initialTime?: Date) {
       activeTransaction = tx;
       try { return await action(asPostgres(tx)); } finally { activeTransaction = null; }
     });
-    const v = Reflect.get(object, key); return typeof v === 'function' ? v.bind(object) : v;
+    const target = object === database && activeTransaction ? activeTransaction : object;
+    const v = Reflect.get(target, key); return typeof v === 'function' ? v.bind(target) : v;
   } });
   const db = asPostgres(database);
   // PGlite has one connection. Global readiness reads must share the synthetic transaction.
@@ -99,6 +100,16 @@ export async function spezialfragenPeriodFixture(initialTime?: Date) {
     '../lib/zeiterfassung-validation.js': { validateGmTimelineStartPoint: async () => {}, respondTimelineValidationError: () => false },
   }, Clock as typeof Date);
   const app = express(); app.use(express.json()); app.use('/admin', authoring.adminFragebogenRouter); app.use(visits.gmVisitSessionsRouter);
+  if (withCampaigns) {
+    const campaigns = await isolatedModule<typeof import('../src/routes/campaigns.js')>(new URL('../src/routes/campaigns.ts', import.meta.url), {
+      ...await replacementsFor('../src/routes/campaigns.ts'),
+      '../lib/kunde-access.js': { requireKundeAdminPermission: pass },
+      './campaign-extension.js': { createCampaignExtensionRouter: () => express.Router() },
+      './campaign-visit-export-index.js': { createCampaignVisitExportIndexRouter: () => express.Router() },
+      '../lib/praemien-workspace.js': { modelDatabase },
+    }, Clock as typeof Date);
+    app.use('/admin', campaigns.adminCampaignsRouter);
+  }
   app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => res.status(500).json({ error: error.message }));
   return { app, database, pg, schema, ids, setTime: (value: string) => { now = new Date(value); } };
 }
