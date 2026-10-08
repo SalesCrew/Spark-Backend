@@ -44,7 +44,7 @@ test("SM Fotoarchiv: actual photo submission, filters, private reads and unchang
         photos.push({ storageBucket: upload.bucket, storagePath: upload.path, originalFileName: name + ` ${index + 1}.png`, mimeType: "image/png", byteSize: 32, widthPx: 320, heightPx: 240 });
       }
       await sm("post", `/sm/visits/${assignment.id}/photos/commit`).send({ answerId, photos }).expect(200);
-      await sm("post", `/sm/visits/${assignment.id}/submit`).send({ actualMinutes: 15, visitStartedAt: `2026-10-07T${hour}:00:00Z`, visitCompletedAt: `2026-10-07T${hour}:15:00Z`, clientMutationToken: randomUUID() }).expect(200);
+      await sm("post", `/sm/visits/${assignment.id}/submit`).send({ actualMinutes: 15, visitStartedAt: `2026-10-07T${hour}:00:00Z`, visitCompletedAt: `2026-10-07T${hour}:15:00Z`, clientMutationToken: randomUUID() }).expect(r => assert.equal(r.status, 200, JSON.stringify(r.body)));
       return { form, version, assignment, question, answerId };
     };
     const standard = await seed("standard", "07", "Standard original", 2);

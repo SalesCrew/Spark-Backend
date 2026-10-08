@@ -74,9 +74,15 @@ await seedSMDurcharbeitAssignment();
 const target = await seedSMDurcharbeitAssignment();
 await admin("patch", `/admin/sm-planning/assignments/${target.id}`).send({ expectedUpdatedAt: target.updatedAt.toISOString(), SMDurcharbeitQuestionnaireOverrideVersionId: durcharbeit.version.id }).expect(200);
 
-const SMDurcharbeitPreviewMarketId = randomUUID();
-await f.database.insert(f.schema.smMarkets).values({ id: SMDurcharbeitPreviewMarketId, internalMarketId: "SYNTHETIC-DA-1", name: "Durcharbeit · Markt am Park", dbName: "Durcharbeit · Markt am Park", chain: "Spar", address: "Vorschauweg 8", postalCode: "1020", city: "Wien", region: "Ost", assignedSmUserId: f.employee });
-await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({ smMarketId: SMDurcharbeitPreviewMarketId });
+const SMDurcharbeitPreviewImport = (await admin("post", "/admin/sm-markets/SMDurcharbeit/import").send({
+  fileName: "Synthetische-Durcharbeit.xlsx", sheetName: "Gesamt",
+  mapping: { SMDurcharbeitVertriebstyp: "A", name: "B", address: "C", postalCode: "D", city: "E", SMDurcharbeitEmEh: "F", shelfMerchandiserName: "G" },
+  rows: [["Vertriebstyp", "Firma/Betrieb", "Straße", "PLZ", "Ort", "EM/EH", "Verplanung"],
+    ["Spar", "Durcharbeit · Markt am Park", "Vorschauweg 8", "1020", "Wien", "EM", "SM Local"],
+    ["Billa", "", "Synthetische Gasse 12", "1030", "Wien", "", "Unbekannte Vorschauperson"],
+  ],
+}).expect(200)).body;
+const SMDurcharbeitPreviewMarketId = SMDurcharbeitPreviewImport.markets.find((row: any) => row.name === "Durcharbeit · Markt am Park").id;
 await admin("post", "/admin/sm-planning/assignments").send({ smMarketId: SMDurcharbeitPreviewMarketId, smUserId: f.employee, workDate: today, plannedMinutes: 90, SMDurcharbeitQuestionnaireOverrideVersionId: durcharbeit.version.id, idempotencyKey: randomUUID() }).expect(201);
 const completedId = (await admin("post", "/admin/sm-planning/assignments").send({ smMarketId: SMDurcharbeitPreviewMarketId, smUserId: f.employee, workDate: today, plannedMinutes: 75, SMDurcharbeitQuestionnaireOverrideVersionId: durcharbeit.version.id, idempotencyKey: randomUUID() }).expect(201)).body.assignmentId;
 const completedPayload = (await sm("post", `/sm/visits/${completedId}/start`).send({ mode: "manual", clientSubmissionToken: randomUUID() }).expect(200)).body;

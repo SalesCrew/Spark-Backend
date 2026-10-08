@@ -24,6 +24,7 @@ import * as lock from "../src/sm-planning-lock.js";
 import * as overlap from "../src/sm-time-overlap.js";
 import { isRoleAllowedForEndpoint } from "../src/lib/admin-role.js";
 import { isolatedModule } from "./isolated-module.js";
+import { createSMDurcharbeitMarketsRouter } from "../src/routes/sm-SMDurcharbeit-markets.js";
 
 /** Actual SM routes and migrations, with all external I/O replaced and a fresh disposable DB. */
 export async function createSMDurcharbeitFixture(options: { photoStorage?: { from: (bucket: string) => any } } = {}) {
@@ -42,6 +43,7 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   }
   await pg.exec(await readFile(new URL("../supabase/migrations/20261007124730_SMDurcharbeit_einsatz_override.sql", import.meta.url), "utf8"));
   await pg.exec(await readFile(new URL("../supabase/migrations/20261007133647_SMDurcharbeit_market_registry.sql", import.meta.url), "utf8"));
+  await pg.exec(await readFile(new URL("../supabase/migrations/20261008125753_SMDurcharbeit_market_import.sql", import.meta.url), "utf8"));
   const admin = randomUUID(), employee = randomUUID(), market = randomUUID();
   await pg.query("insert into users(id,first_name,last_name,role) values($1,'Local','Admin','sm_admin'),($2,'Local','SM','sm')", [admin, employee]);
   await pg.query("insert into sm_markets(id,name,chain,address,postal_code,city,region,internal_market_id) values($1,'Synthetic Billa','Billa','Testgasse 1','1010','Wien','Ost','SYNTHETIC-1')", [market]);
@@ -103,6 +105,7 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
     "../sm-comment.shared.js": comments, "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visit,
   });
   const directory = await isolatedModule<typeof import("../src/routes/sm-markets.js")>(new URL("../src/routes/sm-markets.ts", import.meta.url), {
+    "./sm-SMDurcharbeit-markets.js": { createSMDurcharbeitMarketsRouter },
     ...base, "../sm-market-user-sync.shared.js": sync, "../sm-market-weekly-planning.shared.js": weekly,
     "../sm-market-deactivation.js": { smMarketDeactivationSchema: z.object({}), SmMarketDeactivationError: class extends Error {}, deactivateSmMarket: () => { throw new Error("Not covered by this fixture"); }, loadSmMarketDeactivationPreview: () => { throw new Error("Not covered by this fixture"); } },
   });

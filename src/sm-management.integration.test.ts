@@ -38,6 +38,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     const admin = randomUUID(), employee = randomUUID(), market = randomUUID();
     await pg.exec(await readFile(new URL("../supabase/migrations/20261007124730_SMDurcharbeit_einsatz_override.sql", import.meta.url), "utf8"));
     await pg.exec(await readFile(new URL("../supabase/migrations/20261007133647_SMDurcharbeit_market_registry.sql", import.meta.url), "utf8"));
+    await pg.exec(await readFile(new URL("../supabase/migrations/20261008125753_SMDurcharbeit_market_import.sql", import.meta.url), "utf8"));
     await pg.query("insert into users(id,first_name,last_name,role) values ($1,'Local','Admin','sm_admin'),($2,'Local','SM','sm')", [admin, employee]);
     await pg.query("insert into sm_markets(id,name,chain,address,postal_code,city,region) values ($1,'Local Billa','Billa','Testgasse 1','1010','Wien','Ost')", [market]);
     const [template] = await database.insert(schema.smQuestionnaireTemplates).values({ stableCode: "local-template" }).returning();

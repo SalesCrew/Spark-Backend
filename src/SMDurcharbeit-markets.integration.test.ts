@@ -7,6 +7,7 @@ import request from "supertest";
 import { createSMDurcharbeitFixture } from "../tests/SMDurcharbeit-fixture.js";
 
 test("SMDurcharbeit dedicated markets use isolated identities, authoritative selection and unchanged history", async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-07T15:00:00Z') });
   const f = await createSMDurcharbeitFixture();
   const admin = (method: "get" | "post" | "patch" | "put", path: string) => request(f.app)[method](path).auth("synthetic-sm-admin", { type: "bearer" }).timeout({ response: 5000, deadline: 8000 });
   const sm = (method: "get" | "post" | "put", path: string) => request(f.app)[method](path).auth("synthetic-sm", { type: "bearer" }).timeout({ response: 5000, deadline: 8000 });
@@ -34,6 +35,7 @@ test("SMDurcharbeit dedicated markets use isolated identities, authoritative sel
     await t.test("additive registry migration preserves old rows and denies direct browser writes", async () => {
       await f.pg.exec("drop table sm_smdurcharbeit_markets");
       await f.pg.exec(await readFile(new URL("../supabase/migrations/20261007133647_SMDurcharbeit_market_registry.sql", import.meta.url), "utf8"));
+      await f.pg.exec(await readFile(new URL("../supabase/migrations/20261008125753_SMDurcharbeit_market_import.sql", import.meta.url), "utf8"));
       assert.deepEqual(await capture(), original);
       const result = await f.pg.query<{ relrowsecurity: boolean }>("select relrowsecurity from pg_class where relname='sm_smdurcharbeit_markets'");
       assert.equal(result.rows[0]?.relrowsecurity, true);

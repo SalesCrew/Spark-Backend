@@ -7,8 +7,9 @@ import request from "supertest";
 import { createSMDurcharbeitFixture } from "../tests/SMDurcharbeit-fixture.js";
 
 test("SMDurcharbeit per-Einsatz override is authoritative, immutable after start and safe for history", async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-07T15:00:00Z') });
   const f = await createSMDurcharbeitFixture();
-  const admin = (method: "get" | "post" | "patch" | "put", path: string) => request(f.app)[method](path).auth("synthetic-sm-admin", { type: "bearer" });
+  const admin = (method: "get" | "post" | "patch" | "put", path: string) => { t.mock.timers.tick(1); return request(f.app)[method](path).auth("synthetic-sm-admin", { type: "bearer" }); };
   const sm = (method: "get" | "post" | "put" | "delete", path: string) => request(f.app)[method](path).auth("synthetic-sm", { type: "bearer" });
   const questionnaire = async (scope: "standard" | "SMDurcharbeit", name: string, oncePerMarket = false) => {
     const module = (await admin("post", `/admin/sm-questionnaires/modules?scope=${scope}`).send({ id: "new-" + randomUUID(), name, description: "", questions: [{ id: "new-" + randomUUID(), text: name + " question", type: "yesno", required: true, options: ["Ja", "Nein"], config: {}, rules: [] }] }).expect(201)).body.module;

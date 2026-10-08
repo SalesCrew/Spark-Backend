@@ -30,6 +30,7 @@ async function localFixture() {
   for (const migration of ["0088_sm_markets", "0092_sm_market_assignments", "0108_sm_market_account_assignments"]) {
     await pg.exec(await readFile(new URL(`../drizzle/${migration}.sql`, import.meta.url), "utf8"));
   }
+  for (const migration of ["20261007133647_SMDurcharbeit_market_registry.sql", "20261008125753_SMDurcharbeit_market_import.sql"]) await pg.exec(await readFile(new URL(`../supabase/migrations/${migration}`, import.meta.url), "utf8"));
   await pg.query(`insert into sm_markets(id,internal_market_id,name,chain,address,postal_code,city,region,
     thursday_hours,shelf_merchandiser_name,field_service_manager_name,assigned_sm_user_id,
     field_service_manager_user_id,source_info,admin_info_note,import_source_file_name,updated_at)

@@ -524,8 +524,21 @@ export const smMarkets = pgTable(
 // Membership is separate from market/visit identity. No automatic reclassification of history.
 export const smSMDurcharbeitMarkets = pgTable("sm_smdurcharbeit_markets", {
   smMarketId: uuid("sm_market_id").primaryKey().references(() => smMarkets.id, { onDelete: "restrict" }),
+  SMDurcharbeitSourceKey: text("smdurcharbeit_source_key"),
+  SMDurcharbeitVertriebstyp: text("smdurcharbeit_vertriebstyp"),
+  SMDurcharbeitFirmaBetrieb: text("smdurcharbeit_firma_betrieb"),
+  SMDurcharbeitStrasse: text("smdurcharbeit_strasse"),
+  SMDurcharbeitPlz: text("smdurcharbeit_plz"),
+  SMDurcharbeitOrt: text("smdurcharbeit_ort"),
+  SMDurcharbeitEmEh: text("smdurcharbeit_em_eh"),
+  SMDurcharbeitVerplanung: text("smdurcharbeit_verplanung"),
+  SMDurcharbeitSourceFile: text("smdurcharbeit_source_file"),
+  SMDurcharbeitSourceSheet: text("smdurcharbeit_source_sheet"),
+  SMDurcharbeitSourceRow: integer("smdurcharbeit_source_row"),
+  SMDurcharbeitSourceValues: jsonb("smdurcharbeit_source_values").$type<Record<string, string>>(),
+  SMDurcharbeitImportedAt: timestamp("smdurcharbeit_imported_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, table => [uniqueIndex("sm_smdurcharbeit_source_key_unique").on(table.SMDurcharbeitSourceKey).where(sql`${table.SMDurcharbeitSourceKey} is not null`)]);
 
 export const smMessages = pgTable(
   "sm_messages",

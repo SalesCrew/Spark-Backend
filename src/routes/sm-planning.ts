@@ -55,6 +55,7 @@ const optionalFlatRateSchema = z.number().int().min(0).max(10_000_000).nullable(
 const globalQuestionnaireAssignmentSchema = z.object({ questionnaireTemplateId: z.string().uuid() }).strict();
 
 const singleAssignmentSchema = z.object({
+  SMDurcharbeitMarketScope: z.literal("SMDurcharbeit").optional(),
   SMDurcharbeitQuestionnaireOverrideVersionId: z.string().uuid().optional(),
   smMarketId: z.string().uuid(),
   smUserId: z.string().uuid(),
@@ -1137,6 +1138,8 @@ adminSmPlanningRouter.post("/assignments", async (req: AuthedRequest, res, next)
     const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_assignment:${parsed.data.idempotencyKey}`}, 0))`);
       await lockSmPlanning(tx);
+      const [SMDurcharbeitMarket] = await tx.select().from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, parsed.data.smMarketId)).limit(1);
+      if (parsed.data.SMDurcharbeitMarketScope && !SMDurcharbeitMarket) throw new SMDurcharbeitSelectionError(409, "smdurcharbeit_market_required", "In der Durcharbeit-Verplanung sind nur Durcharbeit-Märkte verfügbar.");
       const [existing] = await tx.select({ id: smAssignments.id }).from(smAssignments).where(and(
         eq(smAssignments.idempotencyKey, parsed.data.idempotencyKey),
         eq(smAssignments.isDeleted, false),
@@ -1144,7 +1147,6 @@ adminSmPlanningRouter.post("/assignments", async (req: AuthedRequest, res, next)
       if (existing) return { id: existing.id, replayed: true };
 
       if (!parsed.data.SMDurcharbeitQuestionnaireOverrideVersionId) {
-        const [SMDurcharbeitMarket] = await tx.select().from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, parsed.data.smMarketId)).limit(1);
         if (SMDurcharbeitMarket) throw new SMDurcharbeitSelectionError(409, "smdurcharbeit_market_questionnaire_required", "Für diesen Durcharbeit-Markt bitte einen Durcharbeit-Fragebogen auswählen.");
         await requireConfiguredGlobalQuestionnaire(tx);
       }

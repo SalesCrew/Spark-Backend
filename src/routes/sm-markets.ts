@@ -9,6 +9,7 @@ import { resolveAutomaticSmNameMatch } from "../sm-market-user-sync.shared.js";
 import { lockSmPlanning } from "../sm-planning-lock.js";
 import { smMarketWeekdayColumns, smMarketWeekdayHoursSchema } from "../sm-market-weekly-planning.shared.js";
 import { deactivateSmMarket, loadSmMarketDeactivationPreview, smMarketDeactivationSchema, SmMarketDeactivationError } from "../sm-market-deactivation.js";
+import { createSMDurcharbeitMarketsRouter } from "./sm-SMDurcharbeit-markets.js";
 
 export const adminSmMarketsRouter = Router();
 
@@ -254,6 +255,14 @@ function smUserDisplayName(user: { firstName: string; lastName: string }): strin
 
 adminSmMarketsRouter.use(requireAuth(["admin", "sm_admin"]));
 
+async function listSMDurcharbeitMarkets() {
+  const rows = await db.select({ market: smMarkets, source: smSMDurcharbeitMarkets }).from(smSMDurcharbeitMarkets)
+    .innerJoin(smMarkets, eq(smMarkets.id, smSMDurcharbeitMarkets.smMarketId))
+    .where(eq(smMarkets.isDeleted, false)).orderBy(asc(smMarkets.chain), asc(smMarkets.name));
+  return rows.map(row => ({ ...mapSmMarketRow(row.market), SMDurcharbeitMarket: true, SMDurcharbeitSourceValues: row.source.SMDurcharbeitSourceValues }));
+}
+adminSmMarketsRouter.use("/SMDurcharbeit", createSMDurcharbeitMarketsRouter(db, listSMDurcharbeitMarkets, mapSmMarketRow));
+
 adminSmMarketsRouter.use("/:id", async (req, res, next) => {
   if (req.method === "GET" || !z.string().uuid().safeParse(req.params.id).success) { next(); return; }
   try {
@@ -267,6 +276,7 @@ adminSmMarketsRouter.get("/", async (req, res, next) => {
   try {
     const scope = req.query.SMDurcharbeitMarketScope ?? "standard";
     if (!["standard", "SMDurcharbeit", "all"].includes(String(scope))) { res.status(400).json({ error: "Ungültiger Marktbereich." }); return; }
+    if (scope === "SMDurcharbeit") { res.status(200).json({ markets: await listSMDurcharbeitMarkets() }); return; }
     const rows = await loadSmMarkets(scope as "standard" | "SMDurcharbeit" | "all");
     const members = scope === "all" ? new Set((await db.select().from(smSMDurcharbeitMarkets)).map(row => row.smMarketId)) : null;
     res.status(200).json({ markets: rows.map(row => scope === "standard" ? mapSmMarketRow(row) : ({ ...mapSmMarketRow(row), SMDurcharbeitMarket: members ? members.has(row.id) : true })) });
