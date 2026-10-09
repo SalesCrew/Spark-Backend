@@ -33,9 +33,13 @@ test("SMDurcharbeit dedicated markets use isolated identities, authoritative sel
     const capture = async () => Object.fromEntries(await Promise.all(historicalTables.map(async name => [name, JSON.stringify((await f.pg.query(`select * from ${name} order by id`)).rows)])));
     const original = await capture();
     await t.test("additive registry migration preserves old rows and denies direct browser writes", async () => {
+      // This historical migration replay precedes campaign data in the disposable fixture.
+      // Detach and restore its empty dependent FK so the original registry can be replayed.
+      await f.pg.exec("alter table sm_smdurcharbeit_campaign_markets drop constraint sm_smdurcharbeit_campaign_markets_sm_market_id_fkey");
       await f.pg.exec("drop table sm_smdurcharbeit_markets");
       await f.pg.exec(await readFile(new URL("../supabase/migrations/20261007133647_SMDurcharbeit_market_registry.sql", import.meta.url), "utf8"));
       await f.pg.exec(await readFile(new URL("../supabase/migrations/20261008125753_SMDurcharbeit_market_import.sql", import.meta.url), "utf8"));
+      await f.pg.exec("alter table sm_smdurcharbeit_campaign_markets add constraint sm_smdurcharbeit_campaign_markets_sm_market_id_fkey foreign key(sm_market_id) references sm_smdurcharbeit_markets(sm_market_id) on delete restrict");
       assert.deepEqual(await capture(), original);
       const result = await f.pg.query<{ relrowsecurity: boolean }>("select relrowsecurity from pg_class where relname='sm_smdurcharbeit_markets'");
       assert.equal(result.rows[0]?.relrowsecurity, true);

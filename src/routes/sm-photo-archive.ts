@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, lte, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lte, or, sql, type SQL } from "drizzle-orm";
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
 import { db } from "../lib/db.js";
@@ -6,7 +6,9 @@ import { supabaseAdmin } from "../lib/supabase.js";
 import { requireAuth } from "../middleware/auth.js";
 import { smAssignments, smQuestionAnswerFiles as files, smQuestionAnswers as answers,
   smQuestionnaireSubmissions as submissions, smQuestionnaireSubmissionQuestions as questions,
-  smQuestionnaireSubmissionSections as sections, smQuestionnaireTemplates as templates } from "../lib/schema.js";
+  smQuestionnaireSubmissionSections as sections, smQuestionnaireTemplates as templates,
+  smSMDurcharbeitTargets as targets, smSMDurcharbeitPeriods as periods, smSMDurcharbeitCampaigns as campaigns,
+  smSMDurcharbeitTimeRevisions as times } from "../lib/schema.js";
 import { isIsoDate } from "../sm-planning.shared.js";
 import type { SmManagementTx } from "../sm-management.js";
 
@@ -15,6 +17,7 @@ export const smPhotoArchiveFiltersSchema = z.object({
   from: date.optional(), to: date.optional(), smUserId: uuid.optional(), marketId: uuid.optional(),
   questionnaireId: uuid.optional(), SMDurcharbeitCatalogScope: z.enum(["standard", "SMDurcharbeit"]).optional(),
   search: z.string().trim().max(200).optional(),
+  SMDurcharbeitCampaignId: uuid.optional(), SMDurcharbeitMonth: date.refine(value => value.endsWith("-01"), "Kalendermonat erforderlich.").optional(),
 }).strict().refine(input => !input.from || !input.to || input.from <= input.to, "Das Ende muss nach dem Beginn liegen.");
 export const smPhotoArchiveQuerySchema = smPhotoArchiveFiltersSchema.safeExtend({
   page: z.coerce.number().int().min(1).max(100_000).default(1),
@@ -25,7 +28,7 @@ export type SmPhotoArchiveFilters = z.infer<typeof smPhotoArchiveFiltersSchema>;
 // Read the frozen visit/question snapshots. Catalog edits, inactive staff and archived
 // markets must never remove historical photos. Only current, submitted answers appear.
 function photoSource(tx: SmManagementTx) {
-  const workDate = sql<string>`coalesce((${submissions.visitStartedAt} at time zone 'Europe/Vienna')::date,
+  const workDate = sql<string>`coalesce((${times.startedAt} at time zone 'Europe/Vienna')::date, (${submissions.visitStartedAt} at time zone 'Europe/Vienna')::date,
     ${smAssignments.replacementWorkDate}, ${smAssignments.originalWorkDate}, (${submissions.submittedAt} at time zone 'Europe/Vienna')::date)::text`;
   return tx.$with("sm_archive_photos").as(tx.select({
     id: sql<string>`${files.id}`.as("id"), submissionId: sql<string>`${submissions.id}`.as("submission_id"), assignmentId: submissions.assignmentId,
@@ -38,6 +41,10 @@ function photoSource(tx: SmManagementTx) {
     address: submissions.marketAddressSnapshot, postalCode: submissions.marketPostalCodeSnapshot, city: submissions.marketCitySnapshot,
     questionnaireId: submissions.questionnaireTemplateId, questionnaireName: submissions.questionnaireNameSnapshot,
     questionnaireVersion: submissions.questionnaireVersionSnapshot,
+    SMDurcharbeitVisitId: submissions.SMDurcharbeitVisitId, SMDurcharbeitTargetId: submissions.SMDurcharbeitTargetId,
+    SMDurcharbeitCampaignId: sql<string | null>`${campaigns.id}`.as("smdurcharbeit_campaign_id"),
+    SMDurcharbeitCampaignName: sql<string | null>`${campaigns.name}`.as("smdurcharbeit_campaign_name"),
+    SMDurcharbeitMonth: sql<string | null>`${periods.month}`.as("smdurcharbeit_month"),
     SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`case when starts_with(${templates.stableCode}, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end`.as("catalog_scope"),
   }).from(files).innerJoin(answers, eq(answers.id, files.answerId))
     .innerJoin(questions, and(eq(questions.id, answers.submissionQuestionId), eq(questions.submissionId, answers.submissionId)))
@@ -45,12 +52,30 @@ function photoSource(tx: SmManagementTx) {
     .innerJoin(submissions, eq(submissions.id, answers.submissionId))
     .leftJoin(smAssignments, eq(smAssignments.id, submissions.assignmentId))
     .leftJoin(templates, eq(templates.id, submissions.questionnaireTemplateId))
-    .where(and(eq(files.isDeleted, false), eq(answers.isDeleted, false), eq(answers.isCurrent, true), eq(answers.answerState, "answered"),
+    .leftJoin(targets, eq(targets.id, submissions.SMDurcharbeitTargetId))
+    .leftJoin(periods, eq(periods.id, targets.periodId))
+    .leftJoin(campaigns, eq(campaigns.id, targets.campaignId))
+    .leftJoin(times, and(eq(times.visitId, submissions.SMDurcharbeitVisitId), eq(times.isCurrent, true)))
+    .where(and(eq(files.isDeleted, false), or(and(eq(answers.isDeleted, false), eq(answers.isCurrent, true), eq(answers.answerState, "answered"),
       eq(questions.isDeleted, false), eq(questions.isApplicable, true), eq(questions.questionTypeSnapshot, "photo"), eq(sections.isDeleted, false),
       eq(submissions.isDeleted, false), eq(submissions.isCurrent, true), eq(submissions.status, "submitted"),
       sql`${answers.valueJson}->>'kind' = 'photo'`,
       sql`(case when jsonb_typeof(${answers.valueJson}->'fileIds') = 'array' then ${answers.valueJson}->'fileIds' else '[]'::jsonb end) ? ${files.id}::text`,
-    )));
+    ), sql`exists (
+      select 1 from sm_smdurcharbeit_answer_file_links retained_link
+      join sm_question_answers retained_answer on retained_answer.id = retained_link.answer_id
+      join sm_questionnaire_submission_questions retained_question on retained_question.id = retained_answer.submission_question_id and retained_question.submission_id = retained_answer.submission_id
+      join sm_questionnaire_submission_sections retained_section on retained_section.id = retained_question.submission_section_id
+      join sm_questionnaire_submissions retained_submission on retained_submission.id = retained_answer.submission_id
+      where retained_link.file_id = ${files.id} and not retained_link.is_deleted
+        and not retained_answer.is_deleted and retained_answer.is_current and retained_answer.answer_state = 'answered'
+        and not retained_question.is_deleted and retained_question.is_applicable and retained_question.question_type_snapshot = 'photo'
+        and not retained_section.is_deleted
+        and not retained_submission.is_deleted and retained_submission.is_current and retained_submission.status = 'submitted'
+        and retained_submission.smdurcharbeit_target_id = ${submissions.SMDurcharbeitTargetId}
+        and retained_answer.value_json->>'kind' = 'photo'
+        and (case when jsonb_typeof(retained_answer.value_json->'fileIds') = 'array' then retained_answer.value_json->'fileIds' else '[]'::jsonb end) ? ${files.id}::text
+    )`))));
 }
 
 function filtersFor(source: ReturnType<typeof photoSource>, input: SmPhotoArchiveFilters): SQL[] {
@@ -60,6 +85,8 @@ function filtersFor(source: ReturnType<typeof photoSource>, input: SmPhotoArchiv
   if (input.smUserId) filters.push(eq(source.smUserId, input.smUserId));
   if (input.marketId) filters.push(eq(source.marketId, input.marketId));
   if (input.questionnaireId) filters.push(eq(source.questionnaireId, input.questionnaireId));
+  if (input.SMDurcharbeitCampaignId) filters.push(eq(source.SMDurcharbeitCampaignId, input.SMDurcharbeitCampaignId));
+  if (input.SMDurcharbeitMonth) filters.push(eq(source.SMDurcharbeitMonth, input.SMDurcharbeitMonth));
   if (input.SMDurcharbeitCatalogScope) filters.push(eq(source.SMDurcharbeitCatalogScope, input.SMDurcharbeitCatalogScope));
   if (input.search) filters.push(sql`strpos(lower(concat_ws(' ', ${source.smName}, ${source.marketName}, ${source.address}, ${source.city}, ${source.questionnaireName}, ${source.questionText}, ${source.fileName})), lower(${input.search})) > 0`);
   return filters;
@@ -82,9 +109,10 @@ export async function listSmArchivePhotos(tx: SmManagementTx, input: z.infer<typ
 export async function smArchivePhotoFacets(tx: SmManagementTx, input: SmPhotoArchiveFilters) {
   const source = photoSource(tx);
   // Keep choices available when another filter is selected; scope/date narrow the catalog.
-  const where = and(...filtersFor(source, { from: input.from, to: input.to, SMDurcharbeitCatalogScope: input.SMDurcharbeitCatalogScope }));
+  const where = and(...filtersFor(source, { from: input.from, to: input.to, SMDurcharbeitCatalogScope: input.SMDurcharbeitCatalogScope, SMDurcharbeitCampaignId: input.SMDurcharbeitCampaignId, SMDurcharbeitMonth: input.SMDurcharbeitMonth }));
   const rows = await tx.with(source).selectDistinct({ smUserId: source.smUserId, smName: source.smName, marketId: source.marketId,
-    marketName: source.marketName, questionnaireId: source.questionnaireId, questionnaireName: source.questionnaireName }).from(source).where(where)
+    marketName: source.marketName, questionnaireId: source.questionnaireId, questionnaireName: source.questionnaireName,
+    SMDurcharbeitCampaignId: source.SMDurcharbeitCampaignId, SMDurcharbeitCampaignName: source.SMDurcharbeitCampaignName, SMDurcharbeitMonth: source.SMDurcharbeitMonth }).from(source).where(where)
     .orderBy(asc(source.smName), asc(source.marketName), asc(source.questionnaireName)).limit(2001);
   return { facets: rows.slice(0, 2000), truncated: rows.length > 2000 };
 }

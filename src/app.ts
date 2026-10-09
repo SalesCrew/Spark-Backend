@@ -31,7 +31,9 @@ import { adminSmActivityRouter, smActivityRouter } from "./routes/sm-activity.js
 import { adminSmMessagesRouter, smMessagesRouter } from "./routes/sm-messages.js";
 import { adminSmQuestionnairesRouter } from "./routes/sm-questionnaires.js";
 import { adminSmDashboardRouter, smHomeDashboardRouter } from "./routes/sm-dashboard.js";
-import { smVisitsRouter } from "./routes/sm-visits.js";
+import { smVisitsRouter, SMDurcharbeitVisitsRouter } from "./routes/sm-visits.js";
+import { adminSMDurcharbeitCampaignsRouter, SMDurcharbeitCampaignsRouter } from "./routes/sm-SMDurcharbeit-campaigns.js";
+import { adminSMDurcharbeitTimesRouter, SMDurcharbeitTimesRouter } from "./routes/sm-SMDurcharbeit-times.js";
 import { adminKurtiRouter } from "./routes/admin-kurti.js";
 import { adminIppRouter } from "./routes/ipp.js";
 import { adminGmDashboardRouter } from "./routes/admin-gm-dashboard.js";
@@ -178,6 +180,11 @@ function createApp() {
   app.use("/sm/dashboard", smHomeDashboardRouter);
   app.use("/sm/activity", smActivityRouter);
   app.use("/sm/visits", smVisitsRouter);
+  app.use("/sm/smdurcharbeit/visits", SMDurcharbeitVisitsRouter);
+  app.use("/sm/smdurcharbeit", SMDurcharbeitCampaignsRouter);
+  app.use("/admin/sm-smdurcharbeit-campaigns", adminSMDurcharbeitCampaignsRouter);
+  app.use("/sm/smdurcharbeit-times", SMDurcharbeitTimesRouter);
+  app.use("/admin/sm-smdurcharbeit-times", adminSMDurcharbeitTimesRouter);
   app.use("/time-tracking", timeTrackingRouter);
   app.use("/telemetry", clientTelemetryRouter);
   app.use("/red-month", redMonthRouter);

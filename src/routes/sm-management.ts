@@ -7,8 +7,11 @@ import { supabaseAdmin } from "../lib/supabase.js";
 import { env } from "../config/env.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { smQuestionnaireSubmissions as submissions, smAssignments, smQuestionAnswers as answers,
-  smQuestionAnswerFiles as files, smQuestionAnswerEvents as events, smQuestionnaireTemplates, users } from "../lib/schema.js";
+  smQuestionAnswerFiles as files, smQuestionAnswerEvents as events, smQuestionnaireTemplates, users,
+  smSMDurcharbeitTimeRevisions as SMDurcharbeitTimes, smSMDurcharbeitTargets as SMDurcharbeitTargets,
+  smSMDurcharbeitPeriods as SMDurcharbeitPeriods, smSMDurcharbeitCampaigns as SMDurcharbeitCampaigns } from "../lib/schema.js";
 import { isIsoDate, isoDateToEpochDay } from "../sm-planning.shared.js";
+import { SMDurcharbeitAnswerFiles } from "../sm-SMDurcharbeit-answer-reuse.shared.js";
 import { SmVisitAnswerValidationError } from "../sm-visit.shared.js";
 import { applySmAdminCorrection, loadSmManagementState, smAdminCorrectionSchema, smManagementDetail, smManagementHash,
   SmManagementError, type SmAdminPhotoReceipt, type SmManagementTx, type SmVerifiedAdminPhoto } from "../sm-management.js";
@@ -20,16 +23,19 @@ export const smManagementListSchema = z.object({
   search: z.string().trim().max(200).optional(), limit: z.coerce.number().int().min(1).max(100).default(40),
   cursorDate: date.optional(), cursorId: uuid.optional(),
   SMDurcharbeitCatalogScope: z.enum(["standard", "SMDurcharbeit"]).optional(),
+  SMDurcharbeitCampaignId: uuid.optional(), SMDurcharbeitMonth: date.optional(),
 }).strict().refine(input => isoDateToEpochDay(input.to) >= isoDateToEpochDay(input.from) && isoDateToEpochDay(input.to) - isoDateToEpochDay(input.from) < 93, "Zeitraum maximal 93 Tage.")
   .refine(input => Boolean(input.cursorDate) === Boolean(input.cursorId), "Ungültiger Seitencursor.");
 
-const workDate = sql<string>`coalesce((${submissions.visitStartedAt} at time zone 'Europe/Vienna')::date,
+const workDate = sql<string>`coalesce((${SMDurcharbeitTimes.startedAt} at time zone 'Europe/Vienna')::date, (${submissions.visitStartedAt} at time zone 'Europe/Vienna')::date,
   ${smAssignments.replacementWorkDate}, ${smAssignments.originalWorkDate}, (${submissions.submittedAt} at time zone 'Europe/Vienna')::date)`;
 
 export async function listSmManagedVisits(tx: SmManagementTx, input: z.infer<typeof smManagementListSchema>) {
   const scope = [eq(submissions.isDeleted, false), eq(submissions.isCurrent, true), eq(submissions.status, "submitted"),
     gte(workDate, input.from), lte(workDate, input.to)];
   if (input.SMDurcharbeitCatalogScope) scope.push(sql`(case when starts_with(${smQuestionnaireTemplates.stableCode}, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${input.SMDurcharbeitCatalogScope}`);
+  if (input.SMDurcharbeitCampaignId) scope.push(eq(SMDurcharbeitCampaigns.id, input.SMDurcharbeitCampaignId));
+  if (input.SMDurcharbeitMonth) scope.push(eq(SMDurcharbeitPeriods.month, input.SMDurcharbeitMonth));
   const filters = [...scope];
   if (input.smUserId) filters.push(eq(submissions.smUserId, input.smUserId));
   if (input.marketId) filters.push(eq(submissions.smMarketId, input.marketId));
@@ -40,16 +46,24 @@ export async function listSmManagedVisits(tx: SmManagementTx, input: z.infer<typ
     smUserId: submissions.smUserId, smName: submissions.smNameSnapshot, marketId: submissions.smMarketId,
     marketName: submissions.marketNameSnapshot, address: submissions.marketAddressSnapshot,
     questionnaireId: submissions.questionnaireTemplateId, questionnaireName: submissions.questionnaireNameSnapshot,
-    questionnaireVersion: submissions.questionnaireVersionSnapshot, startedAt: submissions.visitStartedAt,
-    completedAt: submissions.visitCompletedAt, submittedAt: submissions.submittedAt, answeredCount: submissions.answeredQuestionCount,
+    questionnaireVersion: submissions.questionnaireVersionSnapshot, startedAt: sql<Date | null>`coalesce(${SMDurcharbeitTimes.startedAt},${submissions.visitStartedAt})`,
+    completedAt: sql<Date | null>`coalesce(${SMDurcharbeitTimes.completedAt},${submissions.visitCompletedAt})`, submittedAt: submissions.submittedAt, answeredCount: submissions.answeredQuestionCount,
+    SMDurcharbeitContext: sql<unknown>`case when ${submissions.SMDurcharbeitVisitId} is not null then json_build_object('visitId',${submissions.SMDurcharbeitVisitId},'targetId',${SMDurcharbeitTargets.id},'campaignId',${SMDurcharbeitCampaigns.id},'campaignName',${SMDurcharbeitCampaigns.name},'month',${SMDurcharbeitPeriods.month},'timeRevision',${SMDurcharbeitTimes.revisionNumber}) end`,
     SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`case when starts_with(${smQuestionnaireTemplates.stableCode}, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end`,
-  }).from(submissions).leftJoin(smAssignments, eq(smAssignments.id, submissions.assignmentId)).leftJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, submissions.questionnaireTemplateId)).where(and(...filters))
+  }).from(submissions).leftJoin(smAssignments, eq(smAssignments.id, submissions.assignmentId)).leftJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, submissions.questionnaireTemplateId))
+    .leftJoin(SMDurcharbeitTimes, and(eq(SMDurcharbeitTimes.visitId, submissions.SMDurcharbeitVisitId),eq(SMDurcharbeitTimes.isCurrent,true)))
+    .leftJoin(SMDurcharbeitTargets,eq(SMDurcharbeitTargets.id,submissions.SMDurcharbeitTargetId)).leftJoin(SMDurcharbeitPeriods,eq(SMDurcharbeitPeriods.id,SMDurcharbeitTargets.periodId))
+    .leftJoin(SMDurcharbeitCampaigns,eq(SMDurcharbeitCampaigns.id,SMDurcharbeitTargets.campaignId)).where(and(...filters))
     .orderBy(desc(workDate), desc(submissions.id)).limit(input.limit + 1);
   const facets = await tx.selectDistinct({ smUserId: submissions.smUserId, smName: submissions.smNameSnapshot,
     marketId: submissions.smMarketId, marketName: submissions.marketNameSnapshot,
     questionnaireId: submissions.questionnaireTemplateId, questionnaireName: submissions.questionnaireNameSnapshot,
+    SMDurcharbeitCampaignId: SMDurcharbeitCampaigns.id, SMDurcharbeitCampaignName: SMDurcharbeitCampaigns.name, SMDurcharbeitMonth: SMDurcharbeitPeriods.month,
     SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`case when starts_with(${smQuestionnaireTemplates.stableCode}, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end`,
-  }).from(submissions).leftJoin(smAssignments, eq(smAssignments.id, submissions.assignmentId)).leftJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, submissions.questionnaireTemplateId)).where(and(...scope))
+  }).from(submissions).leftJoin(smAssignments, eq(smAssignments.id, submissions.assignmentId)).leftJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, submissions.questionnaireTemplateId))
+    .leftJoin(SMDurcharbeitTimes, and(eq(SMDurcharbeitTimes.visitId, submissions.SMDurcharbeitVisitId),eq(SMDurcharbeitTimes.isCurrent,true)))
+    .leftJoin(SMDurcharbeitTargets,eq(SMDurcharbeitTargets.id,submissions.SMDurcharbeitTargetId)).leftJoin(SMDurcharbeitPeriods,eq(SMDurcharbeitPeriods.id,SMDurcharbeitTargets.periodId))
+    .leftJoin(SMDurcharbeitCampaigns,eq(SMDurcharbeitCampaigns.id,SMDurcharbeitTargets.campaignId)).where(and(...scope))
     .orderBy(asc(submissions.smNameSnapshot), asc(submissions.marketNameSnapshot), asc(submissions.questionnaireNameSnapshot)).limit(2001);
   const items = rows.slice(0, input.limit), last = items.at(-1);
   return { visits: items, nextCursor: rows.length > input.limit && last ? { date: last.workDate, id: last.id } : null,
@@ -131,7 +145,7 @@ adminSmManagementRouter.get("/:submissionId/history", handle(async (req, res) =>
         ...(input.cursorVersion ? [sql`${answers.answerVersion} < ${input.cursorVersion}`] : [])))
       .orderBy(desc(answers.answerVersion)).limit(21);
     const page = rows.slice(0, 20), ids = page.map(row => row.answer.id);
-    const photos = ids.length ? await tx.select().from(files).where(and(inArray(files.answerId, ids), eq(files.isDeleted, false))) : [];
+    const photos = await SMDurcharbeitAnswerFiles(tx, ids);
     const audit = ids.length ? await tx.select({ answerId: events.answerId, payload: events.payload, createdAt: events.createdAt }).from(events)
       .where(and(eq(events.submissionId, id), inArray(events.answerId, ids), eq(events.eventType, "correction"), sql`${events.payload}->>'source' = 'sm_admin_correction'`)).orderBy(desc(events.createdAt)) : [];
     return { entries: page.map(row => ({ id: row.answer.id, version: row.answer.answerVersion, current: row.answer.isCurrent,

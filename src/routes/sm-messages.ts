@@ -180,6 +180,63 @@ adminSmMessagesRouter.post("/", async (req: AuthedRequest, res, next) => {
 export const smMessagesRouter = Router();
 smMessagesRouter.use(requireAuth(["sm"]));
 
+const inboxCursorSchema = z.object({ read: z.boolean(), sentAt: z.string().datetime(), id: z.string().uuid() }).strict();
+const inboxQuerySchema = z.object({ cursor: z.string().max(256).optional(), limit: z.coerce.number().int().min(1).max(100).default(30) }).strict();
+
+function visibleSmInbox(smUserId: string) {
+  return and(
+    eq(smMessageRecipients.smUserId, smUserId),
+    eq(smMessageRecipients.isDeleted, false),
+    eq(smMessages.isDeleted, false),
+    or(isNull(smMessageRecipients.readAt), isNull(smMessages.visibleAfterReadDays),
+      sql`(${smMessages.visibleAfterReadDays} > 0 and ${smMessageRecipients.readAt} + (${smMessages.visibleAfterReadDays} * interval '1 day') > now())`),
+  );
+}
+
+// The closed SM menu reads only this aggregate, never message bodies or read receipts.
+smMessagesRouter.get("/unread-count", async (req: AuthedRequest, res, next) => {
+  try {
+    if (Object.keys(req.query).length) throw messageError(400, "sm_message_query_invalid", "Ungültiger Nachrichtenfilter.");
+    const [row] = await db.select({ count: sql<number>`count(*)::int` }).from(smMessageRecipients)
+      .innerJoin(smMessages, eq(smMessages.id, smMessageRecipients.messageId))
+      .where(and(visibleSmInbox(req.authUser!.appUserId), isNull(smMessageRecipients.readAt)));
+    res.json({ unreadCount: Number(row?.count ?? 0) });
+  } catch (error) { if (!sendKnownError(error, res)) next(error); }
+});
+
+// Dedicated paginated menu inbox. Keep the legacy GET / response and ordering intact.
+smMessagesRouter.get("/inbox", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = inboxQuerySchema.safeParse(req.query);
+    if (!parsed.success) throw messageError(400, "sm_message_query_invalid", "Ungültiger Nachrichtenfilter.");
+    let cursor: z.infer<typeof inboxCursorSchema> | null = null;
+    if (parsed.data.cursor) {
+      try { cursor = inboxCursorSchema.parse(JSON.parse(Buffer.from(parsed.data.cursor, "base64url").toString("utf8"))); }
+      catch { throw messageError(400, "sm_message_cursor_invalid", "Der Nachrichtenstand ist ungültig. Bitte neu laden."); }
+    }
+    const readGroup = sql`case when ${smMessageRecipients.readAt} is null then 0 else 1 end`;
+    const cursorGroup = cursor?.read ? 1 : 0;
+    const after = cursor ? sql`(${readGroup} > ${cursorGroup} or
+      (${readGroup} = ${cursorGroup} and (${smMessages.sentAt}, ${smMessages.id}) < (${cursor.sentAt}::timestamptz, ${cursor.id}::uuid)))` : undefined;
+    const rows = await db.select({
+      id: smMessages.id, subject: smMessages.subject, body: smMessages.body, sender: smMessages.senderNameSnapshot,
+      sentAt: smMessages.sentAt, deliveredAt: smMessageRecipients.deliveredAt, readAt: smMessageRecipients.readAt,
+      visibleAfterReadDays: smMessages.visibleAfterReadDays,
+    }).from(smMessageRecipients).innerJoin(smMessages, eq(smMessages.id, smMessageRecipients.messageId))
+      .where(and(visibleSmInbox(req.authUser!.appUserId), after))
+      .orderBy(asc(readGroup), desc(smMessages.sentAt), desc(smMessages.id)).limit(parsed.data.limit + 1);
+    const page = rows.slice(0, parsed.data.limit), last = page.at(-1);
+    res.json({
+      messages: page.map(row => ({ ...row, sentAt: row.sentAt.toISOString(), deliveredAt: row.deliveredAt.toISOString(),
+        readAt: row.readAt?.toISOString() ?? null,
+        visibleUntil: smMessageVisibleUntil(row.readAt, row.visibleAfterReadDays)?.toISOString() ?? null })),
+      nextCursor: rows.length > page.length && last ? Buffer.from(JSON.stringify({
+        read: last.readAt !== null, sentAt: last.sentAt.toISOString(), id: last.id,
+      })).toString("base64url") : null,
+    });
+  } catch (error) { if (!sendKnownError(error, res)) next(error); }
+});
+
 smMessagesRouter.get("/", async (req: AuthedRequest, res, next) => {
   try {
     const smUserId = req.authUser!.appUserId;

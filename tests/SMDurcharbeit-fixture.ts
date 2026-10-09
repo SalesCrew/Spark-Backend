@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { PGlite } from "@electric-sql/pglite";
-import { drizzle } from "drizzle-orm/pglite";
+import { createSMDurcharbeitDisposableDatabase } from "./SMDurcharbeit-disposable-database.js";
 import { getTableColumns } from "drizzle-orm";
 import express from "express";
 import * as schema from "../src/lib/schema.js";
@@ -25,48 +24,68 @@ import * as overlap from "../src/sm-time-overlap.js";
 import { isRoleAllowedForEndpoint } from "../src/lib/admin-role.js";
 import { isolatedModule } from "./isolated-module.js";
 import { createSMDurcharbeitMarketsRouter } from "../src/routes/sm-SMDurcharbeit-markets.js";
+import * as monthlyAnswerReuse from "../src/sm-SMDurcharbeit-answer-reuse.shared.js";
+import * as messageShared from "../src/sm-message.shared.js";
 
 /** Actual SM routes and migrations, with all external I/O replaced and a fresh disposable DB. */
-export async function createSMDurcharbeitFixture(options: { photoStorage?: { from: (bucket: string) => any } } = {}) {
+export async function createSMDurcharbeitFixture(options: { photoStorage?: { from: (bucket: string) => any }; clock?: typeof Date; additionalSmUsers?: Array<{ id: string; token: string }>; beforeMonthlyMigrations?: (pg: Awaited<ReturnType<typeof createSMDurcharbeitDisposableDatabase>>["pg"]) => Promise<void> } = {}) {
   if (process.env.DATABASE_URL || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NODE_ENV === "production") {
     throw new Error("Production configuration is forbidden in SMDurcharbeit fixtures.");
   }
-  const pg = new PGlite(), database = drizzle(pg, { schema });
-  await pg.exec(`create role anon; create role authenticated; create role service_role;
+  const { pg, database, nativePostgres } = await createSMDurcharbeitDisposableDatabase();
+  try {
+  await pg.exec(`do $$ begin
+      if not exists(select 1 from pg_roles where rolname='anon') then create role anon; end if;
+      if not exists(select 1 from pg_roles where rolname='authenticated') then create role authenticated; end if;
+      if not exists(select 1 from pg_roles where rolname='service_role') then create role service_role; end if;
+    end $$;
     create table users(id uuid primary key,first_name text,last_name text,email text default 'synthetic@preview.test',role text,is_active boolean default true,deleted_at timestamptz,sm_travel_time_enabled boolean default true);`);
   const existingUserColumns = new Set(["id", "first_name", "last_name", "email", "role", "is_active", "deleted_at", "sm_travel_time_enabled"]);
   for (const column of Object.values(getTableColumns(schema.users))) {
     if (!existingUserColumns.has(column.name)) await pg.exec(`alter table users add column "${column.name}" ${column.getSQLType()}`);
   }
-  for (const migration of ["0088_sm_markets.sql", "0089_sm_questionnaire_domain.sql", "0091_sm_enforce_soft_deletes.sql", "0092_sm_market_assignments.sql", "0093_sm_planning.sql", "0097_sm_visit_runtime_timing.sql", "0099_sm_zeiterfassung_requests.sql", "0100_sm_activity_request_audit.sql", "0102_sm_time_request_timestamps.sql", "0103_sm_time_request_equal_duration.sql", "0105_sm_global_questionnaire_assignment.sql", "0108_sm_market_account_assignments.sql"]) {
+  for (const migration of ["0088_sm_markets.sql", "0089_sm_questionnaire_domain.sql", "0091_sm_enforce_soft_deletes.sql", "0092_sm_market_assignments.sql", "0093_sm_planning.sql", "0096_sm_messages.sql", "0097_sm_visit_runtime_timing.sql", "0099_sm_zeiterfassung_requests.sql", "0100_sm_activity_request_audit.sql", "0102_sm_time_request_timestamps.sql", "0103_sm_time_request_equal_duration.sql", "0104_sm_message_read_visibility.sql", "0105_sm_global_questionnaire_assignment.sql", "0108_sm_market_account_assignments.sql"]) {
     await pg.exec(await readFile(new URL(`../drizzle/${migration}`, import.meta.url), "utf8"));
   }
   await pg.exec(await readFile(new URL("../supabase/migrations/20261007124730_SMDurcharbeit_einsatz_override.sql", import.meta.url), "utf8"));
   await pg.exec(await readFile(new URL("../supabase/migrations/20261007133647_SMDurcharbeit_market_registry.sql", import.meta.url), "utf8"));
   await pg.exec(await readFile(new URL("../supabase/migrations/20261008125753_SMDurcharbeit_market_import.sql", import.meta.url), "utf8"));
+  await options.beforeMonthlyMigrations?.(pg);
+  await pg.exec(await readFile(new URL("../supabase/migrations/20261009100850_SMDurcharbeit_monthly_campaigns.sql", import.meta.url), "utf8"));
+  await pg.exec(await readFile(new URL("../supabase/migrations/20261009133000_SMDurcharbeit_context_integrity.sql", import.meta.url), "utf8"));
   const admin = randomUUID(), employee = randomUUID(), market = randomUUID();
   await pg.query("insert into users(id,first_name,last_name,role) values($1,'Local','Admin','sm_admin'),($2,'Local','SM','sm')", [admin, employee]);
+  for (const person of options.additionalSmUsers ?? []) await pg.query("insert into users(id,first_name,last_name,email,role) values($1,'Second','SM','second@preview.test','sm')", [person.id]);
   await pg.query("insert into sm_markets(id,name,chain,address,postal_code,city,region,internal_market_id) values($1,'Synthetic Billa','Billa','Testgasse 1','1010','Wien','Ost','SYNTHETIC-1')", [market]);
   const harmlessLogger = { logger: { warn() {}, error() {}, info() {} }, logAction() {}, startActionTimer: () => () => {} };
   const auth = { requireAuth: (roles: schema.UserRole[]) => (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const token = req.header("authorization")?.replace(/^Bearer /, "");
     const tokens: Record<string, schema.UserRole> = { "synthetic-sm-admin": "sm_admin", "synthetic-sm": "sm", "synthetic-admin": "admin", "synthetic-gm-admin": "kunde", "synthetic-gm": "gm" };
+    for (const person of options.additionalSmUsers ?? []) tokens[person.token] = "sm";
     const role = token ? tokens[token] ?? null : null;
     if (!role) { res.sendStatus(401); return; }
     if (!isRoleAllowedForEndpoint(role, roles)) { res.sendStatus(403); return; }
-    Object.assign(req, { authUser: { appUserId: role === "sm" ? employee : admin, role } }); next();
+    Object.assign(req, { authUser: { appUserId: options.additionalSmUsers?.find(person => person.token === token)?.id ?? (role === "sm" ? employee : admin), role } }); next();
   } };
   // Match postgres-js raw execute semantics while retaining the real PGlite ORM and transactions.
   const asPostgres = (target: any): any => new Proxy(target, {
     get(object, key) {
       if (key === "execute") return async (query: unknown) => (await object.execute(query)).rows;
-      if (key === "transaction") return (action: (tx: unknown) => unknown) => object.transaction((tx: unknown) => action(asPostgres(tx)));
+      if (key === "transaction") return (action: (tx: unknown) => unknown, config?: unknown) => object.transaction((tx: unknown) => action(asPostgres(tx)), config);
       const value = Reflect.get(object, key);
       return typeof value === "function" ? value.bind(object) : value;
     },
   });
-  const dbForRoutes = asPostgres(database);
-  const base = { "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection, "../sm-planning-lock.js": lock, "../sm-SMDurcharbeit-catalog.shared.js": SMDurcharbeitCatalog, "../lib/db.js": { db: dbForRoutes }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": auth };
+  const dbForRoutes = nativePostgres ? database : asPostgres(database);
+  const monthly = await isolatedModule<typeof import("../src/sm-SMDurcharbeit-campaign.shared.js")>(new URL("../src/sm-SMDurcharbeit-campaign.shared.ts", import.meta.url), {
+    "./lib/schema.js": schema, "./sm-planning.shared.js": planning,
+  }, options.clock ?? Date);
+  const base = { "../sm-SMDurcharbeit-campaign.shared.js": monthly, "../sm-SMDurcharbeit-answer-reuse.shared.js": monthlyAnswerReuse,
+    "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection, "../sm-planning-lock.js": lock, "../sm-SMDurcharbeit-catalog.shared.js": SMDurcharbeitCatalog, "../lib/db.js": { db: dbForRoutes }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": auth };
+  const monthlyReport = await isolatedModule<typeof import("../src/sm-SMDurcharbeit-report.shared.js")>(new URL("../src/sm-SMDurcharbeit-report.shared.ts", import.meta.url), {
+    "./lib/schema.js": schema, "./sm-visit.shared.js": visit,
+    "./sm-SMDurcharbeit-answer-reuse.shared.js": monthlyAnswerReuse, "./sm-SMDurcharbeit-campaign.shared.js": monthly,
+  }, options.clock ?? Date);
   const authoring = await isolatedModule<typeof import("../src/routes/sm-questionnaires.js")>(new URL("../src/routes/sm-questionnaires.ts", import.meta.url), { ...base, "../sm-SMDurcharbeit-catalog.shared.js": SMDurcharbeitCatalog });
   const reporting = await isolatedModule<typeof import("../src/routes/sm-dashboard.js")>(new URL("../src/routes/sm-dashboard.ts", import.meta.url), {
     ...base, "../sm-dashboard.shared.js": dashboard, "../sm-planning.shared.js": planning,
@@ -77,7 +96,7 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
     "../sm-planning-lock.js": lock, "../sm-time-overlap.js": overlap,
     "../sm-market-deactivation.js": { smDeactivationToday: () => "2026-10-07" },
     "../lib/supabase.js": { supabaseAdmin: { storage: options.photoStorage ?? { from: () => { throw new Error("Storage I/O is forbidden in SMDurcharbeit fixtures"); } } } },
-  });
+  }, options.clock ?? Date);
   const holidays = await isolatedModule<typeof import("../src/sm-holiday-planning.js")>(new URL("../src/sm-holiday-planning.ts", import.meta.url), {
     "./lib/db.js": { db: dbForRoutes }, "./lib/schema.js": schema, "./sm-planning-lock.js": lock, "./sm-planning.shared.js": planning, "./sm-holidays.shared.js": holidaysShared,
   });
@@ -94,7 +113,14 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
     "../config/env.js": { env: { JWT_SECRET: "synthetic-only-local-secret" } },
     "../lib/supabase.js": { supabaseAdmin: { storage: options.photoStorage ?? { from: () => ({ createSignedUrl: async () => ({ data: { signedUrl: null }, error: null }) }) } } },
   });
-  const app = express(); app.use(express.json());
+  const app = express(); app.use(express.json({ limit: "10mb" }));
+  // Supertest closes its temporary server after each request; never pool a socket to that server.
+  app.use((_req, res, next) => { res.setHeader("Connection", "close"); next(); });
+  const messages = await isolatedModule<typeof import("../src/routes/sm-messages.js")>(new URL("../src/routes/sm-messages.ts", import.meta.url), {
+    ...base, "../sm-message.shared.js": messageShared,
+  });
+  app.use("/sm/messages", messages.smMessagesRouter);
+  app.use("/admin/sm-messages", messages.adminSmMessagesRouter);
   const photos = await isolatedModule<typeof import("../src/routes/sm-photo-archive.js")>(new URL("../src/routes/sm-photo-archive.ts", import.meta.url), {
     ...base, "../sm-planning.shared.js": planning,
     "../lib/supabase.js": { supabaseAdmin: { storage: options.photoStorage ?? { from: () => ({ createSignedUrls: async () => ({ data: [], error: null }) }) } } },
@@ -116,6 +142,17 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   app.use("/admin/sm-dashboard", reporting.adminSmDashboardRouter);
   app.use("/sm/dashboard", reporting.smHomeDashboardRouter);
   app.use("/sm/visits", runtime.smVisitsRouter);
+  app.use("/sm/smdurcharbeit/visits", runtime.SMDurcharbeitVisitsRouter);
+  const campaignRoutes = await isolatedModule<typeof import("../src/routes/sm-SMDurcharbeit-campaigns.js")>(new URL("../src/routes/sm-SMDurcharbeit-campaigns.ts", import.meta.url), {
+    ...base, "./sm-visits.js": runtime, "../sm-planning.shared.js": planning, "../sm-SMDurcharbeit-report.shared.js": monthlyReport,
+  }, options.clock ?? Date);
+  app.use("/sm/smdurcharbeit", campaignRoutes.SMDurcharbeitCampaignsRouter);
+  app.use("/admin/sm-smdurcharbeit-campaigns", campaignRoutes.adminSMDurcharbeitCampaignsRouter);
+  const campaignTimes = await isolatedModule<typeof import("../src/routes/sm-SMDurcharbeit-times.js")>(new URL("../src/routes/sm-SMDurcharbeit-times.ts", import.meta.url), {
+    ...base, "../sm-planning.shared.js": planning, "../sm-time-overlap.js": overlap,
+  }, options.clock ?? Date);
+  app.use("/sm/smdurcharbeit-times", campaignTimes.SMDurcharbeitTimesRouter);
+  app.use("/admin/sm-smdurcharbeit-times", campaignTimes.adminSMDurcharbeitTimesRouter);
   app.use("/admin/sm-planning", planningRoutes.adminSmPlanningRouter);
   app.use("/sm/planning", planningRoutes.smPlanningRouter);
   app.use("/admin/sm-activity/completed", managed.adminSmManagementRouter);
@@ -126,5 +163,6 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
       createdByUserId: admin, updatedByUserId: admin }).returning();
     return row!;
   };
-  return { app, pg, database, schema, admin, employee, market, assignment, reporting };
+  return { app, pg, database, nativePostgres, schema, admin, employee, market, assignment, reporting };
+  } catch (error) { await pg.close(); throw error; }
 }

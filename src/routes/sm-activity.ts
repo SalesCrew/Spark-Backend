@@ -4,6 +4,8 @@ import { Router, type Response } from "express";
 import { z } from "zod";
 import { smCommentMissing } from "../sm-comment.shared.js";
 import { adminSmManagementRouter } from "./sm-management.js";
+import { SMDurcharbeitAnswerFiles } from "../sm-SMDurcharbeit-answer-reuse.shared.js";
+import { lockSMDurcharbeitSubmissionContext, reconcileSMDurcharbeitTarget } from "../sm-SMDurcharbeit-campaign.shared.js";
 
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { db } from "../lib/db.js";
@@ -12,6 +14,13 @@ import {
   smAssignmentTimeChangeRequests,
   smAssignmentTimeSubmissions,
   smAssignments,
+  smSMDurcharbeitTimeRevisions,
+  smSMDurcharbeitTimeRequests,
+  smSMDurcharbeitVisits,
+  smSMDurcharbeitTargets,
+  smSMDurcharbeitPeriods,
+  smSMDurcharbeitCampaigns,
+  smSMDurcharbeitFileLinks,
   smMarkets,
   smQuestionAnswerEvents,
   smQuestionAnswerFiles,
@@ -116,7 +125,7 @@ async function answerSnapshot(executor: DbExecutor, answer: typeof smQuestionAns
   const [options, matrixCells, files] = await Promise.all([
     executor.select().from(smQuestionAnswerOptions).where(and(eq(smQuestionAnswerOptions.answerId, answer.id), eq(smQuestionAnswerOptions.isDeleted, false))).orderBy(asc(smQuestionAnswerOptions.orderIndex)),
     executor.select().from(smQuestionAnswerMatrixCells).where(and(eq(smQuestionAnswerMatrixCells.answerId, answer.id), eq(smQuestionAnswerMatrixCells.isDeleted, false))).orderBy(asc(smQuestionAnswerMatrixCells.orderIndex)),
-    executor.select().from(smQuestionAnswerFiles).where(and(eq(smQuestionAnswerFiles.answerId, answer.id), eq(smQuestionAnswerFiles.isDeleted, false))).orderBy(asc(smQuestionAnswerFiles.uploadedAt)),
+    SMDurcharbeitAnswerFiles(executor, [answer.id]),
   ]);
   return {
     answerId: answer.id,
@@ -363,6 +372,34 @@ async function publicTimeRequests() {
   });
 }
 
+async function publicSMDurcharbeitTimeRequests() {
+  const rows = await db.select({ request: smSMDurcharbeitTimeRequests, source: smSMDurcharbeitTimeRevisions,
+    submission: smQuestionnaireSubmissions, campaignName: smSMDurcharbeitCampaigns.name, month: smSMDurcharbeitPeriods.month,
+    smFirstName: users.firstName, smLastName: users.lastName, smEmail: users.email })
+    .from(smSMDurcharbeitTimeRequests)
+    .innerJoin(smSMDurcharbeitTimeRevisions, and(eq(smSMDurcharbeitTimeRevisions.visitId, smSMDurcharbeitTimeRequests.visitId), eq(smSMDurcharbeitTimeRevisions.revisionNumber, smSMDurcharbeitTimeRequests.expectedRevision)))
+    .innerJoin(smSMDurcharbeitVisits, eq(smSMDurcharbeitVisits.id, smSMDurcharbeitTimeRequests.visitId))
+    .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.SMDurcharbeitVisitId, smSMDurcharbeitVisits.id))
+    .innerJoin(smSMDurcharbeitTargets, eq(smSMDurcharbeitTargets.id, smSMDurcharbeitVisits.targetId))
+    .innerJoin(smSMDurcharbeitPeriods, eq(smSMDurcharbeitPeriods.id, smSMDurcharbeitTargets.periodId))
+    .innerJoin(smSMDurcharbeitCampaigns, eq(smSMDurcharbeitCampaigns.id, smSMDurcharbeitTargets.campaignId))
+    .innerJoin(users, eq(users.id, smSMDurcharbeitTimeRequests.smUserId))
+    .orderBy(sql`case when ${smSMDurcharbeitTimeRequests.status} = 'pending' then 0 else 1 end`, desc(smSMDurcharbeitTimeRequests.createdAt)).limit(250);
+  // The request's original interval belongs to its immutable source revision, even after a correction or invalidation.
+  return rows.map(({ request, source, submission, ...row }) => ({
+    id: request.id, status: request.status, createdAt: request.createdAt.toISOString(), updatedAt: (request.reviewedAt ?? request.createdAt).toISOString(),
+    reviewedAt: request.reviewedAt?.toISOString() ?? null, adminNote: request.adminNote, assignmentId: null,
+    SMDurcharbeitVisitId: request.visitId, SMDurcharbeitCampaignName: row.campaignName, SMDurcharbeitMonth: row.month,
+    kind: request.kind, originalMinutes: source.actualMinutes,
+    requestedMinutes: request.startedAt && request.completedAt ? Math.round((request.completedAt.getTime() - request.startedAt.getTime()) / 60000) : null,
+    timestampCorrectionVersion: 1 as const, originalStartedAt: source.startedAt.toISOString(), originalCompletedAt: source.completedAt.toISOString(),
+    requestedStartedAt: request.startedAt?.toISOString() ?? null, requestedCompletedAt: request.completedAt?.toISOString() ?? null,
+    requestReason: request.reason, workDate: new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Vienna', year: 'numeric', month: '2-digit', day: '2-digit' }).format(source.startedAt),
+    sm: { id: request.smUserId, name: `${row.smFirstName} ${row.smLastName}`.trim() || row.smEmail, email: row.smEmail },
+    market: { id: submission.smMarketId, name: submission.marketNameSnapshot },
+  }));
+}
+
 export const smActivityRouter = Router();
 smActivityRouter.use(requireAuth(["sm"]));
 
@@ -370,9 +407,16 @@ smActivityRouter.get("/completed", async (req: AuthedRequest, res, next) => {
   try {
     const actor = authUser(req);
     const limit = listSchema.parse(req.query).limit ?? 80;
-    const rows = await db.select({ SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`(select case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end from sm_questionnaire_templates t where t.id = ${smQuestionnaireSubmissions.questionnaireTemplateId})`, submission: smQuestionnaireSubmissions, assignment: smAssignments, market: smMarkets, actualMinutes: smAssignmentTimeSubmissions.actualMinutes })
+    const rows = await db.select({ SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`(select case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end from sm_questionnaire_templates t where t.id = ${smQuestionnaireSubmissions.questionnaireTemplateId})`, submission: smQuestionnaireSubmissions, assignment: smAssignments, market: smMarkets, actualMinutes: sql<number | null>`coalesce(${smSMDurcharbeitTimeRevisions.actualMinutes}, ${smAssignmentTimeSubmissions.actualMinutes})`,
+      SMDurcharbeitWorkDate: sql<string | null>`(${smSMDurcharbeitTimeRevisions.startedAt} at time zone 'Europe/Vienna')::date::text`,
+      SMDurcharbeitStartedAt: smSMDurcharbeitTimeRevisions.startedAt, SMDurcharbeitCompletedAt: smSMDurcharbeitTimeRevisions.completedAt,
+      SMDurcharbeitMonth: smSMDurcharbeitPeriods.month, SMDurcharbeitCampaignId: smSMDurcharbeitCampaigns.id, SMDurcharbeitCampaignName: smSMDurcharbeitCampaigns.name })
       .from(smQuestionnaireSubmissions)
-      .innerJoin(smAssignments, eq(smAssignments.id, smQuestionnaireSubmissions.assignmentId))
+      .leftJoin(smAssignments, eq(smAssignments.id, smQuestionnaireSubmissions.assignmentId))
+      .leftJoin(smSMDurcharbeitTimeRevisions, and(eq(smSMDurcharbeitTimeRevisions.visitId, smQuestionnaireSubmissions.SMDurcharbeitVisitId), eq(smSMDurcharbeitTimeRevisions.isCurrent, true)))
+      .leftJoin(smSMDurcharbeitTargets, eq(smSMDurcharbeitTargets.id, smQuestionnaireSubmissions.SMDurcharbeitTargetId))
+      .leftJoin(smSMDurcharbeitPeriods, eq(smSMDurcharbeitPeriods.id, smSMDurcharbeitTargets.periodId))
+      .leftJoin(smSMDurcharbeitCampaigns, eq(smSMDurcharbeitCampaigns.id, smSMDurcharbeitTargets.campaignId))
       .innerJoin(smMarkets, eq(smMarkets.id, smQuestionnaireSubmissions.smMarketId))
       .leftJoin(smAssignmentTimeSubmissions, and(eq(smAssignmentTimeSubmissions.assignmentId, smAssignments.id), eq(smAssignmentTimeSubmissions.isCurrent, true), eq(smAssignmentTimeSubmissions.isDeleted, false)))
       .where(and(eq(smQuestionnaireSubmissions.smUserId, actor.appUserId), eq(smQuestionnaireSubmissions.status, "submitted"), eq(smQuestionnaireSubmissions.isCurrent, true), eq(smQuestionnaireSubmissions.isDeleted, false)))
@@ -381,24 +425,32 @@ smActivityRouter.get("/completed", async (req: AuthedRequest, res, next) => {
     const submissionIds = rows.map((row) => row.submission.id);
     const questionCounts = submissionIds.length ? await db.select({ submissionId: smQuestionnaireSubmissionQuestions.submissionId, count: sql<number>`count(*)::int` }).from(smQuestionnaireSubmissionQuestions).where(and(inArray(smQuestionnaireSubmissionQuestions.submissionId, submissionIds), eq(smQuestionnaireSubmissionQuestions.isDeleted, false))).groupBy(smQuestionnaireSubmissionQuestions.submissionId) : [];
     const answerCounts = submissionIds.length ? await db.select({ submissionId: smQuestionAnswers.submissionId, count: sql<number>`count(*) filter (where ${smQuestionAnswers.answerState} = 'answered')::int` }).from(smQuestionAnswers).where(and(inArray(smQuestionAnswers.submissionId, submissionIds), eq(smQuestionAnswers.isCurrent, true), eq(smQuestionAnswers.isDeleted, false))).groupBy(smQuestionAnswers.submissionId) : [];
-    const photoCounts = submissionIds.length ? await db.select({ submissionId: smQuestionAnswers.submissionId, count: sql<number>`count(${smQuestionAnswerFiles.id})::int` }).from(smQuestionAnswers).innerJoin(smQuestionAnswerFiles, and(eq(smQuestionAnswerFiles.answerId, smQuestionAnswers.id), eq(smQuestionAnswerFiles.isDeleted, false))).where(and(inArray(smQuestionAnswers.submissionId, submissionIds), eq(smQuestionAnswers.isCurrent, true), eq(smQuestionAnswers.isDeleted, false))).groupBy(smQuestionAnswers.submissionId) : [];
+    const photoAnswers = submissionIds.length ? await db.select({ id: smQuestionAnswers.id, submissionId: smQuestionAnswers.submissionId }).from(smQuestionAnswers).where(and(inArray(smQuestionAnswers.submissionId, submissionIds), eq(smQuestionAnswers.isCurrent, true), eq(smQuestionAnswers.isDeleted, false))) : [];
+    const answerSubmission = new Map(photoAnswers.map(answer => [answer.id, answer.submissionId]));
+    const photoCounts = new Map<string, number>();
+    for (const photo of await SMDurcharbeitAnswerFiles(db, photoAnswers.map(answer => answer.id))) {
+      const submissionId = answerSubmission.get(photo.answerId)!;
+      photoCounts.set(submissionId, (photoCounts.get(submissionId) ?? 0) + 1);
+    }
     const questionsBySubmission = new Map(questionCounts.map((row) => [row.submissionId, Number(row.count)]));
     const answersBySubmission = new Map(answerCounts.map((row) => [row.submissionId, Number(row.count)]));
-    const photosBySubmission = new Map(photoCounts.map((row) => [row.submissionId, Number(row.count)]));
+    const photosBySubmission = photoCounts;
     res.json({ visits: rows.map((row) => {
-      const effective = resolveSmAssignmentValues(row.assignment);
+      const effective = row.assignment ? resolveSmAssignmentValues(row.assignment) : null;
       return {
         submissionId: row.submission.id,
-        assignmentId: row.assignment.id,
-        workDate: effective.workDate,
-        plannedMinutes: effective.plannedMinutes,
+        assignmentId: row.assignment?.id ?? null,
+        SMDurcharbeitVisitId: row.submission.SMDurcharbeitVisitId,
+        SMDurcharbeitContext: row.submission.SMDurcharbeitVisitId ? { campaignId: row.SMDurcharbeitCampaignId, campaignName: row.SMDurcharbeitCampaignName, month: row.SMDurcharbeitMonth } : null,
+        workDate: row.SMDurcharbeitWorkDate ?? effective?.workDate ?? (row.submission.visitStartedAt ? new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Vienna", year: "numeric", month: "2-digit", day: "2-digit" }).format(row.submission.visitStartedAt) : null),
+        plannedMinutes: effective?.plannedMinutes ?? null,
         actualMinutes: row.actualMinutes ?? null,
         questionnaireName: row.submission.questionnaireNameSnapshot,
         SMDurcharbeitCatalogScope: row.SMDurcharbeitCatalogScope,
         questionnaireVersion: row.submission.questionnaireVersionSnapshot,
         market: { id: row.market.id, name: row.submission.marketNameSnapshot, internalId: row.market.internalMarketId, address: row.submission.marketAddressSnapshot, postalCode: row.submission.marketPostalCodeSnapshot, city: row.submission.marketCitySnapshot },
-        visitStartedAt: row.submission.visitStartedAt?.toISOString() ?? null,
-        visitCompletedAt: row.submission.visitCompletedAt?.toISOString() ?? null,
+        visitStartedAt: (row.SMDurcharbeitStartedAt ?? row.submission.visitStartedAt)?.toISOString() ?? null,
+        visitCompletedAt: (row.SMDurcharbeitCompletedAt ?? row.submission.visitCompletedAt)?.toISOString() ?? null,
         submittedAt: row.submission.submittedAt?.toISOString() ?? null,
         totals: { questionCount: questionsBySubmission.get(row.submission.id) ?? 0, answeredCount: answersBySubmission.get(row.submission.id) ?? 0, photoCount: photosBySubmission.get(row.submission.id) ?? 0 },
       };
@@ -425,6 +477,7 @@ smActivityRouter.post("/submissions/:submissionId/questions/:questionId/change-r
     const input = answerRequestSchema.parse(req.body);
     const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_answer_request_token:${actor.appUserId}:${input.clientRequestToken}`}, 0))`);
+      await lockSMDurcharbeitSubmissionContext(tx, submissionId);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_answer_request:${questionId}`}, 0))`);
       const [replayed] = await tx.select().from(smAnswerChangeRequests).where(and(eq(smAnswerChangeRequests.smUserId, actor.appUserId), eq(smAnswerChangeRequests.clientRequestToken, input.clientRequestToken), eq(smAnswerChangeRequests.isDeleted, false))).limit(1);
       if (replayed) {
@@ -450,7 +503,7 @@ smActivityRouter.post("/submissions/:submissionId/questions/:questionId/change-r
       const originalValue = (original?.valueJson ?? { kind: "empty" }) as SmVisitAnswerPayload;
       if (stableSmVisitAnswer(originalValue) === stableSmVisitAnswer(normalized)) throw new SmActivityError(400, "sm_activity_answer_unchanged", "Die gewünschte Antwort ist bereits gespeichert.");
       if (normalized.kind === "photo") {
-        const currentFiles = original ? await tx.select({ id: smQuestionAnswerFiles.id }).from(smQuestionAnswerFiles).where(and(eq(smQuestionAnswerFiles.answerId, original.id), eq(smQuestionAnswerFiles.isDeleted, false))) : [];
+        const currentFiles = original ? await SMDurcharbeitAnswerFiles(tx, [original.id]) : [];
         const allowed = new Set(currentFiles.map((row) => row.id));
         if (normalized.fileIds.some((id) => !allowed.has(id))) throw new SmActivityError(400, "sm_activity_photo_request_invalid", "Foto-Anfragen dürfen nur bereits gespeicherte Fotos behalten oder entfernen.");
       }
@@ -487,6 +540,7 @@ smActivityRouter.post("/submissions/:submissionId/delete-requests", async (req: 
     const input = deleteRequestSchema.parse(req.body);
     const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_submission_delete_request_token:${actor.appUserId}:${input.clientRequestToken}`}, 0))`);
+      await lockSMDurcharbeitSubmissionContext(tx, submissionId);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_submission_delete_request:${submissionId}`}, 0))`);
       const [replayed] = await tx.select().from(smQuestionnaireSubmissionDeleteRequests).where(and(eq(smQuestionnaireSubmissionDeleteRequests.smUserId, actor.appUserId), eq(smQuestionnaireSubmissionDeleteRequests.clientRequestToken, input.clientRequestToken), eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false))).limit(1);
       if (replayed) {
@@ -529,7 +583,8 @@ adminSmActivityRouter.use("/completed", adminSmManagementRouter);
 
 adminSmActivityRouter.get("/requests", async (_req, res, next) => {
   try {
-    const [answerRequests, deleteRequests, timeRequests] = await Promise.all([publicAnswerRequests(), publicDeleteRequests(), publicTimeRequests()]);
+    const [answerRequests, deleteRequests, datedTimeRequests, SMDurcharbeitTimeRequests] = await Promise.all([publicAnswerRequests(), publicDeleteRequests(), publicTimeRequests(), publicSMDurcharbeitTimeRequests()]);
+    const timeRequests = [...datedTimeRequests, ...SMDurcharbeitTimeRequests].sort((a, b) => Number(b.status === 'pending') - Number(a.status === 'pending') || b.updatedAt.localeCompare(a.updatedAt)).slice(0, 250);
     res.json({ answerRequests, deleteRequests, timeRequests });
   } catch (error) { next(error); }
 });
@@ -542,6 +597,7 @@ adminSmActivityRouter.post("/answer-change-requests/:requestId/reject", async (r
     const result = await db.transaction(async (tx) => {
       const [identity] = await tx.select({ submissionId: smAnswerChangeRequests.submissionId, submissionQuestionId: smAnswerChangeRequests.submissionQuestionId }).from(smAnswerChangeRequests).where(and(eq(smAnswerChangeRequests.id, requestId), eq(smAnswerChangeRequests.isDeleted, false))).limit(1);
       if (!identity) throw new SmActivityError(404, "sm_activity_request_not_found", "Die Anfrage wurde nicht gefunden.");
+      await lockSMDurcharbeitSubmissionContext(tx, identity.submissionId);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_answer_request:${identity.submissionQuestionId}`}, 0))`);
       await tx.select({ id: smQuestionnaireSubmissions.id }).from(smQuestionnaireSubmissions).where(eq(smQuestionnaireSubmissions.id, identity.submissionId)).limit(1).for("update");
       await tx.select({ id: smQuestionnaireSubmissionQuestions.id }).from(smQuestionnaireSubmissionQuestions).where(eq(smQuestionnaireSubmissionQuestions.id, identity.submissionQuestionId)).limit(1).for("update");
@@ -568,6 +624,7 @@ adminSmActivityRouter.post("/answer-change-requests/:requestId/approve", async (
     const result = await db.transaction(async (tx) => {
       const [identity] = await tx.select({ submissionId: smAnswerChangeRequests.submissionId, submissionQuestionId: smAnswerChangeRequests.submissionQuestionId }).from(smAnswerChangeRequests).where(and(eq(smAnswerChangeRequests.id, requestId), eq(smAnswerChangeRequests.isDeleted, false))).limit(1);
       if (!identity) throw new SmActivityError(404, "sm_activity_request_not_found", "Die Anfrage wurde nicht gefunden.");
+      await lockSMDurcharbeitSubmissionContext(tx, identity.submissionId);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_answer_request:${identity.submissionQuestionId}`}, 0))`);
       const [submission] = await tx.select().from(smQuestionnaireSubmissions).where(eq(smQuestionnaireSubmissions.id, identity.submissionId)).limit(1).for("update");
       await tx.select({ id: smQuestionnaireSubmissionQuestions.id }).from(smQuestionnaireSubmissionQuestions).where(eq(smQuestionnaireSubmissionQuestions.id, identity.submissionQuestionId)).limit(1).for("update");
@@ -614,12 +671,18 @@ adminSmActivityRouter.post("/answer-change-requests/:requestId/approve", async (
       if (normalized.kind === "matrix" && normalized.cells.length) await tx.insert(smQuestionAnswerMatrixCells).values(normalized.cells.map((cell, orderIndex) => ({ answerId, rowCode: cell.rowCode, columnCode: cell.columnCode, selected: cell.selected, orderIndex })));
       if (normalized.kind === "photo") {
         if (!current) throw new SmActivityError(409, "sm_activity_photo_request_stale", "Die ursprünglichen Fotos wurden nicht gefunden.");
-        const sourceFiles = await tx.select().from(smQuestionAnswerFiles).where(and(eq(smQuestionAnswerFiles.answerId, current.id), inArray(smQuestionAnswerFiles.id, normalized.fileIds), eq(smQuestionAnswerFiles.isDeleted, false)));
+        const sourceFiles = (await SMDurcharbeitAnswerFiles(tx, [current.id])).filter(file => normalized.fileIds.includes(file.id));
         if (sourceFiles.length !== normalized.fileIds.length) throw new SmActivityError(409, "sm_activity_photo_request_stale", "Mindestens ein Foto ist nicht mehr verfügbar.");
-        await tx.insert(smQuestionAnswerFiles).values(sourceFiles.map((file) => ({ answerId, storageBucket: file.storageBucket, storagePath: file.storagePath, originalFileName: file.originalFileName, mimeType: file.mimeType, byteSize: file.byteSize, widthPx: file.widthPx, heightPx: file.heightPx, sha256: file.sha256, uploadedAt: file.uploadedAt })));
+        if (submission.SMDurcharbeitTargetId) {
+          if (sourceFiles.length) await tx.insert(smSMDurcharbeitFileLinks).values(sourceFiles.map(file => ({ answerId, fileId: file.id })));
+        } else if (sourceFiles.length) {
+          const copied = await tx.insert(smQuestionAnswerFiles).values(sourceFiles.map((file) => ({ answerId, storageBucket: file.storageBucket, storagePath: file.storagePath, originalFileName: file.originalFileName, mimeType: file.mimeType, byteSize: file.byteSize, widthPx: file.widthPx, heightPx: file.heightPx, sha256: file.sha256, uploadedAt: file.uploadedAt }))).returning({ id: smQuestionAnswerFiles.id });
+          await tx.update(smQuestionAnswers).set({ valueJson: { ...normalized, fileIds: copied.map(file => file.id) } }).where(eq(smQuestionAnswers.id, answerId));
+        }
       }
       await tx.insert(smQuestionAnswerEvents).values({ answerId, submissionId: submission.id, eventType: answered ? "set" : "clear", answerVersion: currentVersion + 1, payload: { source: "sm_answer_change_request_approved", requestId: request.id, originalAnswerId: current?.id ?? null }, actorUserId: actor.appUserId });
       await recomputeConditionalState(tx, submission.id, actor.appUserId);
+      if (submission.SMDurcharbeitTargetId) await reconcileSMDurcharbeitTarget(tx, submission.SMDurcharbeitTargetId, actor.appUserId, "answer_request_approved");
       const [updated] = await tx.update(smAnswerChangeRequests).set({ status: "approved", reviewedByUserId: actor.appUserId, reviewedAt: now, adminNote: input.adminNote?.trim() || null, appliedAnswerId: answerId, appliedAt: now, updatedAt: now }).where(eq(smAnswerChangeRequests.id, request.id)).returning();
       return { row: updated!, replayed: false };
     });
@@ -638,6 +701,7 @@ adminSmActivityRouter.post("/submission-delete-requests/:requestId/reject", asyn
     const result = await db.transaction(async (tx) => {
       const [identity] = await tx.select({ submissionId: smQuestionnaireSubmissionDeleteRequests.submissionId }).from(smQuestionnaireSubmissionDeleteRequests).where(and(eq(smQuestionnaireSubmissionDeleteRequests.id, requestId), eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false))).limit(1);
       if (!identity) throw new SmActivityError(404, "sm_activity_delete_request_not_found", "Die Löschanfrage wurde nicht gefunden.");
+      await lockSMDurcharbeitSubmissionContext(tx, identity.submissionId);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_submission_delete_request:${identity.submissionId}`}, 0))`);
       await tx.select({ id: smQuestionnaireSubmissions.id }).from(smQuestionnaireSubmissions).where(eq(smQuestionnaireSubmissions.id, identity.submissionId)).limit(1).for("update");
       const [request] = await tx.select().from(smQuestionnaireSubmissionDeleteRequests).where(and(eq(smQuestionnaireSubmissionDeleteRequests.id, requestId), eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false))).limit(1).for("update");
@@ -663,6 +727,7 @@ adminSmActivityRouter.post("/submission-delete-requests/:requestId/approve", asy
     const result = await db.transaction(async (tx) => {
       const [identity] = await tx.select({ submissionId: smQuestionnaireSubmissionDeleteRequests.submissionId }).from(smQuestionnaireSubmissionDeleteRequests).where(and(eq(smQuestionnaireSubmissionDeleteRequests.id, requestId), eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false))).limit(1);
       if (!identity) throw new SmActivityError(404, "sm_activity_delete_request_not_found", "Die Löschanfrage wurde nicht gefunden.");
+      await lockSMDurcharbeitSubmissionContext(tx, identity.submissionId);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_submission_delete_request:${identity.submissionId}`}, 0))`);
       const [submission] = await tx.select().from(smQuestionnaireSubmissions).where(eq(smQuestionnaireSubmissions.id, identity.submissionId)).limit(1).for("update");
       const [request] = await tx.select().from(smQuestionnaireSubmissionDeleteRequests).where(and(eq(smQuestionnaireSubmissionDeleteRequests.id, requestId), eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false))).limit(1).for("update");
@@ -674,7 +739,9 @@ adminSmActivityRouter.post("/submission-delete-requests/:requestId/approve", asy
       const answerIds = answers.map((row) => row.id);
       const now = new Date();
       if (answerIds.length) {
-        await tx.update(smQuestionAnswerFiles).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(and(inArray(smQuestionAnswerFiles.answerId, answerIds), eq(smQuestionAnswerFiles.isDeleted, false)));
+        await tx.update(smSMDurcharbeitFileLinks).set({ isDeleted: true }).where(and(inArray(smSMDurcharbeitFileLinks.answerId, answerIds), eq(smSMDurcharbeitFileLinks.isDeleted, false)));
+        await tx.update(smQuestionAnswerFiles).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(and(inArray(smQuestionAnswerFiles.answerId, answerIds), eq(smQuestionAnswerFiles.isDeleted, false),
+          ...(submission.SMDurcharbeitTargetId ? [sql`not exists (select 1 from sm_smdurcharbeit_answer_file_links retained where retained.file_id=${smQuestionAnswerFiles.id} and not retained.is_deleted)`] : [])));
         await tx.update(smQuestionAnswerOptions).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(and(inArray(smQuestionAnswerOptions.answerId, answerIds), eq(smQuestionAnswerOptions.isDeleted, false)));
         await tx.update(smQuestionAnswerMatrixCells).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(and(inArray(smQuestionAnswerMatrixCells.answerId, answerIds), eq(smQuestionAnswerMatrixCells.isDeleted, false)));
       }
@@ -683,6 +750,7 @@ adminSmActivityRouter.post("/submission-delete-requests/:requestId/approve", asy
       await tx.update(smQuestionnaireSubmissionSections).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(and(eq(smQuestionnaireSubmissionSections.submissionId, submission.id), eq(smQuestionnaireSubmissionSections.isDeleted, false)));
       await tx.update(smAnswerChangeRequests).set({ status: "cancelled", updatedAt: now }).where(and(eq(smAnswerChangeRequests.submissionId, submission.id), eq(smAnswerChangeRequests.status, "pending"), eq(smAnswerChangeRequests.isDeleted, false)));
       await tx.update(smQuestionnaireSubmissions).set({ status: "invalidated", isCurrent: false, invalidatedAt: now, invalidatedByUserId: actor.appUserId, invalidationReason: `SM-Löschanfrage: ${request.requestReason}`, isDeleted: true, deletedAt: now, updatedAt: now }).where(eq(smQuestionnaireSubmissions.id, submission.id));
+      if (submission.SMDurcharbeitTargetId) await reconcileSMDurcharbeitTarget(tx, submission.SMDurcharbeitTargetId, actor.appUserId, "submission_invalidated");
       const [updated] = await tx.update(smQuestionnaireSubmissionDeleteRequests).set({ status: "approved", reviewedByUserId: actor.appUserId, reviewedAt: now, adminNote: input.adminNote?.trim() || null, appliedAt: now, updatedAt: now }).where(eq(smQuestionnaireSubmissionDeleteRequests.id, request.id)).returning();
       return { row: updated!, replayed: false };
     });

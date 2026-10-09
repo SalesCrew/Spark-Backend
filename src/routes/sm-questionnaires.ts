@@ -1,5 +1,6 @@
 import { lockSmPlanning } from "../sm-planning-lock.js";
 import { hasSMDurcharbeitPendingOverride } from "../sm-SMDurcharbeit-selection.shared.js";
+import { SMDurcharbeitHasCampaignReference } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { type NextFunction, type Request, type Response, Router } from "express";
@@ -899,6 +900,7 @@ async function saveQuestionnaire(input: SmQuestionnaireInput, actorUserId: strin
     }
 
     if (existingTemplate && input.status !== "active") {
+      if (await SMDurcharbeitHasCampaignReference(tx, templateId)) throw new SmQuestionnaireDomainError(409, "Dieser Fragebogen ist in einer Durcharbeit-Kampagne veröffentlicht und muss aktiv bleiben.");
       if (await hasSMDurcharbeitPendingOverride(tx, templateId)) throw new SmQuestionnaireDomainError(409, "Dieser Fragebogen wird von einem geplanten Einsatz verwendet und muss aktiv bleiben.");
       const [currentAssignment] = await tx.select({ id: smQuestionnaireGlobalAssignments.id })
         .from(smQuestionnaireGlobalAssignments)
@@ -1122,6 +1124,7 @@ adminSmQuestionnairesRouter.patch("/questionnaires/:id/delete", async (req: Auth
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_questionnaire:${id}`}, 0))`);
       const [root] = await tx.select().from(smQuestionnaireTemplates).where(and(eq(smQuestionnaireTemplates.id, id), eq(smQuestionnaireTemplates.isDeleted, false))).limit(1);
       if (!root || smQuestionnaireCatalogScope(root.stableCode) !== scope) throw new SmQuestionnaireDomainError(404, "SM-Fragebogen in diesem Bereich nicht gefunden.");
+      if (await SMDurcharbeitHasCampaignReference(tx, id)) throw new SmQuestionnaireDomainError(409, "Dieser Fragebogen wird von einer Durcharbeit-Kampagne verwendet und bleibt für ihre Besuche erhalten.");
       if (await hasSMDurcharbeitPendingOverride(tx, id)) throw new SmQuestionnaireDomainError(409, "Dieser Fragebogen wird von einem geplanten Einsatz verwendet. Entferne zuerst die Einsatzzuordnung.");
       const [currentAssignment] = await tx.select({ id: smQuestionnaireGlobalAssignments.id })
         .from(smQuestionnaireGlobalAssignments)

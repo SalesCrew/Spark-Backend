@@ -15,3 +15,11 @@ test("profile totals use active assignments and current recorded times", () => {
   ]), { assignmentCount: 2, completedAssignmentCount: 1, plannedMinutes: 150, actualMinutes: 82 });
   assert.deepEqual(summarizeSmProfileWeek([]), { assignmentCount: 0, completedAssignmentCount: 0, plannedMinutes: 0, actualMinutes: 0 });
 });
+
+test("monthly physical visits add actual and travel time without adding dated assignments or Soll", () => {
+  assert.deepEqual(summarizeSmProfileWeek([
+    { status: "completed", effective: { plannedMinutes: 60 }, actualMinutes: 50 },
+    { status: "planned", effective: { plannedMinutes: 45 }, actualMinutes: null },
+  ], [{ actualMinutes: 20, travelMinutes: 5 }, { actualMinutes: 15, travelMinutes: 0 }]),
+  { assignmentCount: 2, completedAssignmentCount: 1, plannedMinutes: 105, actualMinutes: 90 });
+});

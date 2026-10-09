@@ -1,4 +1,6 @@
 export type SmDsarCounts = {
+  SMDurcharbeit?: { targets: number; ownerRevisions: number; visits: number; timeRevisions: number;
+    timeRequests: number; answerProvenance: number; fileLinks: number; events: number };
   assignedMarkets: number;
   assignments: number;
   submissions: number;
@@ -61,7 +63,7 @@ export function buildSmDsarCategories(counts: SmDsarCounts): DsarCategory[] {
     {
       key: "sm_time",
       label: "SM-Besuchs- und Fahrtzeiten",
-      count: counts.timeRecords,
+      count: counts.timeRecords + (counts.SMDurcharbeit?.timeRevisions ?? 0),
       retention: "7 Jahre, soweit Arbeitszeit, Abrechnung, Aufwandsersatz oder buchhalterischer Nachweis betroffen ist.",
       actionHint: "Berichtigung über den SM-Zeitanfrageprozess; Original und genehmigte Korrektur bleiben nachvollziehbar.",
     },
@@ -75,16 +77,22 @@ export function buildSmDsarCategories(counts: SmDsarCounts): DsarCategory[] {
     {
       key: "sm_requests",
       label: "SM-Korrektur- und Löschanfragen",
-      count: counts.answerChangeRequests + counts.submissionDeleteRequests + counts.timeChangeRequests,
+      count: counts.answerChangeRequests + counts.submissionDeleteRequests + counts.timeChangeRequests + (counts.SMDurcharbeit?.timeRequests ?? 0),
       retention: "Antwort-/Löschanfragen grundsätzlich mit dem Besuch 3 Jahre; zeitrelevante Anfragen bis zu 7 Jahre.",
       actionHint: "Status, Entscheidung, Begründung und angewendete Änderung gemeinsam prüfen.",
     },
     {
       key: "sm_security",
       label: "SM-Audit-, Login- und Vereinbarungsnachweise",
-      count: counts.auditEvents + counts.securityRecords,
+      count: counts.auditEvents + counts.securityRecords + (counts.SMDurcharbeit?.events ?? 0),
       retention: "Login-/Sicherheitslogs grundsätzlich 24 Monate; Vereinbarungsnachweise aktiver Einsatz plus 3 Jahre.",
       actionHint: "Nur für Sicherheit, Rechenschaft und Nachvollziehbarkeit verwenden, nicht als verdeckte Leistungsbewertung.",
     },
+    ...(counts.SMDurcharbeit && Object.values(counts.SMDurcharbeit).some(count => count > 0) ? [{
+      key: "SMDurcharbeit_monthly", label: "SM-Durcharbeit: Monatsziele, Zuordnungen und Übernahmen",
+      count: counts.SMDurcharbeit.targets + counts.SMDurcharbeit.ownerRevisions + counts.SMDurcharbeit.visits + counts.SMDurcharbeit.answerProvenance + counts.SMDurcharbeit.fileLinks,
+      retention: "Die jeweilige Besuchs-, Planungs- und Zeitfrist gilt auch für zugehörige Monatsziele, Zuordnungsrevisionen und Übernahmeverknüpfungen.",
+      actionHint: "Frühere und aktuelle Eigentümer, Originalantworten und referenzierte Fotos gemeinsam prüfen. Übernommene Fotos sind keine zusätzlichen Originaldateien; Aufbewahrung und Zugriff müssen gemeinsam behandelt werden.",
+    }] : []),
   ];
 }

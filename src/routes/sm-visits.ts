@@ -4,6 +4,10 @@ import { and, asc, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-
 import { Router, type Response } from "express";
 import { z } from "zod";
 import { smAnswerComment, smCommentMissing } from "../sm-comment.shared.js";
+import { SMDurcharbeitCampaignError, loadSMDurcharbeitOwnedVisit, loadSMDurcharbeitTarget, lockSMDurcharbeitTarget,
+  assertSMDurcharbeitAvailable, loadSMDurcharbeitVersion, SMDurcharbeitToday, SMDurcharbeitMonth,
+  SMDurcharbeitEvent, reconcileSMDurcharbeitTarget, saveSMDurcharbeitVisitTime } from "../sm-SMDurcharbeit-campaign.shared.js";
+import { copySMDurcharbeitMonthlyAnswers, SMDurcharbeitAnswerFiles } from "../sm-SMDurcharbeit-answer-reuse.shared.js";
 
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { db } from "../lib/db.js";
@@ -34,6 +38,11 @@ import {
   smQuestionnaireVersions,
   smQuestionVersions,
   users,
+  smSMDurcharbeitVisits,
+  smSMDurcharbeitTargets,
+  smSMDurcharbeitTimeRevisions,
+  smSMDurcharbeitFileLinks,
+  smSMDurcharbeitAnswerProvenance,
 } from "../lib/schema.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
@@ -55,6 +64,25 @@ import {
 } from "../sm-visit.shared.js";
 
 type AssignmentRow = typeof smAssignments.$inferSelect;
+type SMDurcharbeitExecution = {
+  id: string; status: "in_progress" | "completed" | "cancelled"; seriesId: null; startedAt: Date | null;
+  SMDurcharbeit: Awaited<ReturnType<typeof loadSMDurcharbeitOwnedVisit>>;
+};
+type VisitExecution = AssignmentRow | SMDurcharbeitExecution;
+function isSMDurcharbeitExecution(execution: VisitExecution): execution is SMDurcharbeitExecution {
+  return "SMDurcharbeit" in execution;
+}
+function executionValues(execution: VisitExecution) {
+  if (!isSMDurcharbeitExecution(execution)) return resolveSmAssignmentValues(execution);
+  const { visit, context } = execution.SMDurcharbeit;
+  return { smUserId: visit.smUserId, smMarketId: context.membership.smMarketId,
+    workDate: null, plannedMinutes: null, marketInternalId: String(context.target.marketSnapshot.internalId ?? context.market.id) };
+}
+function executionCondition(execution: VisitExecution) {
+  return isSMDurcharbeitExecution(execution)
+    ? eq(smQuestionnaireSubmissions.SMDurcharbeitVisitId, execution.id)
+    : eq(smQuestionnaireSubmissions.assignmentId, execution.id);
+}
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 type DbExecutor = typeof db | DbTx;
 
@@ -160,6 +188,10 @@ class SmVisitError extends Error {
 }
 
 function sendError(error: unknown, res: Response): boolean {
+  if (error instanceof SMDurcharbeitCampaignError) {
+    res.status(error.statusCode).json({ error: error.message, code: error.code });
+    return true;
+  }
   if (error instanceof SmTimeOverlapError) {
     res.status(error.statusCode).json({ error: error.message, code: error.code, details: error.details });
     return true;
@@ -183,7 +215,7 @@ function requireAuthUser(req: AuthedRequest) {
   return req.authUser;
 }
 
-async function loadOwnedAssignment(executor: DbExecutor, assignmentId: string, smUserId: string, lock = false): Promise<AssignmentRow> {
+async function loadDatedOwnedAssignment(executor: DbExecutor, assignmentId: string, smUserId: string, lock = false): Promise<AssignmentRow> {
   let query = executor.select().from(smAssignments).where(and(
     eq(smAssignments.id, assignmentId),
     eq(smAssignments.isDeleted, false),
@@ -196,8 +228,8 @@ async function loadOwnedAssignment(executor: DbExecutor, assignmentId: string, s
   return assignment;
 }
 
-async function loadContext(executor: DbExecutor, assignment: AssignmentRow, smUserId: string) {
-  const effective = resolveSmAssignmentValues(assignment);
+async function loadContext(executor: DbExecutor, assignment: VisitExecution, smUserId: string) {
+  const effective = executionValues(assignment);
   const [[user], [market]] = await Promise.all([
     executor.select({
       id: users.id,
@@ -205,10 +237,15 @@ async function loadContext(executor: DbExecutor, assignment: AssignmentRow, smUs
       lastName: users.lastName,
       travelTimeEnabled: users.travelTimeEnabled,
     }).from(users).where(and(eq(users.id, smUserId), eq(users.role, "sm"), eq(users.isActive, true), isNull(users.deletedAt))).limit(1),
-    executor.select().from(smMarkets).where(and(eq(smMarkets.id, effective.smMarketId), eq(smMarkets.isDeleted, false))).limit(1),
+    executor.select().from(smMarkets).where(and(eq(smMarkets.id, effective.smMarketId), isSMDurcharbeitExecution(assignment) ? undefined : eq(smMarkets.isDeleted, false))).limit(1),
   ]);
   if (!user) throw new SmVisitError(403, "sm_visit_sm_inactive", "Der Shelf-Merchandiser-Zugang ist nicht aktiv.");
   if (!market) throw new SmVisitError(409, "sm_visit_market_missing", "Der zugeordnete SM-Markt wurde nicht gefunden.");
+  if (isSMDurcharbeitExecution(assignment)) {
+    const frozen = assignment.SMDurcharbeit.context.target.marketSnapshot;
+    return { effective, user, market: { ...market, name: String(frozen.name ?? market.name), address: String(frozen.address ?? market.address),
+      postalCode: String(frozen.postalCode ?? market.postalCode), city: String(frozen.city ?? market.city), region: String(frozen.region ?? market.region) } };
+  }
   return { effective, user, market };
 }
 
@@ -231,6 +268,7 @@ async function resolveQuestionnaireVersion(tx: DbTx, assignment: AssignmentRow, 
 async function createSubmissionGraph(tx: DbTx, input: {
   submissionId: string;
   questionnaireVersionId: string;
+  SMDurcharbeitPinned?: boolean;
 }) {
   const moduleLinks = await tx.select({
     orderIndex: smQuestionnaireVersionModules.orderIndex,
@@ -247,7 +285,7 @@ async function createSubmissionGraph(tx: DbTx, input: {
       eq(smQuestionnaireVersionModules.isDeleted, false),
       eq(smModuleVersions.status, "published"),
       eq(smModuleVersions.isDeleted, false),
-      eq(smModules.isDeleted, false),
+      input.SMDurcharbeitPinned ? undefined : eq(smModules.isDeleted, false),
     )).orderBy(asc(smQuestionnaireVersionModules.orderIndex));
   if (moduleLinks.length === 0) throw new SmVisitError(409, "sm_visit_questionnaire_empty", "Der veröffentlichte Fragebogen enthält keine Module.");
 
@@ -286,7 +324,7 @@ async function createSubmissionGraph(tx: DbTx, input: {
       eq(smModuleVersionQuestions.isDeleted, false),
       eq(smQuestionVersions.status, "published"),
       eq(smQuestionVersions.isDeleted, false),
-      eq(smQuestions.isDeleted, false),
+      input.SMDurcharbeitPinned ? undefined : eq(smQuestions.isDeleted, false),
     )).orderBy(asc(smModuleVersionQuestions.orderIndex));
   if (questionLinks.length === 0) throw new SmVisitError(409, "sm_visit_questionnaire_no_questions", "Der veröffentlichte Fragebogen enthält keine Fragen.");
 
@@ -365,9 +403,9 @@ async function createSubmissionGraph(tx: DbTx, input: {
   await tx.update(smQuestionnaireSubmissions).set({ resolvedQuestionCount: submissionQuestions.length }).where(eq(smQuestionnaireSubmissions.id, input.submissionId));
 }
 
-function publicAssignment(assignment: AssignmentRow, context: Awaited<ReturnType<typeof loadContext>>) {
+function publicAssignment(assignment: VisitExecution, context: Awaited<ReturnType<typeof loadContext>>) {
   return {
-    id: assignment.id,
+    id: isSMDurcharbeitExecution(assignment) ? `SMDurcharbeit:${assignment.id}` : assignment.id,
     status: assignment.status,
     workDate: context.effective.workDate,
     plannedMinutes: context.effective.plannedMinutes,
@@ -394,14 +432,15 @@ function optionSnapshot(value: unknown): Array<{ code: string; label: string; ma
   });
 }
 
-async function loadVisitPayload(assignment: AssignmentRow, smUserId: string) {
+async function loadVisitPayload(assignment: VisitExecution, smUserId: string) {
   const context = await loadContext(db, assignment, smUserId);
   const [submission] = await db.select().from(smQuestionnaireSubmissions).where(and(
-    eq(smQuestionnaireSubmissions.assignmentId, assignment.id),
+    executionCondition(assignment),
     eq(smQuestionnaireSubmissions.isDeleted, false),
     eq(smQuestionnaireSubmissions.isCurrent, true),
   )).limit(1);
   if (!submission) {
+    if (isSMDurcharbeitExecution(assignment)) throw new SmVisitError(404, "smdurcharbeit_submission_missing", "Der Besuch wurde nicht gefunden.");
     const resolved = resolveSMDurcharbeitSelection(await loadSMDurcharbeitSelectionCatalog(db), assignment);
     return {
       assignment: publicAssignment(assignment, context),
@@ -416,7 +455,10 @@ async function loadVisitPayload(assignment: AssignmentRow, smUserId: string) {
     };
   }
 
-  const [timeSubmission] = submission.status === "submitted"
+  const [timeSubmission] = submission.status === "submitted" && isSMDurcharbeitExecution(assignment)
+    ? await db.select({ actualMinutes: smSMDurcharbeitTimeRevisions.actualMinutes }).from(smSMDurcharbeitTimeRevisions)
+      .where(and(eq(smSMDurcharbeitTimeRevisions.visitId, assignment.id), eq(smSMDurcharbeitTimeRevisions.isCurrent, true))).limit(1)
+    : submission.status === "submitted"
     ? await db.select({ actualMinutes: smAssignmentTimeSubmissions.actualMinutes })
       .from(smAssignmentTimeSubmissions)
       .where(and(
@@ -441,7 +483,7 @@ async function loadVisitPayload(assignment: AssignmentRow, smUserId: string) {
     eq(smQuestionAnswers.isCurrent, true),
   ));
   const answerByQuestion = new Map(answers.map((answer) => [answer.submissionQuestionId, answer]));
-  const photoRows = answers.length ? await db.select().from(smQuestionAnswerFiles).where(and(
+  const photoRows = isSMDurcharbeitExecution(assignment) ? await SMDurcharbeitAnswerFiles(db, answers.map(answer => answer.id)) : answers.length ? await db.select().from(smQuestionAnswerFiles).where(and(
     inArray(smQuestionAnswerFiles.answerId, answers.map((answer) => answer.id)),
     eq(smQuestionAnswerFiles.isDeleted, false),
   )).orderBy(asc(smQuestionAnswerFiles.uploadedAt)) : [];
@@ -457,6 +499,7 @@ async function loadVisitPayload(assignment: AssignmentRow, smUserId: string) {
       mimeType: photo.mimeType,
       byteSize: photo.byteSize,
       signedUrl: error ? null : data.signedUrl,
+      ...("SMDurcharbeitInherited" in photo ? { SMDurcharbeitInherited: photo.SMDurcharbeitInherited, uploadedAt: photo.uploadedAt.toISOString() } : {}),
     };
   }));
   const photoFilesByQuestion = new Map<string, typeof signedPhotoRows>();
@@ -467,12 +510,32 @@ async function loadVisitPayload(assignment: AssignmentRow, smUserId: string) {
   const questionsBySection = new Map<string, typeof questions>();
   for (const question of questions) questionsBySection.set(question.submissionSectionId, [...(questionsBySection.get(question.submissionSectionId) ?? []), question]);
 
-  const resolved = resolveSMDurcharbeitSelection(await loadSMDurcharbeitSelectionCatalog(db), assignment, submission);
+  const selection = isSMDurcharbeitExecution(assignment) ? {
+    questionnaireTemplateId: submission.questionnaireTemplateId, questionnaireVersionId: submission.questionnaireVersionId,
+    name: submission.questionnaireNameSnapshot, versionNumber: submission.questionnaireVersionSnapshot,
+    catalogScope: "SMDurcharbeit" as const, source: "submission" as const, available: true, blockReason: null, revision: submission.id,
+  } : resolveSMDurcharbeitSelection(await loadSMDurcharbeitSelectionCatalog(db), assignment, submission).selection;
+  const inheritedAnswers = isSMDurcharbeitExecution(assignment) && answers.length
+    ? await db.select({ answerId: smSMDurcharbeitAnswerProvenance.answerId, sourceSubmissionId: smSMDurcharbeitAnswerProvenance.sourceSubmissionId })
+      .from(smSMDurcharbeitAnswerProvenance).where(inArray(smSMDurcharbeitAnswerProvenance.answerId, answers.map(answer => answer.id))) : [];
+  let SMDurcharbeitReadOnlyReason: string | null = null;
+  if (isSMDurcharbeitExecution(assignment) && submission.status === "draft") {
+    try { await assertSMDurcharbeitAvailable(db, assignment.SMDurcharbeit.context, smUserId); }
+    catch (error) { if (error instanceof SMDurcharbeitCampaignError) SMDurcharbeitReadOnlyReason = error.message; else throw error; }
+  }
   return {
     assignment: publicAssignment(assignment, context),
     profile: { name: `${context.user.firstName} ${context.user.lastName}`.trim(), travelTimeEnabled: context.user.travelTimeEnabled },
     questionnaireAvailability: { count: 1, names: [submission.questionnaireNameSnapshot] },
-    SMDurcharbeitQuestionnaireSelection: resolved.selection,
+    SMDurcharbeitQuestionnaireSelection: selection,
+    ...(isSMDurcharbeitExecution(assignment) ? { SMDurcharbeitContext: {
+      visitId: assignment.id, targetId: assignment.SMDurcharbeit.context.target.id,
+      campaignId: assignment.SMDurcharbeit.context.campaign.id, campaignName: assignment.SMDurcharbeit.context.campaign.name,
+      month: assignment.SMDurcharbeit.context.period.month, targetRevision: assignment.SMDurcharbeit.context.target.revision,
+      basisSubmissionId: assignment.SMDurcharbeit.visit.basisSubmissionId, basisRevision: assignment.SMDurcharbeit.visit.basisRevision,
+      readOnlyReason: SMDurcharbeitReadOnlyReason,
+      inheritedQuestionIds: inheritedAnswers.flatMap(source => { const answer = answers.find(a => a.id === source.answerId); return answer ? [answer.submissionQuestionId] : []; }),
+    } } : {}),
     submission: {
       id: submission.id,
       status: submission.status,
@@ -509,6 +572,13 @@ async function loadVisitPayload(assignment: AssignmentRow, smUserId: string) {
     })),
     answers: Object.fromEntries(questions.map((question) => {
       const answer = answerByQuestion.get(question.id);
+      if (isSMDurcharbeitExecution(assignment) && submission.status === "draft" && question.questionTypeSnapshot === "photo") {
+        const value = answer?.valueJson as SmVisitAnswerPayload | null;
+        if (value?.kind === "photo") {
+          const visibleIds = new Set((photoFilesByQuestion.get(question.id) ?? []).map(photo => photo.id));
+          return [question.id, { ...value, fileIds: value.fileIds.filter(id => visibleIds.has(id)) }];
+        }
+      }
       return [question.id, answer?.valueJson ?? null];
     })),
     answerVersions: Object.fromEntries(questions.map((question) => [question.id, answerByQuestion.get(question.id)?.answerVersion ?? 0])),
@@ -576,7 +646,139 @@ async function recomputeApplicability(tx: DbTx, submissionId: string, actorUserI
   return { questions, hidden, answeredCount };
 }
 
-export const smVisitsRouter = Router();
+/** Creates a physical visit without a dated planning assignment. Runs wholly in its caller's transaction. */
+export async function initializeSMDurcharbeitVisit(tx: DbTx, targetId: string, smUserId: string, input: {
+  mode: "timer" | "manual"; travelMinutes?: number | null | undefined; clientSubmissionToken: string;
+  expectedRevision: number; followUp: boolean;
+}) {
+  // Token and target locks make retries and two-tab starts resolve to the same draft.
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`SMDurcharbeit_start:${smUserId}:${input.clientSubmissionToken}`}, 0))`);
+  const [replayed] = await tx.select().from(smQuestionnaireSubmissions).where(and(
+    eq(smQuestionnaireSubmissions.smUserId, smUserId), eq(smQuestionnaireSubmissions.clientSubmissionToken, input.clientSubmissionToken), eq(smQuestionnaireSubmissions.isDeleted, false),
+  )).limit(1);
+  if (replayed) {
+    if (replayed.SMDurcharbeitTargetId !== targetId || !replayed.SMDurcharbeitVisitId) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_token_reused", "Dieser Start wurde bereits für einen anderen Besuch verwendet.");
+    return { visitId: replayed.SMDurcharbeitVisitId, submissionId: replayed.id, replayed: true };
+  }
+  await lockSMDurcharbeitTarget(tx, targetId);
+  const context = await loadSMDurcharbeitTarget(tx, targetId);
+  const user = await assertSMDurcharbeitAvailable(tx, context, smUserId);
+  const [draft] = await tx.select().from(smQuestionnaireSubmissions).where(and(
+    eq(smQuestionnaireSubmissions.SMDurcharbeitTargetId, targetId), eq(smQuestionnaireSubmissions.status, "draft"), eq(smQuestionnaireSubmissions.isCurrent, true), eq(smQuestionnaireSubmissions.isDeleted, false),
+  )).limit(1);
+  if (draft) {
+    if (draft.smUserId !== smUserId) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_draft_owner_changed", "Dieser Monatsbesuch gehört einem anderen SM.");
+    return { visitId: draft.SMDurcharbeitVisitId!, submissionId: draft.id, replayed: true };
+  }
+  if (context.target.revision !== input.expectedRevision) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_target_stale", "Der Monatsstand wurde geändert. Bitte neu laden.");
+  const version = await loadSMDurcharbeitVersion(tx, context.period.questionnaireVersionId);
+  const [latestRow] = await tx.select({ submission: smQuestionnaireSubmissions }).from(smQuestionnaireSubmissions)
+    .innerJoin(smSMDurcharbeitVisits, eq(smSMDurcharbeitVisits.id, smQuestionnaireSubmissions.SMDurcharbeitVisitId)).where(and(
+    eq(smQuestionnaireSubmissions.SMDurcharbeitTargetId, targetId), eq(smQuestionnaireSubmissions.status, "submitted"), eq(smQuestionnaireSubmissions.isCurrent, true), eq(smQuestionnaireSubmissions.isDeleted, false),
+  )).orderBy(desc(smSMDurcharbeitVisits.basisRevision), desc(smQuestionnaireSubmissions.submittedAt), desc(smQuestionnaireSubmissions.id)).limit(1);
+  const latest = latestRow?.submission;
+  if (Boolean(latest) !== input.followUp) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_followup_confirmation", latest ? "Das Monatsziel ist erledigt. Bitte einen Folgebesuch ausdrücklich starten." : "Für diesen Monat gibt es noch keinen abgeschlossenen Besuch.");
+  const visitId = randomUUID(), submissionId = randomUUID(), now = new Date();
+  await tx.insert(smSMDurcharbeitVisits).values({ id: visitId, targetId, ownerRevisionId: context.target.ownerRevisionId,
+    smUserId, basisSubmissionId: latest?.id ?? null, basisRevision: context.target.revision + 1 });
+  await tx.insert(smQuestionnaireSubmissions).values({ id: submissionId, SMDurcharbeitVisitId: visitId, SMDurcharbeitTargetId: targetId,
+    assignmentId: null, questionnaireTemplateId: version.questionnaireTemplateId, questionnaireVersionId: version.id,
+    smUserId, smMarketId: context.membership.smMarketId, clientSubmissionToken: input.clientSubmissionToken,
+    timezone: "Europe/Vienna", oncePerMarketSnapshot: false, questionnaireNameSnapshot: version.name, questionnaireVersionSnapshot: version.versionNumber,
+    smNameSnapshot: `${user.firstName} ${user.lastName}`.trim(), marketNameSnapshot: String(context.target.marketSnapshot.name ?? context.market.name),
+    marketAddressSnapshot: String(context.target.marketSnapshot.address ?? context.market.address), marketPostalCodeSnapshot: String(context.target.marketSnapshot.postalCode ?? context.market.postalCode),
+    marketCitySnapshot: String(context.target.marketSnapshot.city ?? context.market.city), visitTimeMode: input.mode,
+    travelMinutes: user.travelTimeEnabled ? input.travelMinutes ?? null : null, visitStartedAt: input.mode === "timer" ? now : null, lastSavedAt: now });
+  await createSubmissionGraph(tx, { submissionId, questionnaireVersionId: version.id, SMDurcharbeitPinned: true });
+  if (latest) await copySMDurcharbeitMonthlyAnswers(tx, { sourceSubmissionId: latest.id, submissionId, actorId: smUserId, basisRevision: context.target.revision });
+  await recomputeApplicability(tx, submissionId, smUserId);
+  await tx.update(smSMDurcharbeitTargets).set({ revision: context.target.revision + 1, updatedAt: now }).where(eq(smSMDurcharbeitTargets.id, targetId));
+  await SMDurcharbeitEvent(tx, { campaignId: context.campaign.id, targetId, visitId, actorUserId: smUserId, action: latest ? "followup_started" : "visit_started",
+    reason: latest ? "Folgebesuch mit Monatsantworten gestartet" : "Monatsbesuch gestartet", afterState: { submissionId, basisSubmissionId: latest?.id ?? null, month: context.period.month } });
+  return { visitId, submissionId, replayed: false };
+}
+
+async function discardSMDurcharbeitDraft(tx: DbTx, execution: SMDurcharbeitExecution, actorId: string, reason = "Vom Shelf Merchandiser verworfen") {
+  const { submission, context } = execution.SMDurcharbeit, now = new Date();
+  if (submission.status !== "draft" || submission.submittedAt) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_draft_required", "Abgeschlossene Besuche können nicht als Entwurf verworfen werden.");
+  const answerRows = await tx.select({ id: smQuestionAnswers.id }).from(smQuestionAnswers).where(eq(smQuestionAnswers.submissionId, submission.id));
+  const answerIds = answerRows.map(row => row.id);
+  const photoRows = answerIds.length ? await tx.select({ bucket: smQuestionAnswerFiles.storageBucket, path: smQuestionAnswerFiles.storagePath })
+    .from(smQuestionAnswerFiles).where(and(inArray(smQuestionAnswerFiles.answerId, answerIds), eq(smQuestionAnswerFiles.isDeleted, false),
+      sql`not exists (select 1 from sm_smdurcharbeit_answer_file_links l where l.file_id = ${smQuestionAnswerFiles.id} and not l.is_deleted)`)) : [];
+  if (answerIds.length) {
+    await tx.update(smSMDurcharbeitFileLinks).set({ isDeleted: true }).where(inArray(smSMDurcharbeitFileLinks.answerId, answerIds));
+    await tx.update(smQuestionAnswerOptions).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(inArray(smQuestionAnswerOptions.answerId, answerIds));
+    await tx.update(smQuestionAnswerMatrixCells).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(inArray(smQuestionAnswerMatrixCells.answerId, answerIds));
+    await tx.update(smQuestionAnswerFiles).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(inArray(smQuestionAnswerFiles.answerId, answerIds));
+    await tx.update(smQuestionAnswers).set({ isCurrent: false, isDeleted: true, deletedAt: now, updatedAt: now }).where(eq(smQuestionAnswers.submissionId, submission.id));
+  }
+  await tx.update(smQuestionnaireSubmissionQuestions).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(eq(smQuestionnaireSubmissionQuestions.submissionId, submission.id));
+  await tx.update(smQuestionnaireSubmissionSections).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(eq(smQuestionnaireSubmissionSections.submissionId, submission.id));
+  await tx.update(smQuestionnaireSubmissions).set({ status: "cancelled", isCurrent: false, isDeleted: true, deletedAt: now, cancelledAt: now,
+    cancellationReason: reason, updatedAt: now, lastSavedAt: now }).where(eq(smQuestionnaireSubmissions.id, submission.id));
+  await reconcileSMDurcharbeitTarget(tx, context.target.id, actorId, "draft_discarded");
+  return { photoRows, restoredStatus: "planned" as const };
+}
+
+/** An explicit admin action can release a protected draft even after its month/owner closes. */
+export async function cancelSMDurcharbeitDraft(tx: DbTx, targetId: string, actorId: string, input: { expectedRevision: number; visitId: string; reason: string }) {
+  await lockSMDurcharbeitTarget(tx, targetId);
+  const context = await loadSMDurcharbeitTarget(tx, targetId);
+  if (context.target.revision !== input.expectedRevision) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_target_stale", "Der Monatsstand wurde geändert. Bitte neu laden.");
+  const [visit] = await tx.select().from(smSMDurcharbeitVisits).where(and(eq(smSMDurcharbeitVisits.id, input.visitId), eq(smSMDurcharbeitVisits.targetId, targetId))).limit(1);
+  const [submission] = visit ? await tx.select().from(smQuestionnaireSubmissions).where(and(eq(smQuestionnaireSubmissions.SMDurcharbeitVisitId, visit.id), eq(smQuestionnaireSubmissions.isDeleted, false), eq(smQuestionnaireSubmissions.isCurrent, true))).limit(1).for("update") : [];
+  if (!visit || !submission || submission.status !== "draft" || submission.submittedAt) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_draft_required", "Der ausgewählte Entwurf ist nicht mehr offen. Bitte neu laden.");
+  const result = await discardSMDurcharbeitDraft(tx, { id: visit.id, status: "in_progress", seriesId: null, startedAt: submission.visitStartedAt, SMDurcharbeit: { context, visit, submission } }, actorId, input.reason);
+  await SMDurcharbeitEvent(tx, { campaignId: context.campaign.id, targetId, visitId: visit.id, actorUserId: actorId,
+    action: "draft_cancelled_by_admin", reason: input.reason, beforeState: { submissionId: submission.id, ownerUserId: visit.smUserId, month: context.period.month }, afterState: { status: "cancelled" } });
+  return result;
+}
+
+export async function cleanupSMDurcharbeitDraftPhotos(photos: Array<{ bucket: string; path: string }>) {
+  const byBucket = new Map<string, string[]>();
+  for (const photo of photos) byBucket.set(photo.bucket, [...(byBucket.get(photo.bucket) ?? []), photo.path]);
+  for (const [bucket, paths] of byBucket) {
+    try { const { error } = await supabaseAdmin.storage.from(bucket).remove([...new Set(paths)]); if (error) logger.warn("smdurcharbeit_cancel_photo_cleanup_failed", { bucket }); }
+    catch { logger.warn("smdurcharbeit_cancel_photo_cleanup_failed", { bucket }); }
+  }
+}
+
+async function removeSMDurcharbeitPhoto(tx: DbTx, execution: SMDurcharbeitExecution, fileId: string, actorId: string) {
+  const { submission } = execution.SMDurcharbeit;
+  if (submission.status !== "draft") throw new SmVisitError(409, "sm_visit_not_in_progress", "Dieser Besuch ist nicht mehr in Arbeit.");
+  const currentAnswers = await tx.select().from(smQuestionAnswers).where(and(eq(smQuestionAnswers.submissionId, submission.id), eq(smQuestionAnswers.isCurrent, true), eq(smQuestionAnswers.isDeleted, false)));
+  const file = (await SMDurcharbeitAnswerFiles(tx, currentAnswers.map(answer => answer.id))).find(row => row.id === fileId);
+  const answer = currentAnswers.find(row => row.id === file?.answerId);
+  if (!file || !answer) throw new SmVisitError(404, "sm_visit_photo_not_found", "Das Foto wurde nicht gefunden.");
+  const now = new Date();
+  let deleteStorage = false;
+  if (file.SMDurcharbeitInherited) {
+    await tx.update(smSMDurcharbeitFileLinks).set({ isDeleted: true }).where(and(eq(smSMDurcharbeitFileLinks.answerId, answer.id), eq(smSMDurcharbeitFileLinks.fileId, file.id)));
+  } else {
+    await tx.update(smQuestionAnswerFiles).set({ isDeleted: true, deletedAt: now, updatedAt: now }).where(eq(smQuestionAnswerFiles.id, file.id));
+    const [retained] = await tx.select({ id: smSMDurcharbeitFileLinks.answerId }).from(smSMDurcharbeitFileLinks).where(and(eq(smSMDurcharbeitFileLinks.fileId, file.id), eq(smSMDurcharbeitFileLinks.isDeleted, false))).limit(1);
+    deleteStorage = !retained;
+  }
+  const remaining = await SMDurcharbeitAnswerFiles(tx, [answer.id]);
+  await tx.update(smQuestionAnswers).set({ answerState: remaining.length ? "answered" : "unanswered",
+    valueJson: { kind: "photo", fileIds: remaining.map(photo => photo.id), ...(remaining.length && smAnswerComment(answer.valueJson) ? { comment: smAnswerComment(answer.valueJson) } : {}) },
+    answeredAt: remaining.length ? now : null, updatedAt: now }).where(eq(smQuestionAnswers.id, answer.id));
+  await tx.insert(smQuestionAnswerEvents).values({ answerId: answer.id, submissionId: submission.id, eventType: remaining.length ? "set" : "clear", answerVersion: answer.answerVersion,
+    payload: { removedFileId: file.id, SMDurcharbeitInherited: file.SMDurcharbeitInherited }, actorUserId: actorId });
+  await recomputeApplicability(tx, submission.id, actorId);
+  return { storageBucket: file.storageBucket, storagePath: file.storagePath, deleteStorage };
+}
+
+export function createSmVisitsRouter(SMDurcharbeit = false) {
+const smVisitsRouter = Router();
+const visitCondition = (id: string) => SMDurcharbeit ? eq(smQuestionnaireSubmissions.SMDurcharbeitVisitId, id) : eq(smQuestionnaireSubmissions.assignmentId, id);
+const loadOwnedAssignment = async (executor: DbExecutor, id: string, smUserId: string, lock = false): Promise<VisitExecution> => {
+  if (!SMDurcharbeit) return loadDatedOwnedAssignment(executor, id, smUserId, lock);
+  const context = await loadSMDurcharbeitOwnedVisit(executor, id, smUserId, lock);
+  return { id, status: context.submission.status === "draft" ? "in_progress" : context.submission.status === "submitted" ? "completed" : "cancelled",
+    seriesId: null, startedAt: context.submission.visitStartedAt, SMDurcharbeit: context };
+};
 smVisitsRouter.use(requireAuth(["sm"]));
 
 smVisitsRouter.get("/:assignmentId", async (req: AuthedRequest, res, next) => {
@@ -599,10 +801,10 @@ smVisitsRouter.delete("/:assignmentId", async (req: AuthedRequest, res, next) =>
     discardSchema.parse(req.body);
     const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_visit:${assignmentId}`}, 0))`);
-      await lockSmPlanning(tx);
+      if (!SMDurcharbeit) await lockSmPlanning(tx);
       const assignment = await loadOwnedAssignment(tx, assignmentId, actor.appUserId, true);
       const [submission] = await tx.select().from(smQuestionnaireSubmissions).where(and(
-        eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+        visitCondition(assignmentId),
         eq(smQuestionnaireSubmissions.smUserId, actor.appUserId),
         eq(smQuestionnaireSubmissions.isDeleted, false),
         eq(smQuestionnaireSubmissions.isCurrent, true),
@@ -614,6 +816,7 @@ smVisitsRouter.delete("/:assignmentId", async (req: AuthedRequest, res, next) =>
       if (assignment.status !== "in_progress") {
         throw new SmVisitError(409, "sm_visit_assignment_not_in_progress", "Der Einsatz ist nicht mehr in Arbeit.");
       }
+      if (isSMDurcharbeitExecution(assignment)) return discardSMDurcharbeitDraft(tx, assignment, actor.appUserId);
 
       const answerRows = await tx.select({ id: smQuestionAnswers.id }).from(smQuestionAnswers).where(eq(smQuestionAnswers.submissionId, submission.id));
       const answerIds = answerRows.map((row) => row.id);
@@ -703,11 +906,12 @@ smVisitsRouter.post("/:assignmentId/start", async (req: AuthedRequest, res, next
     const input = startSchema.parse(req.body);
     await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_visit:${assignmentId}`}, 0))`);
-      await lockSmPlanning(tx);
+      if (!SMDurcharbeit) await lockSmPlanning(tx);
       const assignment = await loadOwnedAssignment(tx, assignmentId, actor.appUserId, true);
       const context = await loadContext(tx, assignment, actor.appUserId);
+      if (isSMDurcharbeitExecution(assignment)) return; // New visits begin at their monthly target; this endpoint only resumes.
       const [existing] = await tx.select().from(smQuestionnaireSubmissions).where(and(
-        eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+        visitCondition(assignmentId),
         eq(smQuestionnaireSubmissions.isDeleted, false),
         eq(smQuestionnaireSubmissions.isCurrent, true),
       )).limit(1).for("update");
@@ -787,7 +991,7 @@ smVisitsRouter.post("/:assignmentId/photos/initialize", async (req: AuthedReques
       const assignment = await loadOwnedAssignment(tx, assignmentId, actor.appUserId, true);
       if (assignment.status !== "in_progress") throw new SmVisitError(409, "sm_visit_not_in_progress", "Der Einsatz ist nicht in Arbeit.");
       const [submission] = await tx.select().from(smQuestionnaireSubmissions).where(and(
-        eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+        visitCondition(assignmentId),
         eq(smQuestionnaireSubmissions.smUserId, actor.appUserId),
         eq(smQuestionnaireSubmissions.status, "draft"),
         eq(smQuestionnaireSubmissions.isDeleted, false),
@@ -842,6 +1046,7 @@ smVisitsRouter.post("/:assignmentId/photos/presign", async (req: AuthedRequest, 
     const assignmentId = assignmentIdSchema.parse(param(req, "assignmentId"));
     const input = photoPresignSchema.parse(req.body);
     const assignment = await loadOwnedAssignment(db, assignmentId, actor.appUserId);
+    if (isSMDurcharbeitExecution(assignment)) await assertSMDurcharbeitAvailable(db, assignment.SMDurcharbeit.context, actor.appUserId);
     if (assignment.status !== "in_progress") throw new SmVisitError(409, "sm_visit_not_in_progress", "Der Einsatz ist nicht in Arbeit.");
     const [answer] = await db.select({ id: smQuestionAnswers.id, submissionId: smQuestionAnswers.submissionId }).from(smQuestionAnswers)
       .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smQuestionAnswers.submissionId))
@@ -850,7 +1055,7 @@ smVisitsRouter.post("/:assignmentId/photos/presign", async (req: AuthedRequest, 
         eq(smQuestionAnswers.id, input.answerId),
         eq(smQuestionAnswers.isDeleted, false),
         eq(smQuestionAnswers.isCurrent, true),
-        eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+        visitCondition(assignmentId),
         eq(smQuestionnaireSubmissions.smUserId, actor.appUserId),
         eq(smQuestionnaireSubmissions.status, "draft"),
         eq(smQuestionnaireSubmissions.isDeleted, false),
@@ -891,7 +1096,7 @@ smVisitsRouter.post("/:assignmentId/photos/commit", async (req: AuthedRequest, r
           eq(smQuestionAnswers.id, input.answerId),
           eq(smQuestionAnswers.isDeleted, false),
           eq(smQuestionAnswers.isCurrent, true),
-          eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+          visitCondition(assignmentId),
           eq(smQuestionnaireSubmissions.smUserId, actor.appUserId),
           eq(smQuestionnaireSubmissions.status, "draft"),
           eq(smQuestionnaireSubmissions.isDeleted, false),
@@ -908,9 +1113,10 @@ smVisitsRouter.post("/:assignmentId/photos/commit", async (req: AuthedRequest, r
         eq(smQuestionAnswerFiles.answerId, answer.id),
         eq(smQuestionAnswerFiles.isDeleted, false),
       ));
+      const inherited = isSMDurcharbeitExecution(assignment) ? (await SMDurcharbeitAnswerFiles(tx, [answer.id])).filter(file => file.SMDurcharbeitInherited) : [];
       const existingPaths = new Set(existing.map((photo) => photo.storagePath));
       const fresh = input.photos.filter((photo) => !existingPaths.has(photo.storagePath));
-      if (existing.length + fresh.length > 20) throw new SmVisitError(400, "sm_visit_photo_limit_exceeded", "Pro Foto-Frage sind maximal 20 Fotos erlaubt.");
+      if (existing.length + inherited.length + fresh.length > 20) throw new SmVisitError(400, "sm_visit_photo_limit_exceeded", "Pro Foto-Frage sind maximal 20 Fotos erlaubt.");
       const inserted = fresh.length ? await tx.insert(smQuestionAnswerFiles).values(fresh.map((photo) => ({
         answerId: answer.id,
         storageBucket: photo.storageBucket,
@@ -921,7 +1127,7 @@ smVisitsRouter.post("/:assignmentId/photos/commit", async (req: AuthedRequest, r
         widthPx: photo.widthPx ?? null,
         heightPx: photo.heightPx ?? null,
       }))).returning() : [];
-      const allFiles = [...existing, ...inserted];
+      const allFiles = [...existing, ...inherited, ...inserted];
       const now = new Date();
       await tx.update(smQuestionAnswers).set({
         answerState: allFiles.length ? "answered" : "unanswered",
@@ -965,7 +1171,7 @@ smVisitsRouter.post("/:assignmentId/photos/cleanup", async (req: AuthedRequest, 
         eq(smQuestionAnswers.id, input.answerId),
         eq(smQuestionAnswers.isDeleted, false),
         eq(smQuestionAnswers.isCurrent, true),
-        eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+        visitCondition(assignmentId),
         eq(smQuestionnaireSubmissions.smUserId, actor.appUserId),
         eq(smQuestionnaireSubmissions.status, "draft"),
         eq(smQuestionnaireSubmissions.isDeleted, false),
@@ -998,7 +1204,8 @@ smVisitsRouter.delete("/:assignmentId/photos/:fileId", async (req: AuthedRequest
     const assignmentId = assignmentIdSchema.parse(param(req, "assignmentId"));
     const fileId = z.string().uuid().parse(param(req, "fileId"));
     const removedPhoto = await db.transaction(async (tx) => {
-      await loadOwnedAssignment(tx, assignmentId, actor.appUserId, true);
+      const execution = await loadOwnedAssignment(tx, assignmentId, actor.appUserId, true);
+      if (isSMDurcharbeitExecution(execution)) return removeSMDurcharbeitPhoto(tx, execution, fileId, actor.appUserId);
       const [file] = await tx.select({
         id: smQuestionAnswerFiles.id,
         answerId: smQuestionAnswerFiles.answerId,
@@ -1015,7 +1222,7 @@ smVisitsRouter.delete("/:assignmentId/photos/:fileId", async (req: AuthedRequest
           eq(smQuestionAnswerFiles.isDeleted, false),
           eq(smQuestionAnswers.isDeleted, false),
           eq(smQuestionAnswers.isCurrent, true),
-          eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+          visitCondition(assignmentId),
           eq(smQuestionnaireSubmissions.smUserId, actor.appUserId),
           eq(smQuestionnaireSubmissions.status, "draft"),
         )).limit(1).for("update");
@@ -1041,9 +1248,9 @@ smVisitsRouter.delete("/:assignmentId/photos/:fileId", async (req: AuthedRequest
         actorUserId: actor.appUserId,
       });
       await recomputeApplicability(tx, file.submissionId, actor.appUserId);
-      return { storageBucket: file.storageBucket, storagePath: file.storagePath };
+      return { storageBucket: file.storageBucket, storagePath: file.storagePath, deleteStorage: true };
     });
-    try {
+    if (removedPhoto.deleteStorage) try {
       const { error } = await supabaseAdmin.storage.from(removedPhoto.storageBucket).remove([removedPhoto.storagePath]);
       if (error) logger.warn("sm_visit_photo_delete_storage_cleanup_failed", {
         assignmentId,
@@ -1079,7 +1286,7 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
       const assignment = await loadOwnedAssignment(tx, assignmentId, actor.appUserId, true);
       if (assignment.status !== "in_progress") throw new SmVisitError(409, "sm_visit_not_in_progress", "Der Einsatz ist nicht in Arbeit.");
       const [submission] = await tx.select().from(smQuestionnaireSubmissions).where(and(
-        eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+        visitCondition(assignmentId),
         eq(smQuestionnaireSubmissions.smUserId, actor.appUserId),
         eq(smQuestionnaireSubmissions.status, "draft"),
         eq(smQuestionnaireSubmissions.isDeleted, false),
@@ -1117,7 +1324,7 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
       const now = new Date();
       if (question.questionTypeSnapshot === "photo") {
         // Comment-only update: never create, remove, replace or move uploaded files.
-        const files = current ? await tx.select({ id: smQuestionAnswerFiles.id }).from(smQuestionAnswerFiles).where(and(
+        const files = current && isSMDurcharbeitExecution(assignment) ? await SMDurcharbeitAnswerFiles(tx, [current.id]) : current ? await tx.select({ id: smQuestionAnswerFiles.id }).from(smQuestionAnswerFiles).where(and(
           eq(smQuestionAnswerFiles.answerId, current.id), eq(smQuestionAnswerFiles.isDeleted, false),
         )) : [];
         if (!current || normalized.kind !== "photo" || files.length !== normalized.fileIds.length || files.some((file) => !normalized.fileIds.includes(file.id))) {
@@ -1208,7 +1415,7 @@ smVisitsRouter.patch("/:assignmentId/timing", async (req: AuthedRequest, res, ne
       if (assignment.status !== "in_progress") throw new SmVisitError(409, "sm_visit_not_in_progress", "Der Einsatz ist nicht in Arbeit.");
       const context = await loadContext(tx, assignment, actor.appUserId);
       const [submission] = await tx.select().from(smQuestionnaireSubmissions).where(and(
-        eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+        visitCondition(assignmentId),
         eq(smQuestionnaireSubmissions.status, "draft"),
         eq(smQuestionnaireSubmissions.isDeleted, false),
         eq(smQuestionnaireSubmissions.isCurrent, true),
@@ -1240,13 +1447,16 @@ smVisitsRouter.post("/:assignmentId/submit", async (req: AuthedRequest, res, nex
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_visit:${assignmentId}:submit`}, 0))`);
       const assignment = await loadOwnedAssignment(tx, assignmentId, actor.appUserId, true);
       const [submission] = await tx.select().from(smQuestionnaireSubmissions).where(and(
-        eq(smQuestionnaireSubmissions.assignmentId, assignmentId),
+        visitCondition(assignmentId),
         eq(smQuestionnaireSubmissions.isDeleted, false),
         eq(smQuestionnaireSubmissions.isCurrent, true),
       )).limit(1).for("update");
       if (!submission) throw new SmVisitError(409, "sm_visit_draft_missing", "Der Fragebogen wurde nicht gefunden.");
       if (submission.status === "submitted") {
-        const [persistedTime] = await tx.select({ actualMinutes: smAssignmentTimeSubmissions.actualMinutes })
+        const [persistedTime] = isSMDurcharbeitExecution(assignment)
+          ? await tx.select({ actualMinutes: smSMDurcharbeitTimeRevisions.actualMinutes }).from(smSMDurcharbeitTimeRevisions)
+            .where(and(eq(smSMDurcharbeitTimeRevisions.visitId, assignmentId), eq(smSMDurcharbeitTimeRevisions.isCurrent, true))).limit(1)
+          : await tx.select({ actualMinutes: smAssignmentTimeSubmissions.actualMinutes })
           .from(smAssignmentTimeSubmissions)
           .where(and(
             eq(smAssignmentTimeSubmissions.assignmentId, assignmentId),
@@ -1304,6 +1514,19 @@ smVisitsRouter.post("/:assignmentId/submit", async (req: AuthedRequest, res, nex
         : null;
       const actualMinutes = elapsedMinutes;
       if (!actualMinutes || actualMinutes < 1 || actualMinutes > 1440) throw new SmVisitError(409, "sm_visit_actual_time_missing", "Bitte trage vor dem Abschluss die tatsächliche Besuchszeit ein.");
+      if (isSMDurcharbeitExecution(assignment)) {
+        const { visit, context } = assignment.SMDurcharbeit;
+        if (visit.basisRevision !== context.target.revision || visit.basisSubmissionId !== context.target.latestSubmissionId) {
+          throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_basis_changed", "Der überprüfte Monatsstand wurde geändert. Deine Antworten bleiben gespeichert. Bitte den Stand vor dem Abschluss mit der Verwaltung prüfen.");
+        }
+        const startDate = SMDurcharbeitToday(effectiveVisitStartedAt), endDate = SMDurcharbeitToday(effectiveVisitCompletedAt);
+        if (SMDurcharbeitMonth(startDate) !== context.period.month || SMDurcharbeitMonth(endDate) !== context.period.month || startDate < context.campaign.startDate || endDate > context.campaign.endDate) {
+          throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_time_month_invalid", "Start und Ende müssen im Kampagnenzeitraum dieses Kalendermonats liegen.");
+        }
+        await assertSmVisitTimeAvailable(tx, { smUserId: actor.appUserId, SMDurcharbeitVisitId: assignmentId, startedAt: effectiveVisitStartedAt, completedAt: effectiveVisitCompletedAt });
+        await saveSMDurcharbeitVisitTime(tx, assignmentId, actor.appUserId, { startedAt: effectiveVisitStartedAt, completedAt: effectiveVisitCompletedAt,
+          travelMinutes: submission.travelMinutes ?? 0, reason: "Monatsbesuch abgeschlossen", expectedRevision: 0 });
+      } else {
       await assertSmVisitTimeAvailable(tx, { smUserId: actor.appUserId, assignmentId, startedAt: effectiveVisitStartedAt, completedAt: effectiveVisitCompletedAt });
       const [existingTime] = await tx.select().from(smAssignmentTimeSubmissions).where(and(
         eq(smAssignmentTimeSubmissions.assignmentId, assignmentId),
@@ -1317,6 +1540,7 @@ smVisitsRouter.post("/:assignmentId/submit", async (req: AuthedRequest, res, nex
         submittedByUserId: actor.appUserId,
         submittedAt: now,
       });
+      }
       await tx.update(smQuestionnaireSubmissions).set({
         status: "submitted",
         visitStartedAt: effectiveVisitStartedAt,
@@ -1327,6 +1551,9 @@ smVisitsRouter.post("/:assignmentId/submit", async (req: AuthedRequest, res, nex
         lastSavedAt: now,
         updatedAt: now,
       }).where(eq(smQuestionnaireSubmissions.id, submission.id));
+      if (isSMDurcharbeitExecution(assignment)) {
+        await reconcileSMDurcharbeitTarget(tx, assignment.SMDurcharbeit.context.target.id, actor.appUserId, "visit_submitted");
+      } else {
       await tx.update(smAssignments).set(buildSmAssignmentCompletionUpdate({
         visitStartedAt: effectiveVisitStartedAt,
         visitCompletedAt: effectiveVisitCompletedAt,
@@ -1348,6 +1575,7 @@ smVisitsRouter.post("/:assignmentId/submit", async (req: AuthedRequest, res, nex
           clientMutationToken: input.clientMutationToken,
         },
       });
+      }
       return { submissionId: submission.id, submittedAt: now.toISOString(), actualMinutes };
     });
     res.json({ receipt });
@@ -1356,3 +1584,8 @@ smVisitsRouter.post("/:assignmentId/submit", async (req: AuthedRequest, res, nex
     if (!sendError(error, res)) next(error);
   }
 });
+
+return smVisitsRouter;
+}
+export const smVisitsRouter = createSmVisitsRouter();
+export const SMDurcharbeitVisitsRouter = createSmVisitsRouter(true);

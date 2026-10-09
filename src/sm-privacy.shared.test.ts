@@ -41,3 +41,14 @@ test("SM DSAR retention notes distinguish visit and time records", () => {
   assert.match(categories.find((category) => category.key === "sm_visits")?.retention ?? "", /3 Jahre/);
   assert.match(categories.find((category) => category.key === "sm_time")?.retention ?? "", /7 Jahre/);
 });
+test("monthly SM inventory includes time history, requests and carry-over without changing legacy counts", () => {
+  const categories = buildSmDsarCategories({ ...counts, SMDurcharbeit: { targets: 3, ownerRevisions: 4, visits: 2,
+    timeRevisions: 3, timeRequests: 1, answerProvenance: 5, fileLinks: 1, events: 8 } });
+  assert.equal(categories.find(c => c.key === "sm_time")?.count, 7);
+  assert.equal(categories.find(c => c.key === "sm_requests")?.count, 5);
+  assert.equal(categories.find(c => c.key === "sm_security")?.count, 18);
+  assert.equal(categories.find(c => c.key === "SMDurcharbeit_monthly")?.count, 15);
+  assert.equal(categories.find(c => c.key === "sm_answers")?.count, counts.answers);
+  assert.equal(categories.find(c => c.key === "sm_photos")?.count, counts.photos);
+  assert.match(categories.find(c => c.key === "SMDurcharbeit_monthly")?.actionHint ?? "", /Originaldateien/);
+});

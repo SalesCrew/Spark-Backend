@@ -31,6 +31,7 @@ import {
   visitSessions,
 } from "../lib/schema.js";
 import { buildSmDsarCategories } from "../sm-privacy.shared.js";
+import { loadSMDurcharbeitPrivacyCounts } from "../sm-SMDurcharbeit-privacy.shared.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
 const requestTypes = ["access", "rectification", "erasure", "restriction", "portability", "objection", "mixed"] as const;
@@ -251,6 +252,7 @@ async function buildSubjectDataPackage(subjectUserId: string) {
       answerAuditEvents,
       authAuditCount,
       agreementCount,
+      SMDurcharbeit,
     ] = await Promise.all([
       countWhere(smMarkets, and(eq(smMarkets.assignedSmUserId, subjectUserId), eq(smMarkets.isDeleted, false))),
       countWhere(
@@ -348,12 +350,14 @@ async function buildSubjectDataPackage(subjectUserId: string) {
         or(eq(authAuditLogs.actorUserId, subjectUserId), eq(authAuditLogs.targetUserId, subjectUserId))!,
       ),
       countWhere(employeeAgreementAcceptances, eq(employeeAgreementAcceptances.userId, subjectUserId)),
+      loadSMDurcharbeitPrivacyCounts(db, subjectUserId),
     ]);
 
     return {
       generatedAt: new Date().toISOString(),
       subject: serializedSubject,
       categories: buildSmDsarCategories({
+        SMDurcharbeit,
         assignedMarkets,
         assignments,
         submissions,

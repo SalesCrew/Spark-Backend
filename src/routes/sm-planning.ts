@@ -16,6 +16,8 @@ import {
   smAssignmentTimeSubmissions,
   smMarkets,
   smSMDurcharbeitMarkets,
+  smSMDurcharbeitVisits,
+  smSMDurcharbeitTimeRevisions,
   smQuestionnaireGlobalAssignments,
   smQuestionnaireSubmissions,
   smQuestionnaireTemplates,
@@ -564,7 +566,7 @@ smPlanningRouter.get("/profile", async (req: AuthedRequest, res, next) => {
   try {
     const smUserId = req.authUser!.appUserId;
     const week = smProfileWeek(viennaDate(new Date()));
-    const [userRows, marketRows, assignments] = await Promise.all([
+    const [userRows, marketRows, assignments, SMDurcharbeitTimes] = await Promise.all([
       db.select({
         id: users.id,
         firstName: users.firstName,
@@ -578,6 +580,12 @@ smPlanningRouter.get("/profile", async (req: AuthedRequest, res, next) => {
         eq(smMarkets.isActive, true),
       )),
       loadAssignments(week.from, week.to, smUserId, true),
+      // Canonical physical time includes invalidated questionnaires, but excludes
+      // approved time deletions. No target is counted as a dated Einsatz or Soll.
+      db.select({ actualMinutes: smSMDurcharbeitTimeRevisions.actualMinutes, travelMinutes: smSMDurcharbeitTimeRevisions.travelMinutes })
+        .from(smSMDurcharbeitTimeRevisions).innerJoin(smSMDurcharbeitVisits, eq(smSMDurcharbeitVisits.id, smSMDurcharbeitTimeRevisions.visitId))
+        .where(and(eq(smSMDurcharbeitVisits.smUserId, smUserId), eq(smSMDurcharbeitTimeRevisions.isCurrent, true),
+          sql`(${smSMDurcharbeitTimeRevisions.startedAt} at time zone 'Europe/Vienna')::date between ${week.from}::date and ${week.to}::date`)),
     ]);
     const user = userRows[0];
     if (!user || !user.isActive) {
@@ -589,7 +597,8 @@ smPlanningRouter.get("/profile", async (req: AuthedRequest, res, next) => {
       week,
       summary: {
         assignedMarketCount: marketRows[0]?.count ?? 0,
-        ...summarizeSmProfileWeek(assignments),
+        ...summarizeSmProfileWeek(assignments, SMDurcharbeitTimes),
+        SMDurcharbeitVisitCount: SMDurcharbeitTimes.length,
       },
     });
   } catch (error) {

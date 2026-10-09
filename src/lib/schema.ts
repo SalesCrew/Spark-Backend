@@ -16,6 +16,8 @@ import {
   timestamp,
   uniqueIndex,
   uuid,
+  type AnyPgColumn,
+  type PgTableExtraConfigValue,
 } from "drizzle-orm/pg-core";
 
 export const userRoleEnum = pgEnum("user_role", ["admin", "sm_admin", "gm", "sm", "kunde"]);
@@ -1158,6 +1160,8 @@ export const smQuestionnaireSubmissions = pgTable(
   {
     id: uuid("id").defaultRandom().primaryKey(),
     assignmentId: uuid("assignment_id").references(() => smAssignments.id, { onDelete: "restrict" }),
+    SMDurcharbeitVisitId: uuid("smdurcharbeit_visit_id"),
+    SMDurcharbeitTargetId: uuid("smdurcharbeit_target_id"),
     questionnaireTemplateId: uuid("questionnaire_template_id").notNull().references(() => smQuestionnaireTemplates.id, { onDelete: "restrict" }),
     questionnaireVersionId: uuid("questionnaire_version_id").notNull().references(() => smQuestionnaireVersions.id, { onDelete: "restrict" }),
     smUserId: uuid("sm_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
@@ -1198,12 +1202,19 @@ export const smQuestionnaireSubmissions = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
-  (table) => [
+  (table): PgTableExtraConfigValue[] => [
     foreignKey({ name: "sm_questionnaire_submissions_supersedes_fk", columns: [table.supersedesSubmissionId], foreignColumns: [table.id] }).onDelete("restrict"),
     foreignKey({ name: "sm_questionnaire_submissions_template_version_fk", columns: [table.questionnaireVersionId, table.questionnaireTemplateId], foreignColumns: [smQuestionnaireVersions.id, smQuestionnaireVersions.questionnaireTemplateId] }).onDelete("restrict"),
     index("sm_questionnaire_submissions_template_version_idx").on(table.questionnaireVersionId, table.questionnaireTemplateId),
     uniqueIndex("sm_questionnaire_submissions_client_token_active_unique").on(table.smUserId, table.clientSubmissionToken).where(sql`${table.isDeleted} = false`),
     uniqueIndex("sm_questionnaire_submissions_current_assignment_unique").on(table.assignmentId).where(sql`${table.isDeleted} = false and ${table.isCurrent} = true and ${table.assignmentId} is not null`),
+    foreignKey({ name: "sm_submission_smdurcharbeit_visit_target_fk", columns: [table.SMDurcharbeitVisitId, table.SMDurcharbeitTargetId], foreignColumns: [smSMDurcharbeitVisits.id, smSMDurcharbeitVisits.targetId] }).onDelete("restrict"),
+    uniqueIndex("sm_submission_smdurcharbeit_target_unique").on(table.id, table.SMDurcharbeitTargetId),
+    foreignKey({ name: "sm_submission_smdurcharbeit_author_fk", columns: [table.SMDurcharbeitVisitId, table.smUserId], foreignColumns: [smSMDurcharbeitVisits.id, smSMDurcharbeitVisits.smUserId] }).onDelete("restrict"),
+    uniqueIndex("sm_submission_smdurcharbeit_visit_unique").on(table.SMDurcharbeitVisitId).where(sql`${table.SMDurcharbeitVisitId} is not null`),
+    uniqueIndex("sm_submission_smdurcharbeit_live_draft_unique").on(table.SMDurcharbeitTargetId).where(sql`${table.SMDurcharbeitTargetId} is not null and ${table.status} = 'draft' and ${table.isCurrent} and not ${table.isDeleted}`),
+    index("sm_submission_smdurcharbeit_target_idx").on(table.SMDurcharbeitTargetId, table.submittedAt).where(sql`${table.SMDurcharbeitTargetId} is not null`),
+    check("sm_submission_smdurcharbeit_context_ck", sql`(${table.SMDurcharbeitVisitId} is null and ${table.SMDurcharbeitTargetId} is null) or (${table.SMDurcharbeitVisitId} is not null and ${table.SMDurcharbeitTargetId} is not null and ${table.assignmentId} is null and ${table.oncePerMarketSnapshot} = false)`),
     uniqueIndex("sm_questionnaire_submissions_once_per_market_unique").on(table.questionnaireTemplateId, table.smMarketId).where(sql`${table.isDeleted} = false and ${table.isCurrent} = true and ${table.status} = 'submitted' and ${table.oncePerMarketSnapshot} = true`),
     index("sm_questionnaire_submissions_sm_status_idx").on(table.smUserId, table.status, table.submittedAt).where(sql`${table.isDeleted} = false`),
     index("sm_questionnaire_submissions_market_status_idx").on(table.smMarketId, table.status, table.submittedAt).where(sql`${table.isDeleted} = false`),
@@ -3773,3 +3784,74 @@ export type CampaignMarketAssignmentHistoryRow = typeof campaignMarketAssignment
 export type NewCampaignMarketAssignmentHistoryRow = typeof campaignMarketAssignmentHistory.$inferInsert;
 export type QuestionBankRow = typeof questionBankShared.$inferSelect;
 export type NewQuestionBankRow = typeof questionBankShared.$inferInsert;
+
+// Separate undated SMDurcharbeit obligations. Legacy planning and snapshots remain unchanged.
+export const smSMDurcharbeitCampaigns = pgTable("sm_smdurcharbeit_campaigns", {
+  id: uuid("id").defaultRandom().primaryKey(), name: text("name").notNull(),
+  status: text("status").$type<"draft" | "published" | "paused" | "archived">().notNull().default("draft"),
+  startDate: date("start_date").notNull(), endDate: date("end_date").notNull(),
+  questionnaireVersionId: uuid("questionnaire_version_id").notNull().references(() => smQuestionnaireVersions.id, { onDelete: "restrict" }),
+  rosterDraft: jsonb("roster_draft").$type<Array<{ smMarketId: string; smUserId: string | null }>>().notNull().default([]),
+  revision: integer("revision").notNull().default(1),
+  createdByUserId: uuid("created_by_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+  updatedByUserId: uuid("updated_by_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(), updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, t => [index("sm_smdurcharbeit_campaign_window_idx").on(t.status,t.startDate,t.endDate), index("sm_smdurcharbeit_campaign_version_idx").on(t.questionnaireVersionId)]);
+export const smSMDurcharbeitCampaignMarkets = pgTable("sm_smdurcharbeit_campaign_markets", {
+  id: uuid("id").defaultRandom().primaryKey(), campaignId: uuid("campaign_id").notNull().references(() => smSMDurcharbeitCampaigns.id, { onDelete: "restrict" }),
+  smMarketId: uuid("sm_market_id").notNull().references(() => smSMDurcharbeitMarkets.smMarketId, { onDelete: "restrict" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, t => [uniqueIndex("sm_smdurcharbeit_membership_unique").on(t.campaignId,t.smMarketId), uniqueIndex("sm_smdurcharbeit_membership_campaign_unique").on(t.id,t.campaignId), index("sm_smdurcharbeit_membership_market_idx").on(t.smMarketId)]);
+export const smSMDurcharbeitPeriods = pgTable("sm_smdurcharbeit_campaign_periods", {
+  id: uuid("id").defaultRandom().primaryKey(), campaignId: uuid("campaign_id").notNull().references(() => smSMDurcharbeitCampaigns.id, { onDelete: "restrict" }),
+  month: date("month").notNull(), questionnaireVersionId: uuid("questionnaire_version_id").notNull().references(() => smQuestionnaireVersions.id, { onDelete: "restrict" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, t => [uniqueIndex("sm_smdurcharbeit_period_unique").on(t.campaignId,t.month), uniqueIndex("sm_smdurcharbeit_period_campaign_unique").on(t.id,t.campaignId), index("sm_smdurcharbeit_period_version_idx").on(t.questionnaireVersionId)]);
+export const smSMDurcharbeitOwnerRevisions = pgTable("sm_smdurcharbeit_assignment_revisions", {
+  id: uuid("id").defaultRandom().primaryKey(), campaignMarketId: uuid("campaign_market_id").notNull().references(() => smSMDurcharbeitCampaignMarkets.id, { onDelete: "restrict" }),
+  month: date("month").notNull(), smUserId: uuid("sm_user_id").notNull().references(() => users.id, { onDelete: "restrict" }), sourcePerson: text("source_person"), reason: text("reason").notNull(),
+  actorUserId: uuid("actor_user_id").notNull().references(() => users.id, { onDelete: "restrict" }), createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, t => [uniqueIndex("sm_smdurcharbeit_owner_member_unique").on(t.id,t.campaignMarketId),uniqueIndex("sm_smdurcharbeit_owner_user_unique").on(t.id,t.smUserId),index("sm_smdurcharbeit_owner_membership_idx").on(t.campaignMarketId,t.month),index("sm_smdurcharbeit_owner_user_idx").on(t.smUserId)]);
+export const smSMDurcharbeitTargets = pgTable("sm_smdurcharbeit_month_targets", {
+  id: uuid("id").defaultRandom().primaryKey(), campaignId: uuid("campaign_id").notNull().references(() => smSMDurcharbeitCampaigns.id, { onDelete: "restrict" }),
+  periodId: uuid("period_id").notNull(), campaignMarketId: uuid("campaign_market_id").notNull(),
+  ownerRevisionId: uuid("owner_revision_id").notNull().references(() => smSMDurcharbeitOwnerRevisions.id, { onDelete: "restrict" }),
+  marketSnapshot: jsonb("market_snapshot").$type<Record<string, string>>().notNull(), eligibility: text("eligibility").$type<"required" | "waived">().notNull().default("required"),
+  waiverReason: text("waiver_reason"), revision: integer("revision").notNull().default(1),
+  latestSubmissionId: uuid("latest_submission_id").references((): AnyPgColumn => smQuestionnaireSubmissions.id, { onDelete: "restrict" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(), updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t): PgTableExtraConfigValue[] => [uniqueIndex("sm_smdurcharbeit_target_unique").on(t.periodId,t.campaignMarketId),
+  uniqueIndex("sm_smdurcharbeit_target_campaign_unique").on(t.id,t.campaignId),
+  foreignKey({ name:"sm_smdurcharbeit_target_owner_member_fk",columns:[t.ownerRevisionId,t.campaignMarketId],foreignColumns:[smSMDurcharbeitOwnerRevisions.id,smSMDurcharbeitOwnerRevisions.campaignMarketId] }).onDelete("restrict"),
+  foreignKey({ name:"sm_smdurcharbeit_latest_target_fk",columns:[t.latestSubmissionId,t.id],foreignColumns:[smQuestionnaireSubmissions.id,smQuestionnaireSubmissions.SMDurcharbeitTargetId] }).onDelete("restrict"),
+  foreignKey({ columns:[t.periodId,t.campaignId],foreignColumns:[smSMDurcharbeitPeriods.id,smSMDurcharbeitPeriods.campaignId] }).onDelete("restrict"),
+  foreignKey({ columns:[t.campaignMarketId,t.campaignId],foreignColumns:[smSMDurcharbeitCampaignMarkets.id,smSMDurcharbeitCampaignMarkets.campaignId] }).onDelete("restrict"),
+  index("sm_smdurcharbeit_target_owner_idx").on(t.ownerRevisionId,t.eligibility),index("sm_smdurcharbeit_target_membership_idx").on(t.campaignMarketId),index("sm_smdurcharbeit_target_latest_idx").on(t.latestSubmissionId)]);
+export const smSMDurcharbeitVisits = pgTable("sm_smdurcharbeit_visits", {
+  id: uuid("id").defaultRandom().primaryKey(), targetId: uuid("target_id").notNull().references(() => smSMDurcharbeitTargets.id, { onDelete: "restrict" }),
+  ownerRevisionId: uuid("owner_revision_id").notNull().references(() => smSMDurcharbeitOwnerRevisions.id, { onDelete: "restrict" }), smUserId: uuid("sm_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+  basisSubmissionId: uuid("basis_submission_id").references((): AnyPgColumn => smQuestionnaireSubmissions.id, { onDelete: "restrict" }), basisRevision: integer("basis_revision").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t): PgTableExtraConfigValue[] => [uniqueIndex("sm_smdurcharbeit_visit_target_unique").on(t.id,t.targetId),uniqueIndex("sm_smdurcharbeit_visit_user_unique").on(t.id,t.smUserId),
+  foreignKey({name:"sm_smdurcharbeit_visit_owner_user_fk",columns:[t.ownerRevisionId,t.smUserId],foreignColumns:[smSMDurcharbeitOwnerRevisions.id,smSMDurcharbeitOwnerRevisions.smUserId]}).onDelete("restrict"),
+  foreignKey({name:"sm_smdurcharbeit_basis_target_fk",columns:[t.basisSubmissionId,t.targetId],foreignColumns:[smQuestionnaireSubmissions.id,smQuestionnaireSubmissions.SMDurcharbeitTargetId]}).onDelete("restrict"),
+  index("sm_smdurcharbeit_visit_target_idx").on(t.targetId,t.createdAt),index("sm_smdurcharbeit_visit_user_idx").on(t.smUserId),index("sm_smdurcharbeit_visit_owner_idx").on(t.ownerRevisionId),index("sm_smdurcharbeit_visit_basis_idx").on(t.basisSubmissionId)]);
+export const smSMDurcharbeitTimeRevisions = pgTable("sm_smdurcharbeit_visit_time_revisions", {
+  id: uuid("id").defaultRandom().primaryKey(), visitId: uuid("visit_id").notNull().references(() => smSMDurcharbeitVisits.id,{onDelete:"restrict"}),
+  revisionNumber: integer("revision_number").notNull(), isCurrent: boolean("is_current").notNull().default(true), startedAt: timestamp("started_at",{withTimezone:true}).notNull(), completedAt: timestamp("completed_at",{withTimezone:true}).notNull(),
+  actualMinutes: integer("actual_minutes").notNull(), travelMinutes: integer("travel_minutes").notNull().default(0), reason: text("reason").notNull(), actorUserId: uuid("actor_user_id").notNull().references(() => users.id,{onDelete:"restrict"}), createdAt: timestamp("created_at",{withTimezone:true}).defaultNow().notNull(),
+},t=>[uniqueIndex("sm_smdurcharbeit_time_current_unique").on(t.visitId).where(sql`${t.isCurrent}`),uniqueIndex("sm_smdurcharbeit_time_revision_unique").on(t.visitId,t.revisionNumber),check("sm_smdurcharbeit_time_duration_ck",sql`${t.completedAt}-${t.startedAt}<=interval '24 hours' and ${t.actualMinutes}=round(extract(epoch from ${t.completedAt}-${t.startedAt})/60)::integer and btrim(${t.reason})<>''`)]);
+export const smSMDurcharbeitTimeRequests = pgTable("sm_smdurcharbeit_time_change_requests", {
+  id: uuid("id").defaultRandom().primaryKey(), visitId: uuid("visit_id").notNull().references(() => smSMDurcharbeitVisits.id,{onDelete:"restrict"}),smUserId:uuid("sm_user_id").notNull().references(()=>users.id,{onDelete:"restrict"}),
+  expectedRevision:integer("expected_revision").notNull(),kind:text("kind").$type<"time_change"|"deletion">().notNull(),status:text("status").$type<"pending"|"approved"|"rejected"|"cancelled">().notNull().default("pending"),
+  startedAt:timestamp("started_at",{withTimezone:true}),completedAt:timestamp("completed_at",{withTimezone:true}),reason:text("reason").notNull(),clientToken:text("client_token").notNull(),reviewedByUserId:uuid("reviewed_by_user_id").references(()=>users.id,{onDelete:"restrict"}),reviewedAt:timestamp("reviewed_at",{withTimezone:true}),adminNote:text("admin_note"),createdAt:timestamp("created_at",{withTimezone:true}).defaultNow().notNull(),
+},t=>[foreignKey({name:"sm_smdurcharbeit_request_author_fk",columns:[t.visitId,t.smUserId],foreignColumns:[smSMDurcharbeitVisits.id,smSMDurcharbeitVisits.smUserId]}).onDelete("restrict"),uniqueIndex("sm_smdurcharbeit_time_request_token_unique").on(t.smUserId,t.clientToken),uniqueIndex("sm_smdurcharbeit_time_request_pending_unique").on(t.visitId).where(sql`${t.status} = 'pending'`),index("sm_smdurcharbeit_time_request_user_idx").on(t.smUserId,t.status)]);
+export const smSMDurcharbeitAnswerProvenance = pgTable("sm_smdurcharbeit_answer_provenance", {
+  answerId:uuid("answer_id").primaryKey().references(()=>smQuestionAnswers.id,{onDelete:"restrict"}),sourceAnswerId:uuid("source_answer_id").notNull().references(()=>smQuestionAnswers.id,{onDelete:"restrict"}),sourceSubmissionId:uuid("source_submission_id").notNull().references(()=>smQuestionnaireSubmissions.id,{onDelete:"restrict"}),sourceRevision:integer("source_revision").notNull(),createdAt:timestamp("created_at",{withTimezone:true}).defaultNow().notNull(),
+},t=>[foreignKey({name:"sm_smdurcharbeit_source_answer_submission_fk",columns:[t.sourceAnswerId,t.sourceSubmissionId],foreignColumns:[smQuestionAnswers.id,smQuestionAnswers.submissionId]}).onDelete("restrict"),check("sm_smdurcharbeit_source_distinct_ck",sql`${t.answerId}<>${t.sourceAnswerId} and ${t.sourceRevision}>0`),index("sm_smdurcharbeit_provenance_source_idx").on(t.sourceAnswerId),index("sm_smdurcharbeit_provenance_submission_idx").on(t.sourceSubmissionId)]);
+export const smSMDurcharbeitFileLinks = pgTable("sm_smdurcharbeit_answer_file_links", {
+  answerId:uuid("answer_id").notNull().references(()=>smQuestionAnswers.id,{onDelete:"restrict"}),fileId:uuid("file_id").notNull().references(()=>smQuestionAnswerFiles.id,{onDelete:"restrict"}),isDeleted:boolean("is_deleted").notNull().default(false),createdAt:timestamp("created_at",{withTimezone:true}).defaultNow().notNull(),
+},t=>[primaryKey({columns:[t.answerId,t.fileId]}),index("sm_smdurcharbeit_file_links_origin_idx").on(t.fileId).where(sql`not ${t.isDeleted}`)]);
+export const smSMDurcharbeitEvents = pgTable("sm_smdurcharbeit_events", {
+  id:uuid("id").defaultRandom().primaryKey(),campaignId:uuid("campaign_id").notNull().references(()=>smSMDurcharbeitCampaigns.id,{onDelete:"restrict"}),targetId:uuid("target_id").references(()=>smSMDurcharbeitTargets.id,{onDelete:"restrict"}),visitId:uuid("visit_id").references(()=>smSMDurcharbeitVisits.id,{onDelete:"restrict"}),actorUserId:uuid("actor_user_id").notNull().references(()=>users.id,{onDelete:"restrict"}),action:text("action").notNull(),reason:text("reason").notNull(),beforeState:jsonb("before_state").$type<unknown>(),afterState:jsonb("after_state").$type<unknown>(),createdAt:timestamp("created_at",{withTimezone:true}).defaultNow().notNull(),
+},t=>[foreignKey({name:"sm_smdurcharbeit_event_target_campaign_fk",columns:[t.targetId,t.campaignId],foreignColumns:[smSMDurcharbeitTargets.id,smSMDurcharbeitTargets.campaignId]}).onDelete("restrict"),foreignKey({name:"sm_smdurcharbeit_event_visit_target_fk",columns:[t.visitId,t.targetId],foreignColumns:[smSMDurcharbeitVisits.id,smSMDurcharbeitVisits.targetId]}).onDelete("restrict"),check("sm_smdurcharbeit_event_visit_context_ck",sql`${t.visitId} is null or ${t.targetId} is not null`),index("sm_smdurcharbeit_events_campaign_idx").on(t.campaignId,t.createdAt),index("sm_smdurcharbeit_events_target_idx").on(t.targetId),index("sm_smdurcharbeit_events_visit_idx").on(t.visitId)]);

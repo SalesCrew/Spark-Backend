@@ -11,12 +11,13 @@ export function smProfileWeek(today: string): { from: string; to: string } {
   return { from: epochDayToIsoDate(monday), to: epochDayToIsoDate(monday + 6) };
 }
 
-export function summarizeSmProfileWeek(assignments: SmProfileAssignment[]) {
+export function summarizeSmProfileWeek(assignments: SmProfileAssignment[], SMDurcharbeitTimes: Array<{ actualMinutes: number; travelMinutes: number }> = []) {
   const active = assignments.filter((assignment) => assignment.status !== "cancelled");
   return {
     assignmentCount: active.length,
     completedAssignmentCount: active.filter((assignment) => assignment.status === "completed").length,
     plannedMinutes: active.reduce((total, assignment) => total + assignment.effective.plannedMinutes, 0),
-    actualMinutes: active.reduce((total, assignment) => total + (assignment.actualMinutes ?? 0), 0),
+    actualMinutes: active.reduce((total, assignment) => total + (assignment.actualMinutes ?? 0), 0)
+      + SMDurcharbeitTimes.reduce((total, visit) => total + visit.actualMinutes + visit.travelMinutes, 0),
   };
 }

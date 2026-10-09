@@ -26,22 +26,35 @@ export async function lockSmVisitTimes(tx: DbTx, smUserId: string) {
 }
 
 export async function assertSmVisitTimeAvailable(tx: DbTx, input: {
-  smUserId: string; assignmentId: string; startedAt: Date; completedAt: Date;
-}) {
+  smUserId: string; startedAt: Date; completedAt: Date;
+} & ({ assignmentId: string; SMDurcharbeitVisitId?: never } | { assignmentId?: never; SMDurcharbeitVisitId: string })) {
   await lockSmVisitTimes(tx, input.smUserId);
+  const excludeExecution = input.assignmentId
+    ? sql`s.assignment_id is distinct from ${input.assignmentId}::uuid`
+    : sql`s.smdurcharbeit_visit_id is distinct from ${input.SMDurcharbeitVisitId}::uuid`;
   const result = await tx.execute<SmTimeConflict>(sql`
+    with recorded as (
+      select s.id, s.assignment_id, s.smdurcharbeit_visit_id, s.sm_user_id,
+        s.market_name_snapshot, s.market_address_snapshot, s.market_postal_code_snapshot, s.market_city_snapshot,
+        coalesce(campaign_time.started_at, s.visit_started_at) as visit_started_at,
+        coalesce(campaign_time.completed_at, s.visit_completed_at) as visit_completed_at
+      from public.sm_questionnaire_submissions s
+      left join public.sm_smdurcharbeit_visit_time_revisions campaign_time
+        on campaign_time.visit_id = s.smdurcharbeit_visit_id and campaign_time.is_current
+      where (s.smdurcharbeit_visit_id is null and s.status = 'submitted' and s.is_current and not s.is_deleted
+        and exists (select 1 from public.sm_assignment_time_submissions t
+          where t.assignment_id = s.assignment_id and t.is_current and not t.is_deleted))
+        or (s.smdurcharbeit_visit_id is not null and campaign_time.id is not null)
+    )
     select s.id as "submissionId", s.assignment_id as "assignmentId",
       s.market_name_snapshot as "marketName",
       concat_ws(', ', nullif(s.market_address_snapshot, ''), nullif(concat_ws(' ', nullif(s.market_postal_code_snapshot, ''), nullif(s.market_city_snapshot, '')), '')) as "marketAddress",
       s.visit_started_at as "startedAt", s.visit_completed_at as "completedAt"
-    from public.sm_questionnaire_submissions s
+    from recorded s
     where s.sm_user_id = ${input.smUserId}::uuid
-      and s.assignment_id is distinct from ${input.assignmentId}::uuid
-      and s.status = 'submitted' and s.is_current and not s.is_deleted
+      and ${excludeExecution}
       and s.visit_started_at < ${input.completedAt.toISOString()}::timestamptz
       and s.visit_completed_at > ${input.startedAt.toISOString()}::timestamptz
-      and exists (select 1 from public.sm_assignment_time_submissions t
-        where t.assignment_id = s.assignment_id and t.is_current and not t.is_deleted)
     order by s.visit_started_at, s.id
   `);
   // postgres-js returns rows directly; the isolated PGlite harness returns a { rows } result.

@@ -1,5 +1,7 @@
 import { smQuestionnaireCatalogScope } from "./sm-SMDurcharbeit-catalog.shared.js";
 import { smQuestionnaireTemplates } from "./lib/schema.js";
+import { SMDurcharbeitAnswerFiles } from "./sm-SMDurcharbeit-answer-reuse.shared.js";
+import { loadSMDurcharbeitTarget, lockSMDurcharbeitSubmissionContext, reconcileSMDurcharbeitTarget } from "./sm-SMDurcharbeit-campaign.shared.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -13,6 +15,8 @@ import {
   smQuestionAnswerMatrixCells as cells,
   smQuestionAnswerFiles as files,
   smQuestionAnswerEvents as events,
+  smSMDurcharbeitFileLinks as SMDurcharbeitLinks,
+  smSMDurcharbeitTimeRevisions as SMDurcharbeitTimes,
 } from "./lib/schema.js";
 import { computeHiddenQuestionIds } from "./lib/conditional-visibility.js";
 import { smCommentMissing } from "./sm-comment.shared.js";
@@ -74,7 +78,8 @@ export async function loadSmManagementState(tx: SmManagementTx, id: string, writ
   const questionRows = await tx.select().from(questions).where(and(eq(questions.submissionId, id), eq(questions.isDeleted, false)))
     .orderBy(asc(questions.submissionSectionId), asc(questions.orderIndex), asc(questions.id));
   const answerRows = await tx.select().from(answers).where(and(eq(answers.submissionId, id), eq(answers.isDeleted, false), eq(answers.isCurrent, true))).orderBy(asc(answers.id));
-  const photoRows = answerRows.length ? await tx.select().from(files).where(and(inArray(files.answerId, answerRows.map(answer => answer.id)), eq(files.isDeleted, false))).orderBy(asc(files.uploadedAt), asc(files.id)) : [];
+  const photoRows = (await SMDurcharbeitAnswerFiles(tx, answerRows.map(answer => answer.id)))
+    .sort((a, b) => a.uploadedAt.getTime() - b.uploadedAt.getTime() || a.id.localeCompare(b.id));
   const values = new Map<string, SmVisitAnswerPayload>();
   for (const answer of answerRows) {
     const value = (answer.valueJson ?? { kind: "empty" }) as SmVisitAnswerPayload;
@@ -111,17 +116,22 @@ async function appendAnswer(tx: SmManagementTx, state: SmManagementState, questi
   const id = randomUUID(), version = (latest?.answerVersion ?? 0) + 1;
   let nextValue = value;
   const photosToInsert: Array<typeof files.$inferInsert> = [];
+  const SMDurcharbeitPhotosToLink: Array<typeof SMDurcharbeitLinks.$inferInsert> = [];
   if (value.kind === "photo") {
     for (const fileId of value.fileIds) {
       const previous = state.photos.find(file => file.id === fileId && file.answerId === current?.id);
       const fresh = uploaded.find(file => file.id === fileId && file.questionId === question.id);
       if (!previous && !fresh) return fail(400, "sm_management_photo_forbidden", "Ein Foto gehört nicht zu dieser Frage.");
       const photo = previous ?? fresh!;
+      if (previous && state.submission.SMDurcharbeitTargetId) {
+        SMDurcharbeitPhotosToLink.push({ answerId: id, fileId: previous.id });
+        continue;
+      }
       photosToInsert.push({ id: randomUUID(), answerId: id, storageBucket: photo.storageBucket, storagePath: photo.storagePath,
         originalFileName: photo.originalFileName, mimeType: photo.mimeType, byteSize: photo.byteSize,
         widthPx: photo.widthPx, heightPx: photo.heightPx, sha256: photo.sha256, uploadedAt: photo.uploadedAt });
     }
-    nextValue = { ...value, fileIds: photosToInsert.map(photo => photo.id!) };
+    nextValue = { ...value, fileIds: [...photosToInsert.map(photo => photo.id!), ...SMDurcharbeitPhotosToLink.map(photo => photo.fileId)] };
   }
   const selected = chosenOptions(question, value);
   const notApplicable = selected.some(option => option.marksNotApplicable === true);
@@ -144,6 +154,7 @@ async function appendAnswer(tx: SmManagementTx, state: SmManagementState, questi
   })));
   if (value.kind === "matrix" && value.cells.length) await tx.insert(cells).values(value.cells.map((cell, orderIndex) => ({ answerId: id, ...cell, orderIndex })));
   if (photosToInsert.length) await tx.insert(files).values(photosToInsert);
+  if (SMDurcharbeitPhotosToLink.length) await tx.insert(SMDurcharbeitLinks).values(SMDurcharbeitPhotosToLink);
   await tx.insert(events).values({ answerId: id, submissionId: state.submission.id, eventType: "correction", answerVersion: version,
     actorUserId: actor, payload: { source: "sm_admin_correction", reason, previousAnswerId: current?.id ?? null,
       before: state.values.get(question.id) ?? { kind: "empty" }, after: nextValue } });
@@ -156,6 +167,7 @@ export async function applySmAdminCorrection(tx: SmManagementTx, submissionId: s
     if (uploads.length) return fail(400, "sm_management_upload_unverified", "Foto-Upload muss verifiziert werden.");
     return [];
   }) {
+  await lockSMDurcharbeitSubmissionContext(tx, submissionId);
   // Lock the same row as answer/delete-request approvals; never acquire their per-question locks afterwards.
   const [identity] = await tx.select({ id: submissions.id }).from(submissions).where(eq(submissions.id, submissionId)).limit(1).for("update");
   if (!identity) return fail(404, "sm_management_submission_not_found", "Der Fragebogen wurde nicht gefunden.");
@@ -216,6 +228,7 @@ export async function applySmAdminCorrection(tx: SmManagementTx, submissionId: s
   // Indexed by submission; row lock serializes token checks/inserts, including concurrent retries.
   await tx.insert(events).values({ answerId: anchor.answerId, submissionId, eventType: "correction", answerVersion: anchor.answerVersion, actorUserId: actor,
     payload: { source: "sm_admin_correction_committed", clientMutationToken: input.clientMutationToken, requestHash, reason: input.reason, result } });
+  if (state.submission.SMDurcharbeitTargetId) await reconcileSMDurcharbeitTarget(tx, state.submission.SMDurcharbeitTargetId, actor, "answers_corrected");
   return { replayed: false, result };
 }
 
@@ -223,14 +236,17 @@ export async function smManagementDetail(tx: SmManagementTx, id: string) {
   const state = await loadSmManagementState(tx, id);
   const sectionRows = await tx.select().from(sections).where(and(eq(sections.submissionId, id), eq(sections.isDeleted, false))).orderBy(asc(sections.orderIndex));
   const submission = state.submission;
+  const SMDurcharbeit = submission.SMDurcharbeitTargetId ? await loadSMDurcharbeitTarget(tx, submission.SMDurcharbeitTargetId) : null;
+  const [SMDurcharbeitTime] = submission.SMDurcharbeitVisitId ? await tx.select().from(SMDurcharbeitTimes).where(and(eq(SMDurcharbeitTimes.visitId, submission.SMDurcharbeitVisitId), eq(SMDurcharbeitTimes.isCurrent, true))).limit(1) : [];
   const [SMDurcharbeitTemplate] = await tx.select({ stableCode: smQuestionnaireTemplates.stableCode }).from(smQuestionnaireTemplates).where(eq(smQuestionnaireTemplates.id, submission.questionnaireTemplateId)).limit(1);
   return {
     version: state.version,
-    visit: { SMDurcharbeitCatalogScope: SMDurcharbeitTemplate ? smQuestionnaireCatalogScope(SMDurcharbeitTemplate.stableCode) : null, id: submission.id, assignmentId: submission.assignmentId, smUserId: submission.smUserId, smName: submission.smNameSnapshot,
+    visit: { SMDurcharbeitContext: SMDurcharbeit ? { visitId: submission.SMDurcharbeitVisitId, targetId: SMDurcharbeit.target.id, campaignId: SMDurcharbeit.campaign.id, campaignName: SMDurcharbeit.campaign.name, month: SMDurcharbeit.period.month, timeRevision: SMDurcharbeitTime?.revisionNumber ?? null } : null,
+      SMDurcharbeitCatalogScope: SMDurcharbeitTemplate ? smQuestionnaireCatalogScope(SMDurcharbeitTemplate.stableCode) : null, id: submission.id, assignmentId: submission.assignmentId, smUserId: submission.smUserId, smName: submission.smNameSnapshot,
       marketId: submission.smMarketId, marketName: submission.marketNameSnapshot, address: submission.marketAddressSnapshot,
       questionnaireId: submission.questionnaireTemplateId, questionnaireName: submission.questionnaireNameSnapshot, questionnaireVersion: submission.questionnaireVersionSnapshot,
-      startedAt: submission.visitStartedAt?.toISOString() ?? null, completedAt: submission.visitCompletedAt?.toISOString() ?? null,
-      submittedAt: submission.submittedAt?.toISOString() ?? null, travelMinutes: submission.travelMinutes, updatedAt: submission.updatedAt.toISOString() },
+      startedAt: (SMDurcharbeitTime?.startedAt ?? submission.visitStartedAt)?.toISOString() ?? null, completedAt: (SMDurcharbeitTime?.completedAt ?? submission.visitCompletedAt)?.toISOString() ?? null,
+      submittedAt: submission.submittedAt?.toISOString() ?? null, travelMinutes: SMDurcharbeitTime?.travelMinutes ?? submission.travelMinutes, updatedAt: submission.updatedAt.toISOString() },
     sections: sectionRows.map(section => ({ id: section.id, title: section.moduleNameSnapshot, description: section.moduleDescriptionSnapshot,
       questions: state.questions.filter(question => question.submissionSectionId === section.id).map(question => ({
         id: question.id, questionCode: question.questionCodeSnapshot, text: question.questionTextSnapshot, type: question.questionTypeSnapshot,
@@ -240,7 +256,8 @@ export async function smManagementDetail(tx: SmManagementTx, id: string) {
         answerId: state.answers.find(answer => answer.submissionQuestionId === question.id)?.id ?? null,
         answerState: state.answers.find(answer => answer.submissionQuestionId === question.id)?.answerState ?? "unanswered",
         photos: state.photos.filter(photo => state.answers.some(answer => answer.id === photo.answerId && answer.submissionQuestionId === question.id))
-          .map(photo => ({ id: photo.id, fileName: photo.originalFileName, mimeType: photo.mimeType, byteSize: photo.byteSize, storageBucket: photo.storageBucket, storagePath: photo.storagePath })),
+          .map(photo => ({ id: photo.id, fileName: photo.originalFileName, mimeType: photo.mimeType, byteSize: photo.byteSize, storageBucket: photo.storageBucket, storagePath: photo.storagePath,
+            SMDurcharbeitInherited: photo.SMDurcharbeitInherited, uploadedAt: photo.uploadedAt.toISOString() })),
       })) })),
   };
 }

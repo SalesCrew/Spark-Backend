@@ -17,6 +17,8 @@ import * as conditionalVisibility from "./lib/conditional-visibility.js";
 import * as comments from "./sm-comment.shared.js";
 import * as SMDurcharbeitSelection from "./sm-SMDurcharbeit-selection.shared.js";
 import * as SMDurcharbeitCatalog from "./sm-SMDurcharbeit-catalog.shared.js";
+import * as SMDurcharbeitCampaigns from "./sm-SMDurcharbeit-campaign.shared.js";
+import * as SMDurcharbeitReuse from "./sm-SMDurcharbeit-answer-reuse.shared.js";
 import * as planningLock from "./sm-planning-lock.js";
 import * as profileShared from "./sm-profile.shared.js";
 import * as timeOverlap from "./sm-time-overlap.js";
@@ -39,6 +41,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     await pg.exec(await readFile(new URL("../supabase/migrations/20261007124730_SMDurcharbeit_einsatz_override.sql", import.meta.url), "utf8"));
     await pg.exec(await readFile(new URL("../supabase/migrations/20261007133647_SMDurcharbeit_market_registry.sql", import.meta.url), "utf8"));
     await pg.exec(await readFile(new URL("../supabase/migrations/20261008125753_SMDurcharbeit_market_import.sql", import.meta.url), "utf8"));
+    await pg.exec(await readFile(new URL("../supabase/migrations/20261009100850_SMDurcharbeit_monthly_campaigns.sql", import.meta.url), "utf8"));
     await pg.query("insert into users(id,first_name,last_name,role) values ($1,'Local','Admin','sm_admin'),($2,'Local','SM','sm')", [admin, employee]);
     await pg.query("insert into sm_markets(id,name,chain,address,postal_code,city,region) values ($1,'Local Billa','Billa','Testgasse 1','1010','Wien','Ost')", [market]);
     const [template] = await database.insert(schema.smQuestionnaireTemplates).values({ stableCode: "local-template" }).returning();
@@ -165,6 +168,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       Object.assign(req, { authUser: { appUserId: req.header("x-local-actor") ?? admin, role } }); next();
     } };
     const route = await isolatedModule<typeof import("./routes/sm-management.js")>(new URL("./routes/sm-management.ts", import.meta.url), {
+      "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
       "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../sm-management.js": management,
       "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visitShared, "../middleware/auth.js": authMock,
       "../config/env.js": { env: { JWT_SECRET: "isolated-test-only-key-never-used-outside-this-process" } },
@@ -192,6 +196,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     const http = (method: "get" | "post", path: string) => request(app)[method](`/completed${path}`).set("x-local-role", "sm_admin");
 
     const activityRoute = await isolatedModule<typeof import("./routes/sm-activity.js")>(new URL("./routes/sm-activity.ts", import.meta.url), {
+      "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
       "../lib/db.js": { db: database }, "../lib/schema.js": schema, "./sm-management.js": route,
       "../lib/conditional-visibility.js": conditionalVisibility, "../sm-comment.shared.js": comments,
       "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visitShared, "../middleware/auth.js": authMock,
@@ -213,6 +218,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       "../sm-holiday-planning.js": holidays, "../sm-series-management.js": { smSeriesManagementRouter: express.Router() },
     });
     const visitRoute = await isolatedModule<typeof import("./routes/sm-visits.js")>(new URL("./routes/sm-visits.ts", import.meta.url), {
+      "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
       "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection,
       "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": authMock,
       "../lib/conditional-visibility.js": conditionalVisibility, "../sm-comment.shared.js": comments, "../sm-visit.shared.js": visitShared,
@@ -406,7 +412,8 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       await request(app).get(`/completed${range}`).expect(401);
       for (const role of ["gm", "sm"]) await request(app).get(`/completed${range}`).set("x-local-role", role).expect(403);
       await request(app).get(`/completed${range}`).set("x-local-role", "admin").expect(200);
-      await http("get", "?from=2026-01-01&to=2026-12-31").expect(400);
+      const invalidRange = await http("get", "?from=2026-01-01&to=2026-12-31");
+      assert.equal(invalidRange.status, 400, JSON.stringify(invalidRange.body));
       await http("get", "?from=2026-08-31&to=2026-08-01").expect(400);
       await http("get", "?from=2026-08-01&to=2026-08-31&cursorDate=2026-08-31").expect(400);
       await pg.query("update users set is_active=false where id=$1", [employee]);
@@ -424,7 +431,8 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
 
     await t.test("real correction/detail/history endpoints preserve versions and reject stale or wrong visits", async () => {
       const fixture = await seed(), id = fixture.submission.id, questionId = fixture.questions[1]!.id;
-      const before = await http("get", `/${id}`).expect(200);
+      const before = await http("get", `/${id}`);
+      assert.equal(before.status, 200, JSON.stringify(before.body));
       const payload = await input(id, [{ questionId, answer: { kind: "text", value: "Per HTTP korrigiert" } }]);
       await http("post", `/${id}/corrections`).send(payload).expect(200);
       assert.equal((await http("post", `/${id}/corrections`).send(payload).expect(200)).body.replayed, true);
