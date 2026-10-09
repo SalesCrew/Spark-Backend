@@ -28,7 +28,7 @@ import * as monthlyAnswerReuse from "../src/sm-SMDurcharbeit-answer-reuse.shared
 import * as messageShared from "../src/sm-message.shared.js";
 
 /** Actual SM routes and migrations, with all external I/O replaced and a fresh disposable DB. */
-export async function createSMDurcharbeitFixture(options: { photoStorage?: { from: (bucket: string) => any }; clock?: typeof Date; additionalSmUsers?: Array<{ id: string; token: string }>; beforeMonthlyMigrations?: (pg: Awaited<ReturnType<typeof createSMDurcharbeitDisposableDatabase>>["pg"]) => Promise<void> } = {}) {
+export async function createSMDurcharbeitFixture(options: { photoStorage?: { from: (bucket: string) => any }; clock?: typeof Date; additionalSmUsers?: Array<{ id: string; token: string }>; beforeMonthlyMigrations?: (pg: Awaited<ReturnType<typeof createSMDurcharbeitDisposableDatabase>>["pg"]) => Promise<void>; beforeSMDurcharbeitMarketSmUserMigration?: (pg: Awaited<ReturnType<typeof createSMDurcharbeitDisposableDatabase>>["pg"]) => Promise<void> } = {}) {
   if (process.env.DATABASE_URL || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NODE_ENV === "production") {
     throw new Error("Production configuration is forbidden in SMDurcharbeit fixtures.");
   }
@@ -53,6 +53,8 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   await options.beforeMonthlyMigrations?.(pg);
   await pg.exec(await readFile(new URL("../supabase/migrations/20261009100850_SMDurcharbeit_monthly_campaigns.sql", import.meta.url), "utf8"));
   await pg.exec(await readFile(new URL("../supabase/migrations/20261009133000_SMDurcharbeit_context_integrity.sql", import.meta.url), "utf8"));
+  await options.beforeSMDurcharbeitMarketSmUserMigration?.(pg);
+  await pg.exec(await readFile(new URL("../supabase/migrations/20261009160312_SMDurcharbeit_market_sm_user_id.sql", import.meta.url), "utf8"));
   const admin = randomUUID(), employee = randomUUID(), market = randomUUID();
   await pg.query("insert into users(id,first_name,last_name,role) values($1,'Local','Admin','sm_admin'),($2,'Local','SM','sm')", [admin, employee]);
   for (const person of options.additionalSmUsers ?? []) await pg.query("insert into users(id,first_name,last_name,email,role) values($1,'Second','SM','second@preview.test','sm')", [person.id]);

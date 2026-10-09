@@ -534,13 +534,18 @@ export const smSMDurcharbeitMarkets = pgTable("sm_smdurcharbeit_markets", {
   SMDurcharbeitOrt: text("smdurcharbeit_ort"),
   SMDurcharbeitEmEh: text("smdurcharbeit_em_eh"),
   SMDurcharbeitVerplanung: text("smdurcharbeit_verplanung"),
+  SMDurcharbeitSmUserId: uuid("smdurcharbeit_sm_user_id"),
   SMDurcharbeitSourceFile: text("smdurcharbeit_source_file"),
   SMDurcharbeitSourceSheet: text("smdurcharbeit_source_sheet"),
   SMDurcharbeitSourceRow: integer("smdurcharbeit_source_row"),
   SMDurcharbeitSourceValues: jsonb("smdurcharbeit_source_values").$type<Record<string, string>>(),
   SMDurcharbeitImportedAt: timestamp("smdurcharbeit_imported_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-}, table => [uniqueIndex("sm_smdurcharbeit_source_key_unique").on(table.SMDurcharbeitSourceKey).where(sql`${table.SMDurcharbeitSourceKey} is not null`)]);
+}, table => [
+  uniqueIndex("sm_smdurcharbeit_source_key_unique").on(table.SMDurcharbeitSourceKey).where(sql`${table.SMDurcharbeitSourceKey} is not null`),
+  foreignKey({ name: "sm_smdurcharbeit_market_sm_user_fk", columns: [table.SMDurcharbeitSmUserId], foreignColumns: [users.id] }).onDelete("restrict"),
+  index("sm_smdurcharbeit_market_sm_user_idx").on(table.SMDurcharbeitSmUserId).where(sql`${table.SMDurcharbeitSmUserId} is not null`),
+]);
 
 export const smMessages = pgTable(
   "sm_messages",

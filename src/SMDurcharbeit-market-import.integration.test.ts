@@ -122,9 +122,11 @@ test('SMDurcharbeit: invalid rows, ambiguous names, archived markets and manual 
     const [target] = await f.database.select().from(f.schema.smSMDurcharbeitMarkets);
     // A reviewed account is kept even when the source names change; archived markets never resurrect.
     await f.database.update(f.schema.smMarkets).set({assignedSmUserId:f.employee}).where(eq(f.schema.smMarkets.id,target!.smMarketId));
+    await f.database.update(f.schema.smSMDurcharbeitMarkets).set({SMDurcharbeitSmUserId:f.employee}).where(eq(f.schema.smSMDurcharbeitMarkets.smMarketId,target!.smMarketId));
     payload.rows[1]![6]='Different Synthetic Person';
     await admin(route+'/import').send(payload).expect(200);
     assert.equal((await f.database.select().from(f.schema.smMarkets).where(eq(f.schema.smMarkets.id,target!.smMarketId)))[0]!.assignedSmUserId,f.employee);
+    assert.equal((await f.database.select().from(f.schema.smSMDurcharbeitMarkets).where(eq(f.schema.smSMDurcharbeitMarkets.smMarketId,target!.smMarketId)))[0]!.SMDurcharbeitSmUserId,f.employee);
     await f.database.update(f.schema.smMarkets).set({isDeleted:true}).where(eq(f.schema.smMarkets.id,target!.smMarketId));
     const archived=(await admin(route+'/import').send(payload).expect(200)).body;
     assert.equal(archived.summary.created,0); assert.equal(archived.summary.skipped,2);
