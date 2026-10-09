@@ -44,7 +44,9 @@ adminSMDurcharbeitCampaignsRouter.get("/options", async (_req, res, next) => {
   try {
     const [markets, people, questionnaires] = await Promise.all([
       db.select({ id: smMarkets.id, name: smMarkets.name, address: smMarkets.address, postalCode: smMarkets.postalCode, city: smMarkets.city,
-        region: smMarkets.region, chain: smMarkets.chain, assignedSmUserId: smMarkets.assignedSmUserId, sourcePerson: smSMDurcharbeitMarkets.SMDurcharbeitVerplanung })
+        region: smMarkets.region, chain: smMarkets.chain,
+        assignedSmUserId: sql<string | null>`coalesce(${smSMDurcharbeitMarkets.SMDurcharbeitSmUserId}, ${smMarkets.assignedSmUserId})`,
+        sourcePerson: smSMDurcharbeitMarkets.SMDurcharbeitVerplanung })
         .from(smSMDurcharbeitMarkets).innerJoin(smMarkets, eq(smMarkets.id, smSMDurcharbeitMarkets.smMarketId))
         .where(and(eq(smMarkets.isDeleted, false), eq(smMarkets.isActive, true))).orderBy(asc(smMarkets.name), asc(smMarkets.id)),
       db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName }).from(users).where(and(eq(users.role, "sm"), eq(users.isActive, true), isNull(users.deletedAt))).orderBy(asc(users.lastName), asc(users.id)),
