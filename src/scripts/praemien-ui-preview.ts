@@ -15,6 +15,7 @@ for (let i = 1; i <= 120; i++) {
   const id = randomUUID(), type = i <= 80 ? "numeric" : i <= 100 ? "yesno" : i <= 115 ? "single" : "text";
   const text = `${i <= 80 ? "Display" : i <= 100 ? "Distribution" : i <= 115 ? "Platzierung" : "Kommentar"} ${String(i).padStart(3, "0")} · synthetische Testfrage`;
   await fixture.pg.query("insert into question_bank_shared(id,text,question_type,config) values($1,$2,$3,$4)", [id, text, type, JSON.stringify(type === "single" ? { options: ["Kühler", "Großplatzierung", "Keine"] } : {})]);
+  await fixture.pg.query("insert into module_main_question(module_id,question_id) values($1,$2)", [fixture.ids.catalogModule, id]);
   if (type !== "text") await fixture.pg.query("insert into question_scoring(question_id,score_key,boni) values($1,$2,1)", [id, type === "numeric" ? "__value__" : type === "yesno" ? "Ja" : "Kühler"]);
   if (type === "yesno") await fixture.pg.query("insert into question_scoring(question_id,score_key,boni) values($1,'Nein',0)", [id]);
 }

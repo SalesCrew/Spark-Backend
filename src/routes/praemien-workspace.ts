@@ -12,6 +12,7 @@ import {
   type ModelDatabase,
 } from "../lib/praemien-workspace.js";
 import type { AuthedRequest } from "../middleware/auth.js";
+import { activeBonusQuestions } from "../lib/praemien-active-questions.js";
 
 // Mounted below the existing admin/kunde auth and page-permission middleware.
 // The same router is mounted behind synthetic authentication only in local tests.
@@ -89,10 +90,8 @@ export function createPraemienWorkspaceRouter(database: ModelDatabase) {
   });
   router.get("/sources", async (_req, res, next) => {
     try {
-      res.json({
-        questions: await database.query(
-          sql`select q.id,q.text,q.question_type as type,q.config, q.updated_at::text as "updatedAt", coalesce(jsonb_agg(jsonb_build_object('scoreKey',s.score_key,'weight',s.boni)) filter(where s.id is not null),'[]'::jsonb) as scores from question_bank_shared q left join question_scoring s on s.question_id=q.id and s.is_deleted=false where q.is_deleted=false group by q.id order by q.text`,
-        ),
+      res.set("Cache-Control", "private, no-store").json({
+        questions: await activeBonusQuestions(database),
       });
     } catch (error) {
       next(error);
