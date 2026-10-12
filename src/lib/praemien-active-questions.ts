@@ -19,13 +19,13 @@ export async function activeBonusQuestions(database: ModelDatabase, at = new Dat
       ? sql`c.section in ('standard','flex','billa') and c.section::text = any(f.section_keywords::text[])`
       : sql`c.section = ${scope}`;
     return [
-      sql`select mq.question_id from active_campaigns c
+      sql`select mq.question_id,c.section::text as section from active_campaigns c
         join ${questionnaire} f on f.id=c.current_fragebogen_id and f.is_deleted=false
         join ${moduleLink} fm on fm.fragebogen_id=f.id and fm.is_deleted=false
         join ${module} m on m.id=fm.module_id and m.is_deleted=false
         join ${questionLink} mq on mq.module_id=m.id and mq.is_deleted=false
         where ${section}`,
-      sql`select sq.question_id from active_campaigns c
+      sql`select sq.question_id,c.section::text as section from active_campaigns c
         join ${questionnaire} f on f.id=c.current_fragebogen_id and f.is_deleted=false
         join ${specialLink} sq on sq.fragebogen_id=f.id and sq.is_deleted=false
         where ${section}`,
@@ -34,7 +34,7 @@ export async function activeBonusQuestions(database: ModelDatabase, at = new Dat
   const questions = await database.query<{
     id: string; text: string; type: string; config: Record<string, unknown>;
     scores: { scoreKey: string; weight: number | null }[];
-    updatedAt: string; isSpezial: boolean;
+    updatedAt: string; isSpezial: boolean; activeSections: string[];
   }>(sql`
     with active_campaigns as (
       select section,current_fragebogen_id from campaigns
@@ -46,11 +46,17 @@ export async function activeBonusQuestions(database: ModelDatabase, at = new Dat
     ), active_questions as (${sql.join(questionLinks, sql` union `)})
     select q.id,q.text,q.question_type as type,q.config,
       q.updated_at::text as "updatedAt",q.is_spezial as "isSpezial",
+      (select jsonb_agg(distinct a.section order by a.section)
+        from active_questions a where a.question_id=q.id) as "activeSections",
       coalesce(jsonb_agg(jsonb_build_object('scoreKey',s.score_key,'weight',s.boni))
         filter(where s.id is not null),'[]'::jsonb) as scores
     from question_bank_shared q
     left join question_scoring s on s.question_id=q.id and s.is_deleted=false
     where q.is_deleted=false and exists(select 1 from active_questions a where a.question_id=q.id)
+      and exists(select 1 from question_scoring b
+        where b.question_id=q.id and b.is_deleted=false and b.boni is not null and b.boni<>0
+          and ((q.question_type in ('numeric','slider') and b.score_key='__value__')
+            or (q.question_type not in ('numeric','slider') and b.score_key<>'__value__')))
     group by q.id order by q.text
   `);
   return questions

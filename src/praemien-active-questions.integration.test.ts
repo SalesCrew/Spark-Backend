@@ -21,6 +21,7 @@ async function campaign(f: Fixture, section: string, patch: {
   await f.pg.query(`insert into fragebogen_${scope}_module(fragebogen_id,module_id) values($1,$2)`, [questionnaire,module]);
   await f.pg.query("insert into question_bank_shared(id,text,question_type) values($1,$2,'numeric')", [question,`Synthetic ${section} ${id}`]);
   await f.pg.query(`insert into module_${scope}_question(module_id,question_id) values($1,$2)`, [module,question]);
+  await f.pg.query("insert into question_scoring(question_id,score_key,boni) values($1,'__value__',2)",[question]);
   await f.pg.query("insert into campaigns(id,section,current_fragebogen_id,status,schedule_type,start_date,end_date,is_deleted) values($1,$2,$3,$4,$5,$6,$7,$8)", [id,section,questionnaire,patch.status ?? "active",patch.schedule ?? "always",patch.start ?? null,patch.end ?? null,patch.deleted ?? false]);
   return { id, questionnaire, module, question, scope };
 }
@@ -35,6 +36,7 @@ test("Boni sources include only live campaign questionnaires across all six GM v
     for (const scope of ["main","kuehler","mhd","durcharbeit"]) {
       const x = live.find(x=>x.scope===scope)!, id=randomUUID();
       await f.pg.query("insert into question_bank_shared(id,text,question_type,is_spezial) values($1,$2,'yesno',true)",[id,`Synthetic special ${scope}`]);
+      await f.pg.query("insert into question_scoring(question_id,score_key,boni) values($1,'Ja',3)",[id]);
       await f.pg.query(`insert into fragebogen_${scope}_spezial_question(fragebogen_id,question_id) values($1,$2)`,[x.questionnaire,id]);
       specialIds.push(id);
     }
@@ -50,6 +52,17 @@ test("Boni sources include only live campaign questionnaires across all six GM v
       await campaign(f,"standard",{questionnaireDeleted:true}),
       await campaign(f,"billa",{sections:["standard"]}),
     ];
+    for (const value of [null,0]) {
+      const x=await campaign(f,"standard");
+      await f.pg.query("update question_scoring set boni=$2 where question_id=$1",[x.question,value]);
+      exclusions.push(x);
+    }
+    const withoutScores=await campaign(f,"standard");
+    await f.pg.query("delete from question_scoring where question_id=$1",[withoutScores.question]);
+    exclusions.push(withoutScores);
+    const removedScore=await campaign(f,"standard");
+    await f.pg.query("update question_scoring set is_deleted=true where question_id=$1",[removedScore.question]);
+    exclusions.push(removedScore);
     for (const table of ["module_main","module_main_question","fragebogen_main_module","question_bank_shared"]) {
       const x = await campaign(f,"standard");
       const key = table === "module_main" ? "id" : table === "module_main_question" ? "question_id" : table === "fragebogen_main_module" ? "fragebogen_id" : "id";
@@ -60,7 +73,11 @@ test("Boni sources include only live campaign questionnaires across all six GM v
     const orphan = randomUUID();
     await f.pg.query("insert into question_bank_shared(id,text,question_type) values($1,'Unlinked old question','numeric')",[orphan]);
     const rows = await activeBonusQuestions(f.database,at), ids = new Set(rows.map(q => q.id));
-    for (const x of [...live,scheduled]) assert.ok(ids.has(x.question),"Editorially inactive questionnaire remains eligible through its live campaign");
+    for (const x of [...live,scheduled]) {
+      assert.ok(ids.has(x.question),"Editorially inactive questionnaire remains eligible through its live campaign");
+      const section=live.indexOf(x)>=0 ? ["standard","flex","billa","kuehler","mhd","durcharbeit"][live.indexOf(x)] : "standard";
+      assert.deepEqual(rows.find(q=>q.id===x.question)!.activeSections,[section]);
+    }
     for (const id of specialIds) assert.ok(ids.has(id),"Linked Spezialfragen supported across all questionnaire scopes");
     for (const x of exclusions) assert.ok(!ids.has(x.question),"Inactive, expired, future, deleted or mismatched context excluded");
     assert.ok(!ids.has(orphan));
@@ -86,6 +103,7 @@ test("Vienna date boundaries, shared-question deduplication, score preservation 
     ] as const) {
       const id = randomUUID();
       await f.pg.query("insert into question_bank_shared(id,text,question_type,is_spezial,config) values($1,$2,'yesno',true,$3)",[id,`Special ${id}`,JSON.stringify(config)]);
+      await f.pg.query("insert into question_scoring(question_id,score_key,boni) values($1,'Ja',1)",[id]);
       await f.pg.query("insert into fragebogen_main_spezial_question(fragebogen_id,question_id) values($1,$2)",[x.questionnaire,id]);
       specials.push({id,visible});
     }
