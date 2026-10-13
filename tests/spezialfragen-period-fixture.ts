@@ -8,6 +8,7 @@ import { getTableConfig, PgDialect, PgTable } from 'drizzle-orm/pg-core';
 import express from 'express';
 import * as schema from '../src/lib/schema.js';
 import * as period from '../src/lib/spezialfragen-period.js';
+import * as chainApplicability from '../src/lib/question-chain-applicability.js';
 import * as persistence from '../src/lib/spezialfragen-persistence.js';
 import * as deepCopy from '../src/lib/fragebogen-deep-copy.js';
 import * as moduleLinks from '../src/lib/fragebogen-module-links.js';
@@ -78,7 +79,7 @@ export async function spezialfragenPeriodFixture(initialTime?: Date, withCampaig
     return activeTransaction ? (await activeTransaction.execute(sql.raw(parts.join('')))).rows : (await pg.query(parts.join(''))).rows;
   };
   const logger = { logger: { warn() {}, info() {}, error() {} }, logAction() {}, startActionTimer: () => 0, aggregateHighVolumeLoad() {}, getRequestLogMeta: () => ({}), markErrorAsLogged() {}, serializeError: (error: Error) => ({ message: error.message }) };
-  const base = { '../lib/db.js': { db, sql: pgSql }, '../lib/schema.js': schema, '../lib/logger.js': logger, '../middleware/auth.js': auth, '../lib/spezialfragen-period.js': period };
+  const base = { '../lib/db.js': { db, sql: pgSql }, '../lib/schema.js': schema, '../lib/logger.js': logger, '../middleware/auth.js': auth, '../lib/spezialfragen-period.js': period, '../lib/question-chain-applicability.js': chainApplicability };
   async function replacementsFor(file: string) {
     const result: Record<string, unknown> = {};
     const src = await readFile(new URL(file, import.meta.url), 'utf8');

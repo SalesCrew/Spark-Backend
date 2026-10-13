@@ -11,6 +11,7 @@ import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { toYmdInTimezone } from "../lib/day-session.js";
 import { selectEffectiveFlexCampaigns } from "../lib/flex-campaign-selection.js";
+import { isQuestionApplicableToMarketChain } from "../lib/question-chain-applicability.js";
 import { normalizeCrossDomainMarketIdentity } from "../market-identity.shared.js";
 import { resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
 import { resolveBillaGmFilterEnrollment } from "../billa-gm-market-filter.shared.js";
@@ -232,13 +233,6 @@ function isMarketVisibleForBillaGm(
   matchValues: string[],
 ): boolean {
   return matchValues.length > 0 ? marketMatchesSpecialArthurFilter(market, matchValues) : isBillaMarketRow(market);
-}
-
-function isQuestionApplicableToMarketChain(questionChains: string[] | null | undefined, marketChain: string): boolean {
-  const normalizedChains = normalizeQuestionChains(questionChains);
-  if (normalizedChains.length === 0) return true;
-  if (!marketChain) return false;
-  return normalizedChains.includes(marketChain);
 }
 
 function extractConfiguredPhotoTagIds(config: Record<string, unknown>): string[] {

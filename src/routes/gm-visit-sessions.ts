@@ -17,6 +17,7 @@ import { addDays, startOfDay } from "../lib/red-monat.js";
 import { resolveCurrentRedPeriod, resolveRedPeriodForDate } from "../lib/red-month-periods.js";
 import { selectMissingSpezialfragenForSession } from "../lib/spezialfragen-session-sync.js";
 import { isSpezialfrageActive } from "../lib/spezialfragen-period.js";
+import { isQuestionApplicableToMarketChain } from "../lib/question-chain-applicability.js";
 import { readRequestedCommentChange, requestedCommentSummary } from "../lib/answer-change-request.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
@@ -493,13 +494,6 @@ function normalizeQuestionChains(chains: string[] | null | undefined): string[] 
       .map((entry) => normalizeMarketChain(entry))
       .filter((entry) => entry.length > 0),
   );
-}
-
-function isQuestionApplicableToMarketChain(questionChains: string[] | null | undefined, marketChain: string): boolean {
-  const normalizedChains = normalizeQuestionChains(questionChains);
-  if (normalizedChains.length === 0) return true;
-  if (!marketChain) return false;
-  return normalizedChains.includes(marketChain);
 }
 
 function extractRuleAnswerValue(answer: (typeof visitAnswers.$inferSelect) | undefined): string | string[] | undefined {
