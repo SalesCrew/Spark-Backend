@@ -17,6 +17,7 @@ import { resolveCurrentRedPeriod } from "../lib/red-month-periods.js";
 import { resolveBillaGmFilterEnrollment } from "../billa-gm-market-filter.shared.js";
 import { planGmMarketSnapshot, planKuehlerMarketSnapshot } from "../gm-market-snapshot.shared.js";
 import { classifyUniversumImportRow } from "../universum-import.shared.js";
+import { assertUniversePromotion, MarketClassificationError, resolveMarketClassification } from "../market-classification.shared.js";
 import {
   campaignMarketAssignments,
   campaigns,
@@ -458,6 +459,7 @@ type MarketType = z.infer<typeof marketTypeSchema>;
 
 const updateMarketSchema = z
   .object({
+    expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
     standardMarketNumber: z.string().optional(),
     cokeMasterNumber: z.string().optional(),
     flexNumber: z.string().optional(),
@@ -4770,15 +4772,18 @@ adminMarketsRouter.patch("/:id/universe-market", async (req: AuthedRequest, res,
       return;
     }
 
-    const [updated] = await db
-      .update(markets)
-      .set({
-        universeMarket: parsed.data.universeMarket,
-        updatedAt: new Date(),
-      })
-      .where(and(eq(markets.id, id), eq(markets.isDeleted, false)))
-      .returning();
-
+    const updated = await db.transaction(async (tx) => {
+      const [existing] = await tx.select().from(markets)
+        .where(and(eq(markets.id, id), eq(markets.isDeleted, false))).limit(1).for("update");
+      if (!existing) return null;
+      const marketType = resolveMarketClassification(existing.marketType, parsed.data);
+      assertUniversePromotion(existing, { ...existing, marketType }, normalizeRegionValue(existing.region).ok);
+      const identity = resolveKuehlerIdentity({ marketType, existingKuehlerStammnr: existing.kuehlerStammnr, existingCokeMasterNumber: existing.cokeMasterNumber });
+      if (!identity.ok) throw new MarketClassificationError(400, "market_type_requirements", identity.error, ["kuehlerStammnr"]);
+      const [saved] = await tx.update(markets).set({ marketType, universeMarket: deriveUniverseMarketFromType(marketType), updatedAt: new Date(Math.max(Date.now(), existing.updatedAt.getTime() + 1)) })
+        .where(eq(markets.id, id)).returning();
+      return saved;
+    });
     if (!updated) {
       res.status(404).json({ error: "Markt nicht gefunden." });
       return;
@@ -4787,9 +4792,11 @@ adminMarketsRouter.patch("/:id/universe-market", async (req: AuthedRequest, res,
       market: {
         id: updated.id,
         universeMarket: updated.universeMarket,
+        marketType: updated.marketType,
       },
     });
   } catch (err) {
+    if (err instanceof MarketClassificationError) { res.status(err.statusCode).json({ error: err.message, code: err.code, fields: err.fields }); return; }
     next(err);
   }
 });
@@ -4825,106 +4832,82 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
     }
 
     const payload = parsed.data;
-    const [existingMarket] = await db
-      .select()
-      .from(markets)
-      .where(and(eq(markets.id, id), eq(markets.isDeleted, false)))
-      .limit(1);
-
-    if (!existingMarket) {
-      logAction("warn", "market_update_not_found", {
-        req,
-        action: "market_update",
-        result: "rejected",
-        statusCode: 404,
-        requestClass: "client_error",
-        startedAtNs,
-        details: { marketId: id },
-      });
-      res.status(404).json({ error: "Market not found." });
-      return;
-    }
-
-    const resolvedMarketType: MarketType = payload.marketType
-      ? payload.marketType
-      : payload.universeMarket != null
-        ? payload.universeMarket
-          ? existingMarket.marketType === "kuehler"
-            ? "universum"
-            : existingMarket.marketType
-          : "kuehler"
-        : existingMarket.marketType;
-    const resolvedUniverseMarket = payload.universeMarket ?? existingMarket.universeMarket;
-    const identityResolution = resolveKuehlerIdentity({
-      marketType: resolvedMarketType,
-      incomingKuehlerStammnr: payload.kuehlerStammnr,
-      incomingCokeMasterNumber: payload.cokeMasterNumber,
-      existingKuehlerStammnr: existingMarket.kuehlerStammnr,
-      existingCokeMasterNumber: existingMarket.cokeMasterNumber,
-    });
-    if (!identityResolution.ok) {
-      res.status(400).json({ error: identityResolution.error });
-      return;
-    }
-    const resolvedStammnr = identityResolution.stammnr;
-
-    const normalizedRegion = payload.region != null ? normalizeRegionValue(payload.region) : null;
-    if (normalizedRegion && !normalizedRegion.ok) {
-      logAction("warn", "market_update_invalid_region", {
-        req,
-        action: "market_update",
-        result: "rejected",
-        statusCode: 400,
-        requestClass: "client_error",
-        startedAtNs,
-        details: { region: normalizedRegion.raw },
-      });
-      res.status(400).json({
-        error: `Unbekannte Region "${normalizedRegion.raw || payload.region}". Erlaubt: ${CANONICAL_REGIONS.join(", ")}.`,
-      });
-      return;
-    }
-    const now = new Date();
     const transactionResult = await db.transaction(async (tx) => {
+      // Lock and validate the current record before writing any identifiers or classification.
+      const [existingMarket] = await tx.select().from(markets)
+        .where(and(eq(markets.id, id), eq(markets.isDeleted, false))).limit(1).for("update");
+      if (!existingMarket) return null;
+      if (payload.expectedUpdatedAt && new Date(payload.expectedUpdatedAt).getTime() !== existingMarket.updatedAt.getTime()) {
+        throw new MarketClassificationError(409, "market_changed", "Der Markt wurde inzwischen geändert. Bitte neu laden und die Änderungen erneut prüfen.");
+      }
+      const now = new Date(Math.max(Date.now(), existingMarket.updatedAt.getTime() + 1));
+      const resolvedMarketType = resolveMarketClassification(existingMarket.marketType, payload);
+      const classificationChanged = resolvedMarketType !== existingMarket.marketType;
+      const universeFlagChanged = payload.universeMarket != null && payload.universeMarket !== existingMarket.universeMarket;
+      if (payload.marketType && payload.universeMarket != null && (classificationChanged || universeFlagChanged) && payload.universeMarket !== deriveUniverseMarketFromType(resolvedMarketType)) {
+        throw new MarketClassificationError(400, "market_type_conflict", "Markt-Typ und Universumsmarkt-Zuordnung widersprechen sich.");
+      }
+      // Preserve legacy cohort flags on ordinary edits; an explicit type change saves a coherent pair.
+      const resolvedUniverseMarket = classificationChanged || universeFlagChanged
+        ? deriveUniverseMarketFromType(resolvedMarketType) : existingMarket.universeMarket;
+      const normalizedRegion = payload.region != null ? normalizeRegionValue(payload.region) : null;
+      if (normalizedRegion && !normalizedRegion.ok) {
+        throw new MarketClassificationError(400, "market_region_invalid", `Unbekannte Region "${normalizedRegion.raw || payload.region}". Erlaubt: ${CANONICAL_REGIONS.join(", ")}.`, ["region"]);
+      }
+      assertUniversePromotion(existingMarket, {
+        ...existingMarket, marketType: resolvedMarketType,
+        name: payload.name ?? existingMarket.name, address: payload.address ?? existingMarket.address,
+        postalCode: payload.postalCode ?? existingMarket.postalCode, city: payload.city ?? existingMarket.city,
+        flexNumber: payload.flexNumber != null ? normalizeIdentity(payload.flexNumber) : existingMarket.flexNumber,
+        region: normalizedRegion?.ok ? normalizedRegion.canonical : existingMarket.region,
+      }, (normalizedRegion ?? normalizeRegionValue(existingMarket.region)).ok);
+      const identityResolution = resolveKuehlerIdentity({
+        marketType: resolvedMarketType,
+        incomingKuehlerStammnr: payload.kuehlerStammnr, incomingCokeMasterNumber: payload.cokeMasterNumber,
+        existingKuehlerStammnr: existingMarket.kuehlerStammnr, existingCokeMasterNumber: existingMarket.cokeMasterNumber,
+      });
+      if (!identityResolution.ok) throw new MarketClassificationError(400, "market_type_requirements", identityResolution.error, ["kuehlerStammnr"]);
+      const resolvedStammnr = identityResolution.stammnr;
       const [updated] = await tx
         .update(markets)
         .set({
-        standardMarketNumber:
-          payload.standardMarketNumber != null
-            ? normalizeIdentity(payload.standardMarketNumber)
-            : undefined,
-        cokeMasterNumber:
-          resolvedMarketType === "universum"
-            ? payload.cokeMasterNumber != null
-              ? normalizeIdentity(payload.cokeMasterNumber)
-              : undefined
-            : resolvedStammnr,
-        flexNumber: payload.flexNumber != null ? normalizeIdentity(payload.flexNumber) : undefined,
-        name: payload.name,
-        dbName: payload.dbName != null ? (normalizeOptionalText(payload.dbName) ?? "") : undefined,
-        address: payload.address,
-        postalCode: payload.postalCode,
-        city: payload.city,
-        region: normalizedRegion?.ok ? normalizedRegion.canonical : payload.region,
-        emEh: payload.emEh != null ? (normalizeOptionalText(payload.emEh) ?? "") : undefined,
-        employee:
-          payload.employee != null ? (normalizeOptionalText(payload.employee) ?? "") : undefined,
-        currentGmName:
-          payload.currentGmName != null
-            ? (normalizeOptionalText(payload.currentGmName) ?? "")
-            : undefined,
-        visitFrequencyPerYear: payload.visitFrequencyPerYear,
-        infoFlag: payload.infoFlag,
-        infoNote: payload.infoNote,
-        universeMarket: resolvedUniverseMarket,
-        marketType: resolvedMarketType,
-        kuehlerStammnr: resolvedMarketType === "universum" ? null : resolvedStammnr,
-        isActive: payload.isActive,
-        importSourceFileName: payload.importSourceFileName,
-        importedAt: payload.importedAt ? new Date(payload.importedAt) : undefined,
-        plannedToId: payload.plannedToId,
+          standardMarketNumber:
+            payload.standardMarketNumber != null
+              ? normalizeIdentity(payload.standardMarketNumber)
+              : undefined,
+          cokeMasterNumber:
+            resolvedMarketType === "universum"
+              ? payload.cokeMasterNumber != null
+                ? normalizeIdentity(payload.cokeMasterNumber)
+                : undefined
+              : resolvedStammnr,
+          flexNumber: payload.flexNumber != null ? normalizeIdentity(payload.flexNumber) : undefined,
+          name: payload.name,
+          dbName: payload.dbName != null ? (normalizeOptionalText(payload.dbName) ?? "") : undefined,
+          address: payload.address,
+          postalCode: payload.postalCode,
+          city: payload.city,
+          region: normalizedRegion?.ok ? normalizedRegion.canonical : payload.region,
+          emEh: payload.emEh != null ? (normalizeOptionalText(payload.emEh) ?? "") : undefined,
+          employee:
+            payload.employee != null ? (normalizeOptionalText(payload.employee) ?? "") : undefined,
+          currentGmName:
+            payload.currentGmName != null
+              ? (normalizeOptionalText(payload.currentGmName) ?? "")
+              : undefined,
+          visitFrequencyPerYear: payload.visitFrequencyPerYear,
+          infoFlag: payload.infoFlag,
+          infoNote: payload.infoNote,
+          universeMarket: resolvedUniverseMarket,
+          marketType: resolvedMarketType,
+          // Removing the cooler classification never deletes its identity or physical units.
+          kuehlerStammnr: resolvedMarketType === "universum" ? existingMarket.kuehlerStammnr : resolvedStammnr,
+          isActive: payload.isActive,
+          importSourceFileName: payload.importSourceFileName,
+          importedAt: payload.importedAt ? new Date(payload.importedAt) : undefined,
+          plannedToId: payload.plannedToId,
           updatedAt: now,
-        })
+          })
         .where(eq(markets.id, existingMarket.id))
         .returning();
 
@@ -4972,6 +4955,7 @@ adminMarketsRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       },
     });
   } catch (err) {
+    if (err instanceof MarketClassificationError) { res.status(err.statusCode).json({ error: err.message, code: err.code, fields: err.fields }); return; }
     if (isIdentityConstraintViolation(err)) {
       logAction("warn", "market_update_identity_conflict", {
         req,
