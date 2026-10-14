@@ -44,12 +44,19 @@ export async function lockSMDurcharbeitSubmissionContext(tx: SMDurcharbeitTx, su
   return identity?.targetId ?? null;
 }
 export async function SMDurcharbeitEvent(tx: SMDurcharbeitTx, input: typeof events.$inferInsert) { await tx.insert(events).values(input); }
-/** Open obligations follow the registry; any physical visit pins its recorded owner. Reads never rewrite history. */
+/** A monthly override is an immutable assignment revision plus its atomic, target-scoped event. */
+export function SMDurcharbeitHasSmOverride() {
+  return sql<boolean>`exists (select 1 from ${events} where ${events.targetId} = ${targets.id}
+    and ${events.action} = 'SMDurcharbeit_owner_override'
+    and ${events.afterState}->>'ownerRevisionId' = ${targets.ownerRevisionId}::text)`;
+}
+/** Open obligations follow the registry unless explicitly overridden for this month. Reads never rewrite history. */
 export function SMDurcharbeitEffectiveOwner() {
   const today = SMDurcharbeitToday();
   return sql<string | null>`case when ${periods.month} >= ${SMDurcharbeitMonth(today)}::date
     and ${campaigns.status} in ('published','paused') and ${campaigns.endDate} >= ${today}::date
     and ${targets.latestSubmissionId} is null
+    and not ${SMDurcharbeitHasSmOverride()}
     and not exists (select 1 from ${visits} where ${visits.targetId} = ${targets.id})
     then ${smSMDurcharbeitMarkets.SMDurcharbeitSmUserId} else ${owners.smUserId} end`;
 }
@@ -167,7 +174,7 @@ export async function listSMDurcharbeitTargets(executor: SMDurcharbeitExecutor, 
   const filters = [eq(periods.month,month),sql`${campaigns.status} <> 'draft'`];
   if (input.campaignId) filters.push(eq(campaigns.id,input.campaignId));
   if (input.smUserId) filters.push(eq(SMDurcharbeitEffectiveOwner(),input.smUserId));
-  const rows = await executor.select({target:targets,campaign:campaigns,period:periods,owner:owners,member:memberships,effectiveSmUserId:SMDurcharbeitEffectiveOwner(),
+  const rows = await executor.select({target:targets,campaign:campaigns,period:periods,owner:owners,member:memberships,effectiveSmUserId:SMDurcharbeitEffectiveOwner(), SMDurcharbeitSmOverride: SMDurcharbeitHasSmOverride(),
     marketAvailable: sql<boolean>`not ${smMarkets.isDeleted} and ${smMarkets.isActive}`,
     user:{firstName:users.firstName,lastName:users.lastName,isActive:users.isActive,deletedAt:users.deletedAt,role:users.role}})
     .from(targets).innerJoin(campaigns,eq(campaigns.id,targets.campaignId)).innerJoin(periods,eq(periods.id,targets.periodId))
@@ -194,7 +201,7 @@ export async function listSMDurcharbeitTargets(executor: SMDurcharbeitExecutor, 
     const history = grouped.get(r.target.id);
     const available = r.campaign.status==="published" && month===SMDurcharbeitMonth(today) && today>=r.campaign.startDate && today<=r.campaign.endDate && r.target.eligibility==="required"
       && r.marketAvailable && Boolean(r.user?.isActive) && !r.user?.deletedAt && r.user?.role==="sm";
-    return {id:r.target.id,revision:r.target.revision,campaignId:r.campaign.id,campaignName:r.campaign.name,campaignStatus:r.campaign.status,startDate:r.campaign.startDate,endDate:r.campaign.endDate,month,market:r.target.marketSnapshot,smUserId:r.effectiveSmUserId,smName:r.user ? `${r.user.firstName ?? ""} ${r.user.lastName ?? ""}`.trim() : "Keine SM-ID hinterlegt",eligibility:r.target.eligibility,waiverReason:r.target.waiverReason,completed:Boolean(history?.latestSubmissionId),available,draftVisitId:history?.draftVisitId??null,latestVisitId:history?.latestVisitId??null,latestVisitSmUserId:history?.latestVisitSmUserId??null,latestSubmissionId:history?.latestSubmissionId??null,completedAt:history?.completedAt ? new Date(history.completedAt).toISOString() : null,visitCount:history?.visitCount??0};
+    return {id:r.target.id,revision:r.target.revision,campaignId:r.campaign.id,campaignName:r.campaign.name,campaignStatus:r.campaign.status,startDate:r.campaign.startDate,endDate:r.campaign.endDate,month,market:r.target.marketSnapshot,SMDurcharbeitSmOverride:r.SMDurcharbeitSmOverride,smUserId:r.effectiveSmUserId,smName:r.user ? `${r.user.firstName ?? ""} ${r.user.lastName ?? ""}`.trim() : "Keine SM-ID hinterlegt",eligibility:r.target.eligibility,waiverReason:r.target.waiverReason,completed:Boolean(history?.latestSubmissionId),available,draftVisitId:history?.draftVisitId??null,latestVisitId:history?.latestVisitId??null,latestVisitSmUserId:history?.latestVisitSmUserId??null,latestSubmissionId:history?.latestSubmissionId??null,completedAt:history?.completedAt ? new Date(history.completedAt).toISOString() : null,visitCount:history?.visitCount??0};
   });
 }
 export async function reconcileSMDurcharbeitTarget(tx:SMDurcharbeitTx,targetId:string,actorId:string,action:string) {
@@ -223,6 +230,29 @@ export async function editSMDurcharbeitTarget(tx:SMDurcharbeitTx,targetId:string
     await SMDurcharbeitEvent(tx,{campaignId:current.campaign.id,targetId:row.id,actorUserId:actorId,action:"roster_changed",reason:input.reason,beforeState:{ownerRevisionId:current.target.ownerRevisionId,eligibility:current.target.eligibility},afterState:{ownerRevisionId:ownerId,eligibility:input.eligibility??current.target.eligibility}});
   }
 }
+/** Change only this target/month; prior owner revisions, visits, answers, photos and times remain immutable. */
+export async function changeSMDurcharbeitMonthOwner(tx: SMDurcharbeitTx, targetId: string, actorId: string, input: { expectedRevision: number; reason: string; SMDurcharbeitSmUserId: string | null }) {
+  await lockSMDurcharbeitTarget(tx, targetId);
+  const context = await loadSMDurcharbeitTarget(tx, targetId);
+  if (context.target.revision !== input.expectedRevision) return fail("smdurcharbeit_target_stale", "Der Monatsstand wurde geändert. Bitte neu laden.");
+  if (!["published", "paused"].includes(context.campaign.status) || context.campaign.endDate < SMDurcharbeitToday() || context.period.month < SMDurcharbeitMonth()) return fail("smdurcharbeit_month_closed", "Abgeschlossene Kampagnen und Kalendermonate bleiben unverändert.");
+  const [draft] = await tx.select({ id: submissions.id }).from(submissions).where(and(eq(submissions.SMDurcharbeitTargetId, targetId), eq(submissions.status, "draft"), eq(submissions.isCurrent, true), eq(submissions.isDeleted, false))).limit(1);
+  if (draft) return fail("smdurcharbeit_draft_protected", "Ein laufender Besuch muss zuerst beendet oder ausdrücklich verworfen werden.");
+  if (context.target.latestSubmissionId) return fail("smdurcharbeit_completed_target_protected", "Ein erledigtes Monatsziel behält seinen ursprünglichen SM.");
+  const [source] = await tx.select().from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, context.membership.smMarketId)).for("share");
+  const smUserId = input.SMDurcharbeitSmUserId ?? source?.SMDurcharbeitSmUserId;
+  if (!smUserId) return fail("smdurcharbeit_owner_missing", "Im Durcharbeit-Markt ist keine Standard-SM-ID hinterlegt.");
+  const [person] = await tx.select({ id: users.id }).from(users).where(and(eq(users.id, smUserId), eq(users.role, "sm"), eq(users.isActive, true), isNull(users.deletedAt))).limit(1).for("share");
+  if (!person) return fail("smdurcharbeit_user_inactive", "Bitte einen aktiven Shelf Merchandiser auswählen.", 400);
+  const [owner] = await tx.insert(owners).values({ campaignMarketId: context.membership.id, month: context.period.month, smUserId,
+    sourcePerson: source?.SMDurcharbeitVerplanung, reason: input.reason, actorUserId: actorId }).returning();
+  await tx.update(targets).set({ ownerRevisionId: owner!.id, revision: sql`${targets.revision}+1`, updatedAt: new Date() }).where(eq(targets.id, targetId));
+  await SMDurcharbeitEvent(tx, { campaignId: context.campaign.id, targetId, actorUserId: actorId,
+    action: input.SMDurcharbeitSmUserId === null ? "SMDurcharbeit_owner_automatic" : "SMDurcharbeit_owner_override", reason: input.reason,
+    beforeState: { ownerRevisionId: context.owner.id, smUserId: context.effectiveSmUserId },
+    afterState: { ownerRevisionId: owner!.id, smUserId, month: context.period.month, SMDurcharbeitSmOverride: input.SMDurcharbeitSmUserId !== null } });
+}
+
 export async function SMDurcharbeitHasCampaignReference(executor:SMDurcharbeitExecutor,templateId:string) {
   const [row]=await executor.select({id:campaigns.id}).from(campaigns).innerJoin(periods,eq(periods.campaignId,campaigns.id)).innerJoin(smQuestionnaireVersions,eq(smQuestionnaireVersions.id,periods.questionnaireVersionId))
     .where(and(eq(smQuestionnaireVersions.questionnaireTemplateId,templateId),sql`${campaigns.status} in ('published','paused') and ${campaigns.endDate} >= ${SMDurcharbeitToday()}::date`)).limit(1);

@@ -13,6 +13,29 @@ class SMDurcharbeitMarketInputError extends Error {}
 /** Mounted inside the authenticated SM market router; never merges with the standard market list. */
 export function createSMDurcharbeitMarketsRouter(db: typeof productionDb, list: () => Promise<unknown[]>, map: (row: typeof smMarkets.$inferSelect) => unknown) {
   const router = Router();
+  router.patch('/:id/owner', async (req, res, next) => {
+    const id = z.string().uuid().safeParse(req.params.id);
+    const parsed = z.object({ SMDurcharbeitSmUserId: z.string().uuid().nullable(), expectedUpdatedAt: z.string().datetime({ offset: true }) }).strict().safeParse(req.body);
+    if (!id.success || !parsed.success) { res.status(400).json({ error: 'Bitte einen gültigen SM auswählen und den aktuellen Marktstand mitsenden.' }); return; }
+    try {
+      const result = await db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '5s'`);
+        await lockSmPlanning(tx);
+        const [market] = await tx.select().from(smMarkets).where(and(eq(smMarkets.id, id.data), eq(smMarkets.isDeleted, false))).for('update');
+        const [source] = await tx.select().from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, id.data)).for('update');
+        if (!market || !source) return { status: 404, error: 'Durcharbeit-Markt nicht gefunden.' };
+        if (market.updatedAt.toISOString() !== parsed.data.expectedUpdatedAt) return { status: 409, error: 'Der Markt wurde inzwischen geändert. Bitte neu laden.' };
+        const smUserId = parsed.data.SMDurcharbeitSmUserId;
+        const [person] = smUserId ? await tx.select().from(users).where(and(eq(users.id, smUserId), eq(users.role, 'sm'), eq(users.isActive, true), isNull(users.deletedAt))).limit(1).for('share') : [];
+        if (smUserId && !person) return { status: 400, error: 'Der ausgewählte Mitarbeiter ist kein aktiver Shelf Merchandiser.' };
+        const updatedAt = new Date(Math.max(Date.now(), market.updatedAt.getTime() + 1));
+        const [updated] = await tx.update(smMarkets).set({ assignedSmUserId: smUserId, shelfMerchandiserName: person ? `${person.firstName} ${person.lastName}`.trim() : '', updatedAt }).where(eq(smMarkets.id, id.data)).returning();
+        await tx.update(smSMDurcharbeitMarkets).set({ SMDurcharbeitSmUserId: smUserId }).where(eq(smSMDurcharbeitMarkets.smMarketId, id.data));
+        return { status: 200, market: { ...(map(updated!) as object), SMDurcharbeitMarket: true, SMDurcharbeitSourceValues: source.SMDurcharbeitSourceValues } };
+      });
+      res.status(result.status).json(result.status === 200 ? { market: result.market } : { error: result.error });
+    } catch (error) { next(error); }
+  });
   router.post('/import', async (req, res, next) => {
     const parsed = SMDurcharbeitImportSchema.safeParse(req.body);
     if (!parsed.success) { res.status(400).json({ error: 'Bitte die Datei und alle sieben Durcharbeit-Spalten korrekt zuweisen.' }); return; }
@@ -38,14 +61,14 @@ export function createSMDurcharbeitMarketsRouter(db: typeof productionDb, list: 
           const existing = byKey.get(row.sourceKey);
           if (existing?.market.isDeleted) { summary.skipped++; summary.skippedReasons.push({ row: row.row, reason: 'Dieser Durcharbeit-Markt wurde archiviert. Er wird durch einen Import nicht reaktiviert.', sample: row.name }); continue; }
           const matches = row.planner ? byName.get(SMDurcharbeitNameKey(row.planner)) ?? [] : [];
-          const assignedSmUserId = existing?.market.assignedSmUserId ?? (matches.length === 1 ? matches[0]! : null);
+          const assignedSmUserId = existing ? existing.source.SMDurcharbeitSmUserId : (matches.length === 1 ? matches[0]! : null);
           if (!assignedSmUserId) summary.SMDurcharbeitUnassignedRows++;
           const sourceValues = {
             SMDurcharbeitSourceKey: row.sourceKey, SMDurcharbeitVertriebstyp: row.chain, SMDurcharbeitFirmaBetrieb: row.company,
             SMDurcharbeitStrasse: row.address, SMDurcharbeitPlz: row.postalCode, SMDurcharbeitOrt: row.city,
             SMDurcharbeitEmEh: row.emEh, SMDurcharbeitVerplanung: row.planner, SMDurcharbeitSourceValues: row.sourceValues,
           };
-          const marketValues = { name: row.name, dbName: row.company || row.chain, chain: row.chain, address: row.address, postalCode: row.postalCode, city: row.city, shelfMerchandiserName: row.planner, assignedSmUserId };
+          const marketValues = { name: row.name, dbName: row.company || row.chain, chain: row.chain, address: row.address, postalCode: row.postalCode, city: row.city, shelfMerchandiserName: existing?.market.shelfMerchandiserName ?? row.planner, assignedSmUserId };
           if (existing) {
             summary.matchedBy.namePostalAddress++;
             const unchanged = Object.entries(marketValues).every(([key, value]) => existing.market[key as keyof typeof existing.market] === value)

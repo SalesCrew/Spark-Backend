@@ -11,7 +11,7 @@ import { smSMDurcharbeitCampaigns as campaigns, smSMDurcharbeitCampaignMarkets a
   smMarkets, smSMDurcharbeitMarkets, smQuestionnaireVersions, smQuestionnaireTemplates, users } from "../lib/schema.js";
 import { SMDurcharbeitCampaignError, SMDurcharbeitToday, SMDurcharbeitMonth, SMDurcharbeitMonths, SMDurcharbeitEvent,
   SMDurcharbeitPublicationPreview, publishSMDurcharbeitCampaign, listSMDurcharbeitTargets, loadSMDurcharbeitTarget,
-  assertSMDurcharbeitAvailable, loadSMDurcharbeitVersion, editSMDurcharbeitTarget, resolveSMDurcharbeitRoster, SMDurcharbeitEffectiveOwner } from "../sm-SMDurcharbeit-campaign.shared.js";
+  assertSMDurcharbeitAvailable, loadSMDurcharbeitVersion, editSMDurcharbeitTarget, changeSMDurcharbeitMonthOwner, resolveSMDurcharbeitRoster, SMDurcharbeitEffectiveOwner } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { initializeSMDurcharbeitVisit, cancelSMDurcharbeitDraft, cleanupSMDurcharbeitDraftPhotos } from "./sm-visits.js";
 import { isIsoDate } from "../sm-planning.shared.js";
 import { loadSMDurcharbeitReport } from "../sm-SMDurcharbeit-report.shared.js";
@@ -129,6 +129,12 @@ adminSMDurcharbeitCampaignsRouter.patch("/:campaignId/markets", async (req: Auth
   try {
     const input = marketEditSchema.extend({ previewToken: z.string().length(64), confirmOverlap: z.boolean().optional() }).strict().parse(req.body);
     res.json(await db.transaction(tx => applySMDurcharbeitMarketEdit(tx, id(req, "campaignId"), actor(req), input)));
+  } catch (error) { if (!errorResponse(error, res)) next(error); }
+});
+adminSMDurcharbeitCampaignsRouter.patch("/targets/:targetId/owner", async (req: AuthedRequest, res, next) => {
+  try {
+    const input = z.object({ expectedRevision: z.number().int().positive(), reason: z.string().trim().min(3).max(1000), SMDurcharbeitSmUserId: uuid.nullable() }).strict().parse(req.body);
+    await db.transaction(tx => changeSMDurcharbeitMonthOwner(tx, id(req, "targetId"), actor(req), input)); res.json({ updated: true });
   } catch (error) { if (!errorResponse(error, res)) next(error); }
 });
 adminSMDurcharbeitCampaignsRouter.patch("/targets/:targetId", async (req: AuthedRequest, res, next) => {

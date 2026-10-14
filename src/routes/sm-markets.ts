@@ -261,7 +261,7 @@ async function listSMDurcharbeitMarkets() {
   const rows = await db.select({ market: smMarkets, source: smSMDurcharbeitMarkets }).from(smSMDurcharbeitMarkets)
     .innerJoin(smMarkets, eq(smMarkets.id, smSMDurcharbeitMarkets.smMarketId))
     .where(eq(smMarkets.isDeleted, false)).orderBy(asc(smMarkets.chain), asc(smMarkets.name));
-  return rows.map(row => ({ ...mapSmMarketRow(row.market), SMDurcharbeitMarket: true, SMDurcharbeitSourceValues: row.source.SMDurcharbeitSourceValues }));
+  return rows.map(row => ({ ...mapSmMarketRow(row.market), assignedSmUserId: row.source.SMDurcharbeitSmUserId, SMDurcharbeitMarket: true, SMDurcharbeitSourceValues: row.source.SMDurcharbeitSourceValues }));
 }
 adminSmMarketsRouter.use("/SMDurcharbeit", createSMDurcharbeitMarketsRouter(db, listSMDurcharbeitMarkets, mapSmMarketRow));
 
