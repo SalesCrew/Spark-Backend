@@ -8,8 +8,8 @@ import { createSMDurcharbeitFixture } from "../tests/SMDurcharbeit-fixture.js";
 test("Durcharbeit defaults and monthly substitutes remain separate across the complete visit flow", { timeout: 30_000 }, async t => {
   let now = "2026-09-15T12:00:00Z";
   class Clock extends Date { constructor(value?: string | number | Date) { super(value === undefined ? now : value instanceof Date ? value.getTime() : value); } static now() { return Date.parse(now); } }
-  const second = randomUUID(), reader = randomUUID(), objects = new Set<string>();
-  const f = await createSMDurcharbeitFixture({ clock: Clock as typeof Date, additionalSmUsers: [{ id: second, token: "synthetic-second-sm" }], customerUsers: [{ id: reader, token: "synthetic-reader", permissions: { sm_durcharbeit_maerkte: ["read"], sm_durcharbeit_verplanung: ["read"] } }], photoStorage: { from: () => ({
+  const second = randomUUID(), reader = randomUUID(), normalEditor = randomUUID(), dedicatedEditor = randomUUID(), objects = new Set<string>();
+  const f = await createSMDurcharbeitFixture({ clock: Clock as typeof Date, additionalSmUsers: [{ id: second, token: "synthetic-second-sm" }], customerUsers: [{ id: reader, token: "synthetic-reader", permissions: { sm_durcharbeit_maerkte: ["read"], sm_durcharbeit_verplanung: ["read"] } }, { id: normalEditor, token: "synthetic-normal-editor", permissions: { sm_maerkte: ["read", "write", "update"] } }, { id: dedicatedEditor, token: "synthetic-dedicated-editor", permissions: { sm_durcharbeit_maerkte: ["read", "write", "update"] } }], photoStorage: { from: () => ({
     createSignedUploadUrl: async (path: string) => ({ data: { path, signedUrl: `https://synthetic.invalid/${path}`, token: "synthetic" }, error: null }),
     list: async (folder: string, options: { search: string }) => ({ data: objects.has(`${folder}/${options.search}`) ? [{ name: options.search }] : [], error: null }),
     createSignedUrl: async (path: string) => ({ data: { signedUrl: `https://synthetic.invalid/${path}` }, error: null }),
@@ -91,6 +91,11 @@ test("Durcharbeit defaults and monthly substitutes remain separate across the co
       const before = await graph(), row = await target();
       await request(f.app).patch(`${root}/targets/${row.id}/owner`).auth("synthetic-reader", { type: "bearer" }).set("x-coke-spark-page-key", "sm_durcharbeit_verplanung").send({ expectedRevision: row.revision, SMDurcharbeitSmUserId: f.employee, reason: "Synthetic blocked" }).expect(403);
       await request(f.app).patch(`/admin/sm-markets/SMDurcharbeit/${marketId}/owner`).auth("synthetic-reader", { type: "bearer" }).set("x-coke-spark-page-key", "sm_durcharbeit_maerkte").send({ SMDurcharbeitSmUserId: second, expectedUpdatedAt: (await market()).updatedAt }).expect(403);
+      for (const prefix of ["SMDurcharbeit", "smdurcharbeit", "SmDurcharbeit"]) {
+        await request(f.app).patch(`/admin/sm-markets/${prefix}/${marketId}/owner`).auth("synthetic-normal-editor", { type: "bearer" }).set("x-coke-spark-page-key", "sm_maerkte").send({ SMDurcharbeitSmUserId: second, expectedUpdatedAt: (await market()).updatedAt }).expect(403);
+      }
+      await request(f.app).patch(`/admin/sm-markets/${f.market}?SMDurcharbeitMarketScope=SMDurcharbeit`).auth("synthetic-dedicated-editor", { type: "bearer" }).send({ name: "Must remain unchanged" }).expect(403);
+      await request(f.app).patch(`${root}/targets/${row.id}/owner`).auth("synthetic-dedicated-editor", { type: "bearer" }).send({ expectedRevision: row.revision, SMDurcharbeitSmUserId: f.employee, reason: "Wrong page permission" }).expect(403);
       await change(row, f.admin).expect(400);
       await changeDefault(f.admin, 400);
       await change({ ...row, revision: row.revision - 1 }, f.employee).expect(409);
@@ -103,6 +108,12 @@ test("Durcharbeit defaults and monthly substitutes remain separate across the co
         assert.deepEqual(await graph(), blocked);
       }
       await f.database.update(f.schema.users).set({ isActive: true, deletedAt: null }).where(eq(f.schema.users.id, second));
+    });
+    await t.test("dedicated market update access accepts all routed case aliases without granting campaign access", async () => {
+      for (const prefix of ["SMDurcharbeit", "smdurcharbeit", "SmDurcharbeit"]) {
+        await request(f.app).patch(`/admin/sm-markets/${prefix}/${marketId}/owner`).auth("synthetic-dedicated-editor", { type: "bearer" }).set("x-coke-spark-page-key", "sm_maerkte").send({ SMDurcharbeitSmUserId: f.employee, expectedUpdatedAt: (await market()).updatedAt }).expect(200);
+        assert.equal((await market()).assignedSmUserId, f.employee);
+      }
     });
     await t.test("an active draft is protected, then the substitute submits answers/photos/time under their own identity", async () => {
       const row = await target(), started = (await sm("post", `${employeeRoot}/targets/${row.id}/start`, "synthetic-second-sm").send({ expectedRevision: row.revision, followUp: false, mode: "manual", clientSubmissionToken: randomUUID() }).expect(201)).body;

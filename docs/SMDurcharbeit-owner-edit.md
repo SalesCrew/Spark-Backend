@@ -2,6 +2,8 @@
 
 The existing registry ID remains authoritative for automatic planning. Admins can now change that default through `PATCH /admin/sm-markets/SMDurcharbeit/:id/owner` with `SMDurcharbeitSmUserId` and `expectedUpdatedAt`. The authenticated, permission-checked transaction locks the market/registry, validates an active non-deleted SM account, and updates the canonical account ID, current SM name, registry account ID and optimistic timestamp together. Clearing the default is explicit. All other market fields and the original imported planner/source cells remain unchanged. Standard markets cannot use this endpoint.
 
+Dedicated Durcharbeit market paths are classified without case sensitivity, matching Express routing. A customer granted only standard-market access cannot use a lowercase or mixed-case path alias to edit a Durcharbeit owner; page-key headers cannot widen this write permission. The list scope query parameter selects only read scope and cannot grant permission to mutate a normal market.
+
 Reimports retain an existing registry ID, including an explicit null, and its current saved display name. They do not silently restore the original spreadsheet's SM after a manual change.
 
 `PATCH /admin/sm-smdurcharbeit-campaigns/targets/:targetId/owner` changes one campaign/month target with `expectedRevision`, `SMDurcharbeitSmUserId` and a reason. A non-null account selects a temporary substitute; null restores the live registry default. Campaign → target → registry locks serialize it with visit start. Closed months, ended/archived campaigns, stale revisions, inactive/deleted/non-SM accounts, live drafts and completed monthly targets are rejected. There is no future-month scope parameter.
