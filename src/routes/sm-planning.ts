@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { randomUUID } from "node:crypto";
 import { assertSMDurcharbeitOverride, loadSMDurcharbeitSelectionCatalog, resolveSMDurcharbeitSelection, SMDurcharbeitVersionAvailable, SMDurcharbeitSelectionError } from "../sm-SMDurcharbeit-selection.shared.js";
 import { smQuestionnaireCatalogScope } from "../sm-SMDurcharbeit-catalog.shared.js";
@@ -717,7 +718,8 @@ smPlanningRouter.post("/assignments/:id/time-change-requests", async (req: Authe
 });
 
 export const adminSmPlanningRouter = Router();
-adminSmPlanningRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSmPlanningRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSmPlanningRouter.use(requireKundeAdminPermission);
 
 adminSmPlanningRouter.post("/holidays/reconcile", async (req: AuthedRequest, res, next) => {
   try {

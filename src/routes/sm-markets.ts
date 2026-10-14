@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
@@ -253,7 +254,8 @@ function smUserDisplayName(user: { firstName: string; lastName: string }): strin
   return `${user.firstName} ${user.lastName}`.trim();
 }
 
-adminSmMarketsRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSmMarketsRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSmMarketsRouter.use(requireKundeAdminPermission);
 
 async function listSMDurcharbeitMarkets() {
   const rows = await db.select({ market: smMarkets, source: smSMDurcharbeitMarkets }).from(smSMDurcharbeitMarkets)

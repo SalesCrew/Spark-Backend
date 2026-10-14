@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
@@ -578,7 +579,8 @@ smActivityRouter.post("/submissions/:submissionId/delete-requests", async (req: 
 });
 
 export const adminSmActivityRouter = Router();
-adminSmActivityRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSmActivityRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSmActivityRouter.use(requireKundeAdminPermission);
 adminSmActivityRouter.use("/completed", adminSmManagementRouter);
 
 adminSmActivityRouter.get("/requests", async (_req, res, next) => {

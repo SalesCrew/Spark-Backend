@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
@@ -99,7 +100,8 @@ async function listTimes(input: z.infer<typeof range>, ownUserId?: string) {
 export const SMDurcharbeitTimesRouter = Router();
 export const adminSMDurcharbeitTimesRouter = Router();
 SMDurcharbeitTimesRouter.use(requireAuth(["sm"]));
-adminSMDurcharbeitTimesRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSMDurcharbeitTimesRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSMDurcharbeitTimesRouter.use(requireKundeAdminPermission);
 SMDurcharbeitTimesRouter.get("/", async (req: AuthedRequest, res, next) => {
   try { const input = range.parse(req.query); if (input.smUserId) return fail("smdurcharbeit_time_input_invalid", "Der SM wird aus der Anmeldung bestimmt.", 400); res.json({ entries: await listTimes(input, req.authUser!.appUserId) }); } catch (error) { if (!send(error, res)) next(error); }
 });

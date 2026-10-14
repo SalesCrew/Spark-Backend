@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { lockSmPlanning } from "../sm-planning-lock.js";
 import { hasSMDurcharbeitPendingOverride } from "../sm-SMDurcharbeit-selection.shared.js";
 import { SMDurcharbeitHasCampaignReference } from "../sm-SMDurcharbeit-campaign.shared.js";
@@ -997,7 +998,8 @@ async function saveQuestionnaire(input: SmQuestionnaireInput, actorUserId: strin
 }
 
 export const adminSmQuestionnairesRouter = Router();
-adminSmQuestionnairesRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSmQuestionnairesRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSmQuestionnairesRouter.use(requireKundeAdminPermission);
 
 adminSmQuestionnairesRouter.use((req, res, next) => {
   if (req.method === "GET") {

@@ -5,7 +5,7 @@ import { z } from "zod";
 import { aggregateHighVolumeLoad, logAction, markErrorAsLogged, startActionTimer } from "../lib/logger.js";
 import { isFullAdminRole } from "../lib/admin-role.js";
 import { canManageUserRole, getRestrictedDirectoryRole } from "../lib/admin-user-scope.js";
-import { getKundePermissionsForUser, hasKundePermission } from "../lib/kunde-access.js";
+import { getKundePermissionsForUser, hasKundePermission, isKundeSmPageKey, KUNDE_ADMIN_PAGE_KEYS } from "../lib/kunde-access.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { db } from "../lib/db.js";
 import { readGmKpiCaches, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
@@ -103,27 +103,27 @@ async function requireAdminUsersAccess(req: AuthedRequest, res: Response, next: 
   }
 
   const method = req.method.toUpperCase();
-  if (method === "GET") {
-    next();
-    return;
-  }
   if (req.path.endsWith("/password")) {
-    res.status(403).json({ error: "Password update is currently admin-only.", code: "role_not_allowed" });
-    return;
+    res.status(403).json({ error: "Password update is currently admin-only.", code: "role_not_allowed" }); return;
   }
-
-  const action = method === "POST" ? "write" : "update";
+  const header = req.get("x-coke-spark-page-key")?.trim();
+  const id = req.path.match(/^\/([0-9a-f-]{36})(?:\/|$)/i)?.[1];
+  const [target] = id ? await db.select({ role: users.role }).from(users).where(eq(users.id, id)).limit(1) : [];
+  const requestedRole = target?.role ?? req.body?.role ?? req.query.role ?? (isKundeSmPageKey(header) ? "sm" : "gm");
+  if (requestedRole !== "gm" && requestedRole !== "sm") {
+    res.status(403).json({ error: "Role is not allowed for this endpoint.", code: "role_not_allowed" }); return;
+  }
+  const pageKey = requestedRole === "sm" ? "shelfmerchandiser" : "gebietsmanager";
+  const action = method === "GET" ? "read" : method === "POST" ? "write" : "update";
   const permissions = await getKundePermissionsForUser(req.authUser.appUserId);
-  if (hasKundePermission(permissions, "gebietsmanager", action)) {
-    next();
-    return;
+  const smDirectoryDependencies = ["sm_dashboard", "sm_verplanung", "sm_durcharbeit_verplanung", "sm_maerkte", "sm_durcharbeit_maerkte", "sm_fbmanagement", "sm_fotoarchiv", "sm_zeiterfassung", "sm_nachrichten"];
+  const permittedDependency = method === "GET" && requestedRole === "sm" && req.path === "/" && header && smDirectoryDependencies.includes(header) && hasKundePermission(permissions, header, "read");
+  const existingGmDirectory = method === "GET" && requestedRole === "gm" && KUNDE_ADMIN_PAGE_KEYS.some(key => !isKundeSmPageKey(key) && (permissions[key]?.length ?? 0) > 0);
+  if (hasKundePermission(permissions, pageKey, action) || permittedDependency || existingGmDirectory) {
+    res.locals.customerDirectoryRole = requestedRole; next(); return;
   }
-  res.status(403).json({
-    error: "Für diese Aktion ist kein Kundenzugriff freigeschaltet.",
-    code: "kunde_permission_denied",
-    pageKey: "gebietsmanager",
-    action,
-  });
+  res.status(403).json({ error: "Für diese Aktion ist kein Kundenzugriff freigeschaltet.", code: "kunde_permission_denied", pageKey, action });
+
 }
 
 adminUsersRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
@@ -154,11 +154,11 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
     const roleParam = req.query.role;
     const requestedRole = roleParam === "admin" || roleParam === "sm_admin" || roleParam === "gm" || roleParam === "sm" ? roleParam : undefined;
     const actorRole = req.authUser?.role ?? "gm";
-    if (requestedRole && !canManageUserRole(actorRole, requestedRole)) {
+    if (requestedRole && !canManageUserRole(actorRole, requestedRole, res.locals.customerDirectoryRole)) {
       res.status(200).json({ users: [] });
       return;
     }
-    const role = getRestrictedDirectoryRole(actorRole) ?? requestedRole;
+    const role = getRestrictedDirectoryRole(actorRole, res.locals.customerDirectoryRole) ?? requestedRole;
     const whereClause = role ? eq(users.role, role) : undefined;
 
     const rows = await db
@@ -367,7 +367,7 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
     }
 
     const payload = parsed.data;
-    if (!req.authUser || !canManageUserRole(req.authUser.role, payload.role)) {
+    if (!req.authUser || !canManageUserRole(req.authUser.role, payload.role, res.locals.customerDirectoryRole)) {
       const isSmAdmin = req.authUser?.role === "sm_admin";
       res.status(403).json({
         error: isSmAdmin ? "SM-Admins dürfen nur Shelf-Merchandiser-Benutzer verwalten." : "Kundenzugänge dürfen nur GM-Benutzer verwalten.",
@@ -540,7 +540,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
       res.status(404).json({ error: "User not found." });
       return;
     }
-    if (!req.authUser || !canManageUserRole(req.authUser.role, existing.role)) {
+    if (!req.authUser || !canManageUserRole(req.authUser.role, existing.role, res.locals.customerDirectoryRole)) {
       const isSmAdmin = req.authUser?.role === "sm_admin";
       res.status(403).json({
         error: isSmAdmin ? "SM-Admins dürfen nur Shelf-Merchandiser-Benutzer verwalten." : "Kundenzugänge dürfen nur GM-Benutzer verwalten.",
@@ -851,7 +851,7 @@ adminUsersRouter.patch("/:id/anonymize", async (req: AuthedRequest, res, next) =
       res.status(403).json({ error: "Nur GM- und SM-Mitarbeiter koennen ueber diesen Prozess anonymisiert werden.", code: "role_not_allowed" });
       return;
     }
-    if (!canManageUserRole(req.authUser.role, target.role)) {
+    if (!canManageUserRole(req.authUser.role, target.role, res.locals.customerDirectoryRole)) {
       res.status(403).json({
         error: req.authUser.role === "sm_admin"
           ? "SM-Admins dürfen nur Shelf-Merchandiser-Benutzer anonymisieren."
@@ -1002,7 +1002,7 @@ adminUsersRouter.patch("/:id/deactivate", async (req: AuthedRequest, res, next) 
       res.status(404).json({ error: "User not found." });
       return;
     }
-    if (!req.authUser || !canManageUserRole(req.authUser.role, target.role)) {
+    if (!req.authUser || !canManageUserRole(req.authUser.role, target.role, res.locals.customerDirectoryRole)) {
       const isSmAdmin = req.authUser?.role === "sm_admin";
       res.status(403).json({
         error: isSmAdmin ? "SM-Admins dürfen nur Shelf-Merchandiser-Benutzer verwalten." : "Kundenzugänge dürfen nur GM-Benutzer verwalten.",

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createSMDurcharbeitDisposableDatabase } from "./SMDurcharbeit-disposable-database.js";
-import { getTableColumns } from "drizzle-orm";
+import { getTableColumns, eq } from "drizzle-orm";
 import express from "express";
 import * as schema from "../src/lib/schema.js";
 import * as SMDurcharbeitCatalog from "../src/sm-SMDurcharbeit-catalog.shared.js";
@@ -21,14 +21,14 @@ import * as weekly from "../src/sm-market-weekly-planning.shared.js";
 import { z } from "zod";
 import * as lock from "../src/sm-planning-lock.js";
 import * as overlap from "../src/sm-time-overlap.js";
-import { isRoleAllowedForEndpoint } from "../src/lib/admin-role.js";
+import { isFullAdminRole, isRoleAllowedForEndpoint } from "../src/lib/admin-role.js";
 import { isolatedModule } from "./isolated-module.js";
 import { createSMDurcharbeitMarketsRouter } from "../src/routes/sm-SMDurcharbeit-markets.js";
 import * as monthlyAnswerReuse from "../src/sm-SMDurcharbeit-answer-reuse.shared.js";
 import * as messageShared from "../src/sm-message.shared.js";
 
 /** Actual SM routes and migrations, with all external I/O replaced and a fresh disposable DB. */
-export async function createSMDurcharbeitFixture(options: { photoStorage?: { from: (bucket: string) => any }; clock?: typeof Date; additionalSmUsers?: Array<{ id: string; token: string }>; beforeMonthlyMigrations?: (pg: Awaited<ReturnType<typeof createSMDurcharbeitDisposableDatabase>>["pg"]) => Promise<void>; beforeSMDurcharbeitMarketSmUserMigration?: (pg: Awaited<ReturnType<typeof createSMDurcharbeitDisposableDatabase>>["pg"]) => Promise<void> } = {}) {
+export async function createSMDurcharbeitFixture(options: { photoStorage?: { from: (bucket: string) => any }; clock?: typeof Date; additionalSmUsers?: Array<{ id: string; token: string }>; customerUsers?: Array<{ id: string; token: string; permissions: schema.KundePagePermissions }>; beforeMonthlyMigrations?: (pg: Awaited<ReturnType<typeof createSMDurcharbeitDisposableDatabase>>["pg"]) => Promise<void>; beforeSMDurcharbeitMarketSmUserMigration?: (pg: Awaited<ReturnType<typeof createSMDurcharbeitDisposableDatabase>>["pg"]) => Promise<void> } = {}) {
   if (process.env.DATABASE_URL || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NODE_ENV === "production") {
     throw new Error("Production configuration is forbidden in SMDurcharbeit fixtures.");
   }
@@ -55,19 +55,32 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   await pg.exec(await readFile(new URL("../supabase/migrations/20261009133000_SMDurcharbeit_context_integrity.sql", import.meta.url), "utf8"));
   await options.beforeSMDurcharbeitMarketSmUserMigration?.(pg);
   await pg.exec(await readFile(new URL("../supabase/migrations/20261009160312_SMDurcharbeit_market_sm_user_id.sql", import.meta.url), "utf8"));
+  await pg.exec(`create table kunde_users(user_id uuid primary key references users(id) on delete cascade, page_permissions jsonb not null default '{}'::jsonb, created_by_user_id uuid, created_at timestamptz default now(), updated_at timestamptz default now(), is_deleted boolean default false, deleted_at timestamptz);
+    alter table users alter column id set default gen_random_uuid();
+    alter table users alter column created_at set default now();
+    alter table users alter column updated_at set default now();`);
   const admin = randomUUID(), employee = randomUUID(), market = randomUUID();
   await pg.query("insert into users(id,first_name,last_name,role) values($1,'Local','Admin','sm_admin'),($2,'Local','SM','sm')", [admin, employee]);
   for (const person of options.additionalSmUsers ?? []) await pg.query("insert into users(id,first_name,last_name,email,role) values($1,'Second','SM','second@preview.test','sm')", [person.id]);
   await pg.query("insert into sm_markets(id,name,chain,address,postal_code,city,region,internal_market_id) values($1,'Synthetic Billa','Billa','Testgasse 1','1010','Wien','Ost','SYNTHETIC-1')", [market]);
+  for (const person of options.customerUsers ?? []) {
+    await database.insert(schema.users).values({ id: person.id, supabaseAuthId: randomUUID(), firstName: "Synthetic", lastName: "Customer", email: `${person.id}@preview.test`, role: "kunde", isActive: true });
+    await database.insert(schema.kundeUsers).values({ userId: person.id, pagePermissions: person.permissions });
+  }
   const harmlessLogger = { logger: { warn() {}, error() {}, info() {} }, logAction() {}, startActionTimer: () => () => {} };
-  const auth = { requireAuth: (roles: schema.UserRole[]) => (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const auth = { requireAuth: (roles: schema.UserRole[]) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const token = req.header("authorization")?.replace(/^Bearer /, "");
     const tokens: Record<string, schema.UserRole> = { "synthetic-sm-admin": "sm_admin", "synthetic-sm": "sm", "synthetic-admin": "admin", "synthetic-gm-admin": "kunde", "synthetic-gm": "gm" };
     for (const person of options.additionalSmUsers ?? []) tokens[person.token] = "sm";
-    const role = token ? tokens[token] ?? null : null;
+    const customer = options.customerUsers?.find(person => person.token === token);
+    const createdCustomerId = token?.startsWith("synthetic-customer:") ? token.slice("synthetic-customer:".length) : undefined;
+    const customerId = customer?.id ?? createdCustomerId;
+    const [customerRow] = customerId ? await database.select().from(schema.users).where(eq(schema.users.id, customerId)) : [];
+    if (customerId && (!customerRow || customerRow.role !== "kunde" || !customerRow.isActive || customerRow.deletedAt)) { res.sendStatus(403); return; }
+    const role = customerRow ? "kunde" : token ? tokens[token] ?? null : null;
     if (!role) { res.sendStatus(401); return; }
     if (!isRoleAllowedForEndpoint(role, roles)) { res.sendStatus(403); return; }
-    Object.assign(req, { authUser: { appUserId: options.additionalSmUsers?.find(person => person.token === token)?.id ?? (role === "sm" ? employee : admin), role } }); next();
+    Object.assign(req, { authUser: { appUserId: customerId ?? options.additionalSmUsers?.find(person => person.token === token)?.id ?? (role === "sm" ? employee : admin), role } }); next();
   } };
   // Match postgres-js raw execute semantics while retaining the real PGlite ORM and transactions.
   const asPostgres = (target: any): any => new Proxy(target, {
@@ -79,10 +92,13 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
     },
   });
   const dbForRoutes = nativePostgres ? database : asPostgres(database);
+  const kundeAccess = await isolatedModule<typeof import("../src/lib/kunde-access.js")>(new URL("../src/lib/kunde-access.ts", import.meta.url), {
+    "./db.js": { db: dbForRoutes }, "./schema.js": schema, "./admin-role.js": { isFullAdminRole },
+  });
   const monthly = await isolatedModule<typeof import("../src/sm-SMDurcharbeit-campaign.shared.js")>(new URL("../src/sm-SMDurcharbeit-campaign.shared.ts", import.meta.url), {
     "./lib/schema.js": schema, "./sm-planning.shared.js": planning,
   }, options.clock ?? Date);
-  const base = { "../sm-SMDurcharbeit-campaign.shared.js": monthly, "../sm-SMDurcharbeit-answer-reuse.shared.js": monthlyAnswerReuse,
+  const base = { "../lib/kunde-access.js": kundeAccess, "../sm-SMDurcharbeit-campaign.shared.js": monthly, "../sm-SMDurcharbeit-answer-reuse.shared.js": monthlyAnswerReuse,
     "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection, "../sm-planning-lock.js": lock, "../sm-SMDurcharbeit-catalog.shared.js": SMDurcharbeitCatalog, "../lib/db.js": { db: dbForRoutes }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": auth };
   const marketEdit = await isolatedModule<typeof import("../src/sm-SMDurcharbeit-market-edit.shared.js")>(new URL("../src/sm-SMDurcharbeit-market-edit.shared.ts", import.meta.url), {
     "./lib/schema.js": schema, "./sm-SMDurcharbeit-campaign.shared.js": monthly,
@@ -169,6 +185,6 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
       createdByUserId: admin, updatedByUserId: admin }).returning();
     return row!;
   };
-  return { app, pg, database, nativePostgres, schema, admin, employee, market, assignment, reporting };
+  return { app, pg, database, dbForRoutes, auth, harmlessLogger, kundeAccess, nativePostgres, schema, admin, employee, market, assignment, reporting };
   } catch (error) { await pg.close(); throw error; }
 }

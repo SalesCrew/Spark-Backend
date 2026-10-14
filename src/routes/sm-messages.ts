@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
@@ -96,7 +97,8 @@ async function loadAdminPayload() {
 }
 
 export const adminSmMessagesRouter = Router();
-adminSmMessagesRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSmMessagesRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSmMessagesRouter.use(requireKundeAdminPermission);
 
 adminSmMessagesRouter.get("/", async (_req, res, next) => {
   try {

@@ -5,14 +5,19 @@ import { eq } from "drizzle-orm";
 import { createSMDurcharbeitFixture } from "./SMDurcharbeit-fixture.js";
 import { createSyntheticPhotoStorage, syntheticShelfPhoto } from "./synthetic-photo-storage.js";
 import { installSmPhotoArchivePreviewFaults } from "./sm-photo-archive-preview-faults.js";
+import { installCustomerAccessRoutes } from "./customer-access-fixture.js";
 import { spezialfragenPeriodFixture } from "./spezialfragen-period-fixture.js";
 
 // Independent, disposable preview. Never imports the production app entry point or environment.
 const photoStorage = createSyntheticPhotoStorage();
 const secondSmId = randomUUID();
+const customerId = randomUUID();
+const customerSmKeys = ["sm_dashboard", "sm_fragebogen", "sm_durcharbeit", "sm_fbmanagement", "sm_fotoarchiv", "sm_verplanung", "sm_durcharbeit_verplanung", "sm_zeiterfassung", "sm_maerkte", "sm_durcharbeit_maerkte", "sm_nachrichten", "shelfmerchandiser"];
 let previewTime: number | undefined;
 class PreviewClock extends Date { constructor(value?: string | number | Date) { super(value === undefined ? previewTime ?? Date.now() : value instanceof Date ? value.getTime() : value); } static now() { return previewTime ?? Date.now(); } }
-const f = await createSMDurcharbeitFixture({ photoStorage: photoStorage.storage, clock: PreviewClock as typeof Date, additionalSmUsers: [{ id: secondSmId, token: "synthetic-second-sm" }] });
+const f = await createSMDurcharbeitFixture({ photoStorage: photoStorage.storage, clock: PreviewClock as typeof Date, additionalSmUsers: [{ id: secondSmId, token: "synthetic-second-sm" }], customerUsers: [{id: customerId, token: "synthetic-customer-sm", permissions: Object.fromEntries(customerSmKeys.map(key => [key, ["read"]]))}] });
+await installCustomerAccessRoutes(f.app, f);
+await f.database.update(f.schema.users).set({firstName: "Kunde", lastName: "Vorschau", email: "customer-sm@preview.test"}).where(eq(f.schema.users.id, customerId));
 const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Vienna", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 const gmFixture = await spezialfragenPeriodFixture(undefined, true);
 await request(gmFixture.app).post("/admin/fragebogen/main").auth("synthetic-gm-admin", { type: "bearer" }).send({
@@ -133,7 +138,8 @@ preview.use((req, res, next) => {
 });
 preview.use(express.json({ limit: "10mb" }));
 preview.use("/synthetic-photo-storage", photoStorage.router);
-const people = {
+const people: Record<string, any> = {
+  "synthetic-customer-sm": { id: customerId, role: "kunde", email: "customer-sm@preview.test", firstName: "Kunde", lastName: "Vorschau", isActive: true },
   "synthetic-gm-admin": { id: gmFixture.ids.admin, role: "admin", email: "gm-admin@preview.test", firstName: "Vorschau", lastName: "GM Admin", isActive: true },
   "synthetic-gm": { id: gmFixture.ids.gm, role: "gm", email: "gm@preview.test", firstName: "Vorschau", lastName: "GM", isActive: true },
   "synthetic-sm-admin": { id: f.admin, role: "sm_admin", email: "sm-admin@preview.test", firstName: "Vorschau", lastName: "Admin", isActive: true },
@@ -141,29 +147,36 @@ const people = {
   "synthetic-second-sm": { id: secondSmId, role: "sm", email: "sm-second@preview.test", firstName: "Second", lastName: "SM", isActive: true, travelTimeEnabled: true },
 };
 const tokenFor = (req: express.Request) => req.get("authorization")?.replace(/^Bearer /, "") as keyof typeof people;
-const sessionFor = (token: keyof typeof people) => ({ user: people[token], session: { accessToken: token, refreshToken: token, expiresAt: Math.floor(Date.now() / 1000) + 86_400 } });
-preview.post("/auth/login", (req, res) => {
-  const token = Object.keys(people).find(key => people[key as keyof typeof people].email === req.body.email) as keyof typeof people | undefined;
-  if (!token || req.body.password !== "preview") { res.status(401).json({ error: "Vorschauzugang: sm-admin@preview.test oder sm@preview.test · Passwort preview" }); return; }
-  res.json(sessionFor(token));
+async function currentPreviewPerson(token: string) {
+  const id = token.startsWith("synthetic-customer:") ? token.slice("synthetic-customer:".length) : people[token]?.role === "kunde" ? people[token].id : null;
+  if (!id) return people[token];
+  const [row] = await f.database.select().from(f.schema.users).where(eq(f.schema.users.id, id));
+  if (!row || row.role !== "kunde" || !row.isActive || row.deletedAt) return null;
+  return { id: row.id, role: row.role, email: row.email, firstName: row.firstName, lastName: row.lastName, isActive: row.isActive, permissions: await f.kundeAccess.getKundePermissionsForUser(id) };
+}
+async function sessionFor(token: string) { return { user: await currentPreviewPerson(token), session: { accessToken: token, refreshToken: token, expiresAt: Math.floor(Date.now() / 1000) + 86_400 } }; }
+preview.post("/auth/login", async (req, res) => {
+  let token = Object.keys(people).find(key => people[key].email === req.body.email);
+  if (!token) {
+    const [row] = await f.database.select().from(f.schema.users).where(eq(f.schema.users.email, String(req.body.email)));
+    if (row?.role === "kunde") token = `synthetic-customer:${row.id}`;
+  }
+  if (!token || !["preview", "Synthetic-preview-only-2026"].includes(req.body.password) || !await currentPreviewPerson(token)) { res.status(401).json({ error: "Nur synthetische Vorschauzugänge." }); return; }
+  res.json(await sessionFor(token));
 });
-preview.post("/auth/refresh", (req, res) => {
-  const token = req.body.refreshToken as keyof typeof people;
-  if (!people[token]) { res.sendStatus(401); return; }
-  res.json(sessionFor(token));
+preview.post("/auth/refresh", async (req, res) => {
+  const token = String(req.body.refreshToken);
+  if (!await currentPreviewPerson(token)) { res.sendStatus(401); return; }
+  res.json(await sessionFor(token));
 });
-preview.get("/auth/me", (req, res) => {
-  const user = people[tokenFor(req)];
+preview.get("/auth/me", async (req, res) => {
+  const user = await currentPreviewPerson(tokenFor(req));
   if (!user) { res.sendStatus(401); return; }
   res.json({ user });
 });
 preview.get("/employee-agreement/current", (req, res) => {
   if (!people[tokenFor(req)]) { res.sendStatus(401); return; }
   res.json({ accepted: true });
-});
-preview.get("/admin/users", (req, res) => {
-  if (!["synthetic-sm-admin", "synthetic-gm-admin"].includes(tokenFor(req))) { res.sendStatus(403); return; }
-  res.json({ users: req.query.role === "sm" ? [people["synthetic-sm"], people["synthetic-second-sm"]] : [people["synthetic-gm"]] });
 });
 // Actual message routes and read-receipt policy are exercised by the independent preview too.
 await admin("post", "/admin/sm-messages").send({ subject: "Monatliche Durcharbeit",
@@ -191,6 +204,14 @@ preview.use(f.app);
 // GM fixture auth is intentionally different; never let an unmatched SM request hit it.
 preview.use((req, res, next) => {
   if (req.path.startsWith("/sm/") || req.path.startsWith("/admin/sm-") || req.path.startsWith("/admin/sm/")) { res.status(404).json({ error: "Nicht Teil dieser synthetischen Vorschau." }); return; }
+  next();
+});
+// The GM fixture has separate synthetic tokens. Valid SM customer identities must
+// receive a permission denial, rather than an artificial expired-auth response.
+preview.use((req, res, next) => {
+  if (tokenFor(req) === "synthetic-customer-sm" || String(tokenFor(req)).startsWith("synthetic-customer:")) {
+    res.status(403).json({error:"Kein GM-Zugriff in dieser synthetischen SM-Vorschau.",code:"kunde_page_forbidden"}); return;
+  }
   next();
 });
 preview.use(gmFixture.app);

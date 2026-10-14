@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { sql, type SQL } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
@@ -238,7 +239,8 @@ async function loadFilterOptions() {
   };
 }
 
-adminSmDashboardRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSmDashboardRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSmDashboardRouter.use(requireKundeAdminPermission);
 
 adminSmDashboardRouter.get("/", async (req, res, next) => {
   try {

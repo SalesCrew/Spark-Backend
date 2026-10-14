@@ -2,7 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { and, eq } from "drizzle-orm";
 import { isFullAdminRole } from "./admin-role.js";
 import { db } from "./db.js";
-import { kundeUsers, type KundePagePermissions } from "./schema.js";
+import { kundeUsers, smAssignments, type KundePagePermissions } from "./schema.js";
 import type { AuthedRequest } from "../middleware/auth.js";
 
 export const KUNDE_PERMISSION_ACTIONS = ["read", "write", "update"] as const;
@@ -25,6 +25,17 @@ export const KUNDE_ADMIN_PAGE_KEYS = [
   "lager",
   "gebietsmanager",
   "shelfmerchandiser",
+  "sm_dashboard",
+  "sm_fragebogen",
+  "sm_durcharbeit",
+  "sm_fbmanagement",
+  "sm_fotoarchiv",
+  "sm_verplanung",
+  "sm_durcharbeit_verplanung",
+  "sm_zeiterfassung",
+  "sm_maerkte",
+  "sm_durcharbeit_maerkte",
+  "sm_nachrichten",
 ] as const;
 
 export type KundeAdminPageKey = (typeof KUNDE_ADMIN_PAGE_KEYS)[number];
@@ -104,6 +115,51 @@ function resolveKundePageKeyHeader(req: Request): KundeAdminPageKey | null {
   return isKundeAdminPageKey(headerValue) ? headerValue : null;
 }
 
+type KundeAdminRequirement = { pageKey: KundeAdminPageKey; action: KundePermissionAction; allowAnyPagePermission?: boolean };
+const smPageKeys = new Set<string>(KUNDE_ADMIN_PAGE_KEYS.filter(key => key.startsWith("sm_") || key === "shelfmerchandiser"));
+export function isKundeSmPageKey(value: unknown): value is KundeAdminPageKey {
+  return typeof value === "string" && smPageKeys.has(value);
+}
+
+/** A page header may select a known read dependency, never an unrelated resource or write scope. */
+function smReadPage(req: Request, canonical: KundeAdminPageKey, dependencies: KundeAdminPageKey[] = []): KundeAdminPageKey {
+  const header = resolveKundePageKeyHeader(req);
+  return header && dependencies.includes(header) ? header : canonical;
+}
+function resolveKundeSmRequirement(req: Request, path: string, action: KundePermissionAction): KundeAdminRequirement | null | undefined {
+  const read = action === "read";
+  if (routeStartsWith(path, "/admin/sm-dashboard")) return { pageKey: "sm_dashboard", action };
+  if (routeStartsWith(path, "/admin/sm-questionnaires")) {
+    const canonical = req.query.scope === "SMDurcharbeit" ? "sm_durcharbeit" : "sm_fragebogen";
+    // The existing POST save handler also accepts an existing UUID. That is an update.
+    const saveAction = req.method === "POST" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(req.body?.id ?? "")) ? "update" : action;
+    return { pageKey: read ? smReadPage(req, canonical, ["sm_fbmanagement", "sm_verplanung", "sm_durcharbeit_verplanung"]) : canonical, action: saveAction };
+  }
+  if (routeStartsWith(path, "/admin/sm-photos")) return { pageKey: "sm_fotoarchiv", action: /\/(signed-urls|export)$/.test(path) ? "read" : action };
+  if (routeStartsWith(path, "/admin/sm-smdurcharbeit-times")) return { pageKey: smReadPage(req, "sm_zeiterfassung", ["sm_fbmanagement"]), action: read ? action : "update" };
+  if (routeStartsWith(path, "/admin/sm-smdurcharbeit-campaigns")) {
+    return { pageKey: "sm_durcharbeit_verplanung", action: /\/preview$/.test(path) ? "read" : read ? action : req.method === "POST" && path === "/admin/sm-smdurcharbeit-campaigns" ? "write" : "update" };
+  }
+  if (routeStartsWith(path, "/admin/sm-activity/completed")) return { pageKey: read ? smReadPage(req, "sm_fbmanagement", ["sm_zeiterfassung", "shelfmerchandiser"]) : "sm_fbmanagement", action: read ? action : "update" };
+  // Internal request-review queues are not customer pages.
+  if (routeStartsWith(path, "/admin/sm-activity")) return null;
+  if (routeStartsWith(path, "/admin/sm-messages")) return { pageKey: "sm_nachrichten", action };
+  if (routeStartsWith(path, "/admin/sm-markets")) {
+    const dedicated = routeStartsWith(path, "/admin/sm-markets/SMDurcharbeit") || req.query.SMDurcharbeitMarketScope === "SMDurcharbeit";
+    const canonical = dedicated ? "sm_durcharbeit_maerkte" : "sm_maerkte";
+    return { pageKey: read ? smReadPage(req, canonical, ["sm_dashboard", "sm_verplanung", "sm_durcharbeit_verplanung", "sm_fbmanagement", "sm_fotoarchiv", "shelfmerchandiser"]) : canonical, action: path.endsWith("/deactivate") ? "update" : action };
+  }
+  if (routeStartsWith(path, "/admin/sm-planning")) {
+    if (path.endsWith("/questionnaire-assignment")) return { pageKey: read ? smReadPage(req, "sm_verplanung", ["sm_durcharbeit_verplanung"]) : "sm_verplanung", action };
+    if (path.endsWith("/gm-visits")) return { pageKey: "zeiterfassung", action: "read" };
+    if (/\/time-change-requests\//.test(path) || /\/(time|visit-time)$/.test(path)) return { pageKey: smReadPage(req, "sm_zeiterfassung", ["sm_fbmanagement"]), action: read ? action : "update" };
+    const canonical = resolveKundePageKeyHeader(req) === "sm_durcharbeit_verplanung" ? "sm_durcharbeit_verplanung" : "sm_verplanung";
+    return { pageKey: read ? smReadPage(req, canonical, ["sm_dashboard", "sm_zeiterfassung", "shelfmerchandiser"]) : canonical,
+      action: path.endsWith("/holidays/reconcile") && req.body?.dryRun === true ? "read" : read ? action : req.method === "POST" && /\/(assignments|series)$/.test(path) ? "write" : "update" };
+  }
+  return undefined;
+}
+
 export function resolveKundeAdminRequirement(req: Request): {
   pageKey: KundeAdminPageKey;
   action: KundePermissionAction;
@@ -114,6 +170,9 @@ export function resolveKundeAdminRequirement(req: Request): {
   const originalPath = originalUrl.split("?")[0] ?? originalUrl;
   const action = methodToDefaultAction(req.method);
   const isExportRequest = /(?:^|[\/-])export(?:[\/-]|$)/i.test(originalPath);
+
+  const smRequirement = resolveKundeSmRequirement(req, originalPath, action);
+  if (smRequirement !== undefined) return smRequirement;
 
   if (routeStartsWith(pathname, "/kunden-users") || routeStartsWith(originalPath, "/admin/kunden-users")) return null;
   if (routeStartsWith(pathname, "/users") || routeStartsWith(originalPath, "/admin/users")) return null;
@@ -179,13 +238,27 @@ export function requireKundeAdminPermission(req: AuthedRequest, res: Response, n
   }
 
   getKundePermissionsForUser(req.authUser.appUserId)
-    .then((permissions) => {
+    .then(async (permissions) => {
+      const planningPath = (req.originalUrl || req.url).split("?")[0] ?? "";
+      if (planningPath.startsWith("/admin/sm-planning/") && requirement.action !== "read" && ["sm_verplanung", "sm_durcharbeit_verplanung"].includes(requirement.pageKey)) {
+        const targetId = planningPath.match(/^\/admin\/sm-planning\/assignments\/([0-9a-f-]{36})(?:\/|$)/i)?.[1];
+        const [target] = targetId ? await db.select({ override: smAssignments.SMDurcharbeitQuestionnaireOverrideVersionId }).from(smAssignments).where(eq(smAssignments.id, targetId)).limit(1) : [];
+        requirement.pageKey = target ? target.override ? "sm_durcharbeit_verplanung" : "sm_verplanung" : req.body?.SMDurcharbeitQuestionnaireOverrideVersionId ? "sm_durcharbeit_verplanung" : "sm_verplanung";
+        // Moving an existing Einsatz to another planning scope requires both scopes.
+        if (target && Object.hasOwn(req.body ?? {}, "SMDurcharbeitQuestionnaireOverrideVersionId")) {
+          const destination = req.body.SMDurcharbeitQuestionnaireOverrideVersionId ? "sm_durcharbeit_verplanung" : "sm_verplanung";
+          if (!hasKundePermission(permissions, destination, "update")) {
+            res.status(403).json({ error: "Für diese Aktion ist kein Kundenzugriff freigeschaltet.", code: "kunde_permission_denied", pageKey: destination, action: "update" });
+            return;
+          }
+        }
+      }
       const pageActions = permissions[requirement.pageKey] ?? [];
       const requestPath = (req.originalUrl || req.url).split("?")[0] ?? "";
       const isExportRequest = /(?:^|[\/-])export(?:[\/-]|$)/i.test(requestPath);
       if (
         hasKundePermission(permissions, requirement.pageKey, requirement.action) ||
-        ((requirement.allowAnyPagePermission === true || isExportRequest) && pageActions.length > 0)
+        ((requirement.allowAnyPagePermission === true || (isExportRequest && !isKundeSmPageKey(requirement.pageKey))) && pageActions.length > 0)
       ) {
         next();
         return;

@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { and, asc, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { Router, type Request, type Response, type NextFunction } from "express";
@@ -113,7 +114,8 @@ async function signPhotos<T extends { storageBucket: string; storagePath: string
 }
 
 export const adminSmManagementRouter = Router();
-adminSmManagementRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSmManagementRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSmManagementRouter.use(requireKundeAdminPermission);
 adminSmManagementRouter.use((_req, res, next) => { res.setHeader("Cache-Control", "private, no-store"); next(); });
 const handle = (action: (req: AuthedRequest, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => {
   void action(req as AuthedRequest, res).catch(error => {

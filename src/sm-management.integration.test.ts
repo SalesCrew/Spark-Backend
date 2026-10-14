@@ -7,6 +7,7 @@ import { drizzle } from "drizzle-orm/pglite";
 import { and, eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
+import * as adminRoles from "./lib/admin-role.js";
 import { isolatedModule } from "../tests/isolated-module.js";
 import * as management from "./sm-management.js";
 import * as planning from "./sm-planning.shared.js";
@@ -42,6 +43,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     await pg.exec(await readFile(new URL("../supabase/migrations/20261007133647_SMDurcharbeit_market_registry.sql", import.meta.url), "utf8"));
     await pg.exec(await readFile(new URL("../supabase/migrations/20261008125753_SMDurcharbeit_market_import.sql", import.meta.url), "utf8"));
     await pg.exec(await readFile(new URL("../supabase/migrations/20261009100850_SMDurcharbeit_monthly_campaigns.sql", import.meta.url), "utf8"));
+    await pg.exec(await readFile(new URL("../supabase/migrations/20261009160312_SMDurcharbeit_market_sm_user_id.sql", import.meta.url), "utf8"));
     await pg.query("insert into users(id,first_name,last_name,role) values ($1,'Local','Admin','sm_admin'),($2,'Local','SM','sm')", [admin, employee]);
     await pg.query("insert into sm_markets(id,name,chain,address,postal_code,city,region) values ($1,'Local Billa','Billa','Testgasse 1','1010','Wien','Ost')", [market]);
     const [template] = await database.insert(schema.smQuestionnaireTemplates).values({ stableCode: "local-template" }).returning();
@@ -167,9 +169,13 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       if (!isRoleAllowedForEndpoint(role, roles)) { res.sendStatus(403); return; }
       Object.assign(req, { authUser: { appUserId: req.header("x-local-actor") ?? admin, role } }); next();
     } };
+    await pg.exec("create table kunde_users(user_id uuid primary key references users(id),page_permissions jsonb not null default '{}'::jsonb,is_deleted boolean not null default false);");
+    const kundeAccess = await isolatedModule<typeof import("./lib/kunde-access.js")>(new URL("./lib/kunde-access.ts", import.meta.url), {
+      "./db.js": { db: database }, "./schema.js": schema, "./admin-role.js": adminRoles,
+    });
     const route = await isolatedModule<typeof import("./routes/sm-management.js")>(new URL("./routes/sm-management.ts", import.meta.url), {
       "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
-      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../sm-management.js": management,
+      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../sm-management.js": management, "../lib/kunde-access.js": kundeAccess,
       "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visitShared, "../middleware/auth.js": authMock,
       "../config/env.js": { env: { JWT_SECRET: "isolated-test-only-key-never-used-outside-this-process" } },
       "../lib/supabase.js": { supabaseAdmin: { storage: { from: (bucket: string) => {
@@ -197,7 +203,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
 
     const activityRoute = await isolatedModule<typeof import("./routes/sm-activity.js")>(new URL("./routes/sm-activity.ts", import.meta.url), {
       "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
-      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "./sm-management.js": route,
+      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "./sm-management.js": route, "../lib/kunde-access.js": kundeAccess,
       "../lib/conditional-visibility.js": conditionalVisibility, "../sm-comment.shared.js": comments,
       "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visitShared, "../middleware/auth.js": authMock,
     });
@@ -212,7 +218,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     });
     const planningRoute = await isolatedModule<typeof import("./routes/sm-planning.js")>(new URL("./routes/sm-planning.ts", import.meta.url), {
       "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection, "../sm-SMDurcharbeit-catalog.shared.js": SMDurcharbeitCatalog,
-      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": authMock,
+      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": authMock, "../lib/kunde-access.js": kundeAccess,
       "../sm-planning.shared.js": planning, "../sm-planning-lock.js": planningLock, "../sm-time-overlap.js": timeOverlap,
       "../sm-profile.shared.js": profileShared,
       "../sm-holiday-planning.js": holidays, "../sm-series-management.js": { smSeriesManagementRouter: express.Router() },
@@ -220,7 +226,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     const visitRoute = await isolatedModule<typeof import("./routes/sm-visits.js")>(new URL("./routes/sm-visits.ts", import.meta.url), {
       "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
       "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection,
-      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": authMock,
+      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": authMock, "../lib/kunde-access.js": kundeAccess,
       "../lib/conditional-visibility.js": conditionalVisibility, "../sm-comment.shared.js": comments, "../sm-visit.shared.js": visitShared,
       "../sm-visit-time.shared.js": visitTimeShared,
       "../sm-planning.shared.js": planning, "../sm-planning-lock.js": planningLock, "../sm-time-overlap.js": timeOverlap,
@@ -315,7 +321,8 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       const moved = await assignment("planned", { originalWorkDate: "2026-08-15", replacementWorkDate: "2026-09-15" });
       const other = await assignment("planned", { originalSmUserId: admin });
       const range = "?from=2026-09-01&to=2026-09-30";
-      const response = await employeeGet(`/employee-planning/assignments${range}`).expect(200);
+      const response = await employeeGet(`/employee-planning/assignments${range}`);
+      assert.equal(response.status, 200, JSON.stringify(response.body));
       assert.deepEqual(new Set(response.body.assignments.map((row: { id: string }) => row.id)), new Set([visible.id, missed.id, moved.id]));
       const adminResult = await request(app).get(`/admin-planning/assignments${range}`).set("x-local-role", "sm_admin").expect(200);
       assert.ok(adminResult.body.assignments.some((row: { id: string }) => row.id === cancelled.id));
@@ -469,7 +476,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     await t.test("OOS reads the real corrected SQL result without moving the visit to another month", async () => {
       const fixture = await seed(), id = fixture.submission.id;
       const dashboard = await isolatedModule<typeof import("./routes/sm-dashboard.js")>(new URL("./routes/sm-dashboard.ts", import.meta.url), {
-        "../lib/db.js": { db: database }, "../middleware/auth.js": authMock,
+        "../lib/db.js": { db: database }, "../middleware/auth.js": authMock, "../lib/kunde-access.js": kundeAccess,
         "../sm-dashboard.shared.js": dashboardShared, "../sm-planning.shared.js": planning,
       });
       // PGlite execute returns { rows }; production postgres-js returns the row array.
@@ -506,7 +513,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
 
     await t.test("no GM business tables exist in this fixture", async () => {
       const tables = await pg.query<{ tablename: string }>("select tablename from pg_tables where schemaname='public'");
-      assert.ok(tables.rows.every(row => row.tablename === "users" || row.tablename.startsWith("sm_")));
+      assert.ok(tables.rows.every(row => row.tablename === "users" || row.tablename === "kunde_users" || row.tablename.startsWith("sm_")));
     });
     if (process.env.SM_MANAGEMENT_BROWSER_FIXTURE === "1") {
       app.put("/fixture-upload", express.raw({ type: ["image/png", "image/jpeg", "image/webp"], limit: "20mb" }), (req, res) => {
@@ -525,7 +532,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
         submittedAt: new Date("2026-09-15T10:00:00Z"), reportingAvailableAt: new Date("2026-09-15T10:00:00Z"),
       }).where(eq(schema.smQuestionnaireSubmissions.id, id));
       const dashboard = await isolatedModule<typeof import("./routes/sm-dashboard.js")>(new URL("./routes/sm-dashboard.ts", import.meta.url), {
-        "../lib/db.js": { db: database }, "../middleware/auth.js": authMock,
+        "../lib/db.js": { db: database }, "../middleware/auth.js": authMock, "../lib/kunde-access.js": kundeAccess,
         "../sm-dashboard.shared.js": dashboardShared, "../sm-planning.shared.js": planning,
       });
       app.get("/fixture-state", async (_req, res) => {

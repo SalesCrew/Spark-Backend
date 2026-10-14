@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { and, asc, desc, eq, gte, inArray, lte, or, sql, type SQL } from "drizzle-orm";
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
@@ -142,7 +143,8 @@ async function signPhotoFiles(photos: Awaited<ReturnType<typeof findSmArchivePho
 }
 
 export const adminSmPhotoArchiveRouter = Router();
-adminSmPhotoArchiveRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSmPhotoArchiveRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSmPhotoArchiveRouter.use(requireKundeAdminPermission);
 adminSmPhotoArchiveRouter.use((_req, res, next) => { res.setHeader("Cache-Control", "private, no-store"); next(); });
 const handle = (action: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => {
   void action(req, res).catch(error => {

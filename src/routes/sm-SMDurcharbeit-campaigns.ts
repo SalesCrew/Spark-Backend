@@ -1,3 +1,4 @@
+import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
@@ -43,7 +44,8 @@ async function lockedCampaign(tx: Parameters<Parameters<typeof db.transaction>[0
 }
 
 export const adminSMDurcharbeitCampaignsRouter = Router();
-adminSMDurcharbeitCampaignsRouter.use(requireAuth(["admin", "sm_admin"]));
+adminSMDurcharbeitCampaignsRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
+adminSMDurcharbeitCampaignsRouter.use(requireKundeAdminPermission);
 adminSMDurcharbeitCampaignsRouter.get("/options", async (_req, res, next) => {
   try {
     const [markets, people, questionnaires] = await Promise.all([
