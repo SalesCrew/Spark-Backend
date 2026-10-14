@@ -24,7 +24,7 @@ test("monthly SMDurcharbeit uses actual routes, immutable physical visits and is
   try {
     const specialId = randomUUID();
     await f.database.insert(f.schema.smMarkets).values({ id: specialId, internalMarketId: "SYNTHETIC-MONTHLY", name: "Monthly synthetic market", chain: "Spar", address: "Synthetic 5", postalCode: "1010", city: "Wien", region: "Ost", assignedSmUserId: f.employee });
-    await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({ smMarketId: specialId, SMDurcharbeitVerplanung: "Local SM" });
+    await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({ smMarketId: specialId, SMDurcharbeitSmUserId: f.employee, SMDurcharbeitVerplanung: "Local SM" });
     const questionInputs = [q("yesno", "yesno", { commentTrigger: { mode: "options", optionCodes: ["option_1"] }, subheading: "Inherited configuration" }),
       q("single", "single", { options: ["A", "B"] }), q("multi", "multiple", { options: ["A", "B"] }),
       q("branch", "yesnomulti", { answers: ["Ja", "Nein"], branches: [{ answer: "Ja", options: ["A", "B"] }] }),
@@ -54,7 +54,7 @@ test("monthly SMDurcharbeit uses actual routes, immutable physical visits and is
       const otherUser = randomUUID(), otherMarket = randomUUID();
       await f.database.insert(f.schema.users).values({ id: otherUser, role: "sm", firstName: "Other", lastName: "Synthetic", email: "other@preview.test", isActive: true });
       await f.database.insert(f.schema.smMarkets).values({ id: otherMarket, internalMarketId: "SYNTHETIC-PRIVATE", name: "Private synthetic market", chain: "Spar", address: "Private 6", postalCode: "1010", city: "Wien", region: "Ost", assignedSmUserId: otherUser });
-      await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({ smMarketId: otherMarket, SMDurcharbeitVerplanung: "Other Synthetic" });
+      await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({ smMarketId: otherMarket, SMDurcharbeitSmUserId: otherUser, SMDurcharbeitVerplanung: "Other Synthetic" });
       const privateCampaign = (await admin("post", campaignPath).send({ name: "Private future campaign", startDate: "2027-01-01", endDate: "2027-02-28", questionnaireVersionId: version!.id, rosterDraft: [{ smMarketId: otherMarket, smUserId: otherUser }] }).expect(201)).body.campaign;
       const privatePreview = (await admin("get", `${campaignPath}/${privateCampaign.id}/preview`).expect(200)).body;
       await admin("post", `${campaignPath}/${privateCampaign.id}/publish`).send({ expectedRevision: 1, previewToken: privatePreview.previewToken }).expect(200);

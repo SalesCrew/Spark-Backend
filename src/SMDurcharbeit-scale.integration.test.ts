@@ -12,7 +12,7 @@ test("native maximum roster publishes and extends atomically with complete month
     const markets = Array.from({ length: 5000 }, (_, index) => ({ id: randomUUID(), name: `Scale ${String(index).padStart(4, "0")}`, chain: "Spar", address: `Synthetic ${index}`, postalCode: "1010", city: "Wien", region: "Ost", assignedSmUserId: f.employee }));
     for (let offset = 0; offset < markets.length; offset += 1000) {
       await f.database.insert(f.schema.smMarkets).values(markets.slice(offset, offset + 1000));
-      await f.database.insert(f.schema.smSMDurcharbeitMarkets).values(markets.slice(offset, offset + 1000).map(row => ({ smMarketId: row.id })));
+      await f.database.insert(f.schema.smSMDurcharbeitMarkets).values(markets.slice(offset, offset + 1000).map(row => ({ smMarketId: row.id, SMDurcharbeitSmUserId: f.employee })));
     }
     const module = (await admin("post", "/admin/sm-questionnaires/modules?scope=SMDurcharbeit").send({ id: `new-${randomUUID()}`, name: "Synthetic scale", description: "", questions: [{ id: `new-${randomUUID()}`, type: "yesno", text: "Synthetic only", required: false, options: ["Ja", "Nein"], config: {}, rules: [] }] }).expect(201)).body.module;
     const form = (await admin("post", "/admin/sm-questionnaires/questionnaires?scope=SMDurcharbeit").send({ id: `new-${randomUUID()}`, name: "Synthetic scale", description: "", status: "active", moduleIds: [module.id] }).expect(201)).body.questionnaire;

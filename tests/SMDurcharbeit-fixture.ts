@@ -84,6 +84,9 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   }, options.clock ?? Date);
   const base = { "../sm-SMDurcharbeit-campaign.shared.js": monthly, "../sm-SMDurcharbeit-answer-reuse.shared.js": monthlyAnswerReuse,
     "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection, "../sm-planning-lock.js": lock, "../sm-SMDurcharbeit-catalog.shared.js": SMDurcharbeitCatalog, "../lib/db.js": { db: dbForRoutes }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": auth };
+  const marketEdit = await isolatedModule<typeof import("../src/sm-SMDurcharbeit-market-edit.shared.js")>(new URL("../src/sm-SMDurcharbeit-market-edit.shared.ts", import.meta.url), {
+    "./lib/schema.js": schema, "./sm-SMDurcharbeit-campaign.shared.js": monthly,
+  }, options.clock ?? Date);
   const monthlyReport = await isolatedModule<typeof import("../src/sm-SMDurcharbeit-report.shared.js")>(new URL("../src/sm-SMDurcharbeit-report.shared.ts", import.meta.url), {
     "./lib/schema.js": schema, "./sm-visit.shared.js": visit,
     "./sm-SMDurcharbeit-answer-reuse.shared.js": monthlyAnswerReuse, "./sm-SMDurcharbeit-campaign.shared.js": monthly,
@@ -146,6 +149,7 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   app.use("/sm/visits", runtime.smVisitsRouter);
   app.use("/sm/smdurcharbeit/visits", runtime.SMDurcharbeitVisitsRouter);
   const campaignRoutes = await isolatedModule<typeof import("../src/routes/sm-SMDurcharbeit-campaigns.js")>(new URL("../src/routes/sm-SMDurcharbeit-campaigns.ts", import.meta.url), {
+    "../sm-SMDurcharbeit-market-edit.shared.js": marketEdit,
     ...base, "./sm-visits.js": runtime, "../sm-planning.shared.js": planning, "../sm-SMDurcharbeit-report.shared.js": monthlyReport,
   }, options.clock ?? Date);
   app.use("/sm/smdurcharbeit", campaignRoutes.SMDurcharbeitCampaignsRouter);

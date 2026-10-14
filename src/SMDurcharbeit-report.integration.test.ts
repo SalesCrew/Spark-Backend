@@ -15,7 +15,7 @@ test("monthly report counts latest required market answers once and every physic
     const markets = [f.market, randomUUID(), randomUUID()];
     for (const [index, id] of markets.entries()) {
       if (index) await f.database.insert(f.schema.smMarkets).values({ id, internalMarketId: `SYNTHETIC-REPORT-${index}`, name: `Report market ${index}`, chain: "Spar", address: "Synthetic 1", postalCode: "1010", city: "Wien", region: "Ost", assignedSmUserId: f.employee });
-      await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({ smMarketId: id });
+      await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({ smMarketId: id, SMDurcharbeitSmUserId: f.employee });
     }
     const q = (type: string, required = false, config = {}) => ({ id: `new-${randomUUID()}`, text: type, type, required, options: [], config, rules: [] });
     const module = (await admin("post", "/admin/sm-questionnaires/modules?scope=SMDurcharbeit").send({ id: `new-${randomUUID()}`, name: "Report questions", description: "", questions: [q("yesno", true), q("numeric"), q("multiple", false, { options: ["A", "B"] }), q("text")] }).expect(201)).body.module;

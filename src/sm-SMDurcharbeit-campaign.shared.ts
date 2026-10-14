@@ -44,18 +44,47 @@ export async function lockSMDurcharbeitSubmissionContext(tx: SMDurcharbeitTx, su
   return identity?.targetId ?? null;
 }
 export async function SMDurcharbeitEvent(tx: SMDurcharbeitTx, input: typeof events.$inferInsert) { await tx.insert(events).values(input); }
+/** Open obligations follow the registry; any physical visit pins its recorded owner. Reads never rewrite history. */
+export function SMDurcharbeitEffectiveOwner() {
+  const today = SMDurcharbeitToday();
+  return sql<string | null>`case when ${periods.month} >= ${SMDurcharbeitMonth(today)}::date
+    and ${campaigns.status} in ('published','paused') and ${campaigns.endDate} >= ${today}::date
+    and ${targets.latestSubmissionId} is null
+    and not exists (select 1 from ${visits} where ${visits.targetId} = ${targets.id})
+    then ${smSMDurcharbeitMarkets.SMDurcharbeitSmUserId} else ${owners.smUserId} end`;
+}
+export async function resolveSMDurcharbeitRoster(executor: SMDurcharbeitExecutor, selection: Array<{ smMarketId: string }>) {
+  const rows = selection.length ? await executor.select({ marketId: smSMDurcharbeitMarkets.smMarketId, smUserId: smSMDurcharbeitMarkets.SMDurcharbeitSmUserId })
+    .from(smSMDurcharbeitMarkets).where(inArray(smSMDurcharbeitMarkets.smMarketId, selection.map(row => row.smMarketId))) : [];
+  const byMarket = new Map(rows.map(row => [row.marketId, row.smUserId]));
+  return selection.map(row => ({ smMarketId: row.smMarketId, smUserId: byMarket.get(row.smMarketId) ?? null }));
+}
 export async function loadSMDurcharbeitTarget(executor: SMDurcharbeitExecutor, targetId: string) {
-  const [row] = await executor.select({ target: targets, campaign: campaigns, period: periods, membership: memberships, owner: owners, market: smMarkets })
+  const [row] = await executor.select({ target: targets, campaign: campaigns, period: periods, membership: memberships, owner: owners, market: smMarkets,
+    source: smSMDurcharbeitMarkets, effectiveSmUserId: SMDurcharbeitEffectiveOwner() })
     .from(targets).innerJoin(campaigns,eq(campaigns.id,targets.campaignId)).innerJoin(periods,eq(periods.id,targets.periodId))
     .innerJoin(memberships,eq(memberships.id,targets.campaignMarketId)).innerJoin(owners,eq(owners.id,targets.ownerRevisionId))
-    .innerJoin(smMarkets,eq(smMarkets.id,memberships.smMarketId)).where(eq(targets.id,targetId)).limit(1);
+    .innerJoin(smMarkets,eq(smMarkets.id,memberships.smMarketId)).leftJoin(smSMDurcharbeitMarkets,eq(smSMDurcharbeitMarkets.smMarketId,memberships.smMarketId))
+    .where(eq(targets.id,targetId)).limit(1);
   if (!row) return fail("smdurcharbeit_target_missing", "Dieses Monatsziel wurde nicht gefunden.",404);
   return row;
 }
 export type SMDurcharbeitTargetContext = Awaited<ReturnType<typeof loadSMDurcharbeitTarget>>;
+/** Only called by a successful new visit start, under the campaign/target and registry locks. */
+export async function pinSMDurcharbeitVisitOwner(tx: SMDurcharbeitTx, context: SMDurcharbeitTargetContext, smUserId: string) {
+  if (context.owner.smUserId === smUserId) return context;
+  if (context.effectiveSmUserId !== smUserId) return fail("smdurcharbeit_target_forbidden", "Die Marktzuordnung wurde geändert.", 403);
+  const [owner] = await tx.insert(owners).values({ campaignMarketId: context.membership.id, month: context.period.month, smUserId,
+    sourcePerson: context.source?.SMDurcharbeitVerplanung, reason: "SM-ID aus Durcharbeit-Marktbestand übernommen", actorUserId: smUserId }).returning();
+  await tx.update(targets).set({ ownerRevisionId: owner!.id, updatedAt: new Date() }).where(eq(targets.id, context.target.id));
+  await SMDurcharbeitEvent(tx, { campaignId: context.campaign.id, targetId: context.target.id, actorUserId: smUserId, action: "owner_resolved",
+    reason: "Automatische Verplanung beim Besuchsstart", beforeState: { ownerRevisionId: context.owner.id, smUserId: context.owner.smUserId },
+    afterState: { ownerRevisionId: owner!.id, smUserId } });
+  return { ...context, owner: owner!, target: { ...context.target, ownerRevisionId: owner!.id } };
+}
 export async function assertSMDurcharbeitAvailable(executor: SMDurcharbeitExecutor, context: SMDurcharbeitTargetContext, smUserId: string, at = new Date()) {
   const today = SMDurcharbeitToday(at);
-  if (context.owner.smUserId !== smUserId) return fail("smdurcharbeit_target_forbidden", "Dieser Markt ist einem anderen SM zugewiesen.",403);
+  if (context.effectiveSmUserId !== smUserId) return fail("smdurcharbeit_target_forbidden", "Dieser Markt ist einem anderen SM zugewiesen.",403);
   const [user] = await executor.select().from(users).where(and(eq(users.id,smUserId),eq(users.role,"sm"),eq(users.isActive,true),isNull(users.deletedAt))).limit(1);
   if (!user) return fail("smdurcharbeit_user_inactive", "Der SM-Zugang ist nicht aktiv.",403);
   if (context.campaign.status !== "published" || today < context.campaign.startDate || today > context.campaign.endDate || context.period.month !== SMDurcharbeitMonth(today)) {
@@ -90,10 +119,11 @@ export async function SMDurcharbeitPublicationPreview(executor: SMDurcharbeitExe
   const markets = await executor.select({ market: smMarkets, source: smSMDurcharbeitMarkets }).from(smSMDurcharbeitMarkets)
     .innerJoin(smMarkets,eq(smMarkets.id,smSMDurcharbeitMarkets.smMarketId)).where(inArray(smMarkets.id,marketIds)).orderBy(asc(smMarkets.id));
   if (markets.length !== marketIds.length || markets.some(r=>r.market.isDeleted || !r.market.isActive)) return fail("smdurcharbeit_roster_market_unavailable","Ein ausgewählter Durcharbeit-Markt ist nicht mehr aktiv.");
-  const peopleIds = [...new Set(campaign.rosterDraft.flatMap(r=>r.smUserId?[r.smUserId]:[]))];
+  const roster = markets.map(row => ({ smMarketId: row.market.id, smUserId: row.source.SMDurcharbeitSmUserId }));
+  const peopleIds = [...new Set(roster.flatMap(r=>r.smUserId?[r.smUserId]:[]))];
   const people = peopleIds.length ? await executor.select({id:users.id,isActive:users.isActive,role:users.role,deletedAt:users.deletedAt}).from(users).where(inArray(users.id,peopleIds)).orderBy(asc(users.id)) : [];
   const activeIds = new Set(people.filter(p=>p.isActive && p.role==="sm" && !p.deletedAt).map(p=>p.id));
-  const unresolved = campaign.rosterDraft.filter(r=>!r.smUserId || !activeIds.has(r.smUserId)).map(r=>r.smMarketId);
+  const unresolved = roster.filter(r=>!r.smUserId || !activeIds.has(r.smUserId)).map(r=>r.smMarketId);
   // Preview detects new campaign obligations overlapping an existing published one.
   const overlapping = await executor.select({ id: campaigns.id, name: campaigns.name, marketId: memberships.smMarketId }).from(memberships)
     .innerJoin(campaigns,eq(campaigns.id,memberships.campaignId)).where(and(inArray(memberships.smMarketId,marketIds),eq(campaigns.status,"published"),
@@ -103,19 +133,21 @@ export async function SMDurcharbeitPublicationPreview(executor: SMDurcharbeitExe
       and ${inArray(sql`coalesce(replacement_sm_market_id,original_sm_market_id)`,marketIds)}
       and coalesce(replacement_work_date,original_work_date) between ${campaign.startDate}::date and ${campaign.endDate}::date order by id`);
   const previewToken = createHash("sha256").update(JSON.stringify({campaign,versionId:version.id,markets,people,months,overlapping,legacy})).digest("hex");
-  return { campaign,version,months,marketCount:markets.length,targetCount:markets.length*months.length,unresolved,overlapping,legacy,previewToken,markets };
+  return { campaign,version,months,marketCount:markets.length,targetCount:markets.length*months.length,unresolved,overlapping,legacy,previewToken,markets,roster };
 }
 export async function publishSMDurcharbeitCampaign(tx: SMDurcharbeitTx, id: string, actorId: string, input: {expectedRevision:number;previewToken:string;confirmOverlap?:boolean | undefined}) {
-  await tx.select({id:campaigns.id}).from(campaigns).where(eq(campaigns.id,id)).for("update");
+  const [locked] = await tx.select({rosterDraft:campaigns.rosterDraft}).from(campaigns).where(eq(campaigns.id,id)).for("update");
+  if (locked?.rosterDraft.length) await tx.select({id:smSMDurcharbeitMarkets.smMarketId}).from(smSMDurcharbeitMarkets)
+    .where(inArray(smSMDurcharbeitMarkets.smMarketId,locked.rosterDraft.map(row=>row.smMarketId))).orderBy(asc(smSMDurcharbeitMarkets.smMarketId)).for("share");
   const preview = await SMDurcharbeitPublicationPreview(tx,id);
   if (preview.campaign.status !== "draft") return fail("smdurcharbeit_campaign_not_draft","Diese Kampagne wurde bereits veröffentlicht.");
   if (preview.campaign.revision !== input.expectedRevision || preview.previewToken !== input.previewToken) return fail("smdurcharbeit_preview_stale","Die Vorschau wurde geändert. Bitte erneut prüfen.");
-  if (preview.unresolved.length) return fail("smdurcharbeit_roster_unassigned","Bitte jedem Markt einen aktiven SM zuweisen.");
+  if (preview.unresolved.length) return fail("smdurcharbeit_roster_unassigned","Ein Markt hat keine gültige SM-ID im Durcharbeit-Marktbestand. Bitte dort die Verplanung prüfen.");
   if ((preview.overlapping.length || preview.legacy.length) && !input.confirmOverlap) return fail("smdurcharbeit_roster_overlap","Es gibt bereits Kampagnen oder offene datierte Einsätze für diese Märkte. Bitte die Überschneidung ausdrücklich bestätigen.");
   const memberRows = preview.markets.map(({market})=>({id:randomUUID(),campaignId:id,smMarketId:market.id}));
   const periodRows = preview.months.map(month=>({id:randomUUID(),campaignId:id,month,questionnaireVersionId:preview.version.id}));
   await tx.insert(memberships).values(memberRows); await tx.insert(periods).values(periodRows);
-  const drafts = new Map(preview.campaign.rosterDraft.map(r=>[r.smMarketId,r]));
+  const drafts = new Map(preview.roster.map(r=>[r.smMarketId,r]));
   const sources = new Map(preview.markets.map(r=>[r.market.id,r]));
   for (const period of periodRows) {
     const ownerRows = memberRows.map(member=>({id:randomUUID(),campaignMarketId:member.id,month:period.month,smUserId:drafts.get(member.smMarketId)!.smUserId!,sourcePerson:sources.get(member.smMarketId)!.source.SMDurcharbeitVerplanung,reason:"Kampagne veröffentlicht",actorUserId:actorId}));
@@ -126,7 +158,7 @@ export async function publishSMDurcharbeitCampaign(tx: SMDurcharbeitTx, id: stri
         marketSnapshot:{id:m.id,name:m.name,chain:m.chain,address:m.address,postalCode:m.postalCode,city:m.city,region:m.region,internalId:m.internalMarketId??m.id}};
     }));
   }
-  await tx.update(campaigns).set({status:"published",revision:sql`${campaigns.revision}+1`,updatedByUserId:actorId,updatedAt:new Date()}).where(eq(campaigns.id,id));
+  await tx.update(campaigns).set({status:"published",rosterDraft:preview.roster,revision:sql`${campaigns.revision}+1`,updatedByUserId:actorId,updatedAt:new Date()}).where(eq(campaigns.id,id));
   await SMDurcharbeitEvent(tx,{campaignId:id,actorUserId:actorId,action:"published",reason:"Monatliche Durcharbeit veröffentlicht",afterState:{months:preview.months,marketCount:preview.marketCount}});
 }
 
@@ -134,12 +166,13 @@ export async function listSMDurcharbeitTargets(executor: SMDurcharbeitExecutor, 
   const month = SMDurcharbeitMonth(input.month);
   const filters = [eq(periods.month,month),sql`${campaigns.status} <> 'draft'`];
   if (input.campaignId) filters.push(eq(campaigns.id,input.campaignId));
-  if (input.smUserId) filters.push(eq(owners.smUserId,input.smUserId));
-  const rows = await executor.select({target:targets,campaign:campaigns,period:periods,owner:owners,member:memberships,
+  if (input.smUserId) filters.push(eq(SMDurcharbeitEffectiveOwner(),input.smUserId));
+  const rows = await executor.select({target:targets,campaign:campaigns,period:periods,owner:owners,member:memberships,effectiveSmUserId:SMDurcharbeitEffectiveOwner(),
     marketAvailable: sql<boolean>`not ${smMarkets.isDeleted} and ${smMarkets.isActive}`,
-    user:{firstName:users.firstName,lastName:users.lastName,isActive:users.isActive,deletedAt:users.deletedAt}})
+    user:{firstName:users.firstName,lastName:users.lastName,isActive:users.isActive,deletedAt:users.deletedAt,role:users.role}})
     .from(targets).innerJoin(campaigns,eq(campaigns.id,targets.campaignId)).innerJoin(periods,eq(periods.id,targets.periodId))
-    .innerJoin(owners,eq(owners.id,targets.ownerRevisionId)).innerJoin(memberships,eq(memberships.id,targets.campaignMarketId)).innerJoin(users,eq(users.id,owners.smUserId))
+    .innerJoin(owners,eq(owners.id,targets.ownerRevisionId)).innerJoin(memberships,eq(memberships.id,targets.campaignMarketId))
+    .leftJoin(smSMDurcharbeitMarkets,eq(smSMDurcharbeitMarkets.smMarketId,memberships.smMarketId)).leftJoin(users,eq(users.id,SMDurcharbeitEffectiveOwner()))
     .innerJoin(smMarkets,eq(smMarkets.id,memberships.smMarketId))
     .where(and(...filters)).orderBy(asc(campaigns.name),asc(targets.id)).limit(10001);
   if (rows.length > 10000) return fail("smdurcharbeit_list_too_large","Bitte die Liste auf eine Kampagne eingrenzen.",400);
@@ -160,8 +193,8 @@ export async function listSMDurcharbeitTargets(executor: SMDurcharbeitExecutor, 
   return rows.map(r=>{
     const history = grouped.get(r.target.id);
     const available = r.campaign.status==="published" && month===SMDurcharbeitMonth(today) && today>=r.campaign.startDate && today<=r.campaign.endDate && r.target.eligibility==="required"
-      && r.marketAvailable && r.user.isActive && !r.user.deletedAt;
-    return {id:r.target.id,revision:r.target.revision,campaignId:r.campaign.id,campaignName:r.campaign.name,campaignStatus:r.campaign.status,startDate:r.campaign.startDate,endDate:r.campaign.endDate,month,market:r.target.marketSnapshot,smUserId:r.owner.smUserId,smName:`${r.user.firstName} ${r.user.lastName}`.trim(),eligibility:r.target.eligibility,waiverReason:r.target.waiverReason,completed:Boolean(history?.latestSubmissionId),available,draftVisitId:history?.draftVisitId??null,latestVisitId:history?.latestVisitId??null,latestVisitSmUserId:history?.latestVisitSmUserId??null,latestSubmissionId:history?.latestSubmissionId??null,completedAt:history?.completedAt ? new Date(history.completedAt).toISOString() : null,visitCount:history?.visitCount??0};
+      && r.marketAvailable && Boolean(r.user?.isActive) && !r.user?.deletedAt && r.user?.role==="sm";
+    return {id:r.target.id,revision:r.target.revision,campaignId:r.campaign.id,campaignName:r.campaign.name,campaignStatus:r.campaign.status,startDate:r.campaign.startDate,endDate:r.campaign.endDate,month,market:r.target.marketSnapshot,smUserId:r.effectiveSmUserId,smName:r.user ? `${r.user.firstName ?? ""} ${r.user.lastName ?? ""}`.trim() : "Keine SM-ID hinterlegt",eligibility:r.target.eligibility,waiverReason:r.target.waiverReason,completed:Boolean(history?.latestSubmissionId),available,draftVisitId:history?.draftVisitId??null,latestVisitId:history?.latestVisitId??null,latestVisitSmUserId:history?.latestVisitSmUserId??null,latestSubmissionId:history?.latestSubmissionId??null,completedAt:history?.completedAt ? new Date(history.completedAt).toISOString() : null,visitCount:history?.visitCount??0};
   });
 }
 export async function reconcileSMDurcharbeitTarget(tx:SMDurcharbeitTx,targetId:string,actorId:string,action:string) {
@@ -172,6 +205,7 @@ export async function reconcileSMDurcharbeitTarget(tx:SMDurcharbeitTx,targetId:s
   await SMDurcharbeitEvent(tx,{campaignId:context.campaign.id,targetId,actorUserId:actorId,action,reason:"Monatsstand aktualisiert",afterState:{latestSubmissionId:latest?.id??null}});
 }
 export async function editSMDurcharbeitTarget(tx:SMDurcharbeitTx,targetId:string,actorId:string,input:{expectedRevision:number;reason:string;smUserId?:string | undefined;eligibility?:"required"|"waived" | undefined;scope:"month"|"future"}) {
+  if (input.smUserId !== undefined) return fail("smdurcharbeit_owner_automatic", "Die SM-Zuordnung kommt automatisch aus dem Durcharbeit-Marktbestand.", 400);
   const identity=await loadSMDurcharbeitTarget(tx,targetId);
   await tx.select({id:campaigns.id}).from(campaigns).where(eq(campaigns.id,identity.campaign.id)).for("update");
   await lockSMDurcharbeitTarget(tx,targetId);
@@ -184,12 +218,7 @@ export async function editSMDurcharbeitTarget(tx:SMDurcharbeitTx,targetId:string
     const [draft]=await tx.select({id:submissions.id}).from(submissions).where(and(eq(submissions.SMDurcharbeitTargetId,row.id),eq(submissions.status,"draft"),eq(submissions.isCurrent,true),eq(submissions.isDeleted,false))).limit(1);
     if(draft) return fail("smdurcharbeit_draft_protected","Ein laufender Besuch muss zuerst beendet oder ausdrücklich verworfen werden.");
     if(input.eligibility==="waived" && current.target.latestSubmissionId && current.period.month===SMDurcharbeitMonth()) return fail("smdurcharbeit_completed_target_protected","Ein erledigtes Monatsziel bleibt in der aktuellen Auswertung erhalten. Wähle einen zukünftigen Monat.");
-    let ownerId=current.target.ownerRevisionId;
-    if(input.smUserId && input.smUserId!==current.owner.smUserId) {
-      const [person]=await tx.select({id:users.id}).from(users).where(and(eq(users.id,input.smUserId),eq(users.role,"sm"),eq(users.isActive,true),isNull(users.deletedAt))).limit(1);
-      if(!person) return fail("smdurcharbeit_user_inactive","Bitte einen aktiven SM auswählen.");
-      const [owner]=await tx.insert(owners).values({campaignMarketId:current.target.campaignMarketId,month:current.period.month,smUserId:input.smUserId,reason:input.reason,actorUserId:actorId}).returning(); ownerId=owner!.id;
-    }
+    const ownerId=current.target.ownerRevisionId;
     await tx.update(targets).set({ownerRevisionId:ownerId,...(input.eligibility?{eligibility:input.eligibility,waiverReason:input.eligibility==="waived"?input.reason:null}:{}),revision:sql`${targets.revision}+1`,updatedAt:new Date()}).where(eq(targets.id,row.id));
     await SMDurcharbeitEvent(tx,{campaignId:current.campaign.id,targetId:row.id,actorUserId:actorId,action:"roster_changed",reason:input.reason,beforeState:{ownerRevisionId:current.target.ownerRevisionId,eligibility:current.target.eligibility},afterState:{ownerRevisionId:ownerId,eligibility:input.eligibility??current.target.eligibility}});
   }

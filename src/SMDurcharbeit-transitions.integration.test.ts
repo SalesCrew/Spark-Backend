@@ -25,15 +25,17 @@ test("monthly transitions preserve ownership, pinned versions and historical sta
   const start = (row: any, token = "synthetic-sm") => sm("post", `${employeeRoot}/targets/${row.id}/start`, token).send({ expectedRevision: row.revision, followUp: row.completed, mode: "manual", clientSubmissionToken: randomUUID() });
   const publish = async (id: string, expectedStatus: number, confirmOverlap = false) => { const p = (await admin("get", `${root}/${id}/preview`).expect(200)).body; return admin("post", `${root}/${id}/publish`).send({ expectedRevision: p.campaign.revision, previewToken: p.previewToken, confirmOverlap }).expect(expectedStatus); };
   try {
-    await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({ smMarketId: f.market, SMDurcharbeitVerplanung: "Local SM" });
+    await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({ smMarketId: f.market, SMDurcharbeitSmUserId: f.employee, SMDurcharbeitVerplanung: "Local SM" });
     const original = await versionFor("Original synthetic version"), replacement = await versionFor("Replacement synthetic version");
     const c = await create(original.version.id);
     await t.test("drafts stay private and unresolved owners cannot publish", async () => {
       assert.equal((await sm("get", `${employeeRoot}/targets`).expect(200)).body.targets.length, 0);
+      await f.database.update(f.schema.smSMDurcharbeitMarkets).set({ SMDurcharbeitSmUserId: null }).where(eq(f.schema.smSMDurcharbeitMarkets.smMarketId, f.market));
       const unresolved = await create(original.version.id, { rosterDraft: [{ smMarketId: f.market, smUserId: null }] });
       const p = (await admin("get", `${root}/${unresolved.id}/preview`).expect(200)).body;
       assert.deepEqual(p.unresolved, [f.market]); await publish(unresolved.id, 409);
       assert.equal((await f.database.select().from(f.schema.smSMDurcharbeitPeriods)).length, 0);
+      await f.database.update(f.schema.smSMDurcharbeitMarkets).set({ SMDurcharbeitSmUserId: f.employee }).where(eq(f.schema.smSMDurcharbeitMarkets.smMarketId, f.market));
     });
     await t.test("a roster change after preview requires a fresh preview", async () => {
       const p = (await admin("get", `${root}/${c.id}/preview`).expect(200)).body;
@@ -58,7 +60,7 @@ test("monthly transitions preserve ownership, pinned versions and historical sta
       const after = (await admin("get", `${root}/${c.id}/periods`).expect(200)).body.periods;
       assert.deepEqual(after.map((row: any) => row.questionnaireVersionId), [original.version.id, replacement.version.id, original.version.id]);
     });
-    await t.test("registry changes never transfer campaign ownership or change its market snapshot", async () => {
+    await t.test("normal market metadata never replaces the Durcharbeit SM ID or its snapshot", async () => {
       const before = await target(c.id);
       await f.database.update(f.schema.smMarkets).set({ assignedSmUserId: second, name: "Registry metadata changed" }).where(eq(f.schema.smMarkets.id, f.market));
       const after = await target(c.id); assert.equal(after.smUserId, f.employee); assert.deepEqual(after.market, before.market);
@@ -75,19 +77,19 @@ test("monthly transitions preserve ownership, pinned versions and historical sta
       await f.database.update(f.schema.smMarkets).set({ isActive: true }).where(eq(f.schema.smMarkets.id, f.market));
       assert.equal((await target(c.id)).revision, before.revision); assert.equal((await target(c.id)).available, true);
     });
-    await t.test("waive, reopen and future reassignment are audited and do not rewrite older targets", async () => {
+    await t.test("waive and reopen are audited; manual owner changes are rejected", async () => {
       const october = await target(c.id); await admin("patch", `${root}/targets/${october.id}`).send({ expectedRevision: october.revision, eligibility: "waived", scope: "month", reason: "Synthetic exception" }).expect(200);
       const waived = await target(c.id); assert.equal(waived.eligibility, "waived"); await start(waived).expect(409);
       await admin("patch", `${root}/targets/${waived.id}`).send({ expectedRevision: waived.revision, eligibility: "required", scope: "month", reason: "Synthetic reopening" }).expect(200);
       const preserved = await target(c.id), november = await target(c.id, "2026-11-01");
-      await admin("patch", `${root}/targets/${november.id}`).send({ expectedRevision: november.revision, smUserId: second, scope: "future", reason: "Synthetic future assignment" }).expect(200);
+      await admin("patch", `${root}/targets/${november.id}`).send({ expectedRevision: november.revision, smUserId: second, scope: "future", reason: "Synthetic future assignment" }).expect(400);
       assert.deepEqual(await target(c.id), preserved);
-      assert.equal((await target(c.id, "2026-11-01")).smUserId, second); assert.equal((await target(c.id, "2026-12-01")).smUserId, second);
+      assert.equal((await target(c.id, "2026-11-01")).smUserId, f.employee); assert.equal((await target(c.id, "2026-12-01")).smUserId, f.employee);
     });
     await t.test("live drafts prevent transfer; pause preserves the graph and explicit resume uses the same visit", async () => {
       const row = await target(c.id), started = (await start(row).expect(201)).body;
       const afterStart = await target(c.id);
-      await admin("patch", `${root}/targets/${row.id}`).send({ expectedRevision: afterStart.revision, smUserId: second, scope: "month", reason: "Synthetic protected transfer" }).expect(409);
+      await admin("patch", `${root}/targets/${row.id}`).send({ expectedRevision: afterStart.revision, smUserId: second, scope: "month", reason: "Synthetic protected transfer" }).expect(400);
       const current = await campaign(c.id); await admin("patch", `${root}/${c.id}/state`).send({ expectedRevision: current.revision, status: "paused", reason: "Synthetic pause" }).expect(200);
       const paused = (await sm("get", `${employeeRoot}/visits/${started.visitId}`).expect(200)).body;
       assert.ok(paused.SMDurcharbeitContext.readOnlyReason); await start(await target(c.id)).expect(409);
@@ -95,6 +97,7 @@ test("monthly transitions preserve ownership, pinned versions and historical sta
       assert.equal((await start(await target(c.id)).expect(200)).body.visitId, started.visitId);
     });
     await t.test("Vienna month boundary selects the new version, leaves new answers empty and closes the old draft", async () => {
+      await f.database.update(f.schema.smSMDurcharbeitMarkets).set({ SMDurcharbeitSmUserId: second }).where(eq(f.schema.smSMDurcharbeitMarkets.smMarketId, f.market));
       now = Date.parse("2026-10-31T23:05:00Z");
       const list = (await sm("get", `${employeeRoot}/targets`, "synthetic-second-sm").expect(200)).body; assert.equal(list.currentMonth, "2026-11-01");
       const november = list.targets.find((row: any) => row.campaignId === c.id);

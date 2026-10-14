@@ -7,14 +7,15 @@ import { createSMDurcharbeitFixture } from "../tests/SMDurcharbeit-fixture.js";
 
 test("native disposable PostgreSQL serializes monthly and legacy writers without duplicate work", { skip: !process.env.SMDURCHARBEIT_SYNTHETIC_PG_SOCKET_DIR, timeout: 30_000 }, async t => {
   class Clock extends Date { constructor(value?: string | number | Date) { super(value === undefined ? "2026-10-09T12:00:00Z" : value instanceof Date ? value.getTime() : value); } static now() { return Date.parse("2026-10-09T12:00:00Z"); } }
-  const f = await createSMDurcharbeitFixture({ clock: Clock as typeof Date });
+  const secondSm = randomUUID();
+  const f = await createSMDurcharbeitFixture({ clock: Clock as typeof Date, additionalSmUsers: [{ id: secondSm, token: "synthetic-second-sm" }] });
   assert.equal(f.nativePostgres, true, "Concurrent checks must run on native PostgreSQL, never PGlite");
   const admin = (method: "get" | "post" | "patch", path: string) => request(f.app)[method](path).auth("synthetic-sm-admin", { type: "bearer" });
   const sm = (method: "get" | "post", path: string) => request(f.app)[method](path).auth("synthetic-sm", { type: "bearer" });
   try {
     const marketIds = [randomUUID(), randomUUID()];
     await f.database.insert(f.schema.smMarkets).values(marketIds.map((id,index) => ({ id, name: `Concurrent synthetic ${index}`, chain: "Spar", address: "Fixture only 1", postalCode: "1010", city: "Wien", region: "Ost", assignedSmUserId: f.employee })));
-    await f.database.insert(f.schema.smSMDurcharbeitMarkets).values(marketIds.map(smMarketId => ({ smMarketId })));
+    await f.database.insert(f.schema.smSMDurcharbeitMarkets).values(marketIds.map(smMarketId => ({ smMarketId, SMDurcharbeitSmUserId: f.employee })));
     const module = (await admin("post", "/admin/sm-questionnaires/modules?scope=SMDurcharbeit").send({ id: `new-${randomUUID()}`, name: "Concurrent fixture", description: "", questions: [{ id: `new-${randomUUID()}`, type: "yesno", text: "Optional synthetic answer", required: false, options: ["Ja","Nein"], config: {}, rules: [] }] }).expect(201)).body.module;
     const form = (await admin("post", "/admin/sm-questionnaires/questionnaires?scope=SMDurcharbeit").send({ id: `new-${randomUUID()}`, name: "Concurrent fixture", description: "", status: "active", moduleIds: [module.id] }).expect(201)).body.questionnaire;
     const [version] = await f.database.select().from(f.schema.smQuestionnaireVersions).where(eq(f.schema.smQuestionnaireVersions.questionnaireTemplateId, form.id));
@@ -81,16 +82,14 @@ test("native disposable PostgreSQL serializes monthly and legacy writers without
       assert.equal(rows.length,12); assert.ok(rows.every(row=>row.rls&&row.server_read&&!row.server_delete));
       for(const role of ["anon","authenticated"]) { await f.pg.exec(`set role ${role}`); try { for(const row of rows) await assert.rejects(f.pg.query(`select * from "${row.name}" limit 1`),/permission denied/); } finally { await f.pg.exec("reset role"); } }
     });
-    await t.test("starts racing waiver, reassignment and pause cannot create work after the winning transition", async () => {
-      const other = randomUUID();
-      await f.database.insert(f.schema.users).values({ id: other, role: "sm", firstName: "Other", lastName: "Synthetic", email: "race@preview.test", isActive: true });
-      for (const action of ["waive", "reassign", "pause"] as const) {
+    await t.test("starts racing waiver and pause cannot create work after the winning transition", async () => {
+      for (const action of ["waive", "pause"] as const) {
         const campaign = (await admin("post", "/admin/sm-smdurcharbeit-campaigns").send({ name: `Synthetic race ${action}`, startDate: "2026-10-01", endDate: "2026-10-31", questionnaireVersionId: version!.id, rosterDraft: [{ smMarketId: marketIds[0], smUserId: f.employee }] }).expect(201)).body.campaign;
         const preview = (await admin("get", `/admin/sm-smdurcharbeit-campaigns/${campaign.id}/preview`).expect(200)).body;
         await admin("post", `/admin/sm-smdurcharbeit-campaigns/${campaign.id}/publish`).send({ expectedRevision: campaign.revision, previewToken: preview.previewToken, confirmOverlap: true }).expect(200);
         const target = (await admin("get", `/admin/sm-smdurcharbeit-campaigns/${campaign.id}/targets`).expect(200)).body.targets[0];
         const change = action === "pause" ? admin("patch", `/admin/sm-smdurcharbeit-campaigns/${campaign.id}/state`).send({ expectedRevision: campaign.revision + 1, status: "paused", reason: "Synthetic race pause" })
-          : admin("patch", `/admin/sm-smdurcharbeit-campaigns/targets/${target.id}`).send({ expectedRevision: target.revision, scope: "month", reason: "Synthetic race roster", ...(action === "waive" ? { eligibility: "waived" } : { smUserId: other }) });
+          : admin("patch", `/admin/sm-smdurcharbeit-campaigns/targets/${target.id}`).send({ expectedRevision: target.revision, scope: "month", reason: "Synthetic race roster", eligibility: "waived" });
         const [startResult, changeResult] = await Promise.all([
           sm("post", `/sm/smdurcharbeit/targets/${target.id}/start`).send({ expectedRevision: target.revision, followUp: false, mode: "manual", clientSubmissionToken: randomUUID() }), change,
         ]);
@@ -110,6 +109,28 @@ test("native disposable PostgreSQL serializes monthly and legacy writers without
           if (startResult.status === 201) assert.equal(changeResult.status, 409);
           else assert.equal(changeResult.status, 200);
         }
+      }
+    });
+    await t.test("registry changes racing start cannot transfer the owner of an actual visit", async () => {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        await f.database.update(f.schema.smSMDurcharbeitMarkets).set({ SMDurcharbeitSmUserId: f.employee }).where(eq(f.schema.smSMDurcharbeitMarkets.smMarketId, marketIds[0]!));
+        const campaign = (await admin("post", "/admin/sm-smdurcharbeit-campaigns").send({ name: `Synthetic automatic race ${attempt}`, startDate: "2026-10-01", endDate: "2026-12-31", questionnaireVersionId: version!.id, rosterDraft: [{ smMarketId: marketIds[0] }] }).expect(201)).body.campaign;
+        const preview = (await admin("get", `/admin/sm-smdurcharbeit-campaigns/${campaign.id}/preview`).expect(200)).body;
+        await admin("post", `/admin/sm-smdurcharbeit-campaigns/${campaign.id}/publish`).send({ expectedRevision: campaign.revision, previewToken: preview.previewToken, confirmOverlap: true }).expect(200);
+        const row = (await admin("get", `/admin/sm-smdurcharbeit-campaigns/${campaign.id}/targets?month=2026-10-01`).expect(200)).body.targets[0];
+        const [startResult] = await Promise.all([
+          sm("post", `/sm/smdurcharbeit/targets/${row.id}/start`).send({ expectedRevision: row.revision, followUp: false, mode: "manual", clientSubmissionToken: randomUUID() }),
+          f.database.update(f.schema.smSMDurcharbeitMarkets).set({ SMDurcharbeitSmUserId: secondSm }).where(eq(f.schema.smSMDurcharbeitMarkets.smMarketId, marketIds[0]!)),
+        ]);
+        assert.ok([201, 403].includes(startResult.status), JSON.stringify(startResult.body));
+        const current = (await admin("get", `/admin/sm-smdurcharbeit-campaigns/${campaign.id}/targets?month=2026-10-01`).expect(200)).body.targets[0];
+        assert.equal(current.smUserId, startResult.status === 201 ? f.employee : secondSm);
+        if (startResult.status === 201) {
+          await sm("get", `/sm/smdurcharbeit/visits/${startResult.body.visitId}`).expect(200);
+          await request(f.app).get(`/sm/smdurcharbeit/visits/${startResult.body.visitId}`).auth("synthetic-second-sm", { type: "bearer" }).expect(403);
+        }
+        const future = (await admin("get", `/admin/sm-smdurcharbeit-campaigns/${campaign.id}/targets?month=2026-11-01`).expect(200)).body.targets[0];
+        assert.equal(future.smUserId, secondSm);
       }
     });
   } finally { await f.pg.close(); }

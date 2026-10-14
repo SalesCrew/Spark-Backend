@@ -101,7 +101,7 @@ await f.database.insert(f.schema.smMarkets).values(SMDurcharbeitExtraMarketIds.m
   name: index ? "Durcharbeit · Markt im Zentrum" : "Durcharbeit · Markt an der Allee", chain: index ? "Billa" : "Spar",
   address: `Synthetische Gasse ${20 + index}`, postalCode: "1040", city: "Wien", region: "Ost", internalMarketId: `SYNTHETIC-CAMPAIGN-${index}`, assignedSmUserId: f.employee,
 })));
-await f.database.insert(f.schema.smSMDurcharbeitMarkets).values(SMDurcharbeitExtraMarketIds.map(smMarketId => ({ smMarketId, SMDurcharbeitVerplanung: "SM Local" })));
+await f.database.insert(f.schema.smSMDurcharbeitMarkets).values(SMDurcharbeitExtraMarketIds.map((smMarketId, index) => ({ smMarketId, SMDurcharbeitSmUserId: index ? secondSmId : f.employee, SMDurcharbeitVerplanung: index ? "Second SM" : "SM Local" })));
 const SMDurcharbeitEnd = new Date(`${today.slice(0, 7)}-01T12:00:00Z`); SMDurcharbeitEnd.setUTCMonth(SMDurcharbeitEnd.getUTCMonth() + 3, 0);
 const SMDurcharbeitCampaign = (await admin("post", "/admin/sm-smdurcharbeit-campaigns").send({
   name: "Durcharbeit · Monatskampagne Vorschau", startDate: `${today.slice(0, 7)}-01`, endDate: SMDurcharbeitEnd.toISOString().slice(0, 10), questionnaireVersionId: durcharbeit.version.id,

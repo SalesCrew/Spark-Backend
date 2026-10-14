@@ -49,6 +49,7 @@ test('SMDurcharbeit: import every synthetic source row, plan, submit answers/pho
       const original = payload.rows[source.SMDurcharbeitSourceRow!-1]!;
       assert.deepEqual(source.SMDurcharbeitSourceValues,Object.fromEntries(SMDurcharbeitImportHeaders.map((h,i)=>[h,original[i]])));
       assert.equal(imported.markets.find((r:any)=>r.id===source.smMarketId).assignedSmUserId,f.employee);
+      assert.equal(source.SMDurcharbeitSmUserId,f.employee);
     }
     const ids = sources.map(row=>row.smMarketId).sort();
     const repeat = (await admin('post','/admin/sm-markets/SMDurcharbeit/import').send(payload).expect(200)).body.summary;
@@ -138,6 +139,7 @@ test('SMDurcharbeit: invalid rows, ambiguous names, archived markets and manual 
     const created=(await admin(route).send(manual).expect(201)).body.market;
     assert.equal(created.SMDurcharbeitMarket,true); assert.equal(created.assignedSmUserId,f.employee);
     const [source]=await f.database.select().from(f.schema.smSMDurcharbeitMarkets).where(eq(f.schema.smSMDurcharbeitMarkets.smMarketId,created.id));
+    assert.equal(source!.SMDurcharbeitSmUserId,f.employee);
     assert.equal(source!.SMDurcharbeitOrt,'Wien');
     assert.equal((await f.database.select().from(f.schema.smMarkets)).length,sizeBefore+1);
     assert.equal((await f.pg.query('select count(*)::int as count from sm_smdurcharbeit_markets r left join sm_markets m on m.id=r.sm_market_id where m.id is null')).rows[0]!.count,0);

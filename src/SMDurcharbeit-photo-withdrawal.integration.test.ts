@@ -12,7 +12,7 @@ test("withdrawn original photos cannot be signed, read or carried through retain
   const admin=(method:"get"|"post",path:string)=>request(f.app)[method](path).auth("synthetic-sm-admin",{type:"bearer"});
   const sm=(method:"get"|"post",path:string)=>request(f.app)[method](path).auth("synthetic-sm",{type:"bearer"});
   try {
-    await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({smMarketId:f.market});
+    await f.database.insert(f.schema.smSMDurcharbeitMarkets).values({smMarketId:f.market,SMDurcharbeitSmUserId:f.employee});
     const module=(await admin("post","/admin/sm-questionnaires/modules?scope=SMDurcharbeit").send({id:`new-${randomUUID()}`,name:"Synthetic withdrawal",description:"",questions:[{id:`new-${randomUUID()}`,type:"photo",text:"Synthetic photo",required:false,options:[],config:{},rules:[]}]}).expect(201)).body.module;
     const form=(await admin("post","/admin/sm-questionnaires/questionnaires?scope=SMDurcharbeit").send({id:`new-${randomUUID()}`,name:"Synthetic withdrawal",description:"",status:"active",moduleIds:[module.id]}).expect(201)).body.questionnaire;
     const [version]=await f.database.select().from(f.schema.smQuestionnaireVersions).where(eq(f.schema.smQuestionnaireVersions.questionnaireTemplateId,form.id));

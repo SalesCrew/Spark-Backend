@@ -10,18 +10,22 @@ import { smSMDurcharbeitCampaigns as campaigns, smSMDurcharbeitCampaignMarkets a
   smMarkets, smSMDurcharbeitMarkets, smQuestionnaireVersions, smQuestionnaireTemplates, users } from "../lib/schema.js";
 import { SMDurcharbeitCampaignError, SMDurcharbeitToday, SMDurcharbeitMonth, SMDurcharbeitMonths, SMDurcharbeitEvent,
   SMDurcharbeitPublicationPreview, publishSMDurcharbeitCampaign, listSMDurcharbeitTargets, loadSMDurcharbeitTarget,
-  assertSMDurcharbeitAvailable, loadSMDurcharbeitVersion, editSMDurcharbeitTarget } from "../sm-SMDurcharbeit-campaign.shared.js";
+  assertSMDurcharbeitAvailable, loadSMDurcharbeitVersion, editSMDurcharbeitTarget, resolveSMDurcharbeitRoster, SMDurcharbeitEffectiveOwner } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { initializeSMDurcharbeitVisit, cancelSMDurcharbeitDraft, cleanupSMDurcharbeitDraftPhotos } from "./sm-visits.js";
 import { isIsoDate } from "../sm-planning.shared.js";
 import { loadSMDurcharbeitReport } from "../sm-SMDurcharbeit-report.shared.js";
+import { applySMDurcharbeitMarketEdit, previewSMDurcharbeitMarketEdit } from "../sm-SMDurcharbeit-market-edit.shared.js";
 
 const date = z.string().refine(isIsoDate, "Ungültiges Datum.");
 const uuid = z.string().uuid();
-const roster = z.array(z.object({ smMarketId: uuid, smUserId: uuid.nullable() }).strict()).max(5000)
+const roster = z.array(z.object({ smMarketId: uuid, smUserId: uuid.nullable().optional() }).strict()).max(5000)
   .refine(rows => new Set(rows.map(row => row.smMarketId)).size === rows.length, "Märkte dürfen nur einmal ausgewählt werden.");
 const draftSchema = z.object({ name: z.string().trim().min(1).max(200), startDate: date, endDate: date,
   questionnaireVersionId: uuid, rosterDraft: roster }).strict().refine(input => input.endDate >= input.startDate, "Das Enddatum liegt vor dem Beginn.");
 const updateSchema = draftSchema.extend({ expectedRevision: z.number().int().positive() }).strict();
+const marketEditSchema = z.object({ expectedRevision: z.number().int().positive(), month: date, scope: z.enum(["month", "future"]),
+  reason: z.string().trim().min(3).max(1000), roster: z.array(z.object({ smMarketId: uuid, smUserId: uuid.optional() }).strict()).max(5000)
+    .refine(rows => new Set(rows.map(row => row.smMarketId)).size === rows.length, "Märkte dürfen nur einmal ausgewählt werden.") }).strict();
 const startSchema = z.object({ expectedRevision: z.number().int().positive(), followUp: z.boolean(), mode: z.enum(["timer", "manual"]),
   travelMinutes: z.number().int().min(0).max(1440).nullable().optional(), clientSubmissionToken: z.string().trim().min(8).max(300) }).strict();
 function id(req: AuthedRequest, key: string) { return uuid.parse(req.params[key]); }
@@ -45,7 +49,7 @@ adminSMDurcharbeitCampaignsRouter.get("/options", async (_req, res, next) => {
     const [markets, people, questionnaires] = await Promise.all([
       db.select({ id: smMarkets.id, name: smMarkets.name, address: smMarkets.address, postalCode: smMarkets.postalCode, city: smMarkets.city,
         region: smMarkets.region, chain: smMarkets.chain,
-        assignedSmUserId: sql<string | null>`coalesce(${smSMDurcharbeitMarkets.SMDurcharbeitSmUserId}, ${smMarkets.assignedSmUserId})`,
+        assignedSmUserId: smSMDurcharbeitMarkets.SMDurcharbeitSmUserId,
         sourcePerson: smSMDurcharbeitMarkets.SMDurcharbeitVerplanung })
         .from(smSMDurcharbeitMarkets).innerJoin(smMarkets, eq(smMarkets.id, smSMDurcharbeitMarkets.smMarketId))
         .where(and(eq(smMarkets.isDeleted, false), eq(smMarkets.isActive, true))).orderBy(asc(smMarkets.name), asc(smMarkets.id)),
@@ -68,7 +72,8 @@ adminSMDurcharbeitCampaignsRouter.post("/", async (req: AuthedRequest, res, next
     const input = draftSchema.parse(req.body); SMDurcharbeitMonths(input.startDate, input.endDate);
     const created = await db.transaction(async tx => {
       await loadSMDurcharbeitVersion(tx, input.questionnaireVersionId);
-      const [campaign] = await tx.insert(campaigns).values({ ...input, createdByUserId: actor(req), updatedByUserId: actor(req) }).returning();
+      const rosterDraft = await resolveSMDurcharbeitRoster(tx, input.rosterDraft);
+      const [campaign] = await tx.insert(campaigns).values({ ...input, rosterDraft, createdByUserId: actor(req), updatedByUserId: actor(req) }).returning();
       await SMDurcharbeitEvent(tx, { campaignId: campaign!.id, actorUserId: actor(req), action: "draft_created", reason: "Kampagnenentwurf erstellt" });
       return campaign!;
     });
@@ -82,7 +87,8 @@ adminSMDurcharbeitCampaignsRouter.patch("/:campaignId", async (req: AuthedReques
       const campaign = await lockedCampaign(tx, id(req, "campaignId"), expectedRevision);
       if (campaign.status !== "draft") throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_campaign_not_draft", "Veröffentlichte Kampagnen werden über ihre Monatsziele bearbeitet.");
       await loadSMDurcharbeitVersion(tx, input.questionnaireVersionId);
-      const [updated] = await tx.update(campaigns).set({ ...input, revision: expectedRevision + 1, updatedByUserId: actor(req), updatedAt: new Date() }).where(eq(campaigns.id, campaign.id)).returning();
+      const rosterDraft = await resolveSMDurcharbeitRoster(tx, input.rosterDraft);
+      const [updated] = await tx.update(campaigns).set({ ...input, rosterDraft, revision: expectedRevision + 1, updatedByUserId: actor(req), updatedAt: new Date() }).where(eq(campaigns.id, campaign.id)).returning();
       await SMDurcharbeitEvent(tx, { campaignId: campaign.id, actorUserId: actor(req), action: "draft_updated", reason: "Kampagnenentwurf bearbeitet" });
       return updated;
     }); res.json({ campaign: result });
@@ -110,10 +116,23 @@ adminSMDurcharbeitCampaignsRouter.get("/:campaignId/periods", async (req: Authed
   try { res.json({ periods: await db.select().from(periods).where(eq(periods.campaignId, id(req, "campaignId"))).orderBy(asc(periods.month)) }); }
   catch (error) { if (!errorResponse(error, res)) next(error); }
 });
+adminSMDurcharbeitCampaignsRouter.post("/:campaignId/markets/preview", async (req: AuthedRequest, res, next) => {
+  try {
+    const input = marketEditSchema.parse(req.body);
+    res.json(await db.transaction(tx => previewSMDurcharbeitMarketEdit(tx, id(req, "campaignId"), input),
+      { isolationLevel: "repeatable read", accessMode: "read only" }));
+  } catch (error) { if (!errorResponse(error, res)) next(error); }
+});
+adminSMDurcharbeitCampaignsRouter.patch("/:campaignId/markets", async (req: AuthedRequest, res, next) => {
+  try {
+    const input = marketEditSchema.extend({ previewToken: z.string().length(64), confirmOverlap: z.boolean().optional() }).strict().parse(req.body);
+    res.json(await db.transaction(tx => applySMDurcharbeitMarketEdit(tx, id(req, "campaignId"), actor(req), input)));
+  } catch (error) { if (!errorResponse(error, res)) next(error); }
+});
 adminSMDurcharbeitCampaignsRouter.patch("/targets/:targetId", async (req: AuthedRequest, res, next) => {
   try {
     const input = z.object({ expectedRevision: z.number().int().positive(), reason: z.string().trim().min(3).max(1000), scope: z.enum(["month", "future"]),
-      smUserId: uuid.optional(), eligibility: z.enum(["required", "waived"]).optional() }).strict().refine(input => input.smUserId !== undefined || input.eligibility !== undefined).parse(req.body);
+      eligibility: z.enum(["required", "waived"]) }).strict().parse(req.body);
     await db.transaction(tx => editSMDurcharbeitTarget(tx, id(req, "targetId"), actor(req), input)); res.json({ updated: true });
   } catch (error) { if (!errorResponse(error, res)) next(error); }
 });
@@ -148,11 +167,19 @@ adminSMDurcharbeitCampaignsRouter.post("/:campaignId/extend", async (req: Authed
       const existingPeriods = await tx.select().from(periods).where(eq(periods.campaignId, campaign.id)).orderBy(desc(periods.month));
       const currentMonths = new Set(existingPeriods.map(p => p.month)), latestPeriod = existingPeriods[0];
       if (!latestPeriod) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_period_missing", "Die Kampagnenmonate fehlen.");
-      const lastTargets = await tx.select({ target: targets, owner: owners }).from(targets).innerJoin(owners, eq(owners.id, targets.ownerRevisionId)).where(eq(targets.periodId, latestPeriod.id)).orderBy(asc(targets.id));
+      const lastTargets = await tx.select({ target: targets, owner: owners, source: smSMDurcharbeitMarkets }).from(targets)
+        .innerJoin(owners, eq(owners.id, targets.ownerRevisionId)).innerJoin(members, eq(members.id, targets.campaignMarketId))
+        .leftJoin(smSMDurcharbeitMarkets, eq(smSMDurcharbeitMarkets.smMarketId, members.smMarketId))
+        .where(eq(targets.periodId, latestPeriod.id)).orderBy(asc(targets.id));
+      const activePeople = new Set((await tx.select({ id: users.id }).from(users)
+        .where(and(eq(users.role, "sm"), eq(users.isActive, true), isNull(users.deletedAt)))).map(row => row.id));
+      if (lastTargets.some(row => row.target.eligibility === "required" && (!row.source?.SMDurcharbeitSmUserId || !activePeople.has(row.source.SMDurcharbeitSmUserId)))) {
+        throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_roster_unassigned", "Ein aktiver Markt hat keine gültige SM-ID im Durcharbeit-Marktbestand. Bitte dort die Verplanung prüfen.");
+      }
       for (const month of months.filter(m => !currentMonths.has(m))) {
         const [period] = await tx.insert(periods).values({ campaignId: campaign.id, month, questionnaireVersionId: latestPeriod.questionnaireVersionId }).returning();
         const ownerRows = lastTargets.map(previous => ({ id: randomUUID(), campaignMarketId: previous.target.campaignMarketId, month,
-          smUserId: previous.owner.smUserId, sourcePerson: previous.owner.sourcePerson, reason: input.reason, actorUserId: actor(req) }));
+          smUserId: previous.source?.SMDurcharbeitSmUserId ?? previous.owner.smUserId, sourcePerson: previous.source?.SMDurcharbeitVerplanung ?? previous.owner.sourcePerson, reason: input.reason, actorUserId: actor(req) }));
         if (ownerRows.length) {
           await tx.insert(owners).values(ownerRows);
           await tx.insert(targets).values(lastTargets.map((previous, index) => ({ campaignId: campaign.id, periodId: period!.id,
@@ -213,7 +240,8 @@ SMDurcharbeitCampaignsRouter.get("/targets", async (req: AuthedRequest, res, nex
       listSMDurcharbeitTargets(db, { smUserId, month }),
       db.selectDistinct({ month: periods.month }).from(targets).innerJoin(periods, eq(periods.id, targets.periodId))
         .innerJoin(campaigns, eq(campaigns.id, targets.campaignId)).innerJoin(owners, eq(owners.id, targets.ownerRevisionId))
-        .where(and(eq(owners.smUserId, smUserId), sql`${campaigns.status} <> 'draft'`)).orderBy(asc(periods.month)),
+        .innerJoin(members, eq(members.id, targets.campaignMarketId)).leftJoin(smSMDurcharbeitMarkets, eq(smSMDurcharbeitMarkets.smMarketId, members.smMarketId))
+        .where(and(eq(SMDurcharbeitEffectiveOwner(), smUserId), sql`${campaigns.status} <> 'draft'`)).orderBy(asc(periods.month)),
     ]);
     res.json({ month, currentMonth, months: ownedMonths.map(period => period.month), targets: monthlyTargets });
   }
@@ -222,7 +250,7 @@ SMDurcharbeitCampaignsRouter.get("/targets", async (req: AuthedRequest, res, nex
 SMDurcharbeitCampaignsRouter.get("/targets/:targetId", async (req: AuthedRequest, res, next) => {
   try {
     const context = await loadSMDurcharbeitTarget(db, id(req, "targetId"));
-    if (context.owner.smUserId !== actor(req)) throw new SMDurcharbeitCampaignError(403, "smdurcharbeit_target_forbidden", "Dieser Markt gehört einem anderen SM.");
+    if (context.effectiveSmUserId !== actor(req)) throw new SMDurcharbeitCampaignError(403, "smdurcharbeit_target_forbidden", "Dieser Markt gehört einem anderen SM.");
     const rows = await listSMDurcharbeitTargets(db, { campaignId: context.campaign.id, month: context.period.month, smUserId: actor(req) });
     const [version] = await db.select({ name: smQuestionnaireVersions.name, versionNumber: smQuestionnaireVersions.versionNumber }).from(smQuestionnaireVersions).where(eq(smQuestionnaireVersions.id, context.period.questionnaireVersionId)).limit(1);
     const [user] = await db.select({ travelTimeEnabled: users.travelTimeEnabled }).from(users).where(eq(users.id, actor(req))).limit(1);

@@ -6,7 +6,7 @@ import { z } from "zod";
 import { smAnswerComment, smCommentMissing } from "../sm-comment.shared.js";
 import { SMDurcharbeitCampaignError, loadSMDurcharbeitOwnedVisit, loadSMDurcharbeitTarget, lockSMDurcharbeitTarget,
   assertSMDurcharbeitAvailable, loadSMDurcharbeitVersion, SMDurcharbeitToday, SMDurcharbeitMonth,
-  SMDurcharbeitEvent, reconcileSMDurcharbeitTarget, saveSMDurcharbeitVisitTime } from "../sm-SMDurcharbeit-campaign.shared.js";
+  SMDurcharbeitEvent, reconcileSMDurcharbeitTarget, saveSMDurcharbeitVisitTime, pinSMDurcharbeitVisitOwner } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { copySMDurcharbeitMonthlyAnswers, SMDurcharbeitAnswerFiles } from "../sm-SMDurcharbeit-answer-reuse.shared.js";
 
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
@@ -40,6 +40,7 @@ import {
   users,
   smSMDurcharbeitVisits,
   smSMDurcharbeitTargets,
+  smSMDurcharbeitMarkets,
   smSMDurcharbeitTimeRevisions,
   smSMDurcharbeitFileLinks,
   smSMDurcharbeitAnswerProvenance,
@@ -661,7 +662,9 @@ export async function initializeSMDurcharbeitVisit(tx: DbTx, targetId: string, s
     return { visitId: replayed.SMDurcharbeitVisitId, submissionId: replayed.id, replayed: true };
   }
   await lockSMDurcharbeitTarget(tx, targetId);
-  const context = await loadSMDurcharbeitTarget(tx, targetId);
+  let context = await loadSMDurcharbeitTarget(tx, targetId);
+  await tx.select({ id: smSMDurcharbeitMarkets.smMarketId }).from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, context.membership.smMarketId)).for("share");
+  context = await loadSMDurcharbeitTarget(tx, targetId);
   const user = await assertSMDurcharbeitAvailable(tx, context, smUserId);
   const [draft] = await tx.select().from(smQuestionnaireSubmissions).where(and(
     eq(smQuestionnaireSubmissions.SMDurcharbeitTargetId, targetId), eq(smQuestionnaireSubmissions.status, "draft"), eq(smQuestionnaireSubmissions.isCurrent, true), eq(smQuestionnaireSubmissions.isDeleted, false),
@@ -678,6 +681,7 @@ export async function initializeSMDurcharbeitVisit(tx: DbTx, targetId: string, s
   )).orderBy(desc(smSMDurcharbeitVisits.basisRevision), desc(smQuestionnaireSubmissions.submittedAt), desc(smQuestionnaireSubmissions.id)).limit(1);
   const latest = latestRow?.submission;
   if (Boolean(latest) !== input.followUp) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_followup_confirmation", latest ? "Das Monatsziel ist erledigt. Bitte einen Folgebesuch ausdrücklich starten." : "Für diesen Monat gibt es noch keinen abgeschlossenen Besuch.");
+  context = await pinSMDurcharbeitVisitOwner(tx, context, smUserId);
   const visitId = randomUUID(), submissionId = randomUUID(), now = new Date();
   await tx.insert(smSMDurcharbeitVisits).values({ id: visitId, targetId, ownerRevisionId: context.target.ownerRevisionId,
     smUserId, basisSubmissionId: latest?.id ?? null, basisRevision: context.target.revision + 1 });

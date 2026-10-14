@@ -57,7 +57,7 @@ export function createSMDurcharbeitMarketsRouter(db: typeof productionDb, list: 
           } else {
             const id = randomUUID();
             await tx.insert(smMarkets).values({ id, ...marketValues, internalMarketId: `SMD-${id}`, region: 'Ohne Region', importSourceFileName: parsed.data.fileName, importedAt: new Date() });
-            await tx.insert(smSMDurcharbeitMarkets).values({ smMarketId: id, ...sourceValues, SMDurcharbeitSourceFile: parsed.data.fileName, SMDurcharbeitSourceSheet: parsed.data.sheetName, SMDurcharbeitSourceRow: row.row, SMDurcharbeitImportedAt: new Date() });
+            await tx.insert(smSMDurcharbeitMarkets).values({ smMarketId: id, ...sourceValues, SMDurcharbeitSmUserId: assignedSmUserId, SMDurcharbeitSourceFile: parsed.data.fileName, SMDurcharbeitSourceSheet: parsed.data.sheetName, SMDurcharbeitSourceRow: row.row, SMDurcharbeitImportedAt: new Date() });
             summary.created++;
           }
         }
@@ -87,7 +87,7 @@ export function createSMDurcharbeitMarketsRouter(db: typeof productionDb, list: 
         const id = randomUUID();
         const [market] = await tx.insert(smMarkets).values({ ...input, id, internalMarketId: `SMD-${id}`, flexNumber: null, region: input.region || 'Ohne Region', shelfMerchandiserName: planner }).returning();
         const source = { Vertriebstyp: input.chain, 'Firma/Betrieb': input.name, Straße: input.address, PLZ: input.postalCode, Ort: input.city, 'EM/EH': '', Verplanung: planner };
-        await tx.insert(smSMDurcharbeitMarkets).values({ smMarketId: id, SMDurcharbeitVertriebstyp: input.chain, SMDurcharbeitFirmaBetrieb: input.name, SMDurcharbeitStrasse: input.address, SMDurcharbeitPlz: input.postalCode, SMDurcharbeitOrt: input.city, SMDurcharbeitEmEh: '', SMDurcharbeitVerplanung: planner, SMDurcharbeitSourceValues: source });
+        await tx.insert(smSMDurcharbeitMarkets).values({ smMarketId: id, SMDurcharbeitSmUserId: input.assignedSmUserId ?? null, SMDurcharbeitVertriebstyp: input.chain, SMDurcharbeitFirmaBetrieb: input.name, SMDurcharbeitStrasse: input.address, SMDurcharbeitPlz: input.postalCode, SMDurcharbeitOrt: input.city, SMDurcharbeitEmEh: '', SMDurcharbeitVerplanung: planner, SMDurcharbeitSourceValues: source });
         return market!;
       });
       res.status(201).json({ market: { ...(map(created) as object), SMDurcharbeitMarket: true } });
