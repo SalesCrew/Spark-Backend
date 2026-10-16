@@ -1,3 +1,4 @@
+import { smBasicActivityCode } from "../sm-basic-activity.shared.js";
 import { randomUUID } from "node:crypto";
 import { assertSMDurcharbeitOverride, loadSMDurcharbeitSelectionCatalog, resolveSMDurcharbeitSelection, SMDurcharbeitSelectionError } from "../sm-SMDurcharbeit-selection.shared.js";
 import { and, asc, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
@@ -766,6 +767,7 @@ async function removeSMDurcharbeitPhoto(tx: DbTx, execution: SMDurcharbeitExecut
   }
   const remaining = await SMDurcharbeitAnswerFiles(tx, [answer.id]);
   await tx.update(smQuestionAnswers).set({ answerState: remaining.length ? "answered" : "unanswered",
+    metricOutcomeCode: remaining.length ? answer.metricOutcomeCode : null,
     valueJson: { kind: "photo", fileIds: remaining.map(photo => photo.id), ...(remaining.length && smAnswerComment(answer.valueJson) ? { comment: smAnswerComment(answer.valueJson) } : {}) },
     answeredAt: remaining.length ? now : null, updatedAt: now }).where(eq(smQuestionAnswers.id, answer.id));
   await tx.insert(smQuestionAnswerEvents).values({ answerId: answer.id, submissionId: submission.id, eventType: remaining.length ? "set" : "clear", answerVersion: answer.answerVersion,
@@ -1093,6 +1095,7 @@ smVisitsRouter.post("/:assignmentId/photos/commit", async (req: AuthedRequest, r
         submissionQuestionId: smQuestionAnswers.submissionQuestionId,
         answerVersion: smQuestionAnswers.answerVersion,
         valueJson: smQuestionAnswers.valueJson,
+        configSnapshot: smQuestionnaireSubmissionQuestions.configSnapshot,
       }).from(smQuestionAnswers)
         .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smQuestionAnswers.submissionId))
         .innerJoin(smQuestionnaireSubmissionQuestions, eq(smQuestionnaireSubmissionQuestions.id, smQuestionAnswers.submissionQuestionId))
@@ -1135,6 +1138,7 @@ smVisitsRouter.post("/:assignmentId/photos/commit", async (req: AuthedRequest, r
       const now = new Date();
       await tx.update(smQuestionAnswers).set({
         answerState: allFiles.length ? "answered" : "unanswered",
+        metricOutcomeCode: smBasicActivityCode({ type: "photo", config: answer.configSnapshot, options: [] }, { kind: "photo", fileIds: allFiles.map(photo => photo.id) }),
         valueJson: { kind: "photo", fileIds: allFiles.map((photo) => photo.id), ...(smAnswerComment(answer.valueJson) ? { comment: smAnswerComment(answer.valueJson) } : {}) },
         answeredAt: allFiles.length ? now : null,
         answeredByUserId: actor.appUserId,
@@ -1218,6 +1222,7 @@ smVisitsRouter.delete("/:assignmentId/photos/:fileId", async (req: AuthedRequest
         submissionId: smQuestionAnswers.submissionId,
         answerVersion: smQuestionAnswers.answerVersion,
         valueJson: smQuestionAnswers.valueJson,
+        metricOutcomeCode: smQuestionAnswers.metricOutcomeCode,
       }).from(smQuestionAnswerFiles)
         .innerJoin(smQuestionAnswers, eq(smQuestionAnswers.id, smQuestionAnswerFiles.answerId))
         .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smQuestionAnswers.submissionId))
@@ -1239,6 +1244,7 @@ smVisitsRouter.delete("/:assignmentId/photos/:fileId", async (req: AuthedRequest
       ));
       await tx.update(smQuestionAnswers).set({
         answerState: remaining.length ? "answered" : "unanswered",
+        metricOutcomeCode: remaining.length ? file.metricOutcomeCode : null,
         valueJson: { kind: "photo", fileIds: remaining.map((photo) => photo.id), ...(remaining.length && smAnswerComment(file.valueJson) ? { comment: smAnswerComment(file.valueJson) } : {}) },
         answeredAt: remaining.length ? now : null,
         updatedAt: now,
@@ -1335,7 +1341,7 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
           throw new SmVisitError(409, "sm_visit_photo_upload_required", "Bitte speichere zuerst alle Fotos, bevor du den Kommentar ergänzt.");
         }
         const version = currentVersion + 1;
-        await tx.update(smQuestionAnswers).set({ valueJson: normalized, answerVersion: version, updatedAt: now }).where(eq(smQuestionAnswers.id, current.id));
+        await tx.update(smQuestionAnswers).set({ metricOutcomeCode: smBasicActivityCode({ type: question.questionTypeSnapshot, config: question.configSnapshot, options }, normalized), valueJson: normalized, answerVersion: version, updatedAt: now }).where(eq(smQuestionAnswers.id, current.id));
         await tx.insert(smQuestionAnswerEvents).values({
           answerId: current.id, submissionId: submission.id, eventType: "set", answerVersion: version,
           payload: { clientMutationToken: input.clientMutationToken, changeKind: "comment", before: current.valueJson, after: normalized },
@@ -1358,7 +1364,7 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
         answerState: isAnswered ? "answered" : "unanswered",
         valueText: normalized.kind === "text" ? normalized.value : null,
         valueNumber: normalized.kind === "number" ? String(normalized.value) : null,
-        valueJson: normalized,
+        metricOutcomeCode: smBasicActivityCode({ type: question.questionTypeSnapshot, config: question.configSnapshot, options }, normalized), valueJson: normalized,
         answeredByUserId: actor.appUserId,
         answeredAt: isAnswered ? now : null,
       });

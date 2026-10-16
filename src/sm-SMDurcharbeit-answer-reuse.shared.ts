@@ -1,3 +1,4 @@
+import { smBasicActivityCode } from "./sm-basic-activity.shared.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import { smQuestionAnswers as answers, smQuestionnaireSubmissionQuestions as questions, smQuestionAnswerOptions as options,
@@ -39,7 +40,7 @@ export async function copySMDurcharbeitMonthlyAnswers(tx:SMDurcharbeitTx,input:{
     const value=normalized.kind==="photo"?{...normalized,fileIds:normalized.fileIds.filter(id=>availableFiles.has(id))}:normalized;
     const answered=isAnsweredSmVisitPayload(value),id=randomUUID();
     await tx.insert(answers).values({id,submissionId:input.submissionId,submissionQuestionId:next.id,answerVersion:1,
-      answerState:answered?"answered":"unanswered",valueJson:value,
+      answerState:answered?"answered":"unanswered",valueJson:value,metricOutcomeCode:smBasicActivityCode(snapshot,value),
       valueText:value.kind==="text"?value.value:null,valueNumber:value.kind==="number"?String(value.value):null,
       // Preserve source attribution/time; the new actor only initiated carry-over, recorded in the event.
       answeredByUserId:source.answeredByUserId,answeredAt:source.answeredAt});

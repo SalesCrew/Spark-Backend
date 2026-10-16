@@ -1,3 +1,4 @@
+import { basicActivityConfigError } from "../sm-basic-activity.shared.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { lockSmPlanning } from "../sm-planning-lock.js";
 import { hasSMDurcharbeitPendingOverride } from "../sm-SMDurcharbeit-selection.shared.js";
@@ -268,6 +269,8 @@ function validateModule(input: SmModuleInput): void {
   });
 
   for (const [ownerIndex, question] of input.questions.entries()) {
+    const basicError = basicActivityConfigError(question.type, question.config, question.type === "matrix" ? (Array.isArray(question.config.columns) ? question.config.columns.map(String).filter(Boolean) : []) : optionsForQuestion(question));
+    if (basicError) throw new SmQuestionnaireDomainError(400, `${basicError} Frage: „${question.text}“`);
     if (question.oos?.enabled) {
       if (!smOosQuestionTypes.has(question.type)) {
         throw new SmQuestionnaireDomainError(400, `Die OOS-Zuordnung bei „${question.text}“ benötigt eine Ja/Nein-, Single-Choice- oder Multiple-Choice-Frage.`);

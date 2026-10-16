@@ -1,3 +1,4 @@
+import { smBasicActivityCode } from "../sm-basic-activity.shared.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -658,7 +659,7 @@ adminSmActivityRouter.post("/answer-change-requests/:requestId/approve", async (
         answerState: answered ? "answered" : "unanswered",
         valueText: normalized.kind === "text" ? normalized.value : null,
         valueNumber: normalized.kind === "number" ? String(normalized.value) : null,
-        valueJson: normalized,
+        metricOutcomeCode: smBasicActivityCode(questionSnapshot(question), normalized), valueJson: normalized,
         answeredByUserId: actor.appUserId,
         answeredAt: answered ? now : null,
       });

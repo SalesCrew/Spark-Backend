@@ -1,3 +1,4 @@
+import { smBasicActivityCode } from "./sm-basic-activity.shared.js";
 import { smQuestionnaireCatalogScope } from "./sm-SMDurcharbeit-catalog.shared.js";
 import { smQuestionnaireTemplates } from "./lib/schema.js";
 import { SMDurcharbeitAnswerFiles } from "./sm-SMDurcharbeit-answer-reuse.shared.js";
@@ -143,6 +144,7 @@ async function appendAnswer(tx: SmManagementTx, state: SmManagementState, questi
     supersedesAnswerId: latest?.id ?? null, answerVersion: version, isCurrent: true,
     answerState: notApplicable ? "not_applicable" : answered ? "answered" : "unanswered",
     applicabilityReason: notApplicable ? "selected_not_applicable_option" : null,
+    metricOutcomeCode: notApplicable ? null : smBasicActivityCode(smManagementQuestionSnapshot(question), nextValue),
     valueJson: nextValue, valueText: value.kind === "text" ? value.value : null, valueNumber: value.kind === "number" ? String(value.value) : null,
     earnedPoints: String(earned), possiblePoints: String(possible), answeredByUserId: actor, answeredAt: answered ? now : null,
   });

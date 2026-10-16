@@ -139,9 +139,10 @@ test("SMDurcharbeit per-Einsatz override is authoritative, immutable after start
     });
 
     await t.test("type reporting matches management, and no-OOS Durcharbeit stays unclassified", async () => {
-      const all = (await admin("get", "/admin/sm-dashboard?from=2026-10-07&to=2026-10-07").expect(200)).body;
+      const standardDefault = (await admin("get", "/admin/sm-dashboard?from=2026-10-07&to=2026-10-07").expect(200)).body;
       const only = (await admin("get", "/admin/sm-dashboard?from=2026-10-07&to=2026-10-07&SMDurcharbeitCatalogScope=SMDurcharbeit").expect(200)).body;
-      assert.equal(all.summary.completedVisits, 2);
+      assert.equal(standardDefault.summary.completedVisits, 1);
+      assert.equal(standardDefault.SMDurcharbeitBreakdown.SMDurcharbeit.completedVisits, 0);
       assert.equal(only.summary.completedVisits, 1);
       assert.equal(only.summary.classifiedChecks, 0);
       assert.equal(only.summary.foundRate, null);

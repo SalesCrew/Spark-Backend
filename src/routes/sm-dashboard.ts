@@ -1,3 +1,4 @@
+import { aggregateSmDashboardOverview, type SmBasicActivityRow, type SmOverviewVisit } from "../sm-dashboard-overview.shared.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { sql, type SQL } from "drizzle-orm";
 import { Router } from "express";
@@ -61,6 +62,8 @@ type OosDbRow = VisitDbRow & {
 };
 
 type FilterDbRow = { value: string; label: string };
+type MarketContext = FilterDbRow & { region: string; chain: string; sms: FilterDbRow[] };
+type FilterContextRow = Omit<MarketContext, "sms"> & { smUserId: string | null; smName: string | null };
 
 export function currentViennaDate(now = new Date()): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -130,6 +133,7 @@ function scopeConditions(input: z.infer<typeof querySchema>): SQL[] {
   if (input.smUserId) conditions.push(sql`s.sm_user_id = ${input.smUserId}::uuid`);
   if (input.marketId) conditions.push(sql`s.sm_market_id = ${input.marketId}::uuid`);
   if (input.SMDurcharbeitCatalogScope) conditions.push(sql`(case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${input.SMDurcharbeitCatalogScope}`);
+  if (input.SMDurcharbeitCatalogScope === "standard") conditions.push(standardMarketCondition());
   return conditions;
 }
 
@@ -137,9 +141,9 @@ function whereClause(conditions: SQL[]): SQL {
   return sql.join(conditions, sql` and `);
 }
 
-export async function loadSmDashboardRows(input: z.infer<typeof querySchema>, executor: Pick<typeof db, "execute"> = db) {
+export async function loadSmDashboardRows(input: z.infer<typeof querySchema>, executor: Pick<typeof db, "execute"> = db, includeOverview = false) {
   const scopedWhere = whereClause(scopeConditions(input));
-  const [visitResult, oosResult] = await Promise.all([
+  const [visitResult, oosResult, basicResult] = await Promise.all([
     executor.execute(sql<VisitDbRow>`
       select
         s.id::text as "submissionId",
@@ -150,8 +154,11 @@ export async function loadSmDashboardRows(input: z.infer<typeof querySchema>, ex
         s.sm_user_id::text as "smUserId",
         s.sm_name_snapshot as "smName",
         s.answered_question_count as "SMDurcharbeitAnsweredQuestionCount",
+        ${includeOverview ? sql`coalesce(da_time.actual_minutes, ze.actual_minutes)` : sql`null`} as "actualMinutes",
         case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end as "SMDurcharbeitCatalogScope"
       from sm_questionnaire_submissions s
+      ${includeOverview ? sql`left join sm_assignment_time_submissions ze on ze.assignment_id = s.assignment_id and ze.is_current = true and ze.is_deleted = false
+      left join sm_smdurcharbeit_visit_time_revisions da_time on da_time.visit_id = s.smdurcharbeit_visit_id and da_time.is_current = true` : sql``}
       inner join sm_markets m on m.id = s.sm_market_id
       left join sm_questionnaire_templates t on t.id = s.questionnaire_template_id
       where ${scopedWhere}
@@ -193,49 +200,110 @@ export async function loadSmDashboardRows(input: z.infer<typeof querySchema>, ex
       where ${scopedWhere}
       order by s.submitted_at, q.order_index, ao.order_index
     `),
+    includeOverview ? executor.execute(sql<SmBasicActivityRow>`
+      select s.id::text as "submissionId", q.id::text as "submissionQuestionId", a.metric_outcome_code as "metricOutcomeCode"
+      from sm_questionnaire_submissions s
+      inner join sm_markets m on m.id = s.sm_market_id
+      left join sm_questionnaire_templates t on t.id = s.questionnaire_template_id
+      inner join sm_questionnaire_submission_questions q on q.submission_id = s.id and q.is_deleted = false and q.is_applicable = true
+      inner join sm_question_answers a on a.submission_question_id = q.id and a.submission_id = s.id
+        and a.is_current = true and a.is_deleted = false and a.answer_state = 'answered'
+        and a.metric_outcome_code in ('basic_activity_yes', 'basic_activity_partial', 'basic_activity_no')
+      where ${scopedWhere}
+    `) : Promise.resolve([]),
   ]);
 
-  const visits = [...visitResult] as SmDashboardVisitRow[];
+  const visits = [...visitResult] as SmOverviewVisit[];
   const oosRows = ([...oosResult] as OosDbRow[]).flatMap((row) => {
     const mapped = toOosRow(row);
     return mapped ? [mapped] : [];
   });
 
-  return { visits, oosRows };
+  return { visits, oosRows, overview: includeOverview ? aggregateSmDashboardOverview(visits, oosRows, [...basicResult] as SmBasicActivityRow[]) : undefined };
 }
 
-async function loadFilterOptions() {
-  const [regions, chains, markets, users] = await Promise.all([
-    db.execute(sql<FilterDbRow>`
-      select distinct region as value, region as label
-      from sm_markets
-      where is_deleted = false and btrim(region) <> ''
-      order by region
-    `),
-    db.execute(sql<FilterDbRow>`
-      select distinct chain as value, chain as label
-      from sm_markets
-      where is_deleted = false and btrim(chain) <> ''
-      order by chain
-    `),
-    db.execute(sql<FilterDbRow>`
-      select id::text as value, concat_ws(' · ', name, nullif(concat_ws(' ', postal_code, city), '')) as label
-      from sm_markets
-      where is_deleted = false
-      order by chain, name, postal_code
-    `),
-    db.execute(sql<FilterDbRow>`
-      select id::text as value, btrim(concat_ws(' ', first_name, last_name)) as label
-      from users
-      where role = 'sm' and deleted_at is null
-      order by first_name, last_name
-    `),
-  ]);
+/** Registry membership alone must not hide a market with a genuine standard history or plan. */
+function standardMarketCondition(): SQL {
+  return sql`(
+    not exists (select 1 from sm_smdurcharbeit_markets d where d.sm_market_id = m.id)
+    or m.service_days_per_week > 0
+    or exists (
+      select 1 from sm_assignments a
+      left join sm_questionnaire_versions v on v.id = coalesce(a.questionnaire_version_id, a.smdurcharbeit_questionnaire_override_version_id)
+      left join sm_questionnaire_templates t on t.id = v.questionnaire_template_id
+      where (a.original_sm_market_id = m.id or a.replacement_sm_market_id = m.id)
+        and a.is_deleted = false
+        and not coalesce(starts_with(t.stable_code, 'smdurcharbeit_'), false)
+    )
+    or exists (
+      select 1 from sm_questionnaire_submissions history
+      left join sm_questionnaire_templates t on t.id = history.questionnaire_template_id
+      where history.sm_market_id = m.id and history.is_deleted = false
+        and not coalesce(starts_with(t.stable_code, 'smdurcharbeit_'), false)
+    )
+  )`;
+}
+
+/** Directory choices include unvisited markets; SM links also preserve period-specific historical visitors. */
+export async function loadSmDashboardFilterOptions(input: z.infer<typeof querySchema>, executor: Pick<typeof db, "execute"> = db) {
+  const scope = input.SMDurcharbeitCatalogScope ?? "standard";
+  const marketCondition = scope === "standard" ? standardMarketCondition() : sql`true`;
+  const contextsResult = await executor.execute(sql<FilterContextRow>`
+    with eligible_markets as (
+      select m.id, m.name, m.postal_code, m.city, m.region, m.chain, m.assigned_sm_user_id
+      from sm_markets m where m.is_deleted = false and ${marketCondition}
+    ), people as (
+      select m.id as market_id, u.id as sm_user_id,
+        btrim(concat_ws(' ', u.first_name, u.last_name)) as sm_name, 0 as priority
+      from eligible_markets m inner join users u on u.id = m.assigned_sm_user_id
+      where u.role = 'sm' and u.deleted_at is null
+      union all
+      select coalesce(a.replacement_sm_market_id, a.original_sm_market_id), u.id,
+        btrim(concat_ws(' ', u.first_name, u.last_name)), 1
+      from sm_assignments a
+      inner join eligible_markets m on m.id = coalesce(a.replacement_sm_market_id, a.original_sm_market_id)
+      inner join users u on u.id = coalesce(a.replacement_sm_user_id, a.original_sm_user_id)
+      left join sm_questionnaire_versions v on v.id = coalesce(a.questionnaire_version_id, a.smdurcharbeit_questionnaire_override_version_id)
+      left join sm_questionnaire_templates t on t.id = v.questionnaire_template_id
+      where a.is_deleted = false and a.status <> 'cancelled' and u.role = 'sm' and u.deleted_at is null
+        and coalesce(a.replacement_work_date, a.original_work_date) between ${input.from}::date and ${input.to}::date
+        and (case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${scope}
+      union all
+      select s.sm_market_id, s.sm_user_id, s.sm_name_snapshot, 2
+      from sm_questionnaire_submissions s
+      inner join eligible_markets m on m.id = s.sm_market_id
+      left join sm_questionnaire_templates t on t.id = s.questionnaire_template_id
+      where s.status = 'submitted' and s.is_current = true and s.is_deleted = false and s.reporting_available_at is not null
+        and s.submitted_at >= (${input.from}::date::timestamp at time zone ${VIENNA_TIMEZONE})
+        and s.submitted_at < (((${input.to}::date + 1)::timestamp) at time zone ${VIENNA_TIMEZONE})
+        and (case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${scope}
+    )
+    select m.id::text as value,
+      concat_ws(' · ', m.name, nullif(concat_ws(' ', m.postal_code, m.city), '')) as label,
+      m.region, m.chain, p.sm_user_id::text as "smUserId", p.sm_name as "smName"
+    from eligible_markets m left join people p on p.market_id = m.id
+    order by m.chain, m.name, m.postal_code, m.id, p.priority, p.sm_name, p.sm_user_id
+  `);
+  const byMarket = new Map<string, MarketContext>();
+  for (const row of contextsResult as unknown as FilterContextRow[]) {
+    let market = byMarket.get(row.value);
+    if (!market) { market = { value: row.value, label: row.label, region: row.region, chain: row.chain, sms: [] }; byMarket.set(row.value, market); }
+    if (row.smUserId && !market.sms.some(person => person.value === row.smUserId)) market.sms.push({ value: row.smUserId, label: row.smName || "SM ohne Namen" });
+  }
+  const marketContexts = [...byMarket.values()];
+  const matches = (market: MarketContext, except: string) =>
+    (except === "region" || !input.region || market.region === input.region)
+    && (except === "chain" || !input.chain || market.chain === input.chain)
+    && (except === "marketId" || !input.marketId || market.value === input.marketId)
+    && (except === "smUserId" || !input.smUserId || market.sms.some(person => person.value === input.smUserId));
+  const unique = (rows: FilterDbRow[]) => [...new Map(rows.map(row => [row.value, row])).values()]
+    .sort((a, b) => a.label.localeCompare(b.label, "de-AT") || a.value.localeCompare(b.value));
   return {
-    regions: [...regions] as FilterDbRow[],
-    chains: [...chains] as FilterDbRow[],
-    markets: [...markets] as FilterDbRow[],
-    sms: [...users] as FilterDbRow[],
+    regions: unique(marketContexts.filter(market => matches(market, "region") && market.region).map(market => ({ value: market.region, label: market.region }))),
+    chains: unique(marketContexts.filter(market => matches(market, "chain") && market.chain).map(market => ({ value: market.chain, label: market.chain }))),
+    markets: unique(marketContexts.filter(market => matches(market, "marketId")).map(({ value, label }) => ({ value, label }))),
+    sms: unique(marketContexts.filter(market => matches(market, "smUserId")).flatMap(market => market.sms)),
+    marketContexts,
   };
 }
 
@@ -252,7 +320,7 @@ adminSmDashboardRouter.get("/", async (req, res, next) => {
       ...(typeof req.query.chain === "string" && req.query.chain.trim() ? { chain: req.query.chain } : {}),
       ...(typeof req.query.smUserId === "string" && req.query.smUserId.trim() ? { smUserId: req.query.smUserId } : {}),
       ...(typeof req.query.marketId === "string" && req.query.marketId.trim() ? { marketId: req.query.marketId } : {}),
-      ...(typeof req.query.SMDurcharbeitCatalogScope === "string" && req.query.SMDurcharbeitCatalogScope.trim() ? { SMDurcharbeitCatalogScope: req.query.SMDurcharbeitCatalogScope } : {}),
+      SMDurcharbeitCatalogScope: typeof req.query.SMDurcharbeitCatalogScope === "string" && req.query.SMDurcharbeitCatalogScope.trim() ? req.query.SMDurcharbeitCatalogScope : "standard",
     });
     if (!parsed.success) {
       res.status(400).json({ error: "Die Dashboard-Filter sind ungültig.", code: "sm_dashboard_query_invalid", details: parsed.error.flatten() });
@@ -267,10 +335,10 @@ adminSmDashboardRouter.get("/", async (req, res, next) => {
       return;
     }
 
-    const [{ visits, oosRows }, filterOptions] = await Promise.all([
-      loadSmDashboardRows(parsed.data),
-      loadFilterOptions(),
-    ]);
+    const [{ visits, oosRows, overview }, filterOptions] = await db.transaction(async tx => Promise.all([
+      loadSmDashboardRows(parsed.data, tx, true),
+      loadSmDashboardFilterOptions(parsed.data, tx),
+    ]), { isolationLevel: "repeatable read", accessMode: "read only" });
 
     res.json({
       meta: {
@@ -287,6 +355,7 @@ adminSmDashboardRouter.get("/", async (req, res, next) => {
         },
       },
       ...aggregateSmDashboard(visits, oosRows),
+      overview,
       SMDurcharbeitBreakdown: {
         standard: { completedVisits: visits.filter(row => row.SMDurcharbeitCatalogScope !== "SMDurcharbeit").length, answeredQuestions: visits.filter(row => row.SMDurcharbeitCatalogScope !== "SMDurcharbeit").reduce((n, row) => n + (row.SMDurcharbeitAnsweredQuestionCount ?? 0), 0) },
         SMDurcharbeit: { completedVisits: visits.filter(row => row.SMDurcharbeitCatalogScope === "SMDurcharbeit").length, answeredQuestions: visits.filter(row => row.SMDurcharbeitCatalogScope === "SMDurcharbeit").reduce((n, row) => n + (row.SMDurcharbeitAnsweredQuestionCount ?? 0), 0) },
