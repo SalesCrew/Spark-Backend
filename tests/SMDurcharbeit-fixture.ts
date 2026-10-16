@@ -107,6 +107,9 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
     "./lib/schema.js": schema, "./sm-visit.shared.js": visit,
     "./sm-SMDurcharbeit-answer-reuse.shared.js": monthlyAnswerReuse, "./sm-SMDurcharbeit-campaign.shared.js": monthly,
   }, options.clock ?? Date);
+  const ownerBulk = await isolatedModule<typeof import("../src/sm-SMDurcharbeit-owner-bulk.shared.js")>(new URL("../src/sm-SMDurcharbeit-owner-bulk.shared.ts", import.meta.url), {
+    "./lib/schema.js": schema, "./sm-planning-lock.js": lock, "./sm-SMDurcharbeit-campaign.shared.js": monthly,
+  }, options.clock ?? Date);
   const authoring = await isolatedModule<typeof import("../src/routes/sm-questionnaires.js")>(new URL("../src/routes/sm-questionnaires.ts", import.meta.url), { ...base, "../sm-SMDurcharbeit-catalog.shared.js": SMDurcharbeitCatalog });
   const reporting = await isolatedModule<typeof import("../src/routes/sm-dashboard.js")>(new URL("../src/routes/sm-dashboard.ts", import.meta.url), {
     ...base, "../sm-dashboard.shared.js": dashboard, "../sm-planning.shared.js": planning,
@@ -165,6 +168,7 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   app.use("/sm/visits", runtime.smVisitsRouter);
   app.use("/sm/smdurcharbeit/visits", runtime.SMDurcharbeitVisitsRouter);
   const campaignRoutes = await isolatedModule<typeof import("../src/routes/sm-SMDurcharbeit-campaigns.js")>(new URL("../src/routes/sm-SMDurcharbeit-campaigns.ts", import.meta.url), {
+    "../sm-SMDurcharbeit-owner-bulk.shared.js": ownerBulk,
     "../sm-SMDurcharbeit-market-edit.shared.js": marketEdit,
     ...base, "./sm-visits.js": runtime, "../sm-planning.shared.js": planning, "../sm-SMDurcharbeit-report.shared.js": monthlyReport,
   }, options.clock ?? Date);

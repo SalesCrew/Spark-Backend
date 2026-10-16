@@ -16,9 +16,13 @@ import { initializeSMDurcharbeitVisit, cancelSMDurcharbeitDraft, cleanupSMDurcha
 import { isIsoDate } from "../sm-planning.shared.js";
 import { loadSMDurcharbeitReport } from "../sm-SMDurcharbeit-report.shared.js";
 import { applySMDurcharbeitMarketEdit, previewSMDurcharbeitMarketEdit } from "../sm-SMDurcharbeit-market-edit.shared.js";
+import { applySMDurcharbeitCampaignOwners, previewSMDurcharbeitCampaignOwners } from "../sm-SMDurcharbeit-owner-bulk.shared.js";
 
 const date = z.string().refine(isIsoDate, "Ungültiges Datum.");
 const uuid = z.string().uuid();
+const ownerBulkSchema = z.object({ expectedRevision: z.number().int().positive(), month: date,
+  SMDurcharbeitSmUserId: uuid, sourceSmUserId: uuid.optional(), reason: z.string().trim().min(3).max(1000),
+  marketIds: z.array(uuid).min(1).max(5000).refine(ids => new Set(ids).size === ids.length, "Märkte dürfen nur einmal ausgewählt werden.") }).strict();
 const roster = z.array(z.object({ smMarketId: uuid, smUserId: uuid.nullable().optional() }).strict()).max(5000)
   .refine(rows => new Set(rows.map(row => row.smMarketId)).size === rows.length, "Märkte dürfen nur einmal ausgewählt werden.");
 const draftSchema = z.object({ name: z.string().trim().min(1).max(200), startDate: date, endDate: date,
@@ -135,6 +139,18 @@ adminSMDurcharbeitCampaignsRouter.patch("/targets/:targetId/owner", async (req: 
   try {
     const input = z.object({ expectedRevision: z.number().int().positive(), reason: z.string().trim().min(3).max(1000), SMDurcharbeitSmUserId: uuid.nullable() }).strict().parse(req.body);
     await db.transaction(tx => changeSMDurcharbeitMonthOwner(tx, id(req, "targetId"), actor(req), input)); res.json({ updated: true });
+  } catch (error) { if (!errorResponse(error, res)) next(error); }
+});
+adminSMDurcharbeitCampaignsRouter.post("/:campaignId/owners/preview", async (req: AuthedRequest, res, next) => {
+  try {
+    const input = ownerBulkSchema.parse(req.body);
+    res.json(await db.transaction(tx => previewSMDurcharbeitCampaignOwners(tx, id(req, "campaignId"), input), { isolationLevel: "repeatable read", accessMode: "read only" }));
+  } catch (error) { if (!errorResponse(error, res)) next(error); }
+});
+adminSMDurcharbeitCampaignsRouter.patch("/:campaignId/owners", async (req: AuthedRequest, res, next) => {
+  try {
+    const input = ownerBulkSchema.extend({ previewToken: z.string().length(64) }).strict().parse(req.body);
+    res.json(await db.transaction(tx => applySMDurcharbeitCampaignOwners(tx, id(req, "campaignId"), actor(req), input)));
   } catch (error) { if (!errorResponse(error, res)) next(error); }
 });
 adminSMDurcharbeitCampaignsRouter.patch("/targets/:targetId", async (req: AuthedRequest, res, next) => {

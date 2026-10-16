@@ -147,7 +147,7 @@ function resolveKundeSmRequirement(req: Request, path: string, action: KundePerm
   if (routeStartsWith(path, "/admin/sm-markets")) {
     const dedicated = routeStartsWith(path.toLowerCase(), "/admin/sm-markets/smdurcharbeit") || (read && req.query.SMDurcharbeitMarketScope === "SMDurcharbeit");
     const canonical = dedicated ? "sm_durcharbeit_maerkte" : "sm_maerkte";
-    return { pageKey: read ? smReadPage(req, canonical, ["sm_dashboard", "sm_verplanung", "sm_durcharbeit_verplanung", "sm_fbmanagement", "sm_fotoarchiv", "shelfmerchandiser"]) : canonical, action: path.endsWith("/deactivate") ? "update" : action };
+    return { pageKey: read ? smReadPage(req, canonical, ["sm_dashboard", "sm_verplanung", "sm_durcharbeit_verplanung", "sm_fbmanagement", "sm_fotoarchiv", "shelfmerchandiser"]) : canonical, action: dedicated && path.endsWith("/owners/preview") ? "read" : path.endsWith("/deactivate") ? "update" : action };
   }
   if (routeStartsWith(path, "/admin/sm-planning")) {
     if (path.endsWith("/questionnaire-assignment")) return { pageKey: read ? smReadPage(req, "sm_verplanung", ["sm_durcharbeit_verplanung"]) : "sm_verplanung", action };

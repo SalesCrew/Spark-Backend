@@ -24,9 +24,8 @@ export function syntheticShelfPhoto(blue: boolean) {
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", header), chunk("IDAT", deflateSync(pixels)), chunk("IEND", Buffer.alloc(0))]);
 }
 
-export function createSyntheticPhotoStorage() {
+export function createSyntheticPhotoStorage(origin = "http://127.0.0.1:4037") {
   const objects = new Map<string, { bytes: Buffer; mimeType: string }>(), issued = new Set<string>();
-  const origin = "http://127.0.0.1:4037";
   const readUrl = (path: string) => `${origin}/synthetic-photo-storage/object?path=${encodeURIComponent(path)}`;
   const storage = { from: (bucket: string) => {
     if (bucket !== "sm-visit-photos") throw new Error("Synthetic storage only supports SM photos");

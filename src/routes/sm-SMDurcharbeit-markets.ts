@@ -7,12 +7,29 @@ import type { db as productionDb } from '../lib/db.js';
 import { smMarkets, smSMDurcharbeitMarkets, users } from '../lib/schema.js';
 import { lockSmPlanning } from '../sm-planning-lock.js';
 import { SMDurcharbeitImportSchema, SMDurcharbeitNameKey, prepareSMDurcharbeitImport } from '../sm-SMDurcharbeit-market-import.shared.js';
+import { applySMDurcharbeitDefaultOwners, previewSMDurcharbeitDefaultOwners } from '../sm-SMDurcharbeit-owner-bulk.shared.js';
+import { SMDurcharbeitCampaignError } from '../sm-SMDurcharbeit-campaign.shared.js';
 
 class SMDurcharbeitMarketInputError extends Error {}
 
 /** Mounted inside the authenticated SM market router; never merges with the standard market list. */
 export function createSMDurcharbeitMarketsRouter(db: typeof productionDb, list: () => Promise<unknown[]>, map: (row: typeof smMarkets.$inferSelect) => unknown) {
   const router = Router();
+  const ownerBulkSchema = z.object({ SMDurcharbeitSmUserId: z.string().uuid(), sourceSmUserId: z.string().uuid().optional(), reason: z.string().trim().min(3).max(1000),
+    markets: z.array(z.object({ id: z.string().uuid(), expectedUpdatedAt: z.string().datetime({ offset: true }) }).strict()).min(1).max(5000)
+      .refine(rows => new Set(rows.map(row => row.id)).size === rows.length, 'Märkte dürfen nur einmal ausgewählt werden.') }).strict();
+  router.post('/owners/preview', async (req, res, next) => {
+    const parsed = ownerBulkSchema.safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: 'Bitte Märkte, SM und Begründung prüfen.' }); return; }
+    try { res.json(await db.transaction(tx => previewSMDurcharbeitDefaultOwners(tx, parsed.data), { isolationLevel: 'repeatable read', accessMode: 'read only' })); }
+    catch (error) { if (error instanceof SMDurcharbeitCampaignError) res.status(error.statusCode).json({ error: error.message, code: error.code }); else next(error); }
+  });
+  router.patch('/owners', async (req, res, next) => {
+    const parsed = ownerBulkSchema.extend({ previewToken: z.string().length(64) }).strict().safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: 'Bitte zuerst eine aktuelle Wechselvorschau prüfen.' }); return; }
+    try { res.json(await db.transaction(tx => applySMDurcharbeitDefaultOwners(tx, parsed.data))); }
+    catch (error) { if (error instanceof SMDurcharbeitCampaignError) res.status(error.statusCode).json({ error: error.message, code: error.code }); else next(error); }
+  });
   router.patch('/:id/owner', async (req, res, next) => {
     const id = z.string().uuid().safeParse(req.params.id);
     const parsed = z.object({ SMDurcharbeitSmUserId: z.string().uuid().nullable(), expectedUpdatedAt: z.string().datetime({ offset: true }) }).strict().safeParse(req.body);
