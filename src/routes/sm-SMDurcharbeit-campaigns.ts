@@ -263,9 +263,9 @@ adminSMDurcharbeitCampaignsRouter.get("/:campaignId/history", async (req: Authed
 });
 adminSMDurcharbeitCampaignsRouter.get("/:campaignId/results", async (req: AuthedRequest, res, next) => {
   try {
-    const input = z.object({ month: date.optional(), smUserId: uuid.optional() }).strict().parse(req.query);
+    const input = z.object({ month: date.optional(), smUserId: uuid.optional(), includeVisitAnswers: z.enum(["true", "false"]).optional() }).strict().parse(req.query);
     const campaignId = id(req, "campaignId"), month = SMDurcharbeitMonth(input.month ?? SMDurcharbeitMonth());
-    res.json(await db.transaction(tx => loadSMDurcharbeitReport(tx, { campaignId, month, ...(input.smUserId ? { smUserId: input.smUserId } : {}) }),
+    res.json(await db.transaction(tx => loadSMDurcharbeitReport(tx, { campaignId, month, ...(input.smUserId ? { smUserId: input.smUserId } : {}), includeVisitAnswers: input.includeVisitAnswers === "true" }),
       { isolationLevel: "repeatable read", accessMode: "read only" }));
   } catch (error) { if (!errorResponse(error, res)) next(error); }
 });
