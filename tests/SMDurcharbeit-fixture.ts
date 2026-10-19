@@ -170,6 +170,9 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   app.use("/sm/visits", runtime.smVisitsRouter);
   app.use("/sm/smdurcharbeit/visits", runtime.SMDurcharbeitVisitsRouter);
   const campaignRoutes = await isolatedModule<typeof import("../src/routes/sm-SMDurcharbeit-campaigns.js")>(new URL("../src/routes/sm-SMDurcharbeit-campaigns.ts", import.meta.url), {
+    "../sm-SMDurcharbeit-questionnaire-update.shared.js": await isolatedModule<typeof import("../src/sm-SMDurcharbeit-questionnaire-update.shared.js")>(new URL("../src/sm-SMDurcharbeit-questionnaire-update.shared.ts", import.meta.url), {
+      "./lib/schema.js": schema, "./sm-planning-lock.js": lock, "./sm-SMDurcharbeit-campaign.shared.js": monthly,
+    }, options.clock ?? Date),
     "../sm-SMDurcharbeit-owner-bulk.shared.js": ownerBulk,
     "../sm-SMDurcharbeit-market-edit.shared.js": marketEdit,
     ...base, "./sm-visits.js": runtime, "../sm-planning.shared.js": planning, "../sm-SMDurcharbeit-report.shared.js": monthlyReport,

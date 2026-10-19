@@ -17,6 +17,7 @@ import { isIsoDate } from "../sm-planning.shared.js";
 import { loadSMDurcharbeitReport } from "../sm-SMDurcharbeit-report.shared.js";
 import { applySMDurcharbeitMarketEdit, previewSMDurcharbeitMarketEdit } from "../sm-SMDurcharbeit-market-edit.shared.js";
 import { applySMDurcharbeitCampaignOwners, previewSMDurcharbeitCampaignOwners } from "../sm-SMDurcharbeit-owner-bulk.shared.js";
+import { applySMDurcharbeitQuestionnaireUpdate, previewSMDurcharbeitQuestionnaireUpdate } from "../sm-SMDurcharbeit-questionnaire-update.shared.js";
 
 const date = z.string().refine(isIsoDate, "Ungültiges Datum.");
 const uuid = z.string().uuid();
@@ -72,6 +73,20 @@ adminSMDurcharbeitCampaignsRouter.get("/options", async (_req, res, next) => {
 adminSMDurcharbeitCampaignsRouter.get("/", async (_req, res, next) => {
   try { res.json({ campaigns: await db.select().from(campaigns).orderBy(desc(campaigns.startDate), asc(campaigns.name)) }); }
   catch (error) { next(error); }
+});
+adminSMDurcharbeitCampaignsRouter.get("/:campaignId/questionnaire-update", async (req: AuthedRequest, res, next) => {
+  try {
+    const input = z.object({ month: date }).strict().parse(req.query);
+    const preview = await db.transaction(tx => previewSMDurcharbeitQuestionnaireUpdate(tx, id(req, "campaignId"), input.month),
+      { isolationLevel: "repeatable read", accessMode: "read only" });
+    res.json(preview);
+  } catch (error) { if (!errorResponse(error, res)) next(error); }
+});
+adminSMDurcharbeitCampaignsRouter.patch("/:campaignId/questionnaire-update", async (req: AuthedRequest, res, next) => {
+  try {
+    const input = z.object({ month: date, expectedRevision: z.number().int().positive(), previewToken: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(req.body);
+    res.json(await db.transaction(tx => applySMDurcharbeitQuestionnaireUpdate(tx, id(req, "campaignId"), actor(req), input)));
+  } catch (error) { if (!errorResponse(error, res)) next(error); }
 });
 adminSMDurcharbeitCampaignsRouter.post("/", async (req: AuthedRequest, res, next) => {
   try {
