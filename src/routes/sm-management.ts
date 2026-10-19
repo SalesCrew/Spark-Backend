@@ -7,7 +7,7 @@ import { db } from "../lib/db.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { env } from "../config/env.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
-import { smQuestionnaireSubmissions as submissions, smAssignments, smQuestionAnswers as answers,
+import { smQuestionnaireSubmissions as submissions, smAssignments, smQuestionAnswers as answers, smQuestionnaireSubmissionQuestions as questions,
   smQuestionAnswerFiles as files, smQuestionAnswerEvents as events, smQuestionnaireTemplates, users,
   smSMDurcharbeitTimeRevisions as SMDurcharbeitTimes, smSMDurcharbeitTargets as SMDurcharbeitTargets,
   smSMDurcharbeitPeriods as SMDurcharbeitPeriods, smSMDurcharbeitCampaigns as SMDurcharbeitCampaigns } from "../lib/schema.js";
@@ -31,9 +31,12 @@ export const smManagementListSchema = z.object({
 const workDate = sql<string>`coalesce((${SMDurcharbeitTimes.startedAt} at time zone 'Europe/Vienna')::date, (${submissions.visitStartedAt} at time zone 'Europe/Vienna')::date,
   ${smAssignments.replacementWorkDate}, ${smAssignments.originalWorkDate}, (${submissions.submittedAt} at time zone 'Europe/Vienna')::date)`;
 
-export async function listSmManagedVisits(tx: SmManagementTx, input: z.infer<typeof smManagementListSchema>) {
+export async function listSmManagedVisits(tx: SmManagementTx, input: z.infer<typeof smManagementListSchema>, campaignMonthOnly = false) {
+  if (campaignMonthOnly && (!input.SMDurcharbeitCampaignId || !input.SMDurcharbeitMonth)) {
+    throw new SmManagementError(400, "sm_review_scope_required", "Kampagne und Kalendermonat sind erforderlich.");
+  }
   const scope = [eq(submissions.isDeleted, false), eq(submissions.isCurrent, true), eq(submissions.status, "submitted"),
-    gte(workDate, input.from), lte(workDate, input.to)];
+    ...(campaignMonthOnly ? [] : [gte(workDate, input.from), lte(workDate, input.to)])];
   if (input.SMDurcharbeitCatalogScope) scope.push(sql`(case when starts_with(${smQuestionnaireTemplates.stableCode}, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${input.SMDurcharbeitCatalogScope}`);
   if (input.SMDurcharbeitCampaignId) scope.push(eq(SMDurcharbeitCampaigns.id, input.SMDurcharbeitCampaignId));
   if (input.SMDurcharbeitMonth) scope.push(eq(SMDurcharbeitPeriods.month, input.SMDurcharbeitMonth));
@@ -41,7 +44,24 @@ export async function listSmManagedVisits(tx: SmManagementTx, input: z.infer<typ
   if (input.smUserId) filters.push(eq(submissions.smUserId, input.smUserId));
   if (input.marketId) filters.push(eq(submissions.smMarketId, input.marketId));
   if (input.questionnaireId) filters.push(eq(submissions.questionnaireTemplateId, input.questionnaireId));
-  if (input.search) filters.push(sql`strpos(lower(${submissions.smNameSnapshot} || ' ' || ${submissions.marketNameSnapshot} || ' ' || ${submissions.marketAddressSnapshot} || ' ' || ${submissions.questionnaireNameSnapshot}), lower(${input.search})) > 0`);
+  if (input.search) {
+    const recordSearch = sql`strpos(lower(concat_ws(' ', ${submissions.id}::text, ${submissions.smUserId}::text, ${submissions.smMarketId}::text,
+      ${submissions.smNameSnapshot}, ${submissions.marketNameSnapshot}, ${submissions.marketAddressSnapshot},
+      ${submissions.marketPostalCodeSnapshot}, ${submissions.marketCitySnapshot}, ${submissions.questionnaireNameSnapshot},
+      ${submissions.questionnaireVersionSnapshot}::text, ${SMDurcharbeitCampaigns.name}, ${SMDurcharbeitPeriods.month}::text,
+      ${SMDurcharbeitTargets.marketSnapshot}::text, ${workDate}::text, to_char(${workDate}::date, 'DD.MM.YYYY'))), lower(${input.search})) > 0`;
+    if (campaignMonthOnly) filters.push(sql`(${recordSearch} or exists (
+      select 1 from ${answers} inner join ${questions} on ${questions.id} = ${answers.submissionQuestionId}
+      where ${answers.submissionId} = ${submissions.id} and ${answers.isCurrent} = true and ${answers.isDeleted} = false
+      and ${answers.answerState} = 'answered' and (strpos(lower(concat_ws(' ', ${questions.questionTextSnapshot},
+        ${answers.valueJson}::text)), lower(${input.search})) > 0 or exists (
+        select 1 from jsonb_array_elements(${questions.answerOptionsSnapshot}) as chosen
+        where jsonb_path_query_array(${answers.valueJson}, '$.**') @> jsonb_build_array(chosen->>'code')
+        and strpos(lower(chosen->>'label'), lower(${input.search})) > 0
+      ))
+    ))`);
+    else filters.push(sql`strpos(lower(${submissions.smNameSnapshot} || ' ' || ${submissions.marketNameSnapshot} || ' ' || ${submissions.marketAddressSnapshot} || ' ' || ${submissions.questionnaireNameSnapshot}), lower(${input.search})) > 0`);
+  }
   if (input.cursorDate && input.cursorId) filters.push(sql`(${workDate}, ${submissions.id}) < (${input.cursorDate}::date, ${input.cursorId}::uuid)`);
   const rows = await tx.select({ id: submissions.id, assignmentId: submissions.assignmentId, workDate: sql<string>`${workDate}::text`,
     smUserId: submissions.smUserId, smName: submissions.smNameSnapshot, marketId: submissions.smMarketId,
@@ -113,7 +133,28 @@ async function signPhotos<T extends { storageBucket: string; storagePath: string
   }));
 }
 
-export const adminSmManagementRouter = Router();
+/** Campaign review reuses the correction protocol, with server-enforced campaign/month boundaries. */
+export function createSmManagementRouter(campaignReview = false) {
+const adminSmManagementRouter = Router({ mergeParams: true });
+async function transaction<T>(req: AuthedRequest, action: (tx: SmManagementTx) => Promise<T>): Promise<T> {
+  return db.transaction(async tx => {
+    if (campaignReview) {
+      const campaignId = uuid.parse(req.params.campaignId), month = date.parse(req.params.reviewMonth);
+      if (!month.endsWith('-01')) throw new SmManagementError(400, 'sm_review_month_invalid', 'Bitte wähle einen Kalendermonat.');
+      const [period] = await tx.select({ id: SMDurcharbeitPeriods.id }).from(SMDurcharbeitPeriods)
+        .where(and(eq(SMDurcharbeitPeriods.campaignId, campaignId), eq(SMDurcharbeitPeriods.month, month))).limit(1);
+      if (!period) throw new SmManagementError(404, 'sm_review_period_missing', 'Kampagnenmonat nicht gefunden.');
+      if (req.params.submissionId) {
+        const [visit] = await tx.select({ id: submissions.id }).from(submissions)
+          .innerJoin(SMDurcharbeitTargets, eq(SMDurcharbeitTargets.id, submissions.SMDurcharbeitTargetId))
+          .where(and(eq(submissions.id, uuid.parse(req.params.submissionId)), eq(SMDurcharbeitTargets.campaignId, campaignId),
+            eq(SMDurcharbeitTargets.periodId, period.id), eq(submissions.isCurrent, true), eq(submissions.isDeleted, false), eq(submissions.status, 'submitted'))).limit(1);
+        if (!visit) throw new SmManagementError(404, 'sm_review_visit_missing', 'Abgeschlossener Besuch in diesem Kampagnenmonat nicht gefunden.');
+      }
+    }
+    return action(tx);
+  });
+}
 adminSmManagementRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
 adminSmManagementRouter.use(requireKundeAdminPermission);
 adminSmManagementRouter.use((_req, res, next) => { res.setHeader("Cache-Control", "private, no-store"); next(); });
@@ -127,11 +168,15 @@ const handle = (action: (req: AuthedRequest, res: Response) => Promise<unknown>)
 };
 
 adminSmManagementRouter.get("/", handle(async (req, res) => {
-  const input = smManagementListSchema.parse(req.query);
-  res.json(await db.transaction(tx => listSmManagedVisits(tx, input)));
+  const query = campaignReview ? z.object({ search: z.string().trim().max(200).optional(), smUserId: uuid.optional(),
+    marketId: uuid.optional(), questionnaireId: uuid.optional(), limit: z.coerce.number().int().min(1).max(100).optional(),
+    cursorDate: date.optional(), cursorId: uuid.optional() }).strict().parse(req.query) : req.query;
+  const input = smManagementListSchema.parse(campaignReview ? { ...query, from: req.params.reviewMonth, to: req.params.reviewMonth,
+    SMDurcharbeitCampaignId: req.params.campaignId, SMDurcharbeitMonth: req.params.reviewMonth } : query);
+  res.json(await transaction(req, tx => listSmManagedVisits(tx, input, campaignReview)));
 }));
 adminSmManagementRouter.get("/:submissionId", handle(async (req, res) => {
-  const result = await db.transaction(tx => smManagementDetail(tx, uuid.parse(req.params.submissionId)));
+  const result = await transaction(req, tx => smManagementDetail(tx, uuid.parse(req.params.submissionId)));
   res.json({ ...result, sections: await Promise.all(result.sections.map(async section => ({ ...section,
     questions: await Promise.all(section.questions.map(async question => ({ ...question, photos: await signPhotos(question.photos) }))),
   }))) });
@@ -139,7 +184,7 @@ adminSmManagementRouter.get("/:submissionId", handle(async (req, res) => {
 adminSmManagementRouter.get("/:submissionId/history", handle(async (req, res) => {
   const id = uuid.parse(req.params.submissionId);
   const input = z.object({ cursorVersion: z.coerce.number().int().positive().optional(), questionId: uuid }).strict().parse(req.query);
-  const result = await db.transaction(async tx => {
+  const result = await transaction(req, async tx => {
     const state = await loadSmManagementState(tx, id);
     if (!state.questions.some(question => question.id === input.questionId)) throw new SmManagementError(404, "sm_management_question_not_found", "Frage nicht gefunden.");
     const rows = await tx.select({ answer: answers, actorFirstName: users.firstName, actorLastName: users.lastName }).from(answers)
@@ -152,6 +197,7 @@ adminSmManagementRouter.get("/:submissionId/history", handle(async (req, res) =>
       .where(and(eq(events.submissionId, id), inArray(events.answerId, ids), eq(events.eventType, "correction"), sql`${events.payload}->>'source' = 'sm_admin_correction'`)).orderBy(desc(events.createdAt)) : [];
     return { entries: page.map(row => ({ id: row.answer.id, version: row.answer.answerVersion, current: row.answer.isCurrent,
       state: row.answer.answerState, value: row.answer.valueJson, at: row.answer.answeredAt?.toISOString() ?? row.answer.createdAt.toISOString(),
+      actorId: row.answer.answeredByUserId,
       actor: [row.actorFirstName, row.actorLastName].filter(Boolean).join(" ") || "System",
       reason: audit.find(event => event.answerId === row.answer.id)?.payload.reason ?? null,
       photos: photos.filter(photo => photo.answerId === row.answer.id).map(photo => ({ id: photo.id, fileName: photo.originalFileName, storageBucket: photo.storageBucket, storagePath: photo.storagePath })),
@@ -161,11 +207,11 @@ adminSmManagementRouter.get("/:submissionId/history", handle(async (req, res) =>
 }));
 adminSmManagementRouter.post("/:submissionId/corrections", handle(async (req, res) => {
   const id = uuid.parse(req.params.submissionId), input = smAdminCorrectionSchema.parse(req.body), actor = req.authUser!.appUserId;
-  res.json(await db.transaction(tx => applySmAdminCorrection(tx, id, input, actor, uploads => verifyPhotos(actor, id, uploads))));
+  res.json(await transaction(req, tx => applySmAdminCorrection(tx, id, input, actor, uploads => verifyPhotos(actor, id, uploads))));
 }));
 adminSmManagementRouter.post("/:submissionId/photos/upload-url", handle(async (req, res) => {
   const id = uuid.parse(req.params.submissionId), input = photoInput.parse(req.body), actor = req.authUser!.appUserId;
-  await db.transaction(async tx => {
+  await transaction(req, async tx => {
     const state = await loadSmManagementState(tx, id);
     if (!state.questions.some(question => question.id === input.questionId && question.questionTypeSnapshot === "photo")) {
       throw new SmManagementError(400, "sm_management_photo_question_invalid", "Diese Foto-Frage gehört nicht zum Fragebogen.");
@@ -178,3 +224,7 @@ adminSmManagementRouter.post("/:submissionId/photos/upload-url", handle(async (r
   if (error || !data) throw new SmManagementError(502, "sm_management_upload_unavailable", "Foto-Upload konnte nicht vorbereitet werden.");
   res.json({ receipt: { ...unsigned, proof: photoProof(actor, id, unsigned) }, upload: { bucket, path: data.path, token: data.token, signedUrl: data.signedUrl } });
 }));
+
+return adminSmManagementRouter;
+}
+export const adminSmManagementRouter = createSmManagementRouter();

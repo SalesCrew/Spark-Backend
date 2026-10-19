@@ -219,6 +219,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       "./sm-planning.shared.js": planning, "./sm-holidays.shared.js": holidaysShared,
     });
     const planningRoute = await isolatedModule<typeof import("./routes/sm-planning.js")>(new URL("./routes/sm-planning.ts", import.meta.url), {
+      "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns,
       "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection, "../sm-SMDurcharbeit-catalog.shared.js": SMDurcharbeitCatalog,
       "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": authMock, "../lib/kunde-access.js": kundeAccess,
       "../sm-planning.shared.js": planning, "../sm-planning-lock.js": planningLock, "../sm-time-overlap.js": timeOverlap,

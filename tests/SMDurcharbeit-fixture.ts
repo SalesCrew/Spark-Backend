@@ -175,7 +175,7 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
     }, options.clock ?? Date),
     "../sm-SMDurcharbeit-owner-bulk.shared.js": ownerBulk,
     "../sm-SMDurcharbeit-market-edit.shared.js": marketEdit,
-    ...base, "./sm-visits.js": runtime, "../sm-planning.shared.js": planning, "../sm-SMDurcharbeit-report.shared.js": monthlyReport,
+    ...base, "./sm-management.js": managed, "./sm-visits.js": runtime, "../sm-planning.shared.js": planning, "../sm-SMDurcharbeit-report.shared.js": monthlyReport,
   }, options.clock ?? Date);
   app.use("/sm/smdurcharbeit", campaignRoutes.SMDurcharbeitCampaignsRouter);
   app.use("/admin/sm-smdurcharbeit-campaigns", campaignRoutes.adminSMDurcharbeitCampaignsRouter);
