@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   bigint,
+  bigserial,
   boolean,
   check,
   date,
@@ -3860,3 +3861,18 @@ export const smSMDurcharbeitFileLinks = pgTable("sm_smdurcharbeit_answer_file_li
 export const smSMDurcharbeitEvents = pgTable("sm_smdurcharbeit_events", {
   id:uuid("id").defaultRandom().primaryKey(),campaignId:uuid("campaign_id").notNull().references(()=>smSMDurcharbeitCampaigns.id,{onDelete:"restrict"}),targetId:uuid("target_id").references(()=>smSMDurcharbeitTargets.id,{onDelete:"restrict"}),visitId:uuid("visit_id").references(()=>smSMDurcharbeitVisits.id,{onDelete:"restrict"}),actorUserId:uuid("actor_user_id").notNull().references(()=>users.id,{onDelete:"restrict"}),action:text("action").notNull(),reason:text("reason").notNull(),beforeState:jsonb("before_state").$type<unknown>(),afterState:jsonb("after_state").$type<unknown>(),createdAt:timestamp("created_at",{withTimezone:true}).defaultNow().notNull(),
 },t=>[foreignKey({name:"sm_smdurcharbeit_event_target_campaign_fk",columns:[t.targetId,t.campaignId],foreignColumns:[smSMDurcharbeitTargets.id,smSMDurcharbeitTargets.campaignId]}).onDelete("restrict"),foreignKey({name:"sm_smdurcharbeit_event_visit_target_fk",columns:[t.visitId,t.targetId],foreignColumns:[smSMDurcharbeitVisits.id,smSMDurcharbeitVisits.targetId]}).onDelete("restrict"),check("sm_smdurcharbeit_event_visit_context_ck",sql`${t.visitId} is null or ${t.targetId} is not null`),index("sm_smdurcharbeit_events_campaign_idx").on(t.campaignId,t.createdAt),index("sm_smdurcharbeit_events_target_idx").on(t.targetId),index("sm_smdurcharbeit_events_visit_idx").on(t.visitId)]);
+
+// Append-only mileage revisions. Raw day readings remain the current effective values.
+export const gmMileageEvents = pgTable("gm_mileage_events", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  sequence: bigserial("sequence", { mode: "number" }).notNull(),
+  daySessionId: uuid("day_session_id").notNull().references(() => gmDaySessions.id, { onDelete: "restrict" }),
+  gmUserId: uuid("gm_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+  actorUserId: uuid("actor_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+  operationId: uuid("operation_id").notNull(),
+  reason: text("reason").notNull(),
+  requestSignature: text("request_signature").notNull(),
+  before: jsonb("before").$type<{ startKm: number | null; endKm: number | null; mileage: import("./gm-mileage.js").MileageState | null }>().notNull(),
+  after: jsonb("after").$type<{ startKm: number | null; endKm: number | null; mileage: import("./gm-mileage.js").MileageState | null }>().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, table => [index("gm_mileage_events_day_idx").on(table.daySessionId, table.sequence), uniqueIndex("gm_mileage_events_operation_day_idx").on(table.operationId, table.daySessionId)]);

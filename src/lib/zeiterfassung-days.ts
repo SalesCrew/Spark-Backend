@@ -1,3 +1,4 @@
+import { createMileageService } from "./gm-mileage-service.js";
 import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import {
   buildDaySessionPayload,
@@ -258,6 +259,7 @@ async function loadZeiterfassungDaySessions(input: ZeiterfassungDaySessionsInput
     });
   }
 
+  const mileageById = await createMileageService(db).metadata(dayRows.map(row => row.sessionId));
   const payload = dayRows.map((row) => {
     const gmName = `${row.gmFirstName} ${row.gmLastName}`.trim();
     const startAt = row.dayStartedAt ?? row.createdAt;
@@ -278,6 +280,7 @@ async function loadZeiterfassungDaySessions(input: ZeiterfassungDaySessionsInput
       endAt,
       startKm: row.startKm,
       endKm: row.endKm,
+      mileage: mileageById.get(row.sessionId) ?? null,
       actions: actionsBySessionId.get(row.sessionId) ?? [],
       timezone: input.timezone,
     });

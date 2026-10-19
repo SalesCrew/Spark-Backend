@@ -1,3 +1,5 @@
+import { createMileageService } from "../lib/gm-mileage-service.js";
+import { segmentSchema } from "./gm-mileage.js";
 import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
@@ -592,7 +594,7 @@ daySessionRouter.get("/current", async (req: AuthedRequest, res, next) => {
         session.workDate < currentWorkDate,
     );
     res.status(200).json({
-      session: serializeDaySession(session ?? null),
+      session: session ? { ...serializeDaySession(session), mileage: (await createMileageService(db).metadata([session.id])).get(session.id) ?? null } : null,
       gate: {
         dayStarted: Boolean(session && session.status === "started" && session.dayStartedAt && !staleDayOpen),
         startKmPending: Boolean(session && !session.isStartKmCompleted),
@@ -1138,6 +1140,7 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
       session.status === "started" || session.status === "ended" || session.status === "submitted"
         ? session.status
         : "started";
+    const mileage = (await createMileageService(db).metadata([session.id])).get(session.id) ?? null;
     const payload = buildDaySessionPayload({
       sessionId: session.id,
       date: workDate,
@@ -1149,6 +1152,7 @@ daySessionRouter.get("/today-submissions", async (req: AuthedRequest, res, next)
       endAt: dayEndAt,
       startKm: session.startKm,
       endKm: session.endKm,
+      mileage,
       actions,
       timezone,
     });
@@ -1285,6 +1289,23 @@ daySessionRouter.post("/start", async (req: AuthedRequest, res, next) => {
   }
 });
 
+daySessionRouter.post("/vehicle-change", async (req: AuthedRequest, res, next) => {
+  try {
+    const parsed = z.object({ segments: z.array(segmentSchema).min(1).max(8), beforeWork: z.boolean() }).safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: "Bitte alle Fahrzeug-Kilometerstände ausfüllen." }); return; }
+    const userId = req.authUser?.appUserId;
+    if (!userId) { res.status(401).json({ error: "Nicht eingeloggt." }); return; }
+    const day = await loadCurrentWritableSession(userId, new Date(), DEFAULT_TIMEZONE);
+    if (!day) { res.status(409).json({ error: "Kein offener Arbeitstag." }); return; }
+    if (!parsed.data.beforeWork && (parsed.data.segments.length !== 2 || parsed.data.segments[0]?.startKm !== day.startKm)) {
+      res.status(400).json({ error: "Bitte den ursprünglichen Startstand und beide Fahrzeugabschnitte angeben." }); return;
+    }
+    if (parsed.data.beforeWork && parsed.data.segments.length !== 1) { res.status(400).json({ error: "Vor Arbeitsbeginn bitte nur das neue Fahrzeug erfassen." }); return; }
+    const updated = await createMileageService(db).liveSwitch(day.id, userId, parsed.data.segments, parsed.data.beforeWork);
+    res.json({ session: serializeDaySession(updated) });
+  } catch (error) { next(error); }
+});
+
 daySessionRouter.patch("/start-km", async (req: AuthedRequest, res, next) => {
   try {
     const parsed = setKmSchema.safeParse(req.body ?? {});
@@ -1302,6 +1323,9 @@ daySessionRouter.patch("/start-km", async (req: AuthedRequest, res, next) => {
     if (!session || (session.status !== "started" && session.status !== "ended")) {
       res.status(409).json({ error: "Arbeitstag wurde noch nicht gestartet.", code: "day_not_started" });
       return;
+    }
+    if ((await createMileageService(db).metadata([session.id])).has(session.id)) {
+      res.status(409).json({ error: "Für diesen Tag ist ein Fahrzeugwechsel gespeichert. Weitere Kilometerkorrekturen bitte durch den Admin." }); return;
     }
     const [updated] = await db
       .update(gmDaySessions)
@@ -1494,6 +1518,9 @@ daySessionRouter.patch("/end-km", async (req: AuthedRequest, res, next) => {
     if (!session || (session.status !== "started" && session.status !== "ended")) {
       res.status(409).json({ error: "Der Arbeitstag wurde noch nicht gestartet.", code: "day_not_started" });
       return;
+    }
+    if ((await createMileageService(db).metadata([session.id])).has(session.id)) {
+      res.status(409).json({ error: "Für diesen Tag ist ein Fahrzeugwechsel gespeichert. Weitere Kilometerkorrekturen bitte durch den Admin." }); return;
     }
     if (session.startKm != null && parsed.data.km < session.startKm) {
       res.status(400).json({ error: "End-KM darf nicht kleiner als Start-KM sein." });

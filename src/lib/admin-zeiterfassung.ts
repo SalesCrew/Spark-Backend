@@ -1,3 +1,4 @@
+import { mileageDistance, type MileageState } from "./gm-mileage.js";
 const QUESTIONNAIRE_SECTION_ORDER = ["standard", "flex", "billa", "kuehler", "mhd"] as const;
 const EXTRA_LABELS: Record<string, string> = {
   schulung: "Schulung",
@@ -66,6 +67,7 @@ type BuildSessionInput = {
   endAt: Date;
   startKm: number | null;
   endKm: number | null;
+  mileage?: MileageState | null;
   actions: BaseAction[];
   timezone: string;
 };
@@ -135,6 +137,7 @@ type DaySessionPayload = {
   timeline: TimelineSegment[];
   stats: SessionStats;
   hasCompleteKm: boolean;
+  mileage?: MileageState | null;
 };
 
 type AggregatePayload = {
@@ -457,10 +460,7 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
       ? submittedPauseMin
       : DEFAULT_FINISHED_DAY_PAUSE_MIN;
   const reineArbeitszeit = Math.max(0, arbeitstag - pauseMin);
-  const kmGefahren =
-    input.startKm != null && input.endKm != null && input.endKm >= input.startKm
-      ? input.endKm - input.startKm
-      : null;
+  const kmGefahren = mileageDistance(input.startKm, input.endKm, input.mileage);
 
   return {
     id: input.sessionId,
@@ -485,6 +485,7 @@ function buildDaySessionPayload(input: BuildSessionInput): DaySessionPayload {
       marktbesuche: entries.filter((entry) => entry.kind === "marktbesuch").length,
       zusatz: entries.filter((entry) => entry.kind === "zusatzzeit").length,
     },
+    mileage: input.mileage ?? null,
     hasCompleteKm: input.startKm != null && input.endKm != null,
   };
 }
@@ -518,6 +519,10 @@ function buildGmAggregates(input: { sessions: DaySessionPayload[]; timezone: str
       const currentEndKm = current.endKm;
       const nextStartKm = next.startKm;
       if (currentEndKm == null || nextStartKm == null) continue;
+      if (sorted.some(day => day.date >= current.date && day.date <= next.date && (
+        (day.id !== current.id && day.mileage?.breakBefore) || (day.id !== next.id && day.mileage?.breakAfter) ||
+        (day.date > current.date && day.date < next.date && (day.mileage?.segments.length ?? 0) > 1)
+      ))) continue;
       const gap = nextStartKm - currentEndKm;
       if (gap > 0) privatnutzungKm += gap;
     }

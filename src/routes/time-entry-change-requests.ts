@@ -1,3 +1,4 @@
+import { createMileageService } from "../lib/gm-mileage-service.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
 import { Router } from "express";
@@ -685,6 +686,9 @@ async function applyApprovedTimeChange(input: {
   database: DbLike;
 }) {
   if (input.kind === "day_km") {
+    if ((await createMileageService(input.database as typeof db).metadata([input.session.id])).has(input.session.id)) {
+      throw Object.assign(new Error("Für diesen Tag ist ein Fahrzeugwechsel gespeichert. Bitte im Adminbereich unter Fahrzeugwechsel nachtragen korrigieren."), { status: 409 });
+    }
     validateKmChange({
       session: input.session,
       sourceId: input.sourceId,

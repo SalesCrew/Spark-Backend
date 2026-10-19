@@ -1,3 +1,5 @@
+import { mileageRouter } from "./gm-mileage.js";
+import { createMileageService } from "../lib/gm-mileage-service.js";
 import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
@@ -66,6 +68,8 @@ adminZeiterfassungRouter.use((req, res, next) => {
   });
   next();
 });
+
+adminZeiterfassungRouter.use("/mileage", mileageRouter);
 
 const ymdRegex = /^\d{4}-\d{2}-\d{2}$/;
 const querySchema = z
@@ -677,6 +681,7 @@ async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayloa
     });
   }
 
+  const mileageById = await createMileageService(db).metadata(dayRows.map(row => row.sessionId));
   const payload = dayRows.map((row) => {
     const gmName = `${row.gmFirstName} ${row.gmLastName}`.trim();
     const startAt = row.dayStartedAt ?? row.createdAt;
@@ -698,6 +703,7 @@ async function loadAdminDaySessions(input: QueryInput): Promise<DaySessionPayloa
       endAt,
       startKm: row.startKm,
       endKm: row.endKm,
+      mileage: mileageById.get(row.sessionId) ?? null,
       actions: actionsBySessionId.get(row.sessionId) ?? [],
       timezone: input.timezone,
     });
@@ -1855,9 +1861,16 @@ adminZeiterfassungRouter.patch("/day-sessions/:sessionId", async (req: AuthedReq
       return;
     }
 
+    if (body.startKm !== undefined || body.endKm !== undefined) {
+      const mileage = await createMileageService(db).metadata([session.id]);
+      if (mileage.has(session.id)) {
+        res.status(409).json({ error: "Dieser Tag hat eine Fahrzeugkorrektur. Bitte die Kilometerstände unter Fahrzeugwechsel nachtragen ändern." });
+        return;
+      }
+    }
     const nextStartKm = body.startKm ?? session.startKm;
     const nextEndKm = body.endKm ?? session.endKm;
-    if (nextStartKm !== null && nextEndKm !== null && nextEndKm < nextStartKm) {
+    if ((body.startKm !== undefined || body.endKm !== undefined) && nextStartKm !== null && nextEndKm !== null && nextEndKm < nextStartKm) {
       res.status(400).json({ error: "End-KM darf nicht kleiner als Start-KM sein.", code: "invalid_km_range" });
       return;
     }
