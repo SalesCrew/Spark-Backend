@@ -6,7 +6,7 @@ import { Router, type Response } from "express";
 import { z } from "zod";
 import { smAnswerComment, smCommentMissing } from "../sm-comment.shared.js";
 import { SMDurcharbeitCampaignError, loadSMDurcharbeitOwnedVisit, loadSMDurcharbeitTarget, lockSMDurcharbeitTarget,
-  assertSMDurcharbeitAvailable, loadSMDurcharbeitVersion, SMDurcharbeitToday, SMDurcharbeitMonth,
+  assertSMDurcharbeitAvailable, assertSMDurcharbeitEmployeeVisible, loadSMDurcharbeitVersion, SMDurcharbeitToday, SMDurcharbeitMonth,
   SMDurcharbeitEvent, reconcileSMDurcharbeitTarget, saveSMDurcharbeitVisitTime, pinSMDurcharbeitVisitOwner } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { copySMDurcharbeitMonthlyAnswers, SMDurcharbeitAnswerFiles } from "../sm-SMDurcharbeit-answer-reuse.shared.js";
 
@@ -655,14 +655,15 @@ export async function initializeSMDurcharbeitVisit(tx: DbTx, targetId: string, s
 }) {
   // Token and target locks make retries and two-tab starts resolve to the same draft.
   await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`SMDurcharbeit_start:${smUserId}:${input.clientSubmissionToken}`}, 0))`);
+  await lockSMDurcharbeitTarget(tx, targetId);
   const [replayed] = await tx.select().from(smQuestionnaireSubmissions).where(and(
     eq(smQuestionnaireSubmissions.smUserId, smUserId), eq(smQuestionnaireSubmissions.clientSubmissionToken, input.clientSubmissionToken), eq(smQuestionnaireSubmissions.isDeleted, false),
   )).limit(1);
   if (replayed) {
     if (replayed.SMDurcharbeitTargetId !== targetId || !replayed.SMDurcharbeitVisitId) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_token_reused", "Dieser Start wurde bereits für einen anderen Besuch verwendet.");
+    assertSMDurcharbeitEmployeeVisible(await loadSMDurcharbeitTarget(tx, targetId));
     return { visitId: replayed.SMDurcharbeitVisitId, submissionId: replayed.id, replayed: true };
   }
-  await lockSMDurcharbeitTarget(tx, targetId);
   let context = await loadSMDurcharbeitTarget(tx, targetId);
   await tx.select({ id: smSMDurcharbeitMarkets.smMarketId }).from(smSMDurcharbeitMarkets).where(eq(smSMDurcharbeitMarkets.smMarketId, context.membership.smMarketId)).for("share");
   context = await loadSMDurcharbeitTarget(tx, targetId);

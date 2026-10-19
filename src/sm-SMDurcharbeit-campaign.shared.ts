@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { db } from "./lib/db.js";
 import { smSMDurcharbeitCampaigns as campaigns, smSMDurcharbeitCampaignMarkets as memberships,
@@ -14,6 +15,15 @@ export class SMDurcharbeitCampaignError extends Error {
   constructor(public statusCode: number, public code: string, message: string) { super(message); }
 }
 const fail = (code: string, message: string, status = 409): never => { throw new SMDurcharbeitCampaignError(status, code, message); };
+/** Employee visibility only. Admin reporting keeps the complete historical graph. */
+export function SMDurcharbeitEmployeeTargetVisible(targetId: AnyPgColumn) {
+  return sql`not exists (select 1 from public.sm_smdurcharbeit_month_targets hidden_target
+    join public.sm_smdurcharbeit_campaigns hidden_campaign on hidden_campaign.id=hidden_target.campaign_id
+    where hidden_target.id=${targetId} and hidden_campaign.status='paused')`;
+}
+export function assertSMDurcharbeitEmployeeVisible(context: SMDurcharbeitTargetContext) {
+  if (context.campaign.status === "paused") return fail("smdurcharbeit_campaign_paused", "Diese Durcharbeit ist derzeit nicht verfügbar.", 404);
+}
 export function SMDurcharbeitToday(at = new Date()) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Vienna", year: "numeric", month: "2-digit", day: "2-digit" }).format(at);
 }
@@ -92,6 +102,7 @@ export async function pinSMDurcharbeitVisitOwner(tx: SMDurcharbeitTx, context: S
 export async function assertSMDurcharbeitAvailable(executor: SMDurcharbeitExecutor, context: SMDurcharbeitTargetContext, smUserId: string, at = new Date()) {
   const today = SMDurcharbeitToday(at);
   if (context.effectiveSmUserId !== smUserId) return fail("smdurcharbeit_target_forbidden", "Dieser Markt ist einem anderen SM zugewiesen.",403);
+  assertSMDurcharbeitEmployeeVisible(context);
   const [user] = await executor.select().from(users).where(and(eq(users.id,smUserId),eq(users.role,"sm"),eq(users.isActive,true),isNull(users.deletedAt))).limit(1);
   if (!user) return fail("smdurcharbeit_user_inactive", "Der SM-Zugang ist nicht aktiv.",403);
   if (context.campaign.status !== "published" || today < context.campaign.startDate || today > context.campaign.endDate || context.period.month !== SMDurcharbeitMonth(today)) {
@@ -169,11 +180,12 @@ export async function publishSMDurcharbeitCampaign(tx: SMDurcharbeitTx, id: stri
   await SMDurcharbeitEvent(tx,{campaignId:id,actorUserId:actorId,action:"published",reason:"Monatliche Durcharbeit veröffentlicht",afterState:{months:preview.months,marketCount:preview.marketCount}});
 }
 
-export async function listSMDurcharbeitTargets(executor: SMDurcharbeitExecutor, input:{month:string;campaignId?:string;smUserId?:string}) {
+export async function listSMDurcharbeitTargets(executor: SMDurcharbeitExecutor, input:{month:string;campaignId?:string;smUserId?:string;employeeVisible?:boolean}) {
   const month = SMDurcharbeitMonth(input.month);
   const filters = [eq(periods.month,month),sql`${campaigns.status} <> 'draft'`];
   if (input.campaignId) filters.push(eq(campaigns.id,input.campaignId));
   if (input.smUserId) filters.push(eq(SMDurcharbeitEffectiveOwner(),input.smUserId));
+  if (input.employeeVisible) filters.push(sql`${campaigns.status} <> 'paused'`);
   const rows = await executor.select({target:targets,campaign:campaigns,period:periods,owner:owners,member:memberships,effectiveSmUserId:SMDurcharbeitEffectiveOwner(), SMDurcharbeitSmOverride: SMDurcharbeitHasSmOverride(),
     marketAvailable: sql<boolean>`not ${smMarkets.isDeleted} and ${smMarkets.isActive}`,
     user:{firstName:users.firstName,lastName:users.lastName,isActive:users.isActive,deletedAt:users.deletedAt,role:users.role}})
@@ -265,6 +277,7 @@ export async function loadSMDurcharbeitOwnedVisit(executor:SMDurcharbeitExecutor
   if(lock) await lockSMDurcharbeitTarget(executor as SMDurcharbeitTx,visit.targetId);
   if(visit.smUserId!==smUserId) return fail("smdurcharbeit_visit_forbidden","Dieser Besuch gehört einem anderen SM.",403);
   const context=await loadSMDurcharbeitTarget(executor,visit.targetId);
+  assertSMDurcharbeitEmployeeVisible(context);
   const [submission]=await executor.select().from(submissions).where(and(eq(submissions.SMDurcharbeitVisitId,visitId),eq(submissions.isDeleted,false),eq(submissions.isCurrent,true))).limit(1);
   if(!submission) return fail("smdurcharbeit_submission_missing","Der Fragebogen wurde nicht gefunden.",404);
   if(lock && submission.status==="draft") {

@@ -11,7 +11,7 @@ import { smSMDurcharbeitCampaigns as campaigns, smSMDurcharbeitCampaignMarkets a
   smMarkets, smSMDurcharbeitMarkets, smQuestionnaireVersions, smQuestionnaireTemplates, users } from "../lib/schema.js";
 import { SMDurcharbeitCampaignError, SMDurcharbeitToday, SMDurcharbeitMonth, SMDurcharbeitMonths, SMDurcharbeitEvent,
   SMDurcharbeitPublicationPreview, publishSMDurcharbeitCampaign, listSMDurcharbeitTargets, loadSMDurcharbeitTarget,
-  assertSMDurcharbeitAvailable, loadSMDurcharbeitVersion, editSMDurcharbeitTarget, changeSMDurcharbeitMonthOwner, resolveSMDurcharbeitRoster, SMDurcharbeitEffectiveOwner } from "../sm-SMDurcharbeit-campaign.shared.js";
+  assertSMDurcharbeitAvailable, assertSMDurcharbeitEmployeeVisible, loadSMDurcharbeitVersion, editSMDurcharbeitTarget, changeSMDurcharbeitMonthOwner, resolveSMDurcharbeitRoster, SMDurcharbeitEffectiveOwner } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { initializeSMDurcharbeitVisit, cancelSMDurcharbeitDraft, cleanupSMDurcharbeitDraftPhotos } from "./sm-visits.js";
 import { isIsoDate } from "../sm-planning.shared.js";
 import { loadSMDurcharbeitReport } from "../sm-SMDurcharbeit-report.shared.js";
@@ -202,6 +202,7 @@ adminSMDurcharbeitCampaignsRouter.post("/:campaignId/extend", async (req: Authed
     await db.transaction(async tx => {
       const campaign = await lockedCampaign(tx, id(req, "campaignId"), input.expectedRevision);
       if (!["published", "paused"].includes(campaign.status) || input.endDate <= campaign.endDate || input.endDate < SMDurcharbeitToday()) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_extension_invalid", "Bitte ein späteres Enddatum für eine veröffentlichte Kampagne wählen.");
+      if (campaign.status === "paused" && input.reactivate) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_resume_required", "Die Kampagne bleibt pausiert. Bitte zum Freigeben ausdrücklich Fortsetzen wählen.");
       const months = SMDurcharbeitMonths(campaign.startDate, input.endDate);
       const existingPeriods = await tx.select().from(periods).where(eq(periods.campaignId, campaign.id)).orderBy(desc(periods.month));
       const currentMonths = new Set(existingPeriods.map(p => p.month)), latestPeriod = existingPeriods[0];
@@ -276,11 +277,11 @@ SMDurcharbeitCampaignsRouter.get("/targets", async (req: AuthedRequest, res, nex
     const input = z.object({ month: date.optional() }).strict().parse(req.query);
     const currentMonth = SMDurcharbeitMonth(), month = SMDurcharbeitMonth(input.month ?? currentMonth), smUserId = actor(req);
     const [monthlyTargets, ownedMonths] = await Promise.all([
-      listSMDurcharbeitTargets(db, { smUserId, month }),
+      listSMDurcharbeitTargets(db, { smUserId, month, employeeVisible: true }),
       db.selectDistinct({ month: periods.month }).from(targets).innerJoin(periods, eq(periods.id, targets.periodId))
         .innerJoin(campaigns, eq(campaigns.id, targets.campaignId)).innerJoin(owners, eq(owners.id, targets.ownerRevisionId))
         .innerJoin(members, eq(members.id, targets.campaignMarketId)).leftJoin(smSMDurcharbeitMarkets, eq(smSMDurcharbeitMarkets.smMarketId, members.smMarketId))
-        .where(and(eq(SMDurcharbeitEffectiveOwner(), smUserId), sql`${campaigns.status} <> 'draft'`)).orderBy(asc(periods.month)),
+        .where(and(eq(SMDurcharbeitEffectiveOwner(), smUserId), sql`${campaigns.status} not in ('draft','paused')`)).orderBy(asc(periods.month)),
     ]);
     res.json({ month, currentMonth, months: ownedMonths.map(period => period.month), targets: monthlyTargets });
   }
@@ -290,7 +291,8 @@ SMDurcharbeitCampaignsRouter.get("/targets/:targetId", async (req: AuthedRequest
   try {
     const context = await loadSMDurcharbeitTarget(db, id(req, "targetId"));
     if (context.effectiveSmUserId !== actor(req)) throw new SMDurcharbeitCampaignError(403, "smdurcharbeit_target_forbidden", "Dieser Markt gehört einem anderen SM.");
-    const rows = await listSMDurcharbeitTargets(db, { campaignId: context.campaign.id, month: context.period.month, smUserId: actor(req) });
+    assertSMDurcharbeitEmployeeVisible(context);
+    const rows = await listSMDurcharbeitTargets(db, { campaignId: context.campaign.id, month: context.period.month, smUserId: actor(req), employeeVisible: true });
     const [version] = await db.select({ name: smQuestionnaireVersions.name, versionNumber: smQuestionnaireVersions.versionNumber }).from(smQuestionnaireVersions).where(eq(smQuestionnaireVersions.id, context.period.questionnaireVersionId)).limit(1);
     const [user] = await db.select({ travelTimeEnabled: users.travelTimeEnabled }).from(users).where(eq(users.id, actor(req))).limit(1);
     res.json({ target: rows.find(row => row.id === context.target.id), questionnaire: version, profile: user });

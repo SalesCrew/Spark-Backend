@@ -91,8 +91,8 @@ test("monthly transitions preserve ownership, pinned versions and historical sta
       const afterStart = await target(c.id);
       await admin("patch", `${root}/targets/${row.id}`).send({ expectedRevision: afterStart.revision, smUserId: second, scope: "month", reason: "Synthetic protected transfer" }).expect(400);
       const current = await campaign(c.id); await admin("patch", `${root}/${c.id}/state`).send({ expectedRevision: current.revision, status: "paused", reason: "Synthetic pause" }).expect(200);
-      const paused = (await sm("get", `${employeeRoot}/visits/${started.visitId}`).expect(200)).body;
-      assert.ok(paused.SMDurcharbeitContext.readOnlyReason); await start(await target(c.id)).expect(409);
+      await sm("get", `${employeeRoot}/visits/${started.visitId}`).expect(404);
+      await start(await target(c.id)).expect(404);
       const p = await campaign(c.id); await admin("patch", `${root}/${c.id}/state`).send({ expectedRevision: p.revision, status: "published", reason: "Synthetic resumption" }).expect(200);
       assert.equal((await start(await target(c.id)).expect(200)).body.visitId, started.visitId);
     });

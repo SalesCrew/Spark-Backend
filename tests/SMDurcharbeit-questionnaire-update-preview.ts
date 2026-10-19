@@ -28,7 +28,7 @@ app.get("/auth/me", (req, res) => {
 });
 app.get("/employee-agreement/current", (req, res) => {
   if (req.header("authorization") !== "Bearer synthetic-sm") { res.sendStatus(401); return; }
-  res.json({ accepted: true });
+  res.json({ accepted: true, agreement: { key: "synthetic", version: "synthetic", title: "Synthetische Vereinbarung", hash: "synthetic", effectiveDate: "2026-10-01", sections: [] }, acceptance: { acceptedAt: "2026-10-01T00:00:00Z" } });
 });
 app.use(f.app);
 const server = app.listen(4037, "127.0.0.1", () => console.log("Durcharbeit questionnaire update preview · disposable synthetic data · 4037"));

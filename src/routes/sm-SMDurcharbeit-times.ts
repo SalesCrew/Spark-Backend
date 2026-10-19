@@ -9,7 +9,7 @@ import { smSMDurcharbeitVisits as visits, smSMDurcharbeitTargets as targets, smS
   smQuestionnaireSubmissions as submissions } from "../lib/schema.js";
 import { isIsoDate, isoDateToEpochDay } from "../sm-planning.shared.js";
 import { SMDurcharbeitCampaignError, SMDurcharbeitToday, SMDurcharbeitEvent, loadSMDurcharbeitTarget,
-  lockSMDurcharbeitTarget, saveSMDurcharbeitVisitTime, type SMDurcharbeitTx } from "../sm-SMDurcharbeit-campaign.shared.js";
+  lockSMDurcharbeitTarget, saveSMDurcharbeitVisitTime, assertSMDurcharbeitEmployeeVisible, SMDurcharbeitEmployeeTargetVisible, type SMDurcharbeitTx } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { assertSmVisitTimeAvailable, lockSmVisitTimes, SmTimeOverlapError } from "../sm-time-overlap.js";
 
 const uuid = z.string().uuid();
@@ -76,6 +76,7 @@ async function listTimes(input: z.infer<typeof range>, ownUserId?: string) {
   const workDate = sql<string>`(coalesce(${times.startedAt},${submissions.visitStartedAt}) at time zone 'Europe/Vienna')::date::text`;
   const filters = [sql`${workDate} between ${input.from} and ${input.to}`, sql`exists(select 1 from public.sm_smdurcharbeit_visit_time_revisions old_time where old_time.visit_id = ${visits.id})`];
   if (ownUserId || input.smUserId) filters.push(eq(visits.smUserId, ownUserId ?? input.smUserId!));
+  if (ownUserId) filters.push(SMDurcharbeitEmployeeTargetVisible(visits.targetId));
   const rows = await db.select({ visitId: visits.id, submissionId: submissions.id, smUserId: visits.smUserId,
     smName: submissions.smNameSnapshot, marketId: submissions.smMarketId, marketName: submissions.marketNameSnapshot,
     marketAddress: submissions.marketAddressSnapshot, marketInternalId: sql<string>`coalesce(${targets.marketSnapshot}->>'internalId','')`,
@@ -111,7 +112,7 @@ adminSMDurcharbeitTimesRouter.get("/", async (req, res, next) => {
 for (const [router, own] of [[SMDurcharbeitTimesRouter, true], [adminSMDurcharbeitTimesRouter, false]] as const) router.get("/:visitId/history", async (req: AuthedRequest, res, next) => {
   try {
     const visitId = uuid.parse(req.params.visitId), input = historyQuery.parse(req.query);
-    const [visit] = await db.select().from(visits).where(and(eq(visits.id, visitId), ...(own ? [eq(visits.smUserId, req.authUser!.appUserId)] : []))).limit(1);
+    const [visit] = await db.select().from(visits).where(and(eq(visits.id, visitId), ...(own ? [eq(visits.smUserId, req.authUser!.appUserId), SMDurcharbeitEmployeeTargetVisible(visits.targetId)] : []))).limit(1);
     if (!visit) return fail("smdurcharbeit_time_visit_missing", "Besuch nicht gefunden.", 404);
     const [original] = await db.select({ startedAt: submissions.visitStartedAt, completedAt: submissions.visitCompletedAt }).from(submissions).where(eq(submissions.SMDurcharbeitVisitId, visitId)).limit(1);
     const [current, page] = await Promise.all([
@@ -150,6 +151,7 @@ SMDurcharbeitTimesRouter.post("/:visitId/requests", async (req: AuthedRequest, r
       const [identity] = await tx.select().from(visits).where(eq(visits.id, visitId)).limit(1);
       if (!identity || identity.smUserId !== actor) return fail("smdurcharbeit_time_forbidden", "Dieser Besuch gehört einem anderen SM.", 403);
       await lockSMDurcharbeitTarget(tx, identity.targetId); await lockSmVisitTimes(tx, actor);
+      assertSMDurcharbeitEmployeeVisible(await loadSMDurcharbeitTarget(tx, identity.targetId));
       const [replayed] = await tx.select().from(requests).where(and(eq(requests.smUserId, actor), eq(requests.clientToken, input.clientRequestToken))).limit(1);
       if (replayed) {
         if (replayed.visitId !== visitId || replayed.kind !== input.kind || replayed.expectedRevision !== input.expectedRevision || replayed.reason !== input.reason || !same(replayed.startedAt, input.requestedStartedAt) || !same(replayed.completedAt, input.requestedCompletedAt))

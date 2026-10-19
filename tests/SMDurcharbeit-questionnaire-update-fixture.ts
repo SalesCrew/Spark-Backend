@@ -5,7 +5,7 @@ import { createSMDurcharbeitFixture } from "./SMDurcharbeit-fixture.js";
 
 /** Disposable real-route setup. No environment files, application entrypoint or cloud storage. */
 export async function createQuestionnaireUpdateFixture() {
-  const now = Date.parse("2026-10-19T10:00:00Z");
+  let now = Date.parse("2026-10-19T10:00:00Z");
   class Clock extends Date { constructor(value?: string | number | Date) { super(value === undefined ? now : value instanceof Date ? value.getTime() : value); } static now() { return now; } }
   const objects = new Set<string>(), reader = randomUUID(), editor = randomUUID(), wrongEditor = randomUUID();
   const f = await createSMDurcharbeitFixture({ clock: Clock as typeof Date,
@@ -63,6 +63,6 @@ export async function createQuestionnaireUpdateFixture() {
       return latestModule;
     };
     await editModule();
-    return { ...f, adminId: f.admin, admin, sm, root, employeeRoot, visitRoot, originalModule, form, version: version!, campaign, otherCampaign, targets, completed, draft, photoId, objects, list, start, editModule };
+    return { setNow: (value: string) => { now = Date.parse(value); }, ...f, adminId: f.admin, admin, sm, root, employeeRoot, visitRoot, originalModule, form, version: version!, campaign, otherCampaign, targets, completed, draft, photoId, objects, list, start, editModule };
   } catch (error) { await f.pg.close(); throw error; }
 }

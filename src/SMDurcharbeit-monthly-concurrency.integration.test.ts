@@ -93,15 +93,14 @@ test("native disposable PostgreSQL serializes monthly and legacy writers without
         const [startResult, changeResult] = await Promise.all([
           sm("post", `/sm/smdurcharbeit/targets/${target.id}/start`).send({ expectedRevision: target.revision, followUp: false, mode: "manual", clientSubmissionToken: randomUUID() }), change,
         ]);
-        assert.ok([201, 403, 409].includes(startResult.status), JSON.stringify(startResult.body));
+        assert.ok([201, 403, 404, 409].includes(startResult.status), JSON.stringify(startResult.body));
         assert.ok([200, 409].includes(changeResult.status), JSON.stringify(changeResult.body));
         const graph = await f.database.select().from(f.schema.smQuestionnaireSubmissions).where(eq(f.schema.smQuestionnaireSubmissions.SMDurcharbeitTargetId, target.id));
         if (action === "pause") {
           assert.equal(changeResult.status, 200); assert.equal(graph.length, startResult.status === 201 ? 1 : 0);
           if (startResult.status === 201) {
-            const read = (await sm("get", `/sm/smdurcharbeit/visits/${startResult.body.visitId}`).expect(200)).body;
-            assert.ok(read.SMDurcharbeitContext.readOnlyReason);
-            await sm("post", `/sm/smdurcharbeit/visits/${startResult.body.visitId}/submit`).send({ visitStartedAt: "2026-10-09T10:00:00Z", visitCompletedAt: "2026-10-09T10:10:00Z", clientMutationToken: randomUUID() }).expect(409);
+            await sm("get", `/sm/smdurcharbeit/visits/${startResult.body.visitId}`).expect(404);
+            await sm("post", `/sm/smdurcharbeit/visits/${startResult.body.visitId}/submit`).send({ visitStartedAt: "2026-10-09T10:00:00Z", visitCompletedAt: "2026-10-09T10:10:00Z", clientMutationToken: randomUUID() }).expect(404);
           }
         } else {
           assert.notEqual(startResult.status === 201 && changeResult.status === 200, true, "A roster transition cannot bypass the live-draft guard");

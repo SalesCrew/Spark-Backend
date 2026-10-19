@@ -2,6 +2,7 @@ import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { randomUUID } from "node:crypto";
 import { assertSMDurcharbeitOverride, loadSMDurcharbeitSelectionCatalog, resolveSMDurcharbeitSelection, SMDurcharbeitVersionAvailable, SMDurcharbeitSelectionError } from "../sm-SMDurcharbeit-selection.shared.js";
 import { smQuestionnaireCatalogScope } from "../sm-SMDurcharbeit-catalog.shared.js";
+import { SMDurcharbeitEmployeeTargetVisible } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
@@ -585,7 +586,7 @@ smPlanningRouter.get("/profile", async (req: AuthedRequest, res, next) => {
       // approved time deletions. No target is counted as a dated Einsatz or Soll.
       db.select({ actualMinutes: smSMDurcharbeitTimeRevisions.actualMinutes, travelMinutes: smSMDurcharbeitTimeRevisions.travelMinutes })
         .from(smSMDurcharbeitTimeRevisions).innerJoin(smSMDurcharbeitVisits, eq(smSMDurcharbeitVisits.id, smSMDurcharbeitTimeRevisions.visitId))
-        .where(and(eq(smSMDurcharbeitVisits.smUserId, smUserId), eq(smSMDurcharbeitTimeRevisions.isCurrent, true),
+        .where(and(eq(smSMDurcharbeitVisits.smUserId, smUserId), eq(smSMDurcharbeitTimeRevisions.isCurrent, true), SMDurcharbeitEmployeeTargetVisible(smSMDurcharbeitVisits.targetId),
           sql`(${smSMDurcharbeitTimeRevisions.startedAt} at time zone 'Europe/Vienna')::date between ${week.from}::date and ${week.to}::date`)),
     ]);
     const user = userRows[0];

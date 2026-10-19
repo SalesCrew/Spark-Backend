@@ -7,7 +7,7 @@ import { z } from "zod";
 import { smCommentMissing } from "../sm-comment.shared.js";
 import { adminSmManagementRouter } from "./sm-management.js";
 import { SMDurcharbeitAnswerFiles } from "../sm-SMDurcharbeit-answer-reuse.shared.js";
-import { lockSMDurcharbeitSubmissionContext, reconcileSMDurcharbeitTarget } from "../sm-SMDurcharbeit-campaign.shared.js";
+import { lockSMDurcharbeitSubmissionContext, reconcileSMDurcharbeitTarget, SMDurcharbeitEmployeeTargetVisible } from "../sm-SMDurcharbeit-campaign.shared.js";
 
 import { computeHiddenQuestionIds } from "../lib/conditional-visibility.js";
 import { db } from "../lib/db.js";
@@ -86,6 +86,13 @@ const deleteRequestSchema = z.object({
   clientRequestToken: z.string().trim().min(8).max(300),
 }).strict();
 const reviewSchema = z.object({ adminNote: z.string().trim().max(2_000).optional() }).strict();
+
+async function requireEmployeeVisibleSubmission(executor: DbExecutor, submissionId: string, smUserId: string) {
+  const [row] = await executor.select({ id: smQuestionnaireSubmissions.id }).from(smQuestionnaireSubmissions).where(and(
+    eq(smQuestionnaireSubmissions.id, submissionId), eq(smQuestionnaireSubmissions.smUserId, smUserId),
+    SMDurcharbeitEmployeeTargetVisible(smQuestionnaireSubmissions.SMDurcharbeitTargetId))).limit(1);
+  if (!row) throw new SmActivityError(404, "sm_activity_submission_not_found", "Der Fragebogen wurde nicht gefunden.");
+}
 
 function optionSnapshot(value: unknown): Array<{ code: string; label: string; marksNotApplicable?: boolean }> {
   if (!Array.isArray(value)) return [];
@@ -254,7 +261,7 @@ async function publicAnswerRequests(smUserId?: string) {
     .innerJoin(smQuestionnaireSubmissionSections, eq(smQuestionnaireSubmissionSections.id, smQuestionnaireSubmissionQuestions.submissionSectionId))
     .innerJoin(users, eq(users.id, smAnswerChangeRequests.smUserId))
     .innerJoin(smMarkets, eq(smMarkets.id, smAnswerChangeRequests.smMarketId))
-    .where(and(eq(smAnswerChangeRequests.isDeleted, false), ...(smUserId ? [eq(smAnswerChangeRequests.smUserId, smUserId)] : [])))
+    .where(and(eq(smAnswerChangeRequests.isDeleted, false), ...(smUserId ? [eq(smAnswerChangeRequests.smUserId, smUserId), SMDurcharbeitEmployeeTargetVisible(smQuestionnaireSubmissions.SMDurcharbeitTargetId)] : [])))
     .orderBy(sql`case when ${smAnswerChangeRequests.status} = 'pending' then 0 else 1 end`, desc(smAnswerChangeRequests.updatedAt))
     .limit(250);
   return Promise.all(rows.map(async (row) => {
@@ -312,8 +319,9 @@ async function publicAnswerRequests(smUserId?: string) {
 async function publicDeleteRequests(smUserId?: string) {
   const rows = await db.select({ SMDurcharbeitCatalogScope: sql<"standard" | "SMDurcharbeit">`(select case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end from sm_questionnaire_templates t join sm_questionnaire_submissions s on s.questionnaire_template_id = t.id where s.id = ${smQuestionnaireSubmissionDeleteRequests.submissionId})`, request: smQuestionnaireSubmissionDeleteRequests, smFirstName: users.firstName, smLastName: users.lastName, smEmail: users.email })
     .from(smQuestionnaireSubmissionDeleteRequests)
+    .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smQuestionnaireSubmissionDeleteRequests.submissionId))
     .innerJoin(users, eq(users.id, smQuestionnaireSubmissionDeleteRequests.smUserId))
-    .where(and(eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false), ...(smUserId ? [eq(smQuestionnaireSubmissionDeleteRequests.smUserId, smUserId)] : [])))
+    .where(and(eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false), ...(smUserId ? [eq(smQuestionnaireSubmissionDeleteRequests.smUserId, smUserId), SMDurcharbeitEmployeeTargetVisible(smQuestionnaireSubmissions.SMDurcharbeitTargetId)] : [])))
     .orderBy(sql`case when ${smQuestionnaireSubmissionDeleteRequests.status} = 'pending' then 0 else 1 end`, desc(smQuestionnaireSubmissionDeleteRequests.updatedAt))
     .limit(250);
   return rows.map((row) => ({
@@ -421,7 +429,7 @@ smActivityRouter.get("/completed", async (req: AuthedRequest, res, next) => {
       .leftJoin(smSMDurcharbeitCampaigns, eq(smSMDurcharbeitCampaigns.id, smSMDurcharbeitTargets.campaignId))
       .innerJoin(smMarkets, eq(smMarkets.id, smQuestionnaireSubmissions.smMarketId))
       .leftJoin(smAssignmentTimeSubmissions, and(eq(smAssignmentTimeSubmissions.assignmentId, smAssignments.id), eq(smAssignmentTimeSubmissions.isCurrent, true), eq(smAssignmentTimeSubmissions.isDeleted, false)))
-      .where(and(eq(smQuestionnaireSubmissions.smUserId, actor.appUserId), eq(smQuestionnaireSubmissions.status, "submitted"), eq(smQuestionnaireSubmissions.isCurrent, true), eq(smQuestionnaireSubmissions.isDeleted, false)))
+      .where(and(eq(smQuestionnaireSubmissions.smUserId, actor.appUserId), eq(smQuestionnaireSubmissions.status, "submitted"), eq(smQuestionnaireSubmissions.isCurrent, true), eq(smQuestionnaireSubmissions.isDeleted, false), SMDurcharbeitEmployeeTargetVisible(smQuestionnaireSubmissions.SMDurcharbeitTargetId)))
       .orderBy(desc(smQuestionnaireSubmissions.submittedAt), desc(smQuestionnaireSubmissions.createdAt))
       .limit(limit);
     const submissionIds = rows.map((row) => row.submission.id);
@@ -481,6 +489,7 @@ smActivityRouter.post("/submissions/:submissionId/questions/:questionId/change-r
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_answer_request_token:${actor.appUserId}:${input.clientRequestToken}`}, 0))`);
       await lockSMDurcharbeitSubmissionContext(tx, submissionId);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_answer_request:${questionId}`}, 0))`);
+      await requireEmployeeVisibleSubmission(tx, submissionId, actor.appUserId);
       const [replayed] = await tx.select().from(smAnswerChangeRequests).where(and(eq(smAnswerChangeRequests.smUserId, actor.appUserId), eq(smAnswerChangeRequests.clientRequestToken, input.clientRequestToken), eq(smAnswerChangeRequests.isDeleted, false))).limit(1);
       if (replayed) {
         if (replayed.submissionId !== submissionId || replayed.submissionQuestionId !== questionId) {
@@ -544,6 +553,7 @@ smActivityRouter.post("/submissions/:submissionId/delete-requests", async (req: 
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_submission_delete_request_token:${actor.appUserId}:${input.clientRequestToken}`}, 0))`);
       await lockSMDurcharbeitSubmissionContext(tx, submissionId);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sm_submission_delete_request:${submissionId}`}, 0))`);
+      await requireEmployeeVisibleSubmission(tx, submissionId, actor.appUserId);
       const [replayed] = await tx.select().from(smQuestionnaireSubmissionDeleteRequests).where(and(eq(smQuestionnaireSubmissionDeleteRequests.smUserId, actor.appUserId), eq(smQuestionnaireSubmissionDeleteRequests.clientRequestToken, input.clientRequestToken), eq(smQuestionnaireSubmissionDeleteRequests.isDeleted, false))).limit(1);
       if (replayed) {
         if (replayed.submissionId !== submissionId) {
