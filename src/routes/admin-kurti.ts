@@ -1,3 +1,5 @@
+import { setTimeout as waitForRetry } from "node:timers/promises";
+import { createKurtiRequestDeadline, KURTI_REQUEST_TIMEOUT_MS } from "../lib/kurti-request-deadline.js";
 import { kurtiRestrictedRequestReply } from "../lib/kurti-operating-policy.js";
 import { loadKurtiIdentityBoundary, KURTI_IDENTITY_INSTRUCTIONS, KURTI_MENTION_HELP, KURTI_MODEL } from "../lib/kurti-identity.js";
 import OpenAI from "openai";
@@ -91,7 +93,8 @@ function serializeWindowLayout(row: typeof adminKurtiWindowPreferences.$inferSel
 const openai = env.OPENAI_API_KEY
   ? new OpenAI({
       apiKey: env.OPENAI_API_KEY,
-      timeout: env.OPENAI_KURTI_TIMEOUT_MS,
+      // Old deployment overrides must not keep the former short timeout.
+      timeout: Math.max(KURTI_REQUEST_TIMEOUT_MS, env.OPENAI_KURTI_TIMEOUT_MS),
       maxRetries: 0,
     })
   : null;
@@ -109,9 +112,10 @@ async function createAdminKurtiResponse(
   client: OpenAI,
   body: Responses.ResponseCreateParamsNonStreaming,
   logMeta: ReturnType<typeof getRequestLogMeta>,
+  signal: AbortSignal,
 ) {
   try {
-    return await client.responses.create(body);
+    return await client.responses.create(body, { signal });
   } catch (error) {
     if (!(error instanceof OpenAI.APIError)) throw error;
     const retryDelayMs = getRateLimitRetryDelayMs(error);
@@ -124,8 +128,8 @@ async function createAdminKurtiResponse(
       providerStatus: error.status,
       providerCode: error.code,
     });
-    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-    return client.responses.create(body);
+    await waitForRetry(retryDelayMs, undefined, { signal });
+    return client.responses.create(body, { signal });
   }
 }
 
@@ -270,6 +274,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
   }
 
   activeAdminKurtiRequests.add(requestKey);
+  const deadline = createKurtiRequestDeadline(res);
   try {
     const identity = await loadKurtiIdentityBoundary(req.authUser!);
     const prepared = identity.prepareMessage(parsed.data.message);
@@ -338,9 +343,10 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       include: ["reasoning.encrypted_content"],
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
       store: false,
-    }), getRequestLogMeta(req));
+    }), getRequestLogMeta(req), deadline.signal);
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+      deadline.signal.throwIfAborted();
       const toolCalls = response.output.filter((item) => item.type === "function_call");
       if (toolCalls.length === 0) break;
 
@@ -477,9 +483,10 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
         include: ["reasoning.encrypted_content"],
         max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
         store: false,
-      }), getRequestLogMeta(req));
+      }), getRequestLogMeta(req), deadline.signal);
     }
 
+    deadline.signal.throwIfAborted();
     const assistantText = identity.redactText(response.output_text.trim());
     if (!assistantText && renderedCharts.length === 0 && renderedVisualizations.length === 0 && preparedExports.length === 0 && smExports.length === 0) {
       logger.warn("admin_kurti_empty_response", {
@@ -516,6 +523,11 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       expiresAt: messages.at(-1)?.expiresAt ?? null,
     });
   } catch (error) {
+    if (deadline.timedOut) {
+      if (!res.destroyed) res.status(504).json({error:"Die Anfrage hat das Zeitlimit erreicht. Bitte grenze sie ein und versuche es erneut.",code:"admin_kurti_timeout"});
+      return;
+    }
+    if (deadline.signal.aborted && res.destroyed) return;
     if(typeof error === "object" && error !== null && "code" in error && error.code === "kurti_person_not_allowed") {res.status(403).json({error:"Diese Person kann hier nicht ausgewählt werden.",code:"kurti_person_not_allowed"});return;}
     if (error instanceof OpenAI.APIError) {
       logger.warn("admin_kurti_openai_request_failed", {
@@ -538,6 +550,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     }
     next(error);
   } finally {
+    deadline.dispose();
     activeAdminKurtiRequests.delete(requestKey);
   }
 });

@@ -1,3 +1,4 @@
+import { createKurtiRequestDeadline, KURTI_REQUEST_TIMEOUT_MS } from "../lib/kurti-request-deadline.js";
 import { kurtiRestrictedRequestReply } from "../lib/kurti-operating-policy.js";
 import { loadKurtiIdentityBoundary, kurtiWorkerIdentityInstructions, KURTI_MENTION_HELP, KURTI_MODEL } from "../lib/kurti-identity.js";
 import OpenAI from "openai";
@@ -28,7 +29,8 @@ const messageSchema = z.object({
 const openai = env.OPENAI_API_KEY
   ? new OpenAI({
       apiKey: env.OPENAI_API_KEY,
-      timeout: env.OPENAI_KURTI_TIMEOUT_MS,
+      // Old deployment overrides must not keep the former short timeout.
+      timeout: Math.max(KURTI_REQUEST_TIMEOUT_MS, env.OPENAI_KURTI_TIMEOUT_MS),
       maxRetries: 1,
     })
   : null;
@@ -125,6 +127,7 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
   }
 
   activeKurtiRequests.add(gmUserId);
+  const deadline = createKurtiRequestDeadline(res);
   try {
     const identity = await loadKurtiIdentityBoundary(req.authUser!);
     const prepared = identity.prepareWorkerMessage(parsed.data.message);
@@ -161,7 +164,8 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       reasoning: { effort: "low" },
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
       store: false,
-    }));
+    }), { signal: deadline.signal });
+    deadline.signal.throwIfAborted();
     const assistantContent = identity.redactText(response.output_text.trim());
     if (!assistantContent) {
       logger.warn("kurti_empty_response", {
@@ -191,6 +195,11 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       expiresAt: messages.at(-1)?.expiresAt ?? null,
     });
   } catch (error) {
+    if (deadline.timedOut) {
+      if (!res.destroyed) res.status(504).json({error:"Die Anfrage hat das Zeitlimit erreicht. Bitte grenze sie ein und versuche es erneut.",code:"kurti_timeout"});
+      return;
+    }
+    if (deadline.signal.aborted && res.destroyed) return;
     if(typeof error === "object" && error !== null && "code" in error && error.code === "kurti_person_not_allowed") {res.status(403).json({error:"Diese Person kann hier nicht ausgewählt werden.",code:"kurti_person_not_allowed"});return;}
     if (error instanceof OpenAI.APIError) {
       logger.warn("kurti_openai_request_failed", {
@@ -213,6 +222,7 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     }
     next(error);
   } finally {
+    deadline.dispose();
     activeKurtiRequests.delete(gmUserId);
   }
 });
