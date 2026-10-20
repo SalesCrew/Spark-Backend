@@ -86,6 +86,14 @@ function executionCondition(execution: VisitExecution) {
     : eq(smQuestionnaireSubmissions.assignmentId, execution.id);
 }
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Called under the visit/submission write lock. Inactive history still reserves its version numbers. */
+async function nextQuestionAnswerRevision(tx: DbTx, questionId: string) {
+  const [latest] = await tx.select({ id: smQuestionAnswers.id, answerVersion: smQuestionAnswers.answerVersion })
+    .from(smQuestionAnswers).where(eq(smQuestionAnswers.submissionQuestionId, questionId))
+    .orderBy(desc(smQuestionAnswers.answerVersion)).limit(1);
+  return { supersedesAnswerId: latest?.id ?? null, answerVersion: (latest?.answerVersion ?? 0) + 1 };
+}
 type DbExecutor = typeof db | DbTx;
 
 const assignmentIdSchema = z.string().uuid();
@@ -1020,11 +1028,12 @@ smVisitsRouter.post("/:assignmentId/photos/initialize", async (req: AuthedReques
       )).limit(1).for("update");
       if (current) return current.id;
       const id = randomUUID();
+      const revision = await nextQuestionAnswerRevision(tx, question.id);
       await tx.insert(smQuestionAnswers).values({
         id,
         submissionId: submission.id,
         submissionQuestionId: question.id,
-        answerVersion: 1,
+        ...revision,
         isCurrent: true,
         answerState: "unanswered",
         valueJson: { kind: "photo", fileIds: [] },
@@ -1034,7 +1043,7 @@ smVisitsRouter.post("/:assignmentId/photos/initialize", async (req: AuthedReques
         answerId: id,
         submissionId: submission.id,
         eventType: "clear",
-        answerVersion: 1,
+        answerVersion: revision.answerVersion,
         payload: { initializedForUpload: true },
         actorUserId: actor.appUserId,
       });
@@ -1332,6 +1341,7 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
           submissionQuestionId: question.id,
         });
       }
+      const { supersedesAnswerId, answerVersion: version } = await nextQuestionAnswerRevision(tx, question.id);
       const now = new Date();
       if (question.questionTypeSnapshot === "photo") {
         // Comment-only update: never create, remove, replace or move uploaded files.
@@ -1341,7 +1351,6 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
         if (!current || normalized.kind !== "photo" || files.length !== normalized.fileIds.length || files.some((file) => !normalized.fileIds.includes(file.id))) {
           throw new SmVisitError(409, "sm_visit_photo_upload_required", "Bitte speichere zuerst alle Fotos, bevor du den Kommentar ergänzt.");
         }
-        const version = currentVersion + 1;
         await tx.update(smQuestionAnswers).set({ metricOutcomeCode: smBasicActivityCode({ type: question.questionTypeSnapshot, config: question.configSnapshot, options }, normalized), valueJson: normalized, answerVersion: version, updatedAt: now }).where(eq(smQuestionAnswers.id, current.id));
         await tx.insert(smQuestionAnswerEvents).values({
           answerId: current.id, submissionId: submission.id, eventType: "set", answerVersion: version,
@@ -1354,12 +1363,11 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
       if (current) await tx.update(smQuestionAnswers).set({ isCurrent: false, updatedAt: now }).where(eq(smQuestionAnswers.id, current.id));
       const answerId = randomUUID();
       const isAnswered = isAnsweredSmVisitPayload(normalized);
-      const version = currentVersion + 1;
       await tx.insert(smQuestionAnswers).values({
         id: answerId,
         submissionId: submission.id,
         submissionQuestionId: question.id,
-        supersedesAnswerId: current?.id ?? null,
+        supersedesAnswerId,
         answerVersion: version,
         isCurrent: true,
         answerState: isAnswered ? "answered" : "unanswered",
