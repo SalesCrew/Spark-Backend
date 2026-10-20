@@ -1,5 +1,6 @@
 import { setTimeout as waitForRetry } from "node:timers/promises";
 import { createKurtiRequestDeadline, KURTI_REQUEST_TIMEOUT_MS } from "../lib/kurti-request-deadline.js";
+import { observeKurtiTurn } from "../lib/kurti-observability.js";
 import { kurtiRestrictedRequestReply } from "../lib/kurti-operating-policy.js";
 import { loadKurtiIdentityBoundary, KURTI_IDENTITY_INSTRUCTIONS, KURTI_MENTION_HELP, KURTI_MODEL } from "../lib/kurti-identity.js";
 import OpenAI from "openai";
@@ -113,11 +114,19 @@ async function createAdminKurtiResponse(
   body: Responses.ResponseCreateParamsNonStreaming,
   logMeta: ReturnType<typeof getRequestLogMeta>,
   signal: AbortSignal,
+  audit: ReturnType<typeof observeKurtiTurn>,
 ) {
+  const create = async () => {
+    audit.providerCall();
+    const response = await client.responses.create(body, { signal });
+    audit.providerResponse(response);
+    return response;
+  };
   try {
-    return await client.responses.create(body, { signal });
+    return await create();
   } catch (error) {
     if (!(error instanceof OpenAI.APIError)) throw error;
+    audit.providerError(error);
     const retryDelayMs = getRateLimitRetryDelayMs(error);
     if (retryDelayMs === null) throw error;
     logger.warn("admin_kurti_rate_limit_retry_scheduled", {
@@ -129,10 +138,11 @@ async function createAdminKurtiResponse(
       providerCode: error.code,
     });
     await waitForRetry(retryDelayMs, undefined, { signal });
-    return client.responses.create(body, { signal });
+    return create();
   }
 }
 
+adminKurtiRouter.use((_req, res, next) => { res.set("Cache-Control", "private, no-store"); next(); });
 adminKurtiRouter.use(requireAuth(["admin"]));
 
 adminKurtiRouter.get("/layout", async (req: AuthedRequest, res, next) => {
@@ -224,7 +234,7 @@ adminKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
     res.json({
       messages,
       people: identity.people,
-      configured: Boolean(openai),
+      configured: Boolean(openai) && env.OPENAI_KURTI_ENABLED !== false,
       expiresAt: messages.at(-1)?.expiresAt ?? null,
       capabilities: {
         readOnly: true,
@@ -248,8 +258,10 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     return;
   }
 
+  const audit = observeKurtiTurn(req, res, { workspace, audience: "admin" });
   const parsed = messageSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
+    audit.outcome("invalid_message");
     res.status(400).json({
       error: "Bitte gib eine Nachricht mit maximal 4.000 Zeichen ein.",
       code: "invalid_admin_kurti_message",
@@ -257,7 +269,14 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     return;
   }
 
+  if (env.OPENAI_KURTI_ENABLED === false) {
+    audit.outcome("disabled");
+    res.status(503).json({ error: "Kurti ist vorübergehend nicht verfügbar. Bitte später erneut versuchen.", code: "kurti_temporarily_unavailable" });
+    return;
+  }
+
   if (!openai) {
+    audit.outcome("not_configured");
     res.status(503).json({
       error: "Admin-Kurti wird gerade eingerichtet. Bitte später erneut versuchen.",
       code: "admin_kurti_not_configured",
@@ -266,6 +285,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
   }
 
   if (activeAdminKurtiRequests.has(requestKey)) {
+    audit.outcome("busy");
     res.status(409).json({
       error: "Kurti schreibt bereits an einer Admin-Antwort.",
       code: "admin_kurti_request_in_progress",
@@ -279,11 +299,13 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     const identity = await loadKurtiIdentityBoundary(req.authUser!);
     const prepared = identity.prepareMessage(parsed.data.message);
     if(prepared.needsMention){
+      audit.outcome("mention_required");
       const messages=await saveAdminKurtiExchange({adminUserId,workspace,userContent:prepared.text,assistantContent:KURTI_MENTION_HELP,identityProtected:true,now:new Date()});
       res.json({messages,people:identity.people,assistantMessage:messages.at(-1),expiresAt:messages.at(-1)?.expiresAt ?? null});return;
     }
     const restrictedReply = kurtiRestrictedRequestReply(prepared.text);
     if (restrictedReply) {
+      audit.outcome("policy_guard");
       const messages=await saveAdminKurtiExchange({adminUserId,workspace,userContent:prepared.text,assistantContent:restrictedReply,identityProtected:true,now:new Date()});
       res.json({messages,people:identity.people,assistantMessage:messages.at(-1),expiresAt:messages.at(-1)?.expiresAt ?? null});return;
     }
@@ -343,7 +365,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       include: ["reasoning.encrypted_content"],
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
       store: false,
-    }), getRequestLogMeta(req), deadline.signal);
+    }), getRequestLogMeta(req), deadline.signal, audit);
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       deadline.signal.throwIfAborted();
@@ -353,6 +375,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       input.push(...response.output as Responses.ResponseInputItem[]);
       const toolOutputs = await Promise.all(
         toolCalls.map(async (toolCall) => {
+          audit.toolCall();
           let output: string;
           if (!activeTools.some(tool => tool.name === toolCall.name)) {
             output = JSON.stringify({error:"tool_not_available",tool:toolCall.name});
@@ -483,12 +506,13 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
         include: ["reasoning.encrypted_content"],
         max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
         store: false,
-      }), getRequestLogMeta(req), deadline.signal);
+      }), getRequestLogMeta(req), deadline.signal, audit);
     }
 
     deadline.signal.throwIfAborted();
     const assistantText = identity.redactText(response.output_text.trim());
     if (!assistantText && renderedCharts.length === 0 && renderedVisualizations.length === 0 && preparedExports.length === 0 && smExports.length === 0) {
+      audit.outcome("empty_response");
       logger.warn("admin_kurti_empty_response", {
         ...getRequestLogMeta(req),
         action: "admin_kurti_chat",
@@ -524,12 +548,15 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     });
   } catch (error) {
     if (deadline.timedOut) {
+      audit.outcome("timeout");
       if (!res.destroyed) res.status(504).json({error:"Die Anfrage hat das Zeitlimit erreicht. Bitte grenze sie ein und versuche es erneut.",code:"admin_kurti_timeout"});
       return;
     }
     if (deadline.signal.aborted && res.destroyed) return;
-    if(typeof error === "object" && error !== null && "code" in error && error.code === "kurti_person_not_allowed") {res.status(403).json({error:"Diese Person kann hier nicht ausgewählt werden.",code:"kurti_person_not_allowed"});return;}
+    if(typeof error === "object" && error !== null && "code" in error && error.code === "kurti_person_not_allowed") {audit.outcome("forbidden");res.status(403).json({error:"Diese Person kann hier nicht ausgewählt werden.",code:"kurti_person_not_allowed"});return;}
     if (error instanceof OpenAI.APIError) {
+      audit.outcome("provider_error");
+      audit.providerError(error);
       logger.warn("admin_kurti_openai_request_failed", {
         ...getRequestLogMeta(req),
         action: "admin_kurti_chat",

@@ -1,8 +1,10 @@
 import * as requestDeadline from "../src/lib/kurti-request-deadline.js";
 import * as operatingPolicy from "../src/lib/kurti-operating-policy.js";
+import * as personalText from "../src/lib/kurti-personal-text.js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import express from "express";
+import { APIError as OpenAIAPIError } from "openai";
 import { eq } from "drizzle-orm";
 import * as schema from "../src/lib/schema.js";
 import * as role from "../src/lib/admin-role.js";
@@ -32,7 +34,7 @@ import { createSyntheticPhotoStorage } from "./synthetic-photo-storage.js";
 import { createSMDurcharbeitFixture } from "./SMDurcharbeit-fixture.js";
 import { isolatedModule } from "./isolated-module.js";
 export type ModelBody=Record<string,any>;
-export type ModelReply={output_text:string;output:any[]};
+export type ModelReply={output_text:string;output:any[];_request_id?:string};
 export async function createSmKurtiFixture(options: {requestTimeoutMs?:number} = {}){
  const other=randomUUID();
  const storage=createSyntheticPhotoStorage();
@@ -59,7 +61,7 @@ export async function createSmKurtiFixture(options: {requestTimeoutMs?:number} =
  const ctx=await isolatedModule<typeof import("../src/lib/sm-kurti-context.js")>(new URL("../src/lib/sm-kurti-context.ts",import.meta.url),{
   ...base,"../sm-SMDurcharbeit-campaign.shared.js":monthly
  });
- const identity=await isolatedModule<typeof import("../src/lib/kurti-identity.js")>(new URL("../src/lib/kurti-identity.ts",import.meta.url),{...base,"./admin-role.js":role});
+ const identity=await isolatedModule<typeof import("../src/lib/kurti-identity.js")>(new URL("../src/lib/kurti-identity.ts",import.meta.url),{...base,"./admin-role.js":role,"./kurti-personal-text.js":personalText});
  const toolErrors:unknown[]=[];
  const report=await isolatedModule(new URL("../src/sm-SMDurcharbeit-report.shared.ts",import.meta.url),{"./lib/schema.js":schema,"./sm-visit.shared.js":visitShared,"./sm-SMDurcharbeit-answer-reuse.shared.js":monthlyReuse,"./sm-SMDurcharbeit-campaign.shared.js":monthly});
  const tools=await isolatedModule<typeof import("../src/lib/sm-kurti-tools.js")>(new URL("../src/lib/sm-kurti-tools.ts",import.meta.url),{
@@ -68,7 +70,10 @@ export async function createSmKurtiFixture(options: {requestTimeoutMs?:number} =
   "../sm-planning.shared.js":planning,"../sm-management.js":management,"./admin-kurti-visualization-tools.js":visualizationTools,
   "./admin-kurti-tools.js":{ADMIN_KURTI_TOOLS:[],executeAdminKurtiTool:async()=>JSON.stringify({skills:[]})},"./sm-kurti-exports.js":smExports
  });
- const logger={logger:{warn(){},info(){},error(){}},serializeError:()=>({}),getRequestLogMeta:()=>({})};
+ const logs:{level:string;event:string;payload:Record<string,unknown>}[]=[];
+ const log=(level:string)=>(event:string,payload:Record<string,unknown>={})=>logs.push({level,event,payload});
+ const logger={logger:{warn:log("warn"),info:log("info"),error:log("error")},serializeError:()=>({}),getRequestLogMeta:()=>({})};
+ const observability=await isolatedModule<typeof import("../src/lib/kurti-observability.js")>(new URL("../src/lib/kurti-observability.ts",import.meta.url),{"./logger.js":logger});
  const memory=await isolatedModule<typeof import("../src/lib/admin-kurti-memory.js")>(new URL("../src/lib/admin-kurti-memory.ts",import.meta.url),{
   ...base,"./logger.js":logger,"./admin-kurti-charts.js":chart,"./admin-kurti-exports.js":exports,
   "./sm-kurti-exports.js":smExports,"./admin-kurti-visualizations.js":visualizations
@@ -79,12 +84,12 @@ export async function createSmKurtiFixture(options: {requestTimeoutMs?:number} =
  let answer:(body:ModelBody, options:{signal?:AbortSignal})=>ModelReply|Promise<ModelReply>=()=>({output:[],output_text:"Synthetic Kurti Antwort."});
  class FakeOpenAI{
   constructor(options:Record<string,unknown>){clientOptions.push(options);}
-  static APIError=class extends Error{};
+  static APIError=OpenAIAPIError;
   responses={create:async(body:ModelBody,options:{signal?:AbortSignal}={})=>{calls.push(structuredClone(body));providerOptions.push(options);return answer(body,options);}};
  }
- const env={OPENAI_API_KEY:"synthetic-only",OPENAI_KURTI_TIMEOUT_MS:5000,OPENAI_KURTI_MODEL:"synthetic-model",OPENAI_KURTI_MAX_OUTPUT_TOKENS:3000};
+ const env={OPENAI_API_KEY:"synthetic-only",OPENAI_KURTI_ENABLED:true,OPENAI_KURTI_TIMEOUT_MS:5000,OPENAI_KURTI_MODEL:"synthetic-model",OPENAI_KURTI_MAX_OUTPUT_TOKENS:3000};
  const router=await isolatedModule<typeof import("../src/routes/admin-kurti.js")>(new URL("../src/routes/admin-kurti.ts",import.meta.url),{
-  ...base,"../lib/kurti-identity.js":identity,"../lib/kurti-operating-policy.js":operatingPolicy,"../lib/kurti-request-deadline.js":deadlines,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
+  ...base,"../lib/kurti-identity.js":identity,"../lib/kurti-observability.js":observability,"../lib/kurti-operating-policy.js":operatingPolicy,"../lib/kurti-request-deadline.js":deadlines,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
   "../lib/admin-kurti-charts.js":chart,"../lib/admin-kurti-exports.js":exports,"../lib/admin-kurti-visualizations.js":visualizations,
   "../lib/admin-kurti-visualization-tools.js":visualizationTools,"../lib/admin-kurti-visualization-skill-loader.js":skills,
   "../lib/admin-kurti-memory.js":memory,"../lib/admin-kurti-model-context.js":modelContext,"../lib/admin-kurti-system-prompt.js":adminPrompt,
@@ -93,17 +98,20 @@ export async function createSmKurtiFixture(options: {requestTimeoutMs?:number} =
   "../lib/sm-admin-kurti-system-prompt.js":smAdminPrompt,"../lib/sm-kurti-tools.js":tools,"../lib/sm-kurti-exports.js":smExports
  });
  const worker=await isolatedModule<typeof import("../src/routes/gm-kurti.js")>(new URL("../src/routes/gm-kurti.ts",import.meta.url),{
-  ...base,"../lib/kurti-identity.js":identity,"../lib/kurti-operating-policy.js":operatingPolicy,"../lib/kurti-request-deadline.js":deadlines,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
+  ...base,"../lib/kurti-identity.js":identity,"../lib/kurti-observability.js":observability,"../lib/kurti-operating-policy.js":operatingPolicy,"../lib/kurti-request-deadline.js":deadlines,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
   "../lib/employee-agreement-meta.js":gmAgreement,"../lib/sm-employee-agreement.js":smAgreement,
   "../lib/kurti-context.js":{buildKurtiGmContext:async()=>({onlyGm:true})},"../lib/sm-kurti-context.js":ctx,
   "../lib/kurti-system-prompt.js":gmPrompt,"../lib/sm-kurti-system-prompt.js":smPrompt,"../lib/kurti-memory.js":employeeMemory
  });
  const app=express();app.use(express.json());
+ app.use((req,res,next)=>{(req as typeof req & {requestId:string}).requestId=randomUUID();next();});
  app.use("/admin/sm-kurti",router.smAdminKurtiRouter);app.use("/admin/kurti",router.adminKurtiRouter);
  app.use("/sm/kurti",worker.smKurtiRouter);app.use("/gm/kurti",worker.gmKurtiRouter);app.use(f.app);
  const actor={appUserId:f.admin,role:"sm_admin" as const};
  const accept=async(userId=f.employee)=>f.database.insert(schema.employeeAgreementAcceptances).values({userId,agreementKey:smAgreement.SM_EMPLOYEE_AGREEMENT.key,agreementVersion:smAgreement.SM_EMPLOYEE_AGREEMENT.version,agreementTitle:smAgreement.SM_EMPLOYEE_AGREEMENT.title,agreementHash:smAgreement.SM_EMPLOYEE_AGREEMENT.hash});
- return {...f,app,identity,other,storage,tools,ctx,memory,employeeMemory,calls,providerOptions,clientOptions,actor,accept,toolErrors,setAnswer:(fn:typeof answer)=>{answer=fn;}};
+ return {...f,app,identity,other,storage,tools,ctx,memory,employeeMemory,calls,providerOptions,clientOptions,actor,accept,toolErrors,logs,env,
+  providerError:(message:string,status:number,requestId:string)=>new OpenAIAPIError(status,{message},message,new Headers({"x-request-id":requestId})),
+  setAnswer:(fn:typeof answer)=>{answer=fn;}};
  }catch(e){await f.pg.close();throw e;}
 }
 export function toolCall(name:string,args:unknown,id=randomUUID()):ModelReply{

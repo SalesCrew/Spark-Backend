@@ -2,6 +2,7 @@ import { db } from "./db.js";
 import { users } from "./schema.js";
 import { isFullAdminRole } from "./admin-role.js";
 import type { AuthedRequest } from "../middleware/auth.js";
+import { redactRecognisablePersonalText } from "./kurti-personal-text.js";
 export const KURTI_MODEL = "gpt-6-luna";
 export const KURTI_MENTION_HELP = "Ich kenne keine Namen. Wähle die Person mit @ aus der Vorschlagsliste aus, damit ich ihre Benutzer-ID erhalte.";
 export const KURTI_IDENTITY_INSTRUCTIONS = `HÖCHSTE PRIORITÄT: PERSONEN NUR ÜBER BENUTZER-IDS.
@@ -66,7 +67,7 @@ export function createKurtiIdentityBoundary(rows:Identity[],actor:Actor){
     text=text.slice(0,offsets[start])+(id?token(id):"[Person]")+text.slice(offsets[end]);
    }
   }
-  return text.replace(/[^\s<>"']+@[^\s<>"']+\.[a-z]{2,}/gi,"[Kontakt entfernt]").replace(/\uE000(\d+)\uE001/g,(_,i)=>protectedRefs[Number(i)]??"[Person]");
+  return redactRecognisablePersonalText(text).replace(/\uE000(\d+)\uE001/g,(_,i)=>protectedRefs[Number(i)]??"[Person]");
  }
  function sanitize(value:unknown):any{
   collect(value);if(typeof value==="string")return redactText(value);if(Array.isArray(value))return value.map(sanitize);

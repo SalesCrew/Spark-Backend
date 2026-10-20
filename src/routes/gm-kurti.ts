@@ -1,4 +1,5 @@
 import { createKurtiRequestDeadline, KURTI_REQUEST_TIMEOUT_MS } from "../lib/kurti-request-deadline.js";
+import { observeKurtiTurn } from "../lib/kurti-observability.js";
 import { kurtiRestrictedRequestReply } from "../lib/kurti-operating-policy.js";
 import { loadKurtiIdentityBoundary, kurtiWorkerIdentityInstructions, KURTI_MENTION_HELP, KURTI_MODEL } from "../lib/kurti-identity.js";
 import OpenAI from "openai";
@@ -35,6 +36,7 @@ const openai = env.OPENAI_API_KEY
     })
   : null;
 
+gmKurtiRouter.use((_req, res, next) => { res.set("Cache-Control", "private, no-store"); next(); });
 gmKurtiRouter.use(requireAuth([role]));
 gmKurtiRouter.use(async (req: AuthedRequest, res, next) => {
   try {
@@ -86,7 +88,7 @@ gmKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
     res.json({
       messages,
       people: identity.people,
-      configured: Boolean(openai),
+      configured: Boolean(openai) && env.OPENAI_KURTI_ENABLED !== false,
       expiresAt: messages.at(-1)?.expiresAt ?? null,
     });
   } catch (error) {
@@ -101,8 +103,10 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     return;
   }
 
+  const audit = observeKurtiTurn(req, res, { workspace: role, audience: "worker" });
   const parsed = messageSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
+    audit.outcome("invalid_message");
     res.status(400).json({
       error: "Bitte gib eine Nachricht mit maximal 1.500 Zeichen ein.",
       code: "invalid_kurti_message",
@@ -110,7 +114,14 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     return;
   }
 
+  if (env.OPENAI_KURTI_ENABLED === false) {
+    audit.outcome("disabled");
+    res.status(503).json({ error: "Kurti ist vorübergehend nicht verfügbar. Bitte später erneut versuchen.", code: "kurti_temporarily_unavailable" });
+    return;
+  }
+
   if (!openai) {
+    audit.outcome("not_configured");
     res.status(503).json({
       error: "Kurti wird gerade eingerichtet. Bitte später erneut versuchen.",
       code: "kurti_not_configured",
@@ -119,6 +130,7 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
   }
 
   if (activeKurtiRequests.has(gmUserId)) {
+    audit.outcome("busy");
     res.status(409).json({
       error: "Kurti schreibt bereits an einer Antwort.",
       code: "kurti_request_in_progress",
@@ -133,6 +145,7 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     const prepared = identity.prepareWorkerMessage(parsed.data.message);
     const restrictedReply = kurtiRestrictedRequestReply(prepared.text);
     if (restrictedReply) {
+      audit.outcome("policy_guard");
       const messages = await saveKurtiExchange({gmUserId,userContent:prepared.text,assistantContent:restrictedReply,identityProtected:true,now:new Date()});
       res.json({messages,people:identity.people,assistantMessage:messages.at(-1),expiresAt:messages.at(-1)?.expiresAt ?? null});return;
     }
@@ -157,6 +170,7 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       },
     ];
 
+    audit.providerCall();
     const response = await openai.responses.create(identity.providerRequest({
       model: KURTI_MODEL,
       instructions: kurtiWorkerIdentityInstructions(gmUserId) + "\n\n" + (role === "sm" ? SM_KURTI_SYSTEM_PROMPT : KURTI_SYSTEM_PROMPT),
@@ -165,9 +179,11 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
       store: false,
     }), { signal: deadline.signal });
+    audit.providerResponse(response);
     deadline.signal.throwIfAborted();
     const assistantContent = identity.redactText(response.output_text.trim());
     if (!assistantContent) {
+      audit.outcome("empty_response");
       logger.warn("kurti_empty_response", {
         ...getRequestLogMeta(req),
         action: "kurti_chat",
@@ -196,12 +212,15 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     });
   } catch (error) {
     if (deadline.timedOut) {
+      audit.outcome("timeout");
       if (!res.destroyed) res.status(504).json({error:"Die Anfrage hat das Zeitlimit erreicht. Bitte grenze sie ein und versuche es erneut.",code:"kurti_timeout"});
       return;
     }
     if (deadline.signal.aborted && res.destroyed) return;
-    if(typeof error === "object" && error !== null && "code" in error && error.code === "kurti_person_not_allowed") {res.status(403).json({error:"Diese Person kann hier nicht ausgewählt werden.",code:"kurti_person_not_allowed"});return;}
+    if(typeof error === "object" && error !== null && "code" in error && error.code === "kurti_person_not_allowed") {audit.outcome("forbidden");res.status(403).json({error:"Diese Person kann hier nicht ausgewählt werden.",code:"kurti_person_not_allowed"});return;}
     if (error instanceof OpenAI.APIError) {
+      audit.outcome("provider_error");
+      audit.providerError(error);
       logger.warn("kurti_openai_request_failed", {
         ...getRequestLogMeta(req),
         action: "kurti_chat",
