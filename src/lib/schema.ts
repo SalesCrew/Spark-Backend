@@ -3876,3 +3876,29 @@ export const gmMileageEvents = pgTable("gm_mileage_events", {
   after: jsonb("after").$type<{ startKm: number | null; endKm: number | null; mileage: import("./gm-mileage.js").MileageState | null }>().notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, table => [index("gm_mileage_events_day_idx").on(table.daySessionId, table.sequence), uniqueIndex("gm_mileage_events_operation_day_idx").on(table.operationId, table.daySessionId)]);
+
+// GM Wochenschwerpunkte: editable drafts, immutable publications and per-GM page receipts.
+export const gmWeeklyBriefings = pgTable('gm_weekly_briefings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  title: text('title').notNull(), description: text('description').notNull().default(''),
+  file: jsonb('file').$type<import('./gm-briefings.js').BriefingFile>().notNull(),
+  pages: jsonb('pages').$type<import('./gm-briefings.js').BriefingPage[]>().notNull(),
+  visibleFrom: date('visible_from'), visibleUntil: date('visible_until'),
+  draftRevision: integer('draft_revision').notNull().default(1), archivedAt: timestamp('archived_at', { withTimezone: true }),
+  createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [index('gm_weekly_briefings_creator_idx').on(t.createdByUserId)]);
+export const gmWeeklyBriefingPublications = pgTable('gm_weekly_briefing_publications', {
+  id: uuid('id').primaryKey().defaultRandom(), briefingId: uuid('briefing_id').notNull().references(() => gmWeeklyBriefings.id, { onDelete: 'restrict' }),
+  version: integer('version').notNull(), sourceDraftRevision: integer('source_draft_revision').notNull(),
+  snapshot: jsonb('snapshot').$type<import('./gm-briefings.js').BriefingSnapshot>().notNull(),
+  visibleFrom: date('visible_from').notNull(), visibleUntil: date('visible_until'), operationId: uuid('operation_id').notNull().unique(),
+  publishedByUserId: uuid('published_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  publishedAt: timestamp('published_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [uniqueIndex('gm_weekly_briefing_version_idx').on(t.briefingId, t.version), index('gm_weekly_briefing_publisher_idx').on(t.publishedByUserId), index('gm_weekly_briefing_schedule_idx').on(t.visibleFrom)]);
+export const gmWeeklyBriefingReads = pgTable('gm_weekly_briefing_reads', {
+  publicationId: uuid('publication_id').notNull().references(() => gmWeeklyBriefingPublications.id, { onDelete: 'restrict' }),
+  gmUserId: uuid('gm_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  seenPages: integer('seen_pages').array().notNull().default(sql`'{}'::integer[]`), readAt: timestamp('read_at', { withTimezone: true }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [primaryKey({ columns: [t.publicationId, t.gmUserId] }), index('gm_weekly_briefing_reader_idx').on(t.gmUserId)]);
