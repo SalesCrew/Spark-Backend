@@ -1,4 +1,5 @@
-import { loadKurtiIdentityBoundary, KURTI_IDENTITY_INSTRUCTIONS, KURTI_MENTION_HELP, KURTI_MODEL } from "../lib/kurti-identity.js";
+import { kurtiRestrictedRequestReply } from "../lib/kurti-operating-policy.js";
+import { loadKurtiIdentityBoundary, kurtiWorkerIdentityInstructions, KURTI_MENTION_HELP, KURTI_MODEL } from "../lib/kurti-identity.js";
 import OpenAI from "openai";
 import type { Responses } from "openai/resources/responses/responses";
 import { and, eq } from "drizzle-orm";
@@ -126,9 +127,10 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
   activeKurtiRequests.add(gmUserId);
   try {
     const identity = await loadKurtiIdentityBoundary(req.authUser!);
-    const prepared = identity.prepareMessage(parsed.data.message);
-    if (prepared.needsMention) {
-      const messages = await saveKurtiExchange({gmUserId,userContent:prepared.text,assistantContent:KURTI_MENTION_HELP,identityProtected:true,now:new Date()});
+    const prepared = identity.prepareWorkerMessage(parsed.data.message);
+    const restrictedReply = kurtiRestrictedRequestReply(prepared.text);
+    if (restrictedReply) {
+      const messages = await saveKurtiExchange({gmUserId,userContent:prepared.text,assistantContent:restrictedReply,identityProtected:true,now:new Date()});
       res.json({messages,people:identity.people,assistantMessage:messages.at(-1),expiresAt:messages.at(-1)?.expiresAt ?? null});return;
     }
     const now = new Date();
@@ -142,7 +144,7 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
         role: "developer",
         content: `LIVE-DATEN DES AKTUELL ANGEMELDETEN ${role === "sm" ? "SM" : "GMS"}\n${JSON.stringify(identity.sanitize(gmContext))}`,
       },
-      ...history.filter(message=>message.identityProtected).map((message) => ({
+      ...history.filter(message=>message.identityProtected && message.content !== KURTI_MENTION_HELP).map((message) => ({
         role: message.role,
         content: message.content,
       } satisfies Responses.EasyInputMessage)),
@@ -154,7 +156,7 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
 
     const response = await openai.responses.create(identity.providerRequest({
       model: KURTI_MODEL,
-      instructions: KURTI_IDENTITY_INSTRUCTIONS + "\n\n" + (role === "sm" ? SM_KURTI_SYSTEM_PROMPT : KURTI_SYSTEM_PROMPT),
+      instructions: kurtiWorkerIdentityInstructions(gmUserId) + "\n\n" + (role === "sm" ? SM_KURTI_SYSTEM_PROMPT : KURTI_SYSTEM_PROMPT),
       input,
       reasoning: { effort: "low" },
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,

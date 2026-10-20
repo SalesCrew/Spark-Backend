@@ -1,3 +1,4 @@
+import * as operatingPolicy from "../src/lib/kurti-operating-policy.js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import express from "express";
@@ -80,7 +81,7 @@ export async function createSmKurtiFixture(){
  }
  const env={OPENAI_API_KEY:"synthetic-only",OPENAI_KURTI_TIMEOUT_MS:5000,OPENAI_KURTI_MODEL:"synthetic-model",OPENAI_KURTI_MAX_OUTPUT_TOKENS:3000};
  const router=await isolatedModule<typeof import("../src/routes/admin-kurti.js")>(new URL("../src/routes/admin-kurti.ts",import.meta.url),{
-  ...base,"../lib/kurti-identity.js":identity,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
+  ...base,"../lib/kurti-identity.js":identity,"../lib/kurti-operating-policy.js":operatingPolicy,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
   "../lib/admin-kurti-charts.js":chart,"../lib/admin-kurti-exports.js":exports,"../lib/admin-kurti-visualizations.js":visualizations,
   "../lib/admin-kurti-visualization-tools.js":visualizationTools,"../lib/admin-kurti-visualization-skill-loader.js":skills,
   "../lib/admin-kurti-memory.js":memory,"../lib/admin-kurti-model-context.js":modelContext,"../lib/admin-kurti-system-prompt.js":adminPrompt,
@@ -89,7 +90,7 @@ export async function createSmKurtiFixture(){
   "../lib/sm-admin-kurti-system-prompt.js":smAdminPrompt,"../lib/sm-kurti-tools.js":tools,"../lib/sm-kurti-exports.js":smExports
  });
  const worker=await isolatedModule<typeof import("../src/routes/gm-kurti.js")>(new URL("../src/routes/gm-kurti.ts",import.meta.url),{
-  ...base,"../lib/kurti-identity.js":identity,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
+  ...base,"../lib/kurti-identity.js":identity,"../lib/kurti-operating-policy.js":operatingPolicy,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
   "../lib/employee-agreement-meta.js":gmAgreement,"../lib/sm-employee-agreement.js":smAgreement,
   "../lib/kurti-context.js":{buildKurtiGmContext:async()=>({onlyGm:true})},"../lib/sm-kurti-context.js":ctx,
   "../lib/kurti-system-prompt.js":gmPrompt,"../lib/sm-kurti-system-prompt.js":smPrompt,"../lib/kurti-memory.js":employeeMemory

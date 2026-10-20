@@ -41,6 +41,35 @@ async function mention(p,label,query,aria,screen,arrowDown=0){
  assert.equal(hiddenScroll,0,"Focusing a mention must not horizontally scroll the sliding chat");
  await p.screenshot({path:artifacts+`/${screen}-identity-answer.png`});
 }
+async function ownGreeting(p,firstName,workspace){
+ const input=p.getByLabel("Nachricht an Kurti",{exact:true});
+ await p.waitForFunction(()=>!document.querySelector('[aria-label="Nachricht an Kurti"]')?.disabled);
+ await input.fill("Hallo, begrüße mich bitte");await input.press("Enter");
+ await p.getByText(`Hallo ${firstName}! Ich kann dir deine eigenen erfassten Daten erklären.`,{exact:true}).last().waitFor();
+ await p.waitForTimeout(1800);
+ assert.equal(requests.filter(r=>r.path===`/${workspace}/kurti/people`).length,0,"Employee ordinary composer never loads mention directory");
+ await input.fill("@foo");assert.equal(await p.getByRole("listbox",{name:"Personenvorschläge"}).count(),0);await input.fill("");
+ await p.screenshot({path:artifacts+`/${workspace}-own-greeting.png`});
+}
+async function disclosure(p,workspace,admin){
+ const input=p.getByLabel(admin?"Nachricht an Admin-Kurti":"Nachricht an Kurti",{exact:true});
+ assert.ok(await p.getByLabel("KI-Assistent",{exact:true}).first().isVisible());
+ const notice=p.locator("[data-kurti-ai-notice]");assert.equal(await notice.innerText(),"KI kann Fehler machen. Prüfe wichtige Angaben in Coke Spark.");
+ await p.waitForFunction(label=>!document.querySelector(`[aria-label="${label}"]`)?.disabled,admin?"Nachricht an Admin-Kurti":"Nachricht an Kurti");
+ await input.fill("Text bleibt beim Öffnen erhalten");
+ const button=p.getByRole("button",{name:"Informationen",exact:true});await button.focus();await button.press("Enter");
+ const dialog=p.getByRole("dialog",{name:/Über Kurti/});await dialog.waitFor();
+ assert.ok(await dialog.getByText("Was OpenAI erhält",{exact:true}).isVisible());
+ assert.equal(await dialog.getByRole("link",{name:"Datenschutzhinweise",exact:true}).getAttribute("href"),`/datenschutz/${workspace}`);
+ await p.screenshot({path:artifacts+`/${workspace}-information-top.png`});
+ const contact=dialog.getByRole("link",{name:"datenschutz@merch.at",exact:true});await contact.focus();await contact.press("Tab");assert.ok(await dialog.getByRole("button",{name:"Informationen schließen",exact:true}).evaluate(e=>e===document.activeElement));
+ await p.screenshot({path:artifacts+`/${workspace}-information.png`});
+ await p.keyboard.press("Escape");await dialog.waitFor({state:"hidden"});assert.ok(await button.evaluate(e=>e===document.activeElement));
+ assert.equal(await input.inputValue(),"Text bleibt beim Öffnen erhalten");assert.ok(await notice.isVisible());
+ await button.click();await dialog.waitFor();await p.locator("[data-kurti-information-overlay]").click({position:{x:2,y:2}});await dialog.waitFor({state:"hidden"});
+ assert.ok(await button.evaluate(e=>e===document.activeElement));await input.fill("");
+ const hiddenScroll=await input.evaluate(e=>{let node=e.parentElement;while(node){if(node.scrollLeft!==0)return node.scrollLeft;node=node.parentElement;}return 0;});assert.equal(hiddenScroll,0);
+}
 try{
  const sm=await context({viewport:{width:390,height:844},isMobile:true,hasTouch:true});const phone=await sm.newPage();
  await login(phone,"sm@preview.test","/sm");
@@ -54,11 +83,13 @@ try{
  assert.ok(!requests.some(r=>r.path==="/gm/kurti/messages"));
  await phone.screenshot({path:artifacts+"/phone-chat.png"});
  assert.equal(await phone.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
- await mention(phone,"Annika Musterfrau","Ann","Nachricht an Kurti","sm");
+ await ownGreeting(phone,"Annika","sm");
+ await disclosure(phone,"sm",false);
  const admin=await context({viewport:{width:1440,height:900}});const laptop=await admin.newPage();
  await login(laptop,"admin@preview.test","/admin/sm/dashboard");
  if(await laptop.locator('button[aria-controls="admin-kurti-panel"]').getAttribute("aria-expanded")!=="true")await laptop.locator('button[aria-controls="admin-kurti-panel"]').click();
  await laptop.getByText("Kurti SM Admin",{exact:true}).waitFor();
+ await disclosure(laptop,"admin",true);
  const input=laptop.getByLabel("Nachricht an Admin-Kurti",{exact:true});
  await input.fill("Zeig mir SM Kennzahlen als Diagramm");
  await input.press("Enter");
@@ -96,7 +127,8 @@ try{
  const gm=await context({viewport:{width:834,height:1194},isMobile:true,hasTouch:true});const ipad=await gm.newPage();
  await login(ipad,"gm@preview.test","/gm");
  await ipad.locator(".gm-menu-scrollbars-hidden").tap();await ipad.getByText("Frag Kurti...",{exact:true}).click();
- await mention(ipad,"Benedikt Musteradmin","Ben","Nachricht an Kurti","gm");
+ await ownGreeting(ipad,"Benedikt","gm");
+ await disclosure(ipad,"gm",false);
  const state=await (await fetch(api+"/__fixture/state")).json();
  assert.ok(state.wire.length>6);for(const call of state.wire){assert.equal(call.model,"gpt-6-luna");assert.ok(!/Annika|Musterfrau|Benedikt|Musteradmin|Carolin|Beispielsm|Denise|Doris/.test(JSON.stringify(call)));}
 

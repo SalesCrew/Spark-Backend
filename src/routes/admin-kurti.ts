@@ -1,3 +1,4 @@
+import { kurtiRestrictedRequestReply } from "../lib/kurti-operating-policy.js";
 import { loadKurtiIdentityBoundary, KURTI_IDENTITY_INSTRUCTIONS, KURTI_MENTION_HELP, KURTI_MODEL } from "../lib/kurti-identity.js";
 import OpenAI from "openai";
 import type { Responses } from "openai/resources/responses/responses";
@@ -274,6 +275,11 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     const prepared = identity.prepareMessage(parsed.data.message);
     if(prepared.needsMention){
       const messages=await saveAdminKurtiExchange({adminUserId,workspace,userContent:prepared.text,assistantContent:KURTI_MENTION_HELP,identityProtected:true,now:new Date()});
+      res.json({messages,people:identity.people,assistantMessage:messages.at(-1),expiresAt:messages.at(-1)?.expiresAt ?? null});return;
+    }
+    const restrictedReply = kurtiRestrictedRequestReply(prepared.text);
+    if (restrictedReply) {
+      const messages=await saveAdminKurtiExchange({adminUserId,workspace,userContent:prepared.text,assistantContent:restrictedReply,identityProtected:true,now:new Date()});
       res.json({messages,people:identity.people,assistantMessage:messages.at(-1),expiresAt:messages.at(-1)?.expiresAt ?? null});return;
     }
     const now = new Date();

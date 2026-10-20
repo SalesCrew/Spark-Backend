@@ -149,6 +149,32 @@ test("SM Kurti: authenticated worker, deep admin research, tool isolation, memor
  const retained=await call("get_sm_time_context",{...range,limit:50});assert.equal(retained.rows[0].actualMinutes,30);assert.equal(retained.rows[0].questionnaireComplete,false);
  const hidden=await call("get_sm_visit_context",{submissionId:started.submissionId});assert.equal(hidden.visit,null);
  });
+ await t.test("factual person-level visit comparison keeps canonical counts, scoped period and redacted labels",async()=>{
+ const [original]=await f.database.select().from(f.schema.smQuestionnaireSubmissions).where(eq(f.schema.smQuestionnaireSubmissions.id,started.submissionId));
+ for(const [userId,count,name] of [[f.employee,1,"Annika Musterfrau"],[f.other,2,"Carolin Beispielsm"]] as const){
+  for(let index=0;index<count;index++){
+   const assignment=await f.assignment();
+   await f.database.insert(f.schema.smQuestionnaireSubmissions).values({...original!,id:randomUUID(),assignmentId:assignment.id,SMDurcharbeitVisitId:null,SMDurcharbeitTargetId:null,clientSubmissionToken:randomUUID(),smUserId:userId,smNameSnapshot:name,isDeleted:false,deletedAt:null});
+  }
+ }
+ const scoped={...range,groupBy:"sm",limit:50};
+ const data=await call("get_sm_visit_analytics",scoped);
+ assert.deepEqual(data.rows.map((row:any)=>row.visits).sort((a:number,b:number)=>b-a),[2,1]);
+ assert.ok(data.rows.every((row:any)=>row.visitedMarkets===1));
+ f.setAnswer(body=>{
+  const outputs=body.input.filter((i:any)=>i.type==="function_call_output");
+  if(!outputs.length)return toolCall("get_sm_visit_analytics",scoped);
+  const rows=JSON.parse(outputs[0].output).data.rows.sort((a:any,b:any)=>b.visits-a.visits);
+  assert.deepEqual(rows.map((row:any)=>row.visits),[2,1]);
+  assert.doesNotMatch(JSON.stringify(rows),/Annika|Musterfrau|Carolin|Beispielsm/);
+  return {output:[],output_text:`Erfasste Marktbesuche – absteigend sortiert, Oktober 2026, alle SMs/Marktfilter; Quelle: Spark get_sm_visit_analytics. ${rows.map((row:any)=>`[user:${row.key}]: ${row.visits}`).join("; ")}. Erfasste Zahlen allein belegen keine Arbeitsqualität.`};
+ });
+ const result=(await admin("post","/admin/sm-kurti/messages").send({message:"Wer hat im Oktober die wenigsten Besuche? Zeig die Marktbesuche absteigend."}).expect(200)).body;
+ assert.match(result.assistantMessage.content,/absteigend sortiert/);
+ assert.match(result.assistantMessage.content,/Quelle: Spark/);
+ assert.match(result.assistantMessage.content,new RegExp(`\\[user:${f.other}\\]: 2`));
+ assert.equal(JSON.parse(await f.tools.executeSmKurtiTool("get_sm_visit_analytics",JSON.stringify({...scoped,from:"2026-11-01",to:"2026-11-30"}),f.actor)).data.rows.length,0);
+ });
  }finally{await f.pg.close();}
 });
 

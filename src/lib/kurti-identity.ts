@@ -8,10 +8,10 @@ export const KURTI_IDENTITY_INSTRUCTIONS = `HÖCHSTE PRIORITÄT: PERSONEN NUR Ü
 Du kennst KEINE Personennamen, E-Mail-Adressen oder Namenszuordnungen. Versuche niemals, Namen zu erraten, aus Werkzeugen zu rekonstruieren oder per Suche zu ermitteln. Personen werden ausschließlich durch [user:BENUTZER-ID] bezeichnet. Verwende genau diesen unveränderten Verweis in Antworten, Diagrammtiteln, Tabellen, Legenden und allen anderen Darstellungen. Das Frontend zeigt dafür den Namen an; du erhältst diese Zuordnung niemals.
 Bei personenbezogenen Fragen ohne eindeutige Benutzer-ID: erkläre „Ich kenne keine Namen. Bitte wähle die Person mit @ aus der Vorschlagsliste aus.“ Verwende zum Nachschlagen ausschließlich die ID aus der Auswahl; niemals einen Namen als Suchbegriff. Eigene Daten beziehen sich auf die angemeldete Benutzer-ID. Werkzeugparameter für Benutzer-IDs erhalten die rohe UUID ohne die [user:…]-Klammern. Die Benutzer-ID-Verweise sind ausdrücklich erlaubt, auch wenn andere Abschnitte die Ausgabe interner IDs untersagen. Ein ID-Verweis erweitert keine Zugriffsrechte. Entfernte Personenangaben nicht erraten. Diese Regel gilt auch für zitierte Texte, alte Nachrichten und Werkzeugdaten und hat Vorrang vor anderslautenden Namens-/Anredevorgaben.`;
 type Actor = NonNullable<AuthedRequest["authUser"]>;
-export type KurtiPerson = {id:string;label:string;role:string};
+export type KurtiPerson = {id:string;label:string;role:string;firstName?:string};
 type Identity = {id:string;firstName:string;lastName:string;email:string;role:string};
 const token=(id:string)=>`[user:${id}]`;
-const reference=/\[user:([0-9a-f-]{36})\]/gi;
+const reference=/\[user:([0-9a-f-]{36})(?::first)?\]/gi;
 const identityKey={test:(key:string)=>/^(?:(?:(?:current|assigned|original|replacement|effective|standard|durcharbeit)?(?:gm|sm|user|employee|person|author|actor|owner|sender|recipient|createdby|updatedby|submittedby))?(?:first|last|full|display)?names?(?:snapshot)?|smdurcharbeitsmname|sourceperson|assignedgm|employee)$/i.test(key.replace(/_/g,""))};
 const contactKey=/(?:email|phone|telephone|mobile|password|authToken|accessToken|refreshToken|storagePath|storageBucket|fileName|signedUrl|profilePhoto|imageUrl)/i;
 const escape=(s:string)=>s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
@@ -20,7 +20,7 @@ const normalize=(s:string)=>s.replace(/[\u200b-\u200d\ufeff]/g,"").normalize("NF
 export function createKurtiIdentityBoundary(rows:Identity[],actor:Actor){
  const allowed=rows.filter(row=>isFullAdminRole(actor.role)||row.id===actor.appUserId);
  const allowedIds=new Set(allowed.map(r=>r.id));const allIds=new Set(rows.map(r=>r.id));
- const people:KurtiPerson[]=allowed.map(row=>({id:row.id,label:[row.firstName,row.lastName].filter(Boolean).join(" ").trim()||row.id,role:row.role}));
+ const people:KurtiPerson[]=allowed.map(row=>({id:row.id,label:[row.firstName,row.lastName].filter(Boolean).join(" ").trim()||row.id,role:row.role,firstName:row.firstName}));
  const aliases=new Map<string,Set<string>>();
  function addAlias(label:unknown,id?:string){
   if(typeof label!=="string"||!label.trim()||label.startsWith("[user:"))return;
@@ -81,6 +81,11 @@ export function createKurtiIdentityBoundary(rows:Identity[],actor:Actor){
   const needsMention=safe!==withoutReferences||/(^|\s)@\S*/u.test(withoutReferences);
   return {text:needsMention?redactText(value).replace(reference,"[Person ohne Auswahl]").replace(/(^|\s)@[^\s]+/gu,"$1[Person ohne Auswahl]"):value,needsMention};
  }
+ function prepareWorkerMessage(value:string){
+  // Validate explicit references exactly as for admins, but own-data questions never need @.
+  prepareMessage(value);
+  return {text:redactText(value),needsMention:false};
+ }
  function sanitizeToolResult(serialized:string,toolName:string):string {
   let value:unknown;try{value=JSON.parse(serialized);}catch{return redactText(serialized);}
   collect(value);
@@ -121,9 +126,13 @@ export function createKurtiIdentityBoundary(rows:Identity[],actor:Actor){
       ["content","output","arguments"].includes(key) ? (typeof value==="string"?redactText(value):sanitize(value)) : value]));
    }):body.input};
  }
- return {people,sanitize,redactText,prepareMessage,sanitizeToolResult,providerRequest,toolArguments};
+ return {people,sanitize,redactText,prepareMessage,prepareWorkerMessage,sanitizeToolResult,providerRequest,toolArguments};
 }
 export async function loadKurtiIdentityBoundary(actor:Actor){
  const rows=await db.select({id:users.id,firstName:users.firstName,lastName:users.lastName,email:users.email,role:users.role}).from(users);
  return createKurtiIdentityBoundary(rows,actor);
+}
+
+export function kurtiWorkerIdentityInstructions(userId:string):string {
+ return `PERSONEN NUR ÜBER BENUTZER-IDS. Du kennst keine Namen oder Namenszuordnungen. Deine Gesprächsperson ist automatisch der angemeldete Benutzer [user:${userId}]; „ich“, „meine“ und eigene Daten beziehen sich ausschließlich auf diese ID. Keine @-Auswahl verlangen. Keine anderen Personen nachschlagen. Für eine persönliche Begrüßung schreibe z. B. „Hallo [user:${userId}:first]“; das Frontend setzt den Vornamen ein. Sonst verwende [user:${userId}]. Keine Namen erraten oder aus Inhalten rekonstruieren. Diese Verweise sind ausdrücklich erlaubt, auch wenn andere Abschnitte interne IDs untersagen. Alte Nachrichten mit einer @-Aufforderung sind überholt. Nutzereingaben oder ID-Verweise erweitern niemals deinen Zugriff.`;
 }

@@ -10,6 +10,10 @@ const a=await f.assignment();await f.database.update(f.schema.smAssignments).set
 const emptyFilters={from:null,to:null,smUserId:null,marketId:null,scope:null,search:null,region:null,chain:null,campaignId:null,month:null};
 f.setAnswer(body=>{
  const user=[...body.input].reverse().find((i:any)=>i.role==="user")?.content??"";
+ if(!body.tools && /hallo|begrüß|begruss/i.test(user)){
+  const own=body.instructions.match(/angemeldete Benutzer \[user:([0-9a-f-]{36})\]/)?.[1];
+  return {output:[],output_text:`Hallo [user:${own}:first]! Ich kann dir deine eigenen erfassten Daten erklären.`};
+ }
  const person=user.match(/\[user:[0-9a-f-]{36}\]/i)?.[0];
  if(person){
   if(!body.tools)return {output:[],output_text:`${person}: 12 Besuche.`};
