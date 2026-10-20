@@ -3,6 +3,7 @@ import { db } from "./db.js";
 import { logger, serializeError } from "./logger.js";
 import { gmKurtiMessages, type GmKurtiMessageRole } from "./schema.js";
 
+const IDENTITY_PREFIX = "<!--kurti-identity:v1-->\n";
 const KURTI_MEMORY_TTL_MS = 15 * 60 * 1000;
 const KURTI_CLEANUP_INTERVAL_MS = 60 * 1000;
 
@@ -10,6 +11,7 @@ export type KurtiMemoryMessage = {
   id: string;
   role: GmKurtiMessageRole;
   content: string;
+  identityProtected?: boolean;
   createdAt: string;
   expiresAt: string;
 };
@@ -18,7 +20,8 @@ function toPayload(row: typeof gmKurtiMessages.$inferSelect): KurtiMemoryMessage
   return {
     id: row.id,
     role: row.role,
-    content: row.content,
+    content: row.content.startsWith(IDENTITY_PREFIX) ? row.content.slice(IDENTITY_PREFIX.length) : row.content,
+    identityProtected: row.content.startsWith(IDENTITY_PREFIX),
     createdAt: row.createdAt.toISOString(),
     expiresAt: row.expiresAt.toISOString(),
   };
@@ -58,6 +61,7 @@ export async function saveKurtiExchange(input: {
   gmUserId: string;
   userContent: string;
   assistantContent: string;
+  identityProtected?: boolean;
   now?: Date;
 }): Promise<KurtiMemoryMessage[]> {
   const now = input.now ?? new Date();
@@ -87,14 +91,14 @@ export async function saveKurtiExchange(input: {
       {
         gmUserId: input.gmUserId,
         role: "user",
-        content: input.userContent,
+        content: (input.identityProtected ? IDENTITY_PREFIX : "") + input.userContent,
         createdAt: now,
         expiresAt,
       },
       {
         gmUserId: input.gmUserId,
         role: "assistant",
-        content: input.assistantContent,
+        content: (input.identityProtected ? IDENTITY_PREFIX : "") + input.assistantContent,
         createdAt: new Date(now.getTime() + 1),
         expiresAt,
       },

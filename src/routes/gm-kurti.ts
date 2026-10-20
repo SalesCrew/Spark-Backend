@@ -1,3 +1,4 @@
+import { loadKurtiIdentityBoundary, KURTI_IDENTITY_INSTRUCTIONS, KURTI_MENTION_HELP, KURTI_MODEL } from "../lib/kurti-identity.js";
 import OpenAI from "openai";
 import type { Responses } from "openai/resources/responses/responses";
 import { and, eq } from "drizzle-orm";
@@ -12,7 +13,7 @@ import { buildKurtiSmContext } from "../lib/sm-kurti-context.js";
 import { SM_EMPLOYEE_AGREEMENT } from "../lib/sm-employee-agreement.js";
 import { KURTI_SYSTEM_PROMPT } from "../lib/kurti-system-prompt.js";
 import { loadActiveKurtiMessages, saveKurtiExchange } from "../lib/kurti-memory.js";
-import { getRequestLogMeta, logger, serializeError } from "../lib/logger.js";
+import { getRequestLogMeta, logger } from "../lib/logger.js";
 import { employeeAgreementAcceptances } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
@@ -66,6 +67,10 @@ gmKurtiRouter.use(async (req: AuthedRequest, res, next) => {
   }
 });
 
+gmKurtiRouter.get("/people", async (req: AuthedRequest, res, next) => {
+  try {const identity=await loadKurtiIdentityBoundary(req.authUser!);res.set("Cache-Control","private, no-store").json({people:identity.people});}catch(error){next(error);}
+});
+
 gmKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;
@@ -74,9 +79,10 @@ gmKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
       return;
     }
 
-    const messages = await loadActiveKurtiMessages(gmUserId);
+    const [messages, identity] = await Promise.all([loadActiveKurtiMessages(gmUserId), loadKurtiIdentityBoundary(req.authUser!)]);
     res.json({
       messages,
+      people: identity.people,
       configured: Boolean(openai),
       expiresAt: messages.at(-1)?.expiresAt ?? null,
     });
@@ -119,6 +125,12 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
 
   activeKurtiRequests.add(gmUserId);
   try {
+    const identity = await loadKurtiIdentityBoundary(req.authUser!);
+    const prepared = identity.prepareMessage(parsed.data.message);
+    if (prepared.needsMention) {
+      const messages = await saveKurtiExchange({gmUserId,userContent:prepared.text,assistantContent:KURTI_MENTION_HELP,identityProtected:true,now:new Date()});
+      res.json({messages,people:identity.people,assistantMessage:messages.at(-1),expiresAt:messages.at(-1)?.expiresAt ?? null});return;
+    }
     const now = new Date();
     const [history, gmContext] = await Promise.all([
       loadActiveKurtiMessages(gmUserId, now),
@@ -128,33 +140,33 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     const input: Responses.ResponseInput = [
       {
         role: "developer",
-        content: `LIVE-DATEN DES AKTUELL ANGEMELDETEN ${role === "sm" ? "SM" : "GMS"}\n${JSON.stringify(gmContext)}`,
+        content: `LIVE-DATEN DES AKTUELL ANGEMELDETEN ${role === "sm" ? "SM" : "GMS"}\n${JSON.stringify(identity.sanitize(gmContext))}`,
       },
-      ...history.map((message) => ({
+      ...history.filter(message=>message.identityProtected).map((message) => ({
         role: message.role,
         content: message.content,
       } satisfies Responses.EasyInputMessage)),
       {
         role: "user",
-        content: parsed.data.message,
+        content: prepared.text,
       },
     ];
 
-    const response = await openai.responses.create({
-      model: env.OPENAI_KURTI_MODEL,
-      instructions: role === "sm" ? SM_KURTI_SYSTEM_PROMPT : KURTI_SYSTEM_PROMPT,
+    const response = await openai.responses.create(identity.providerRequest({
+      model: KURTI_MODEL,
+      instructions: KURTI_IDENTITY_INSTRUCTIONS + "\n\n" + (role === "sm" ? SM_KURTI_SYSTEM_PROMPT : KURTI_SYSTEM_PROMPT),
       input,
       reasoning: { effort: "low" },
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
       store: false,
-    });
-    const assistantContent = response.output_text.trim();
+    }));
+    const assistantContent = identity.redactText(response.output_text.trim());
     if (!assistantContent) {
       logger.warn("kurti_empty_response", {
         ...getRequestLogMeta(req),
         action: "kurti_chat",
         result: "failure",
-        model: env.OPENAI_KURTI_MODEL,
+        model: KURTI_MODEL,
       });
       res.status(502).json({
         error: "Kurti konnte gerade keine Antwort erstellen. Bitte erneut versuchen.",
@@ -165,25 +177,28 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
 
     const messages = await saveKurtiExchange({
       gmUserId,
-      userContent: parsed.data.message,
+      userContent: prepared.text,
       assistantContent,
+      identityProtected: true,
       now: new Date(),
     });
     res.json({
       messages,
+      people: identity.people,
       assistantMessage: messages.at(-1) ?? null,
       expiresAt: messages.at(-1)?.expiresAt ?? null,
     });
   } catch (error) {
+    if(typeof error === "object" && error !== null && "code" in error && error.code === "kurti_person_not_allowed") {res.status(403).json({error:"Diese Person kann hier nicht ausgewählt werden.",code:"kurti_person_not_allowed"});return;}
     if (error instanceof OpenAI.APIError) {
       logger.warn("kurti_openai_request_failed", {
         ...getRequestLogMeta(req),
         action: "kurti_chat",
         result: "failure",
-        model: env.OPENAI_KURTI_MODEL,
+        model: KURTI_MODEL,
         providerStatus: error.status,
         providerCode: error.code,
-        error: serializeError(error),
+        error: { status: error.status, code: error.code },
       });
       const isRateLimited = error.status === 429;
       res.status(isRateLimited ? 503 : 502).json({

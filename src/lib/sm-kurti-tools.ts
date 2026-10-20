@@ -76,7 +76,7 @@ register("get_sm_overview","Exact live SM/market/draft counts and monthly campai
  (select count(*)::int from sm_questionnaire_submissions where not is_deleted and is_current and status='draft') as "openVisits"`);
  return {counts:counts[0],campaigns:await db.execute(sql`select status,count(*)::int as count from sm_smdurcharbeit_campaigns group by status`),today:SMDurcharbeitToday(),month:SMDurcharbeitMonth()};
 });
-register("search_sms","Find SM IDs by name/email and active status. No GM/customer/admin rows or credentials.",
+register("search_sms","List pseudonymous SM IDs and active status. Select people with @ and use their IDs directly with get_sm_context. Names/emails are never returned to the model.",
  {search:stringJson,active:{type:["boolean","null"]},limit:limitJson},z.object({search:text,active:z.boolean().nullable(),limit}).strict(),async a=>
  page(await db.execute(sql`select id,first_name as "firstName",last_name as "lastName",email,is_active as active,sm_travel_time_enabled as "travelTimeEnabled"
  from users where role='sm' and deleted_at is null and (${a.active}::boolean is null or is_active=${a.active})

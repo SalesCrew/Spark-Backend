@@ -60,7 +60,7 @@ test("SM Kurti: authenticated worker, deep admin research, tool isolation, memor
  const model=f.calls.at(-1)!;
  assert.match(model.instructions,/Shelf Merchandiser/);
  const live=JSON.parse(model.input[0].content.split("\n").slice(1).join("\n"));
- assert.equal(live.profile.firstName,"Local");assert.equal(live.durcharbeit.count,1);
+ assert.equal(live.profile.firstName,`[user:${f.employee}]`);assert.equal(live.durcharbeit.count,1);
  assert.equal(live.planning.assignments.some((a:any)=>a.id===assignment.id),false);
  assert.doesNotMatch(JSON.stringify(live),/Synthetic paused campaign|Second|onlyGm|adminInfoNote|storagePath|password/);
  const otherContext=await f.ctx.buildKurtiSmContext(f.other);

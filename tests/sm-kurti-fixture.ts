@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import express from "express";
+import { eq } from "drizzle-orm";
 import * as schema from "../src/lib/schema.js";
 import * as role from "../src/lib/admin-role.js";
 import * as planning from "../src/sm-planning.shared.js";
@@ -35,6 +36,9 @@ export async function createSmKurtiFixture(){
  const storage=createSyntheticPhotoStorage();
  const f=await createSMDurcharbeitFixture({photoStorage:storage.storage,additionalSmUsers:[{id:other,token:"synthetic-other-sm"}]});
  try{
+ await f.database.update(schema.users).set({firstName:"Annika",lastName:"Musterfrau"}).where(eq(schema.users.id,f.employee));
+ await f.database.update(schema.users).set({firstName:"Benedikt",lastName:"Musteradmin"}).where(eq(schema.users.id,f.admin));
+ await f.database.update(schema.users).set({firstName:"Carolin",lastName:"Beispielsm"}).where(eq(schema.users.id,other));
  for(const migration of ["0058_employee_agreement_acceptances.sql","0070_gm_kurti_messages.sql","0072_admin_kurti_messages.sql","0073_admin_kurti_window_preferences.sql","0074_admin_kurti_window_collapsed.sql"]){
   await f.pg.exec(await readFile(new URL("../drizzle/"+migration,import.meta.url),"utf8"));
  }
@@ -53,6 +57,7 @@ export async function createSmKurtiFixture(){
  const ctx=await isolatedModule<typeof import("../src/lib/sm-kurti-context.js")>(new URL("../src/lib/sm-kurti-context.ts",import.meta.url),{
   ...base,"../sm-SMDurcharbeit-campaign.shared.js":monthly
  });
+ const identity=await isolatedModule<typeof import("../src/lib/kurti-identity.js")>(new URL("../src/lib/kurti-identity.ts",import.meta.url),{...base,"./admin-role.js":role});
  const toolErrors:unknown[]=[];
  const report=await isolatedModule(new URL("../src/sm-SMDurcharbeit-report.shared.ts",import.meta.url),{"./lib/schema.js":schema,"./sm-visit.shared.js":visitShared,"./sm-SMDurcharbeit-answer-reuse.shared.js":monthlyReuse,"./sm-SMDurcharbeit-campaign.shared.js":monthly});
  const tools=await isolatedModule<typeof import("../src/lib/sm-kurti-tools.js")>(new URL("../src/lib/sm-kurti-tools.ts",import.meta.url),{
@@ -71,11 +76,11 @@ export async function createSmKurtiFixture(){
  let answer:(body:ModelBody)=>ModelReply|Promise<ModelReply>=()=>({output:[],output_text:"Synthetic Kurti Antwort."});
  class FakeOpenAI{
   static APIError=class extends Error{};
-  responses={create:async(body:ModelBody)=>{calls.push(body);return answer(body);}};
+  responses={create:async(body:ModelBody)=>{calls.push(structuredClone(body));return answer(body);}};
  }
  const env={OPENAI_API_KEY:"synthetic-only",OPENAI_KURTI_TIMEOUT_MS:5000,OPENAI_KURTI_MODEL:"synthetic-model",OPENAI_KURTI_MAX_OUTPUT_TOKENS:3000};
  const router=await isolatedModule<typeof import("../src/routes/admin-kurti.js")>(new URL("../src/routes/admin-kurti.ts",import.meta.url),{
-  ...base,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
+  ...base,"../lib/kurti-identity.js":identity,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
   "../lib/admin-kurti-charts.js":chart,"../lib/admin-kurti-exports.js":exports,"../lib/admin-kurti-visualizations.js":visualizations,
   "../lib/admin-kurti-visualization-tools.js":visualizationTools,"../lib/admin-kurti-visualization-skill-loader.js":skills,
   "../lib/admin-kurti-memory.js":memory,"../lib/admin-kurti-model-context.js":modelContext,"../lib/admin-kurti-system-prompt.js":adminPrompt,
@@ -84,7 +89,7 @@ export async function createSmKurtiFixture(){
   "../lib/sm-admin-kurti-system-prompt.js":smAdminPrompt,"../lib/sm-kurti-tools.js":tools,"../lib/sm-kurti-exports.js":smExports
  });
  const worker=await isolatedModule<typeof import("../src/routes/gm-kurti.js")>(new URL("../src/routes/gm-kurti.ts",import.meta.url),{
-  ...base,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
+  ...base,"../lib/kurti-identity.js":identity,"openai":FakeOpenAI,"../config/env.js":{env},"../middleware/auth.js":f.auth,"../lib/logger.js":logger,
   "../lib/employee-agreement-meta.js":gmAgreement,"../lib/sm-employee-agreement.js":smAgreement,
   "../lib/kurti-context.js":{buildKurtiGmContext:async()=>({onlyGm:true})},"../lib/sm-kurti-context.js":ctx,
   "../lib/kurti-system-prompt.js":gmPrompt,"../lib/sm-kurti-system-prompt.js":smPrompt,"../lib/kurti-memory.js":employeeMemory
@@ -94,7 +99,7 @@ export async function createSmKurtiFixture(){
  app.use("/sm/kurti",worker.smKurtiRouter);app.use("/gm/kurti",worker.gmKurtiRouter);app.use(f.app);
  const actor={appUserId:f.admin,role:"sm_admin" as const};
  const accept=async(userId=f.employee)=>f.database.insert(schema.employeeAgreementAcceptances).values({userId,agreementKey:smAgreement.SM_EMPLOYEE_AGREEMENT.key,agreementVersion:smAgreement.SM_EMPLOYEE_AGREEMENT.version,agreementTitle:smAgreement.SM_EMPLOYEE_AGREEMENT.title,agreementHash:smAgreement.SM_EMPLOYEE_AGREEMENT.hash});
- return {...f,app,other,storage,tools,ctx,memory,employeeMemory,calls,actor,accept,toolErrors,setAnswer:(fn:typeof answer)=>{answer=fn;}};
+ return {...f,app,identity,other,storage,tools,ctx,memory,employeeMemory,calls,actor,accept,toolErrors,setAnswer:(fn:typeof answer)=>{answer=fn;}};
  }catch(e){await f.pg.close();throw e;}
 }
 export function toolCall(name:string,args:unknown,id=randomUUID()):ModelReply{

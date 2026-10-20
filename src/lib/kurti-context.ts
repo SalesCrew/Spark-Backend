@@ -579,6 +579,7 @@ export async function buildKurtiGmContext(gmUserId: string, now = new Date()): P
   return {
     generatedAt: formatDateTime(now),
     gm: {
+      userId: gmUserId,
       firstName: cleanText(profile.firstName),
       fullName: [cleanText(profile.firstName), cleanText(profile.lastName)].filter(Boolean).join(" "),
       email: cleanText(profile.email),

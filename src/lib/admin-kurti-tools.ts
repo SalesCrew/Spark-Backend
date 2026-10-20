@@ -117,7 +117,7 @@ export const ADMIN_KURTI_TOOLS: Responses.FunctionTool[] = [
   ),
   functionTool(
     "search_gms",
-    "Finds GMs by name, email, or region and returns operational counts plus cached IPP and bonus KPIs. Use it to resolve a GM name to an app user ID before requesting deep GM context.",
+    "Lists pseudonymous GM IDs by region/status with operational counts, cached IPP and bonus KPIs. Use the ID from the @ selection directly with get_gm_context. Do not search for names or emails.",
     {
       query: NULLABLE_STRING_SCHEMA,
       region: NULLABLE_STRING_SCHEMA,

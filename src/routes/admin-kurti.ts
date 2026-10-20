@@ -1,3 +1,4 @@
+import { loadKurtiIdentityBoundary, KURTI_IDENTITY_INSTRUCTIONS, KURTI_MENTION_HELP, KURTI_MODEL } from "../lib/kurti-identity.js";
 import OpenAI from "openai";
 import type { Responses } from "openai/resources/responses/responses";
 import { eq } from "drizzle-orm";
@@ -39,7 +40,7 @@ import {
 } from "../lib/admin-kurti-tool-routing.js";
 import { ADMIN_KURTI_TOOLS, executeAdminKurtiTool } from "../lib/admin-kurti-tools.js";
 import { db } from "../lib/db.js";
-import { getRequestLogMeta, logger, serializeError } from "../lib/logger.js";
+import { getRequestLogMeta, logger } from "../lib/logger.js";
 import { adminKurtiWindowPreferences, users } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
@@ -203,6 +204,10 @@ adminKurtiRouter.put("/layout", async (req: AuthedRequest, res, next) => {
   }
 });
 
+adminKurtiRouter.get("/people", async (req: AuthedRequest, res, next) => {
+  try {const identity=await loadKurtiIdentityBoundary(req.authUser!);res.set("Cache-Control","private, no-store").json({people:identity.people});}catch(error){next(error);}
+});
+
 adminKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
   try {
     const adminUserId = req.authUser?.appUserId;
@@ -210,9 +215,10 @@ adminKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
       res.status(401).json({ error: "Nicht eingeloggt.", code: "auth_required" });
       return;
     }
-    const messages = await loadActiveAdminKurtiMessages(adminUserId, new Date(), workspace);
+    const [messages,identity] = await Promise.all([loadActiveAdminKurtiMessages(adminUserId, new Date(), workspace),loadKurtiIdentityBoundary(req.authUser!)]);
     res.json({
       messages,
+      people: identity.people,
       configured: Boolean(openai),
       expiresAt: messages.at(-1)?.expiresAt ?? null,
       capabilities: {
@@ -264,14 +270,17 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
 
   activeAdminKurtiRequests.add(requestKey);
   try {
+    const identity = await loadKurtiIdentityBoundary(req.authUser!);
+    const prepared = identity.prepareMessage(parsed.data.message);
+    if(prepared.needsMention){
+      const messages=await saveAdminKurtiExchange({adminUserId,workspace,userContent:prepared.text,assistantContent:KURTI_MENTION_HELP,identityProtected:true,now:new Date()});
+      res.json({messages,people:identity.people,assistantMessage:messages.at(-1),expiresAt:messages.at(-1)?.expiresAt ?? null});return;
+    }
     const now = new Date();
     const [history, adminRows] = await Promise.all([
       loadActiveAdminKurtiMessages(adminUserId, now, workspace),
       db
         .select({
-          firstName: users.firstName,
-          lastName: users.lastName,
-          email: users.email,
           role: users.role,
         })
         .from(users)
@@ -295,15 +304,15 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
           `Zeitzone: Europe/Vienna`,
           `Arbeitsbereich: ${workspace === "sm" ? "SM" : "GM"}`,
           `Angemeldete Rolle: ${admin?.role ?? "admin"}`,
-          `Admin: ${[admin?.firstName, admin?.lastName].filter(Boolean).join(" ") || "Admin"}`,
+          `Admin-ID: [user:${adminUserId}]`,
           "Der Assistent ist strikt read-only. Aktuelle Geschäftsdaten müssen über die bereitgestellten Werkzeuge gelesen werden.",
           ...(visualizationSkillContext ? ["", visualizationSkillContext] : []),
         ].join("\n"),
       },
-      ...buildAdminKurtiModelHistory(history),
+      ...buildAdminKurtiModelHistory(history.filter(message=>message.identityProtected)),
       {
         role: "user",
-        content: parsed.data.message,
+        content: prepared.text,
       },
     ];
     const renderedCharts: AdminKurtiChartSpec[] = [];
@@ -312,9 +321,9 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     const smExports: SmKurtiExport[] = [];
     let activeTools = workspace === "sm" ? SM_ADMIN_KURTI_TOOLS : selectAdminKurtiTools(routingText);
 
-    let response = await createAdminKurtiResponse(openai, {
-      model: env.OPENAI_KURTI_MODEL,
-      instructions: workspace === "sm" ? SM_ADMIN_KURTI_SYSTEM_PROMPT : ADMIN_KURTI_SYSTEM_PROMPT,
+    let response = await createAdminKurtiResponse(openai, identity.providerRequest({
+      model: KURTI_MODEL,
+      instructions: KURTI_IDENTITY_INSTRUCTIONS + "\n\n" + (workspace === "sm" ? SM_ADMIN_KURTI_SYSTEM_PROMPT : ADMIN_KURTI_SYSTEM_PROMPT),
       input,
       tools: activeTools,
       tool_choice: "auto",
@@ -323,7 +332,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       include: ["reasoning.encrypted_content"],
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
       store: false,
-    }, getRequestLogMeta(req));
+    }), getRequestLogMeta(req));
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       const toolCalls = response.output.filter((item) => item.type === "function_call");
@@ -335,6 +344,8 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
           let output: string;
           if (!activeTools.some(tool => tool.name === toolCall.name)) {
             output = JSON.stringify({error:"tool_not_available",tool:toolCall.name});
+          } else if (["search_gms","search_sms"].includes(toolCall.name) && Object.entries((()=>{try{return JSON.parse(toolCall.arguments) ?? {search:"invalid"};}catch{return {search:"invalid"};}})()).some(([key,value])=>/(query|search|name)/i.test(key) && typeof value==="string" && value.trim() && !/^[0-9a-f-]{36}$/i.test(value))) {
+            output=JSON.stringify({error:"person_id_required",message:KURTI_MENTION_HELP});
           } else if (workspace === "sm" && toolCall.name === "prepare_sm_excel_export") {
             try {
               if(smExports.length >= 3) throw new Error("Höchstens drei Auszüge pro Antwort.");
@@ -367,7 +378,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
                   message: "At most three Excel exports can be prepared in one answer.",
                 });
               } else {
-                const preparedExport = parseAdminKurtiExcelExportArguments(toolCall.arguments);
+                const preparedExport = parseAdminKurtiExcelExportArguments(identity.toolArguments(toolCall.arguments));
                 preparedExports.push(preparedExport);
                 output = JSON.stringify({
                   tool: toolCall.name,
@@ -437,21 +448,21 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
             }
           } else {
             output = workspace === "sm"
-              ? await executeSmKurtiTool(toolCall.name, toolCall.arguments, req.authUser!)
-              : await executeAdminKurtiTool(toolCall.name, toolCall.arguments);
+              ? await executeSmKurtiTool(toolCall.name, identity.toolArguments(toolCall.arguments), req.authUser!)
+              : await executeAdminKurtiTool(toolCall.name, identity.toolArguments(toolCall.arguments));
           }
           return {
             type: "function_call_output" as const,
             call_id: toolCall.call_id,
-            output,
+            output: identity.sanitizeToolResult(output,toolCall.name),
           };
         }),
       );
       input.push(...toolOutputs);
 
-      response = await createAdminKurtiResponse(openai, {
-        model: env.OPENAI_KURTI_MODEL,
-        instructions: workspace === "sm" ? SM_ADMIN_KURTI_SYSTEM_PROMPT : ADMIN_KURTI_SYSTEM_PROMPT,
+      response = await createAdminKurtiResponse(openai, identity.providerRequest({
+        model: KURTI_MODEL,
+        instructions: KURTI_IDENTITY_INSTRUCTIONS + "\n\n" + (workspace === "sm" ? SM_ADMIN_KURTI_SYSTEM_PROMPT : ADMIN_KURTI_SYSTEM_PROMPT),
         input,
         tools: activeTools,
         tool_choice: round === MAX_TOOL_ROUNDS - 1 ? "none" : "auto",
@@ -460,16 +471,16 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
         include: ["reasoning.encrypted_content"],
         max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
         store: false,
-      }, getRequestLogMeta(req));
+      }), getRequestLogMeta(req));
     }
 
-    const assistantText = response.output_text.trim();
+    const assistantText = identity.redactText(response.output_text.trim());
     if (!assistantText && renderedCharts.length === 0 && renderedVisualizations.length === 0 && preparedExports.length === 0 && smExports.length === 0) {
       logger.warn("admin_kurti_empty_response", {
         ...getRequestLogMeta(req),
         action: "admin_kurti_chat",
         result: "failure",
-        model: env.OPENAI_KURTI_MODEL,
+        model: KURTI_MODEL,
       });
       res.status(502).json({
         error: "Kurti konnte gerade keine Admin-Antwort erstellen. Bitte erneut versuchen.",
@@ -487,25 +498,28 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     const messages = await saveAdminKurtiExchange({
       adminUserId,
       workspace,
-      userContent: parsed.data.message,
+      userContent: prepared.text,
       assistantContent,
+      identityProtected: true,
       now: new Date(),
     });
     res.json({
       messages,
+      people: identity.people,
       assistantMessage: messages.at(-1) ?? null,
       expiresAt: messages.at(-1)?.expiresAt ?? null,
     });
   } catch (error) {
+    if(typeof error === "object" && error !== null && "code" in error && error.code === "kurti_person_not_allowed") {res.status(403).json({error:"Diese Person kann hier nicht ausgewählt werden.",code:"kurti_person_not_allowed"});return;}
     if (error instanceof OpenAI.APIError) {
       logger.warn("admin_kurti_openai_request_failed", {
         ...getRequestLogMeta(req),
         action: "admin_kurti_chat",
         result: "failure",
-        model: env.OPENAI_KURTI_MODEL,
+        model: KURTI_MODEL,
         providerStatus: error.status,
         providerCode: error.code,
-        error: serializeError(error),
+        error: { status: error.status, code: error.code },
       });
       const isRateLimited = error.status === 429;
       res.status(isRateLimited ? 503 : 502).json({

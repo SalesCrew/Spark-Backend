@@ -26,7 +26,8 @@
     "test:SMDurcharbeit": "tsx --test src/SMDurcharbeit.integration.test.ts src/SMDurcharbeit-einsatz.integration.test.ts",
     "test:SMDurcharbeit-questionnaire-update": "tsx --test src/SMDurcharbeit-questionnaire-update.integration.test.ts",
     "test:SMDurcharbeit-pause": "tsx --test src/SMDurcharbeit-pause.integration.test.ts",
-    "test:sm-kurti": "tsx --test src/sm-kurti.integration.test.ts"
+    "test:sm-kurti": "tsx --test src/sm-kurti.integration.test.ts",
+    "test:kurti-identity": "node --import tsx --test src/kurti-identity.integration.test.ts"
   },
   "keywords": [],
   "author": "",

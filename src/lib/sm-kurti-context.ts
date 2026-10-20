@@ -49,7 +49,7 @@ export async function buildKurtiSmContext(smUserId: string, now = new Date()) {
       (select count(*)::int from sm_questionnaire_submission_delete_requests r where r.sm_user_id=${smUserId}::uuid and not r.is_deleted and r.status='pending' and exists(select 1 from sm_questionnaire_submissions s where s.id=r.submission_id and (s.smdurcharbeit_target_id is null or exists(select 1 from sm_smdurcharbeit_month_targets tg join sm_smdurcharbeit_campaigns c on c.id=tg.campaign_id where tg.id=s.smdurcharbeit_target_id and c.status<>'paused')))) as deletions`),
   ]);
   if (!people.length) throw new Error("SM-Profil nicht verfügbar.");
-  return { generatedAt: now.toISOString(), timezone:"Europe/Vienna", today, profile: people[0],
+  return { generatedAt: now.toISOString(), timezone:"Europe/Vienna", today, profile: people[0] ? {userId:smUserId,...people[0]} : null,
     planning: { from:from.toISOString().slice(0,10), to:to.toISOString().slice(0,10), truncated:assignments.length>100, assignments:assignments.slice(0,100) },
     durcharbeit: { month, count:targets.length, truncated:targets.length>100, targets:targets.slice(0,100).map(t=>({
       market:t.market,campaign:t.campaignName, status:t.campaignStatus, eligibility:t.eligibility, available:t.available,

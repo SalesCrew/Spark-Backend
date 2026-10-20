@@ -7,6 +7,7 @@ import { db } from "./db.js";
 import { logger, serializeError } from "./logger.js";
 import { adminKurtiMessages, type AdminKurtiMessageRole } from "./schema.js";
 
+const IDENTITY_PREFIX = "<!--kurti-identity:v1-->\n";
 const SM_PREFIX = "<!--kurti-workspace:sm-->\n";
 const GM_PREFIX = "<!--kurti-workspace:gm-->\n";
 type Workspace = "gm" | "sm";
@@ -20,6 +21,7 @@ export type AdminKurtiMemoryMessage = {
   id: string;
   role: AdminKurtiMessageRole;
   content: string;
+  identityProtected?: boolean;
   charts: AdminKurtiChartSpec[];
   visualizations: AdminKurtiVisualization[];
   exports: AdminKurtiExcelExport[];
@@ -29,7 +31,9 @@ export type AdminKurtiMemoryMessage = {
 };
 
 function toPayload(row: typeof adminKurtiMessages.$inferSelect): AdminKurtiMemoryMessage {
-  const sm = parseSmKurtiStoredExports(row.content.startsWith(SM_PREFIX) ? row.content.slice(SM_PREFIX.length) : row.content.startsWith(GM_PREFIX) ? row.content.slice(GM_PREFIX.length) : row.content);
+  const workspaceContent = row.content.startsWith(SM_PREFIX) ? row.content.slice(SM_PREFIX.length) : row.content.startsWith(GM_PREFIX) ? row.content.slice(GM_PREFIX.length) : row.content;
+  const identityProtected = workspaceContent.startsWith(IDENTITY_PREFIX);
+  const sm = parseSmKurtiStoredExports(identityProtected ? workspaceContent.slice(IDENTITY_PREFIX.length) : workspaceContent);
   const parsedExports = parseAdminKurtiStoredExports(sm.content);
   const parsedVisualizations = parseAdminKurtiStoredVisualizations(parsedExports.content);
   const parsedContent = parseAdminKurtiStoredContent(parsedVisualizations.content);
@@ -37,6 +41,7 @@ function toPayload(row: typeof adminKurtiMessages.$inferSelect): AdminKurtiMemor
     id: row.id,
     role: row.role,
     content: parsedContent.content,
+    identityProtected,
     charts: parsedContent.charts,
     visualizations: parsedVisualizations.visualizations,
     exports: parsedExports.exports,
@@ -87,6 +92,7 @@ export async function saveAdminKurtiExchange(input: {
   adminUserId: string;
   userContent: string;
   assistantContent: string;
+  identityProtected?: boolean;
   now?: Date;
   workspace?: Workspace;
 }): Promise<AdminKurtiMemoryMessage[]> {
@@ -120,14 +126,14 @@ export async function saveAdminKurtiExchange(input: {
       {
         adminUserId: input.adminUserId,
         role: "user",
-        content: prefix + input.userContent,
+        content: prefix + (input.identityProtected ? IDENTITY_PREFIX : "") + input.userContent,
         createdAt: now,
         expiresAt,
       },
       {
         adminUserId: input.adminUserId,
         role: "assistant",
-        content: prefix + input.assistantContent,
+        content: prefix + (input.identityProtected ? IDENTITY_PREFIX : "") + input.assistantContent,
         createdAt: new Date(now.getTime() + 1),
         expiresAt,
       },
