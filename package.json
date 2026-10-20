@@ -13,6 +13,7 @@
     "test:campaign-visit-reassignment": "tsx --test src/campaign-visit-reassignment.test.ts",
     "test:sm-comments": "tsx --test src/sm-comment.shared.test.ts src/sm-visit.shared.test.ts",
     "test:sm-management": "tsx --test src/sm-management.integration.test.ts",
+    "test:sm-answer-recovery": "tsx --test src/sm-visit-answer-version.integration.test.ts src/SMDurcharbeit-photo-withdrawal.integration.test.ts src/SMDurcharbeit-report.integration.test.ts",
     "test:sm-series": "tsx --test src/sm-series.shared.test.ts src/sm-series.integration.test.ts src/sm-planning.shared.test.ts",
     "test:integration": "tsx --test src/app.integration.test.ts",
     "test:sm-safety": "tsx --test src/sm-time-overlap.test.ts src/sm-safety.integration.test.ts",
