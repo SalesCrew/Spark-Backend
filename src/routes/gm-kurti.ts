@@ -7,12 +7,16 @@ import { env } from "../config/env.js";
 import { db } from "../lib/db.js";
 import { EMPLOYEE_AGREEMENT_KEY, EMPLOYEE_AGREEMENT_VERSION } from "../lib/employee-agreement-meta.js";
 import { buildKurtiGmContext } from "../lib/kurti-context.js";
+import { SM_KURTI_SYSTEM_PROMPT } from "../lib/sm-kurti-system-prompt.js";
+import { buildKurtiSmContext } from "../lib/sm-kurti-context.js";
+import { SM_EMPLOYEE_AGREEMENT } from "../lib/sm-employee-agreement.js";
 import { KURTI_SYSTEM_PROMPT } from "../lib/kurti-system-prompt.js";
 import { loadActiveKurtiMessages, saveKurtiExchange } from "../lib/kurti-memory.js";
 import { getRequestLogMeta, logger, serializeError } from "../lib/logger.js";
 import { employeeAgreementAcceptances } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
+export function createWorkerKurtiRouter(role: "gm" | "sm") {
 const gmKurtiRouter = Router();
 const activeKurtiRequests = new Set<string>();
 const messageSchema = z.object({
@@ -27,7 +31,7 @@ const openai = env.OPENAI_API_KEY
     })
   : null;
 
-gmKurtiRouter.use(requireAuth(["gm"]));
+gmKurtiRouter.use(requireAuth([role]));
 gmKurtiRouter.use(async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;
@@ -42,8 +46,8 @@ gmKurtiRouter.use(async (req: AuthedRequest, res, next) => {
       .where(
         and(
           eq(employeeAgreementAcceptances.userId, gmUserId),
-          eq(employeeAgreementAcceptances.agreementKey, EMPLOYEE_AGREEMENT_KEY),
-          eq(employeeAgreementAcceptances.agreementVersion, EMPLOYEE_AGREEMENT_VERSION),
+          eq(employeeAgreementAcceptances.agreementKey, (role === "sm" ? SM_EMPLOYEE_AGREEMENT.key : EMPLOYEE_AGREEMENT_KEY)),
+          eq(employeeAgreementAcceptances.agreementVersion, (role === "sm" ? SM_EMPLOYEE_AGREEMENT.version : EMPLOYEE_AGREEMENT_VERSION)),
         ),
       )
       .limit(1);
@@ -118,13 +122,13 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     const now = new Date();
     const [history, gmContext] = await Promise.all([
       loadActiveKurtiMessages(gmUserId, now),
-      buildKurtiGmContext(gmUserId, now),
+      role === "sm" ? buildKurtiSmContext(gmUserId, now) : buildKurtiGmContext(gmUserId, now),
     ]);
 
     const input: Responses.ResponseInput = [
       {
         role: "developer",
-        content: `LIVE-DATEN DES AKTUELL ANGEMELDETEN GMS\n${JSON.stringify(gmContext)}`,
+        content: `LIVE-DATEN DES AKTUELL ANGEMELDETEN ${role === "sm" ? "SM" : "GMS"}\n${JSON.stringify(gmContext)}`,
       },
       ...history.map((message) => ({
         role: message.role,
@@ -138,7 +142,7 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
 
     const response = await openai.responses.create({
       model: env.OPENAI_KURTI_MODEL,
-      instructions: KURTI_SYSTEM_PROMPT,
+      instructions: role === "sm" ? SM_KURTI_SYSTEM_PROMPT : KURTI_SYSTEM_PROMPT,
       input,
       reasoning: { effort: "low" },
       max_output_tokens: env.OPENAI_KURTI_MAX_OUTPUT_TOKENS,
@@ -196,4 +200,7 @@ gmKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
   }
 });
 
-export { gmKurtiRouter };
+return gmKurtiRouter;
+}
+export const gmKurtiRouter = createWorkerKurtiRouter("gm");
+export const smKurtiRouter = createWorkerKurtiRouter("sm");

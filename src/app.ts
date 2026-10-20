@@ -23,7 +23,7 @@ import { employeeAgreementRouter } from "./routes/employee-agreement.js";
 import { adminFragebogenRouter } from "./routes/fragebogen.js";
 import { gmVisitSessionsRouter } from "./routes/gm-visit-sessions.js";
 import { gmProfileRouter } from "./routes/gm-profile.js";
-import { gmKurtiRouter } from "./routes/gm-kurti.js";
+import { gmKurtiRouter, smKurtiRouter } from "./routes/gm-kurti.js";
 import { smSettingsRouter } from "./routes/sm-settings.js";
 import { adminSmMarketsRouter } from "./routes/sm-markets.js";
 import { adminSmPlanningRouter, smPlanningRouter } from "./routes/sm-planning.js";
@@ -34,7 +34,7 @@ import { adminSmDashboardRouter, smHomeDashboardRouter } from "./routes/sm-dashb
 import { smVisitsRouter, SMDurcharbeitVisitsRouter } from "./routes/sm-visits.js";
 import { adminSMDurcharbeitCampaignsRouter, SMDurcharbeitCampaignsRouter } from "./routes/sm-SMDurcharbeit-campaigns.js";
 import { adminSMDurcharbeitTimesRouter, SMDurcharbeitTimesRouter } from "./routes/sm-SMDurcharbeit-times.js";
-import { adminKurtiRouter } from "./routes/admin-kurti.js";
+import { adminKurtiRouter, smAdminKurtiRouter } from "./routes/admin-kurti.js";
 import { adminIppRouter } from "./routes/ipp.js";
 import { adminGmDashboardRouter } from "./routes/admin-gm-dashboard.js";
 import { kundenUsersRouter } from "./routes/kunden-users.js";
@@ -173,6 +173,7 @@ function createApp() {
   app.use("/markets", marketsRouter);
   app.use("/markets", gmVisitSessionsRouter);
   app.use("/gm/kurti", gmKurtiRouter);
+  app.use("/sm/kurti", smKurtiRouter);
   app.use("/gm", gmProfileRouter);
   app.use("/sm/settings", smSettingsRouter);
   app.use("/sm/messages", smMessagesRouter);
@@ -190,6 +191,7 @@ function createApp() {
   app.use("/red-month", redMonthRouter);
   app.use("/admin/kunden-users", kundenUsersRouter);
   app.use("/admin/kurti", adminKurtiRouter);
+  app.use("/admin/sm-kurti", smAdminKurtiRouter);
   app.use("/admin/users", adminUsersRouter);
   app.use("/admin/dsar", adminDsarRouter);
   app.use("/admin/markets", adminMarketsRouter);

@@ -1,11 +1,18 @@
-import { and, desc, eq, gt, lte } from "drizzle-orm";
+import { and, desc, eq, gt, lte, sql } from "drizzle-orm";
 import { parseAdminKurtiStoredContent, type AdminKurtiChartSpec } from "./admin-kurti-charts.js";
 import { parseAdminKurtiStoredExports, type AdminKurtiExcelExport } from "./admin-kurti-exports.js";
 import { parseAdminKurtiStoredVisualizations, type AdminKurtiVisualization } from "./admin-kurti-visualizations.js";
+import { parseSmKurtiStoredExports, type SmKurtiExport } from "./sm-kurti-exports.js";
 import { db } from "./db.js";
 import { logger, serializeError } from "./logger.js";
 import { adminKurtiMessages, type AdminKurtiMessageRole } from "./schema.js";
 
+const SM_PREFIX = "<!--kurti-workspace:sm-->\n";
+const GM_PREFIX = "<!--kurti-workspace:gm-->\n";
+type Workspace = "gm" | "sm";
+function workspaceCondition(workspace:Workspace) {
+ return workspace === "sm" ? sql`left(${adminKurtiMessages.content}, ${SM_PREFIX.length}) = ${SM_PREFIX}` : sql`left(${adminKurtiMessages.content}, ${SM_PREFIX.length}) <> ${SM_PREFIX}`;
+}
 const ADMIN_KURTI_MEMORY_TTL_MS = 8 * 60 * 60 * 1000;
 const ADMIN_KURTI_CLEANUP_INTERVAL_MS = 60 * 1000;
 
@@ -16,12 +23,14 @@ export type AdminKurtiMemoryMessage = {
   charts: AdminKurtiChartSpec[];
   visualizations: AdminKurtiVisualization[];
   exports: AdminKurtiExcelExport[];
+  smExports?: SmKurtiExport[];
   createdAt: string;
   expiresAt: string;
 };
 
 function toPayload(row: typeof adminKurtiMessages.$inferSelect): AdminKurtiMemoryMessage {
-  const parsedExports = parseAdminKurtiStoredExports(row.content);
+  const sm = parseSmKurtiStoredExports(row.content.startsWith(SM_PREFIX) ? row.content.slice(SM_PREFIX.length) : row.content.startsWith(GM_PREFIX) ? row.content.slice(GM_PREFIX.length) : row.content);
+  const parsedExports = parseAdminKurtiStoredExports(sm.content);
   const parsedVisualizations = parseAdminKurtiStoredVisualizations(parsedExports.content);
   const parsedContent = parseAdminKurtiStoredContent(parsedVisualizations.content);
   return {
@@ -31,6 +40,7 @@ function toPayload(row: typeof adminKurtiMessages.$inferSelect): AdminKurtiMemor
     charts: parsedContent.charts,
     visualizations: parsedVisualizations.visualizations,
     exports: parsedExports.exports,
+    smExports: sm.smExports,
     createdAt: row.createdAt.toISOString(),
     expiresAt: row.expiresAt.toISOString(),
   };
@@ -55,6 +65,7 @@ export async function purgeExpiredAdminKurtiMessages(now = new Date(), adminUser
 export async function loadActiveAdminKurtiMessages(
   adminUserId: string,
   now = new Date(),
+  workspace: Workspace = "gm",
 ): Promise<AdminKurtiMemoryMessage[]> {
   await purgeExpiredAdminKurtiMessages(now, adminUserId);
   const rows = await db
@@ -64,6 +75,7 @@ export async function loadActiveAdminKurtiMessages(
       and(
         eq(adminKurtiMessages.adminUserId, adminUserId),
         gt(adminKurtiMessages.expiresAt, now),
+        workspaceCondition(workspace),
       ),
     )
     .orderBy(desc(adminKurtiMessages.createdAt));
@@ -76,8 +88,11 @@ export async function saveAdminKurtiExchange(input: {
   userContent: string;
   assistantContent: string;
   now?: Date;
+  workspace?: Workspace;
 }): Promise<AdminKurtiMemoryMessage[]> {
   const now = input.now ?? new Date();
+  const workspace = input.workspace ?? "gm";
+  const prefix = workspace === "sm" ? SM_PREFIX : GM_PREFIX;
   const expiresAt = getAdminKurtiConversationExpiry(now);
 
   await db.transaction(async (tx) => {
@@ -97,6 +112,7 @@ export async function saveAdminKurtiExchange(input: {
         and(
           eq(adminKurtiMessages.adminUserId, input.adminUserId),
           gt(adminKurtiMessages.expiresAt, now),
+          workspaceCondition(workspace),
         ),
       );
 
@@ -104,21 +120,21 @@ export async function saveAdminKurtiExchange(input: {
       {
         adminUserId: input.adminUserId,
         role: "user",
-        content: input.userContent,
+        content: prefix + input.userContent,
         createdAt: now,
         expiresAt,
       },
       {
         adminUserId: input.adminUserId,
         role: "assistant",
-        content: input.assistantContent,
+        content: prefix + input.assistantContent,
         createdAt: new Date(now.getTime() + 1),
         expiresAt,
       },
     ]);
   });
 
-  return loadActiveAdminKurtiMessages(input.adminUserId, now);
+  return loadActiveAdminKurtiMessages(input.adminUserId, now, workspace);
 }
 
 export function startAdminKurtiMemoryCleanupScheduler(): void {

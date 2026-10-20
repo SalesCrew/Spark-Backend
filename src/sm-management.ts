@@ -70,9 +70,9 @@ export function smManagementQuestionSnapshot(question: Question): SmVisitQuestio
 }
 
 /** Caller holds a transaction. Share lock gives the read DTO one coherent answer generation. */
-export async function loadSmManagementState(tx: SmManagementTx, id: string, write = false) {
+export async function loadSmManagementState(tx: SmManagementTx, id: string, write = false, lockRead = true) {
   const query = tx.select().from(submissions).where(eq(submissions.id, id)).limit(1);
-  const [submission] = await (write ? query.for("update") : query.for("share"));
+  const [submission] = await (write ? query.for("update") : lockRead ? query.for("share") : query);
   if (!submission || submission.isDeleted || !submission.isCurrent || submission.status !== "submitted") {
     return fail(409, "sm_management_submission_unavailable", "Dieser abgeschlossene Fragebogen ist nicht mehr verfügbar. Bitte aktualisiere die Übersicht.");
   }
@@ -234,8 +234,8 @@ export async function applySmAdminCorrection(tx: SmManagementTx, submissionId: s
   return { replayed: false, result };
 }
 
-export async function smManagementDetail(tx: SmManagementTx, id: string) {
-  const state = await loadSmManagementState(tx, id);
+export async function smManagementDetail(tx: SmManagementTx, id: string, options: { lockRead?: boolean } = {}) {
+  const state = await loadSmManagementState(tx, id, false, options.lockRead ?? true);
   const sectionRows = await tx.select().from(sections).where(and(eq(sections.submissionId, id), eq(sections.isDeleted, false))).orderBy(asc(sections.orderIndex));
   const submission = state.submission;
   const SMDurcharbeit = submission.SMDurcharbeitTargetId ? await loadSMDurcharbeitTarget(tx, submission.SMDurcharbeitTargetId) : null;

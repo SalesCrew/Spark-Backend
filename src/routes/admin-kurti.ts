@@ -28,6 +28,9 @@ import {
 } from "../lib/admin-kurti-visualization-skill-loader.js";
 import { loadActiveAdminKurtiMessages, saveAdminKurtiExchange } from "../lib/admin-kurti-memory.js";
 import { buildAdminKurtiModelHistory } from "../lib/admin-kurti-model-context.js";
+import { SM_ADMIN_KURTI_SYSTEM_PROMPT } from "../lib/sm-admin-kurti-system-prompt.js";
+import { SM_ADMIN_KURTI_TOOLS, executeSmKurtiTool, loadSmKurtiExport } from "../lib/sm-kurti-tools.js";
+import { parseSmKurtiExport, appendSmKurtiExports, smKurtiExportSchema, type SmKurtiExport } from "../lib/sm-kurti-exports.js";
 import { ADMIN_KURTI_SYSTEM_PROMPT } from "../lib/admin-kurti-system-prompt.js";
 import {
   addAdminKurtiToolGroups,
@@ -40,6 +43,7 @@ import { getRequestLogMeta, logger, serializeError } from "../lib/logger.js";
 import { adminKurtiWindowPreferences, users } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 
+export function createAdminKurtiRouter(workspace: "gm" | "sm" = "gm") {
 const adminKurtiRouter = Router();
 const activeAdminKurtiRequests = new Set<string>();
 const MAX_TOOL_ROUNDS = 6;
@@ -206,15 +210,17 @@ adminKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
       res.status(401).json({ error: "Nicht eingeloggt.", code: "auth_required" });
       return;
     }
-    const messages = await loadActiveAdminKurtiMessages(adminUserId);
+    const messages = await loadActiveAdminKurtiMessages(adminUserId, new Date(), workspace);
     res.json({
       messages,
       configured: Boolean(openai),
       expiresAt: messages.at(-1)?.expiresAt ?? null,
       capabilities: {
         readOnly: true,
-        crossGm: true,
-        toolCount: ADMIN_KURTI_TOOLS.length,
+        crossGm: workspace === "gm",
+        crossSm: workspace === "sm",
+        workspace,
+        toolCount: workspace === "sm" ? SM_ADMIN_KURTI_TOOLS.length : ADMIN_KURTI_TOOLS.length,
         memoryMinutes: 480,
       },
     });
@@ -225,6 +231,7 @@ adminKurtiRouter.get("/messages", async (req: AuthedRequest, res, next) => {
 
 adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
   const adminUserId = req.authUser?.appUserId;
+  const requestKey = `${workspace}:${adminUserId}`;
   if (!adminUserId) {
     res.status(401).json({ error: "Nicht eingeloggt.", code: "auth_required" });
     return;
@@ -247,7 +254,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     return;
   }
 
-  if (activeAdminKurtiRequests.has(adminUserId)) {
+  if (activeAdminKurtiRequests.has(requestKey)) {
     res.status(409).json({
       error: "Kurti schreibt bereits an einer Admin-Antwort.",
       code: "admin_kurti_request_in_progress",
@@ -255,11 +262,11 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     return;
   }
 
-  activeAdminKurtiRequests.add(adminUserId);
+  activeAdminKurtiRequests.add(requestKey);
   try {
     const now = new Date();
     const [history, adminRows] = await Promise.all([
-      loadActiveAdminKurtiMessages(adminUserId, now),
+      loadActiveAdminKurtiMessages(adminUserId, now, workspace),
       db
         .select({
           firstName: users.firstName,
@@ -286,6 +293,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
           "VERTRAUENSWÜRDIGER ANMELDEKONTEXT",
           `Zeitpunkt: ${now.toISOString()}`,
           `Zeitzone: Europe/Vienna`,
+          `Arbeitsbereich: ${workspace === "sm" ? "SM" : "GM"}`,
           `Angemeldete Rolle: ${admin?.role ?? "admin"}`,
           `Admin: ${[admin?.firstName, admin?.lastName].filter(Boolean).join(" ") || "Admin"}`,
           "Der Assistent ist strikt read-only. Aktuelle Geschäftsdaten müssen über die bereitgestellten Werkzeuge gelesen werden.",
@@ -301,11 +309,12 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     const renderedCharts: AdminKurtiChartSpec[] = [];
     const renderedVisualizations: AdminKurtiVisualization[] = [];
     const preparedExports: AdminKurtiExcelExport[] = [];
-    let activeTools = selectAdminKurtiTools(routingText);
+    const smExports: SmKurtiExport[] = [];
+    let activeTools = workspace === "sm" ? SM_ADMIN_KURTI_TOOLS : selectAdminKurtiTools(routingText);
 
     let response = await createAdminKurtiResponse(openai, {
       model: env.OPENAI_KURTI_MODEL,
-      instructions: ADMIN_KURTI_SYSTEM_PROMPT,
+      instructions: workspace === "sm" ? SM_ADMIN_KURTI_SYSTEM_PROMPT : ADMIN_KURTI_SYSTEM_PROMPT,
       input,
       tools: activeTools,
       tool_choice: "auto",
@@ -324,7 +333,15 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       const toolOutputs = await Promise.all(
         toolCalls.map(async (toolCall) => {
           let output: string;
-          if (toolCall.name === "load_admin_tool_group") {
+          if (!activeTools.some(tool => tool.name === toolCall.name)) {
+            output = JSON.stringify({error:"tool_not_available",tool:toolCall.name});
+          } else if (workspace === "sm" && toolCall.name === "prepare_sm_excel_export") {
+            try {
+              if(smExports.length >= 3) throw new Error("Höchstens drei Auszüge pro Antwort.");
+              const spec=parseSmKurtiExport(toolCall.arguments);smExports.push(spec);
+              output=JSON.stringify({accepted:true,dataset:spec.dataset,title:spec.title});
+            } catch { output=JSON.stringify({error:"invalid_sm_export",message:"Datumsbereich und verfügbare Filter prüfen."}); }
+          } else if (toolCall.name === "load_admin_tool_group") {
             try {
               const groups = parseAdminKurtiToolGroupArguments(toolCall.arguments);
               activeTools = addAdminKurtiToolGroups(activeTools, groups);
@@ -419,7 +436,9 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
               });
             }
           } else {
-            output = await executeAdminKurtiTool(toolCall.name, toolCall.arguments);
+            output = workspace === "sm"
+              ? await executeSmKurtiTool(toolCall.name, toolCall.arguments, req.authUser!)
+              : await executeAdminKurtiTool(toolCall.name, toolCall.arguments);
           }
           return {
             type: "function_call_output" as const,
@@ -432,7 +451,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
 
       response = await createAdminKurtiResponse(openai, {
         model: env.OPENAI_KURTI_MODEL,
-        instructions: ADMIN_KURTI_SYSTEM_PROMPT,
+        instructions: workspace === "sm" ? SM_ADMIN_KURTI_SYSTEM_PROMPT : ADMIN_KURTI_SYSTEM_PROMPT,
         input,
         tools: activeTools,
         tool_choice: round === MAX_TOOL_ROUNDS - 1 ? "none" : "auto",
@@ -445,7 +464,7 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     }
 
     const assistantText = response.output_text.trim();
-    if (!assistantText && renderedCharts.length === 0 && renderedVisualizations.length === 0 && preparedExports.length === 0) {
+    if (!assistantText && renderedCharts.length === 0 && renderedVisualizations.length === 0 && preparedExports.length === 0 && smExports.length === 0) {
       logger.warn("admin_kurti_empty_response", {
         ...getRequestLogMeta(req),
         action: "admin_kurti_chat",
@@ -463,10 +482,11 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
       renderedCharts,
     );
     const contentWithVisualizations = appendAdminKurtiVisualizations(contentWithLegacyCharts, renderedVisualizations);
-    const assistantContent = appendAdminKurtiExcelExports(contentWithVisualizations, preparedExports);
+    const assistantContent = appendSmKurtiExports(appendAdminKurtiExcelExports(contentWithVisualizations, preparedExports), smExports);
 
     const messages = await saveAdminKurtiExchange({
       adminUserId,
+      workspace,
       userContent: parsed.data.message,
       assistantContent,
       now: new Date(),
@@ -498,8 +518,19 @@ adminKurtiRouter.post("/messages", async (req: AuthedRequest, res, next) => {
     }
     next(error);
   } finally {
-    activeAdminKurtiRequests.delete(adminUserId);
+    activeAdminKurtiRequests.delete(requestKey);
   }
 });
 
-export { adminKurtiRouter };
+if(workspace === "sm") adminKurtiRouter.post("/export",async(req:AuthedRequest,res,next)=>{
+  try {
+    const spec=smKurtiExportSchema.safeParse(req.body);
+    if(!spec.success){res.status(400).json({error:"Ungültige Exportfilter."});return;}
+    res.set("Cache-Control","private, no-store");
+    res.json(await loadSmKurtiExport(spec.data,req.authUser!));
+  }catch(error){res.status(400).json({error:error instanceof Error && error.message.includes("5.000")?error.message:"SM-Auszug konnte nicht erstellt werden. Bitte Filter prüfen."});}
+});
+return adminKurtiRouter;
+}
+export const adminKurtiRouter=createAdminKurtiRouter("gm");
+export const smAdminKurtiRouter=createAdminKurtiRouter("sm");
