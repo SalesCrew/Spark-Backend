@@ -163,7 +163,7 @@ export function createGmBriefingRouters(
         if (e.type === "entity.too.large") {
           res
             .status(413)
-            .json({ error: "Die PDF darf maximal 25 MB groß sein." });
+            .json({ error: "Die PDF darf maximal 500 MB groß sein." });
           return;
         }
         if (e.status && e.status < 500) {

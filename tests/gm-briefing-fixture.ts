@@ -100,6 +100,15 @@ export async function createBriefingFixture() {
       "utf8",
     ),
   );
+  await pg.exec(
+    await readFile(
+      new URL(
+        "../supabase/migrations/20261020134423_gm_briefing_500mb_upload_limit.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
   const admin = randomUUID(),
     gm = randomUUID(),
     gm2 = randomUUID(),

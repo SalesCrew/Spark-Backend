@@ -3,7 +3,7 @@ import { PDFDocument } from "pdf-lib";
 import { z } from "zod";
 
 export const BRIEFING_BUCKET = "gm-weekly-briefings";
-export const MAX_PDF_BYTES = 25 * 1024 * 1024;
+export const MAX_PDF_BYTES = 500 * 1024 * 1024;
 export const MAX_PDF_PAGES = 80;
 export type BriefingFile = {
   path: string;
@@ -81,7 +81,7 @@ export async function inspectBriefingPdf(
   filename: string,
 ): Promise<Omit<BriefingFile, "path">> {
   if (!bytes.length || bytes.length > MAX_PDF_BYTES)
-    throw briefingError("Bitte eine PDF mit maximal 25 MB wählen.");
+    throw briefingError("Bitte eine PDF mit maximal 500 MB wählen.");
   if (!bytes.subarray(0, 1024).includes(Buffer.from("%PDF-")))
     throw briefingError("Die Datei ist keine gültige PDF.");
   let pdf: PDFDocument;

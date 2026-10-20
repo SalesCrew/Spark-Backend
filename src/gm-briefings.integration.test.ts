@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import request from "supertest";
 import { randomUUID } from "node:crypto";
+import { inspectBriefingPdf, MAX_PDF_BYTES } from "./lib/gm-briefings.js";
 import {
   createBriefingFixture,
   syntheticBriefingPdf,
@@ -315,15 +316,42 @@ test("validation rejects invalid dates, page loss, oversized documents and unaut
       .set("x-operation-id", randomUUID())
       .send(await syntheticBriefingPdf(81))
       .expect(400);
-    await request(f.app)
+    // The size guard runs before parsing bytes; a length-only stand-in avoids
+    // allocating a half-gigabyte fixture merely to test this rejection.
+    await assert.rejects(
+      inspectBriefingPdf({ length: MAX_PDF_BYTES + 1 } as Buffer, "too-large.pdf"),
+      /maximal 500 MB/,
+    );
+    assert.equal((await f.service.list()).length, 1);
+    assert.equal(f.objects.size, 1);
+  } finally {
+    await f.close();
+  }
+});
+test("PDFs above the former 25 MB cap upload and remain private under the 500 MB limit", async () => {
+  const f = await createBriefingFixture();
+  try {
+    const pdf = await syntheticBriefingPdf(1);
+    const bytes = Buffer.concat([pdf, Buffer.alloc(26 * 1024 * 1024, 0x20)]);
+    const operationId = randomUUID();
+    const response = await request(f.app)
       .post("/admin/gm-briefings/upload")
       .set(admin)
       .set("Content-Type", "application/pdf")
-      .set("x-operation-id", randomUUID())
-      .send(Buffer.alloc(25 * 1024 * 1024 + 1))
-      .expect(413);
+      .set("x-pdf-filename", "Large-weekly.pdf")
+      .set("x-operation-id", operationId)
+      .send(bytes)
+      .expect(200);
+    assert.equal(response.body.file.byteSize, bytes.length);
+    assert.equal(response.body.file.pageCount, 1);
+    assert.deepEqual([...f.objects.values()][0], bytes);
+    const bucket = await f.pg.query<{ public: boolean; file_size_limit: number | string; allowed_mime_types: string[] }>(
+      "select public, file_size_limit, allowed_mime_types from storage.buckets where id='gm-weekly-briefings'",
+    );
+    assert.equal(Number(bucket.rows[0]!.file_size_limit), 500 * 1024 * 1024);
+    assert.equal(bucket.rows[0]!.public, false);
+    assert.deepEqual(bucket.rows[0]!.allowed_mime_types, ["application/pdf"]);
     assert.equal((await f.service.list()).length, 1);
-    assert.equal(f.objects.size, 1);
   } finally {
     await f.close();
   }
