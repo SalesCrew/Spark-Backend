@@ -81,6 +81,8 @@ test("SM Kurti: authenticated worker, deep admin research, tool isolation, memor
  search_sm_photos:{...range,limit:10}};
  const results:Record<string,any>={};
  for(const [name,input] of Object.entries(args))results[name]=await call(name,input);
+ assert.ok(results.get_sm_app_guide.pages.some((p:any)=>p.href==="/admin/sm/durcharbeit"));
+ assert.ok(results.get_sm_app_guide.pages.some((p:any)=>p.href==="/admin/shelfmerchandiser"));
  assert.equal(results.search_sms.rows.length,2);assert.equal(results.search_sm_markets.rows[0].durcharbeitSmUserId,f.employee);
  assert.equal(results.get_sm_planning.rows[0].smUserId,f.other);
  assert.equal(results.get_sm_targets.completed,1);assert.equal(results.search_sm_visits.rows.length,1);

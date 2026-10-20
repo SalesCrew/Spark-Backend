@@ -46,7 +46,19 @@ function visitWhere(a:Range, effectiveDate:SQL=sql`coalesce(s.visit_started_at,s
  and (${a.smUserId}::uuid is null or s.sm_user_id=${a.smUserId}::uuid) and (${a.marketId}::uuid is null or s.sm_market_id=${a.marketId}::uuid)
  and (${a.scope}::text is null or (case when qt.stable_code like 'smdurcharbeit\\_%' then 'SMDurcharbeit' else 'standard' end)=${a.scope})`;}
 register("get_sm_app_guide","SM navigation, ownership/version semantics and KPI definitions. No GM concepts.",{},z.object({}).strict(),async()=>({
- pages:["/admin/sm/dashboard","/admin/sm/maerkte","/admin/sm/durcharbeit-maerkte","/admin/sm/verplanung","/admin/sm/durcharbeit-verplanung","/admin/sm/fragebogen","/admin/sm/fbmanagement","/admin/sm/zeiterfassung","/admin/sm/nachrichten","/admin/sm/fotoarchiv"],
+ pages:[
+  {href:"/admin/sm/dashboard",label:"SM Dashboard"},
+  {href:"/admin/sm/fragebogen",label:"Standartfragebogen"},
+  {href:"/admin/sm/durcharbeit",label:"Durcharbeit",purpose:"Durcharbeit-Fragebögen und Module bearbeiten"},
+  {href:"/admin/sm/fbmanagement",label:"FB Management"},
+  {href:"/admin/sm/fotoarchiv",label:"Fotoarchiv"},
+  {href:"/admin/sm/verplanung",label:"Verplanung"},
+  {href:"/admin/sm/durcharbeit-verplanung",label:"Durcharbeit Verplanung",purpose:"Monatskampagnen, Märkte, Vertretungen, Fragebogenfassung und abgeschlossene Besuche"},
+  {href:"/admin/sm/zeiterfassung",label:"Zeiterfassung"},
+  {href:"/admin/sm/maerkte",label:"Märkte"},
+  {href:"/admin/sm/durcharbeit-maerkte",label:"Durcharbeit Märkte"},
+  {href:"/admin/shelfmerchandiser",label:"Shelf Merchandiser"},
+  {href:"/admin/sm/nachrichten",label:"Nachrichten"}],
  rules:["Kurti liest nur. Änderungen erfolgen auf der jeweiligen Seite.",
  "Durcharbeit nutzt Kalendermonate, nicht RED-Monate. Mehrere Kampagnen sind möglich.",
  "Dauerhafte SM-ID am Markt, Monatsvertretung und historischer Besuchsautor unterscheiden.",
