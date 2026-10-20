@@ -43,10 +43,10 @@ export async function buildKurtiSmContext(smUserId: string, now = new Date()) {
         join sm_smdurcharbeit_campaigns c on c.id=tg.campaign_id where tg.id=s.smdurcharbeit_target_id and c.status<>'paused'))
       order by coalesce(mt.started_at,s.visit_started_at) desc,s.id limit 101`),
     db.execute(sql`select
-      (select count(*)::int from sm_answer_change_requests where sm_user_id=${smUserId}::uuid and not is_deleted and status='pending') as answers,
+      (select count(*)::int from sm_answer_change_requests r where r.sm_user_id=${smUserId}::uuid and not r.is_deleted and r.status='pending' and exists(select 1 from sm_questionnaire_submissions s where s.id=r.submission_id and (s.smdurcharbeit_target_id is null or exists(select 1 from sm_smdurcharbeit_month_targets tg join sm_smdurcharbeit_campaigns c on c.id=tg.campaign_id where tg.id=s.smdurcharbeit_target_id and c.status<>'paused')))) as answers,
       (select count(*)::int from sm_assignment_time_change_requests where sm_user_id=${smUserId}::uuid and not is_deleted and status='pending') as "datedTimes",
-      (select count(*)::int from sm_smdurcharbeit_time_change_requests where sm_user_id=${smUserId}::uuid and status='pending') as "monthlyTimes",
-      (select count(*)::int from sm_questionnaire_submission_delete_requests where sm_user_id=${smUserId}::uuid and not is_deleted and status='pending') as deletions`),
+      (select count(*)::int from sm_smdurcharbeit_time_change_requests r where r.sm_user_id=${smUserId}::uuid and r.status='pending' and exists(select 1 from sm_smdurcharbeit_visits v join sm_smdurcharbeit_month_targets tg on tg.id=v.target_id join sm_smdurcharbeit_campaigns c on c.id=tg.campaign_id where v.id=r.visit_id and c.status<>'paused')) as "monthlyTimes",
+      (select count(*)::int from sm_questionnaire_submission_delete_requests r where r.sm_user_id=${smUserId}::uuid and not r.is_deleted and r.status='pending' and exists(select 1 from sm_questionnaire_submissions s where s.id=r.submission_id and (s.smdurcharbeit_target_id is null or exists(select 1 from sm_smdurcharbeit_month_targets tg join sm_smdurcharbeit_campaigns c on c.id=tg.campaign_id where tg.id=s.smdurcharbeit_target_id and c.status<>'paused')))) as deletions`),
   ]);
   if (!people.length) throw new Error("SM-Profil nicht verfügbar.");
   return { generatedAt: now.toISOString(), timezone:"Europe/Vienna", today, profile: people[0],

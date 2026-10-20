@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import { mkdir,readFile } from "node:fs/promises";
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE??"playwright");
 const front="http://127.0.0.1:3038",api="http://127.0.0.1:4038",artifacts=process.env.SM_KURTI_ARTIFACT_DIR??"/tmp/coke-sm-kurti-artifacts";
 await mkdir(artifacts,{recursive:true});
+let ready=false;
+for(let attempt=0;attempt<60;attempt++){
+ try{const r=await fetch(api+"/__fixture/state",{signal:AbortSignal.timeout(500)});if(r.ok){ready=true;break;}}catch{}
+ await new Promise(resolve=>setTimeout(resolve,100));
+}
+assert.ok(ready,"The explicitly started synthetic fixture must be ready");
 const browser=await chromium.launch({headless:true});
 const errors=[],requests=[];
 async function context(options){
@@ -15,7 +22,7 @@ async function context(options){
 async function login(p,email,path){
  p.setDefaultTimeout(15000);p.on("pageerror",e=>errors.push(e.message));
  await p.goto(front);await p.locator("#cs-email").fill(email);await p.locator("#cs-pass").fill("preview");
- await p.locator("button[type=submit]").click();await p.waitForURL(url=>url.pathname===path);
+ await p.locator("button[type=submit]").click();await p.waitForURL(url=>url.pathname===path,{waitUntil:"domcontentloaded"});
 }
 try{
  const sm=await context({viewport:{width:390,height:844},isMobile:true,hasTouch:true});const phone=await sm.newPage();
@@ -46,7 +53,7 @@ try{
  await download.saveAs(artifacts+"/sm-markets.xlsx");
  assert.equal(await download.failure(),null);
  const bytes=await readFile(artifacts+"/sm-markets.xlsx");assert.ok(bytes.length>1000);
- const XLSX=(await import("../../node_modules/xlsx-js-style/xlsx.js")).default;
+ const XLSX=createRequire(new URL("../../package.json",import.meta.url))("xlsx-js-style");
  const workbook=XLSX.read(bytes,{type:"buffer"});
  const sheet=XLSX.utils.sheet_to_json(workbook.Sheets["SM Auszug"],{header:1});
  assert.ok(JSON.stringify(sheet).includes("Synthetic Billa"));
@@ -64,5 +71,5 @@ try{
  assert.ok(requests.some(r=>r.path==="/admin/kurti/messages"&&r.method==="GET"));
  assert.deepEqual(errors,[]);
  console.log(JSON.stringify({result:"PASS",phone:"390×844",admin:"1440×900",synthetic:true,requests,uncaughtErrors:errors.length,downloadBytes:bytes.length,artifacts}));
-}finally{await browser.close();}
+}catch(error){for(const c of browser.contexts())for(const p of c.pages()){console.error("Failure page:",p.url(),(await p.locator("body").innerText()).slice(0,1200));await p.screenshot({path:artifacts+"/failure-"+c.pages().indexOf(p)+".png"});}throw error;}finally{await browser.close();}
 
