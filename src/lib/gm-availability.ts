@@ -19,7 +19,7 @@ type RecordedQuestion = Omit<AvailabilityObservation, "answer" | "visible"> & {
 const stcRanges = { gold: [12, 24], silver: [8, 10], bronze: [6, 7] } as const;
 
 // Read historical snapshots, including rule triggers. No schema repair or writes.
-export async function loadAvailabilityAudit(database: ModelDatabase, intervals: DashboardInterval[], scope: DashboardScope) {
+export async function loadAvailabilityAudit(database: ModelDatabase, intervals: DashboardInterval[], scope: DashboardScope, excludeSupplementalGms = false) {
   const frequency = scope.stc ? stcRanges[scope.stc] : null;
   const questions = await database.query<RecordedQuestion>(sql`
     with periods as (
@@ -34,6 +34,7 @@ export async function loadAvailabilityAudit(database: ModelDatabase, intervals: 
           or (s.started_at is null and s.submitted_at>=p.lo and s.submitted_at<p.hi))
       join markets m on m.id=s.market_id
       where s.is_deleted=false and s.status='submitted' and s.submitted_at is not null
+        and (${!excludeSupplementalGms} or s.is_supplemental_gm_snapshot=false)
         and (${scope.gmId}::uuid is null or s.gm_user_id=${scope.gmId}::uuid)
         and (${scope.region}::text is null or coalesce(nullif(m.region,''),'Unbekannt')=${scope.region})
         and (${scope.marketId}::uuid is null or m.id=${scope.marketId}::uuid)

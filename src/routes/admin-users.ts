@@ -36,6 +36,7 @@ const createUserSchema = z.object({
   isActive: z.boolean().optional(),
   ipp: z.number().min(0).max(99.9).optional(),
   isBillaGm: z.boolean().optional(),
+  isSupplementalGm: z.boolean().optional(),
 });
 
 const updateUserSchema = z.object({
@@ -51,6 +52,7 @@ const updateUserSchema = z.object({
   isActive: z.boolean().optional(),
   ipp: z.number().min(0).max(99.9).optional(),
   isBillaGm: z.boolean().optional(),
+  isSupplementalGm: z.boolean().optional(),
 });
 
 const updateOwnPasswordSchema = z.object({
@@ -83,6 +85,7 @@ function mapUserResponse(row: typeof users.$inferSelect, gmKpi?: { ipp: number; 
       ? { travelTimeEnabled }
       : { phone, address, city, postalCode, region }),
     isBillaGm: row.role === "gm" ? row.isBillaGm : false,
+    isSupplementalGm: row.role === "gm" ? row.isSupplementalGm : false,
     ipp: row.role === "gm" ? gmKpi?.ipp ?? 0 : row.ipp == null ? null : Number(row.ipp),
     ippSampleCount: row.role === "gm" ? gmKpi?.ippSampleCount ?? 0 : null,
   };
@@ -203,6 +206,7 @@ adminUsersRouter.get("/", async (req: AuthedRequest, res, next) => {
               region: row.region,
             }),
         isBillaGm: row.role === "gm" ? row.isBillaGm : false,
+    isSupplementalGm: row.role === "gm" ? row.isSupplementalGm : false,
         ...(row.role !== "gm" ? { ipp: row.ipp == null ? null : Number(row.ipp), ippSampleCount: null } : {}),
         isActive: row.isActive,
         deletedAt: row.deletedAt,
@@ -429,6 +433,7 @@ adminUsersRouter.post("/", async (req: AuthedRequest, res, next) => {
           isActive,
           ipp: payload.ipp != null ? payload.ipp.toFixed(1) : null,
           isBillaGm: payload.role === "gm" ? Boolean(payload.isBillaGm ?? false) : false,
+          isSupplementalGm: payload.role === "gm" ? Boolean(payload.isSupplementalGm ?? false) : false,
         })
         .returning();
 
@@ -599,6 +604,7 @@ adminUsersRouter.patch("/:id", async (req: AuthedRequest, res, next) => {
           isActive: canToggleAccountStatus(existing.role) ? payload.isActive : undefined,
           ipp: payload.ipp != null ? payload.ipp.toFixed(1) : undefined,
           isBillaGm: existing.role === "gm" ? payload.isBillaGm : undefined,
+          isSupplementalGm: existing.role === "gm" ? payload.isSupplementalGm : undefined,
           updatedAt: new Date(),
         })
         .where(eq(users.id, id))

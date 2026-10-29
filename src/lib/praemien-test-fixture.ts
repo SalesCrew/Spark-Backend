@@ -121,5 +121,6 @@ export async function praemienFixture() {
     { id: ids.admin, name: "Lokal Admin" },
     { type: "values", entries: values },
   );
+  await pg.exec(await readFile(new URL("../../supabase/migrations/20261029184231_gm_supplemental_budget.sql", import.meta.url), "utf8"));
   return { pg, database, ids, workspace, model };
 }

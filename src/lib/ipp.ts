@@ -451,6 +451,7 @@ export async function computeMarketIppSummariesForPeriod(input: {
 
 export async function computeMarketIppSummariesForRedPeriods(input: {
   redPeriodIds: string[];
+  excludeSupplementalGms?: boolean;
 }): Promise<Map<string, IppMarketRedPeriodSummary>> {
   const redPeriodIds = normalizeUnique(input.redPeriodIds);
   const summaries = new Map<string, IppMarketRedPeriodSummary>();
@@ -473,6 +474,7 @@ export async function computeMarketIppSummariesForRedPeriods(input: {
       and vs.submitted_at < ((p.end_date + 1)::timestamp at time zone 'Europe/Vienna')
       and vs.is_deleted = false
       and vs.status = 'submitted'
+      and (${!input.excludeSupplementalGms} or vs.is_supplemental_gm_snapshot = false)
     where p.id = any(${redPeriodIds}::uuid[])
       and p.is_deleted = false
     group by p.id, p.label, p.red_year, p.period_index, p.start_date, p.end_date, vs.market_id
@@ -511,6 +513,7 @@ export async function computeMarketIppSummariesForRedPeriods(input: {
       and vs.submitted_at < ((p.end_date + 1)::timestamp at time zone 'Europe/Vienna')
       and vs.is_deleted = false
       and vs.status = 'submitted'
+      and (${!input.excludeSupplementalGms} or vs.is_supplemental_gm_snapshot = false)
     join visit_answers va on va.visit_session_id = vs.id and va.is_deleted = false
     join visit_session_questions vsq on vsq.id = va.visit_session_question_id and vsq.is_deleted = false
     join visit_session_sections vss on vss.id = va.visit_session_section_id and vss.is_deleted = false

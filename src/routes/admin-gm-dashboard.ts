@@ -12,7 +12,7 @@ adminGmDashboardRouter.use(
   requireKundeAdminPermission,
 );
 adminGmDashboardRouter.use(
-  createGmDashboardRouter(modelDatabase(db), async (intervals, scope, data) => {
+  createGmDashboardRouter(modelDatabase(db), async (intervals, scope, data, includeSupplementalGms) => {
     // Whole-GM RED views use the existing archived/corrected IPP service. A
     // correction for an entire GM must not be spread arbitrarily across markets.
     if (!canUseWholeGmIpp(scope)) return;
@@ -24,6 +24,7 @@ adminGmDashboardRouter.use(
       redPeriodIds: ids,
       ...(scope.gmId ? { gmUserIds: [scope.gmId] } : {}),
       includeEmptyGms: false,
+      excludeSupplementalGms: !includeSupplementalGms,
     });
     for (const point of data.points) {
       if (!ids.includes(point.id)) continue;

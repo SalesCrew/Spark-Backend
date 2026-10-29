@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   ModelError,
   readWorkspace,
+  readDashboardWorkspace,
   workspaceReady,
   type ModelDatabase,
 } from "../lib/praemien-workspace.js";
@@ -43,7 +44,9 @@ export function createPraemienDashboardReadRouter(database: ModelDatabase) {
     }
     try {
       res.set("Cache-Control", "private, no-store").json(
-        await readWorkspace(database, id.data),
+        req.query.includeSupplementalGms === "true"
+          ? await readWorkspace(database, id.data)
+          : await readDashboardWorkspace(database, id.data),
       );
     } catch (error) {
       if (error instanceof ModelError) {

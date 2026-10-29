@@ -167,12 +167,12 @@ export async function loadIppPeriodCatalog(options?: { throughCurrent?: boolean 
   return rows.filter((row) => row.startDate <= current.startYmd);
 }
 
-async function loadMarketSamples(periods: IppPeriodMeta[]): Promise<MarketSample[]> {
+async function loadMarketSamples(periods: IppPeriodMeta[], excludeSupplementalGms = false): Promise<MarketSample[]> {
   if (periods.length === 0) return [];
   const periodIds = periods.map((period) => period.id);
   const periodStarts = periods.map((period) => period.startDate);
   const current = redMonthPeriodToYmd(await resolveCurrentRedPeriod(new Date()));
-  const computed = await computeMarketIppSummariesForRedPeriods({ redPeriodIds: periodIds });
+  const computed = await computeMarketIppSummariesForRedPeriods({ redPeriodIds: periodIds, excludeSupplementalGms });
   const finalized = await pgSql<FinalizedSqlRow[]>`
     select
       r.red_period_id::text,
@@ -189,6 +189,7 @@ async function loadMarketSamples(periods: IppPeriodMeta[]): Promise<MarketSample
       where vs.market_id = r.market_id
         and vs.is_deleted = false
         and vs.status = 'submitted'
+        and (${!excludeSupplementalGms} or vs.is_supplemental_gm_snapshot = false)
         and vs.submitted_at is not null
         and vs.submitted_at >= (r.red_period_start::timestamp at time zone 'Europe/Vienna')
         and vs.submitted_at < ((r.red_period_end + 1)::timestamp at time zone 'Europe/Vienna')
@@ -197,6 +198,15 @@ async function loadMarketSamples(periods: IppPeriodMeta[]): Promise<MarketSample
     ) latest on true
     where r.is_deleted = false
       and r.is_finalized = true
+      -- Archived market totals may contain both budgets. Recompute only those
+      -- markets from eligible original answers, never overwrite the archive.
+      and (${!excludeSupplementalGms} or not exists (
+        select 1 from visit_sessions extra where extra.market_id=r.market_id
+          and extra.status='submitted' and extra.is_deleted=false
+          and extra.is_supplemental_gm_snapshot=true
+          and extra.submitted_at >= (r.red_period_start::timestamp at time zone 'Europe/Vienna')
+          and extra.submitted_at < ((r.red_period_end+1)::timestamp at time zone 'Europe/Vienna')
+      ))
       and r.red_period_start::text = any(${periodStarts}::text[])
   `;
 
@@ -266,11 +276,12 @@ export async function loadEffectiveGmIppPeriods(input: {
   redPeriodIds: string[];
   gmUserIds?: string[];
   includeEmptyGms?: boolean;
+  excludeSupplementalGms?: boolean | undefined;
 }): Promise<EffectiveGmIppPeriodRow[]> {
   const requestedPeriodIds = Array.from(new Set(input.redPeriodIds));
   if (requestedPeriodIds.length === 0) return [];
   const catalog = (await loadIppPeriodCatalog()).filter((period) => requestedPeriodIds.includes(period.id));
-  const samples = await loadMarketSamples(catalog);
+  const samples = await loadMarketSamples(catalog, input.excludeSupplementalGms);
   const requestedGmIds = input.gmUserIds ? new Set(input.gmUserIds) : null;
   const gmRows = await db
     .select({ id: users.id, firstName: users.firstName, lastName: users.lastName, region: users.region, isActive: users.isActive })
@@ -290,13 +301,27 @@ export async function loadEffectiveGmIppPeriods(input: {
     eligibleGms.map((gm) => gm.id),
     catalog.map((period) => period.id),
   );
+  const supplementalPeriods = input.excludeSupplementalGms ? await pgSql<{ gm_user_id: string; red_period_id: string }[]>`
+    select distinct v.gm_user_id::text,p.id::text as red_period_id
+    from red_month_periods p join visit_sessions v
+      on v.submitted_at >= (p.start_date::timestamp at time zone 'Europe/Vienna')
+      and v.submitted_at < ((p.end_date+1)::timestamp at time zone 'Europe/Vienna')
+    where p.id=any(${requestedPeriodIds}::uuid[]) and v.is_deleted=false
+      and v.status='submitted' and (v.is_supplemental_gm_snapshot=true or exists (
+        select 1 from visit_sessions extra where extra.market_id=v.market_id
+          and extra.is_deleted=false and extra.status='submitted' and extra.is_supplemental_gm_snapshot=true
+          and extra.submitted_at >= (p.start_date::timestamp at time zone 'Europe/Vienna')
+          and extra.submitted_at < ((p.end_date+1)::timestamp at time zone 'Europe/Vienna')
+      ))
+  ` : [];
+  const supplementalKeys = new Set(supplementalPeriods.map(r => `${r.gm_user_id}::${r.red_period_id}`));
   const current = redMonthPeriodToYmd(await resolveCurrentRedPeriod(new Date()));
   const output: EffectiveGmIppPeriodRow[] = [];
   for (const period of catalog) {
     for (const gm of eligibleGms) {
       const key = `${gm.id}::${period.id}`;
       const gmSamples = samplesByKey.get(key) ?? [];
-      const latestEvent = latestEvents.get(key) ?? null;
+      const latestEvent = supplementalKeys.has(key) ? null : latestEvents.get(key) ?? null;
       if (!includeGmIppPeriod({
         isActive: gm.isActive,
         includeEmptyGms: Boolean(input.includeEmptyGms),

@@ -145,6 +145,7 @@ export const users = pgTable(
     travelTimeEnabled: boolean("sm_travel_time_enabled").notNull().default(false),
     ipp: numeric("ipp", { precision: 4, scale: 1 }),
     isBillaGm: boolean("is_billa_gm").notNull().default(false),
+    isSupplementalGm: boolean("is_supplemental_gm").notNull().default(false),
     profilePhotoBucket: text("profile_photo_bucket"),
     profilePhotoPath: text("profile_photo_path"),
     profilePhotoUpdatedAt: timestamp("profile_photo_updated_at", { withTimezone: true }),
@@ -3176,6 +3177,8 @@ export const fragebogenDurcharbeitSpezialQuestion = pgTable(
 export const visitSessions = pgTable(
   "visit_sessions",
   {
+    // Frozen at creation by the database; account changes never reclassify work.
+    isSupplementalGmSnapshot: boolean("is_supplemental_gm_snapshot").notNull().default(false),
     id: uuid("id").defaultRandom().primaryKey(),
     gmUserId: uuid("gm_user_id")
       .notNull()

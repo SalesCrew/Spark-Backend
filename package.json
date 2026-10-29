@@ -28,7 +28,8 @@
     "test:SMDurcharbeit-pause": "tsx --test src/SMDurcharbeit-pause.integration.test.ts",
     "test:sm-kurti": "tsx --test src/sm-kurti.integration.test.ts",
     "test:kurti-identity": "node --import tsx --test src/kurti-identity.integration.test.ts",
-    "test:kurti-safeguards": "node tests/run-kurti-safeguards.mjs"
+    "test:kurti-safeguards": "node tests/run-kurti-safeguards.mjs",
+    "test:gm-supplemental": "node --import ./node_modules/tsx/dist/loader.mjs --test tests/gm-supplemental.integration.test.ts tests/gm-supplemental-ipp.test.ts"
   },
   "keywords": [],
   "author": "",

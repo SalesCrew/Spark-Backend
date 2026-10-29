@@ -246,10 +246,28 @@ async function observations(
     numeric: r.numeric === null ? null : Number(r.numeric),
   }));
 }
+/** Whole-wave rewards cannot be split by individual visit. Separate the entire
+ * GM/wave when it contains supplemental work, including after conversion. This
+ * only filters the dashboard read; original bonus records/exports stay intact. */
+export async function readDashboardWorkspace(database: ModelDatabase, id: string): Promise<Workspace> {
+  if (!(await workspaceReady(database))) throw new ModelError(503, "Prämien noch nicht eingerichtet.");
+  const wave = await waveInfo(database, id);
+  const excluded = await database.query<{ id: string }>(sql`
+    select u.id from users u where u.role='gm' and (u.is_supplemental_gm=true or exists (
+      select 1 from visit_sessions v where v.gm_user_id=u.id
+        and v.is_supplemental_gm_snapshot=true and v.is_deleted=false and v.status='submitted'
+        and (v.submitted_at at time zone 'Europe/Vienna')::date between ${wave.startDate}::date and ${wave.endDate}::date
+    ))
+  `);
+  // Fetch with the excluded roster removed BEFORE model evaluation; do not
+  // filter already-calculated sums/means. Frozen waves are stored per GM.
+  return readWorkspace(database, id, undefined, new Set(excluded.map(r => r.id)));
+}
 export async function readWorkspace(
   database: ModelDatabase,
   id: string,
   gmId?: string,
+  excludedGmIds: Set<string> = new Set(),
 ): Promise<Workspace> {
   if (!(await workspaceReady(database)))
     throw new ModelError(
@@ -267,11 +285,11 @@ export async function readWorkspace(
     return {
       ...config.snapshot,
       results: gmId
-        ? config.snapshot.results.filter((r) => r.gmId === gmId)
-        : config.snapshot.results,
+        ? config.snapshot.results.filter((r) => r.gmId === gmId && !excludedGmIds.has(r.gmId))
+        : config.snapshot.results.filter(r => !excludedGmIds.has(r.gmId)),
       entries: gmId
-        ? config.snapshot.entries.filter((e) => e.gmId === gmId)
-        : config.snapshot.entries,
+        ? config.snapshot.entries.filter((e) => e.gmId === gmId && !excludedGmIds.has(e.gmId))
+        : config.snapshot.entries.filter(e => !excludedGmIds.has(e.gmId)),
       history,
     };
   }
@@ -294,9 +312,9 @@ export async function readWorkspace(
   const results = config
     ? evaluateModel(
         config.model,
-        roster,
-        entries,
-        await observations(database, wave, config.model, gmId),
+        roster.filter(r => !excludedGmIds.has(r.gmId)),
+        entries.filter(e => !excludedGmIds.has(e.gmId)),
+        (await observations(database, wave, config.model, gmId)).filter(o => !excludedGmIds.has(o.gmId)),
       )
     : [];
   let legacyTotals: Workspace["legacyTotals"];
@@ -313,7 +331,7 @@ export async function readWorkspace(
       }>(
         sql`select t.gm_user_id as "gmId",trim(u.first_name || ' ' || u.last_name) as name,t.current_reward_eur as earned,t.total_points as "totalPoints" from praemien_gm_wave_totals t join users u on u.id=t.gm_user_id where t.wave_id=${id} order by t.current_reward_eur desc,u.first_name,u.last_name`,
       );
-      legacyTotals = old.map((r) => ({
+      legacyTotals = old.filter(r => !excludedGmIds.has(r.gmId)).map((r) => ({
         ...r,
         earned: Number(r.earned),
         totalPoints: Number(r.totalPoints),
@@ -331,7 +349,7 @@ export async function readWorkspace(
     model: config?.model ?? null,
     ...(legacyTotals ? {legacyTotals} : {}),
     revision: config?.revision ?? 0,
-    entries,
+    entries: entries.filter(e => !excludedGmIds.has(e.gmId)),
     results,
     calculatedAt: new Date().toISOString(),
     closedAt: null,

@@ -44,6 +44,7 @@ export function createGmDashboardRouter(
     intervals: DashboardInterval[],
     scope: DashboardScope,
     data: DashboardData,
+    includeSupplementalGms: boolean,
   ) => Promise<void>,
 ) {
   const router = Router();
@@ -78,6 +79,7 @@ export function createGmDashboardRouter(
             ),
           scope,
           includeAvailabilityAudit: z.boolean().optional(),
+          includeSupplementalGms: z.boolean().optional(),
         })
         .safeParse(req.body);
       if (!input.success) {
@@ -91,9 +93,10 @@ export function createGmDashboardRouter(
         input.data.intervals,
         input.data.scope,
         input.data.includeAvailabilityAudit ?? false,
+        input.data.includeSupplementalGms ?? false,
       );
       if (effectiveIpp)
-        await effectiveIpp(input.data.intervals, input.data.scope, data);
+        await effectiveIpp(input.data.intervals, input.data.scope, data, input.data.includeSupplementalGms ?? false);
       res.set("Cache-Control", "private, no-store").json(data);
     } catch (error) {
       if (error instanceof SyntaxError) {
