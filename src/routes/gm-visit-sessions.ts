@@ -8,7 +8,7 @@ import {
 import { ensureAndGetGmKpiCache, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { db } from "../lib/db.js";
-import { copyReusableAnswer, loadReusableSubmittedAnswers } from "../lib/visit-answer-reuse.js";
+import { copyReusableAnswer, durcharbeitQuarterQuestionIds, loadReusableSubmittedAnswers } from "../lib/visit-answer-reuse.js";
 import { DEFAULT_TIMEZONE, ensureGmSubmissionGate, gmSubmissionGateError } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { planGmPhotoCommit } from "../lib/gm-photo-commit.js";
@@ -638,6 +638,7 @@ async function loadReusableSubmittedAnswersByQuestionId(input: {
   gmUserId: string;
   marketId: string;
   questionIds: string[];
+  quarterQuestionIds: string[];
   now: Date;
 }) {
   return loadReusableSubmittedAnswers(db, input, resolveCurrentRedPeriod);
@@ -2061,6 +2062,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       gmUserId,
       marketId: market.id,
       questionIds: sessionQuestionIds,
+      quarterQuestionIds: durcharbeitQuarterQuestionIds(sections),
       now: new Date(),
     });
     const hasAvailabilityTypeSnapshotColumn = await ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady();

@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { visitAnswerReuseFixture } from "./lib/visit-answer-reuse-test-fixture.js";
-import { copyReusableAnswer, loadReusableSubmittedAnswers } from "./lib/visit-answer-reuse.js";
+import { copyReusableAnswer, durcharbeitQuarterQuestionIds, loadReusableSubmittedAnswers } from "./lib/visit-answer-reuse.js";
 import { modelTemplate } from "./praemien-model.shared.js";
 import { createPraemienWorkspaceRouter } from "./routes/praemien-workspace.js";
 
@@ -52,6 +52,103 @@ function adminApp(f: Fixture) {
   app.use("/admin/praemien/workspace", createPraemienWorkspaceRouter(f.database));
   return app;
 }
+
+test("only resolved GM Durcharbeit answer questions opt in, leaving other sections and photo references unchanged", () => {
+  const included = randomUUID(), photo = randomUUID();
+  const sections = ["standard", "flex", "billa", "kuehler", "mhd", "sm"].map(section => ({
+    section, questions: [{ questionId: randomUUID(), type: "numeric" }],
+  }));
+  sections.push({ section: "durcharbeit", questions: [
+    { questionId: included, type: "yesnomulti" },
+    { questionId: included, type: "yesnomulti" },
+    { questionId: photo, type: "photo" },
+    { questionId: "not-a-saved-question", type: "numeric" },
+  ] });
+  assert.deepEqual(durcharbeitQuarterQuestionIds(sections), [included]);
+  assert.deepEqual(durcharbeitQuarterQuestionIds([]), []);
+});
+
+test("GM Durcharbeit retains October answers in November without a bonus wave, saves edits separately and resets in January", async () => {
+  const f = await visitAnswerReuseFixture();
+  try {
+    await f.pg.exec("delete from praemien_metric_entries; delete from praemien_wave_events; delete from praemien_wave_settings; delete from praemien_waves");
+    const october = await newVisit(f, "2026-10-15T12:00:00Z");
+    const original = await numericAnswer(f, october, f.ids.question, 3, "Bestand erhoben");
+    await submit(f, october);
+    const novemberInput = {
+      ...input(f, [f.ids.question], "2026-11-02T12:00:00Z"),
+      quarterQuestionIds: durcharbeitQuarterQuestionIds([{
+        section: "durcharbeit", questions: [{ questionId: f.ids.question, type: "numeric" }],
+      }]),
+    };
+    const carried = await loadReusableSubmittedAnswers(f.visitDb, novemberInput, redPeriod);
+    assert.equal(carried.get(f.ids.question)?.reuseScope, "calendar-quarter");
+    assert.equal(Number(carried.get(f.ids.question)?.answer.valueNumber), 3);
+    assert.equal(carried.get(f.ids.question)?.commentText, "Bestand erhoben");
+
+    const november = await newVisit(f, "2026-11-02T12:00:00Z");
+    const visitQuestionId = randomUUID();
+    await f.pg.query("insert into visit_session_questions(id) values($1)", [visitQuestionId]);
+    assert.equal(await f.visitDb.transaction(tx => copyReusableAnswer(tx, {
+      sessionId: november.id, sectionId: november.sectionId, visitQuestionId,
+      question: { questionId: f.ids.question, type: "numeric", config: {} }, now: novemberInput.now,
+    }, carried.get(f.ids.question)!)), true);
+    const saved = (await f.pg.query<{ id: string; answer_status: string; value_number: string }>(
+      "select id,answer_status,value_number from visit_answers where visit_session_question_id=$1", [visitQuestionId],
+    )).rows[0]!;
+    assert.notEqual(saved.id, original.answerId);
+    assert.equal(saved.answer_status, "answered");
+    assert.equal(Number(saved.value_number), 3);
+    assert.equal((await f.pg.query<{ comment_text: string }>(
+      "select comment_text from visit_question_comments where visit_session_question_id=$1", [visitQuestionId],
+    )).rows[0]!.comment_text, "Bestand erhoben");
+
+    // A valid change to zero must remain zero, rather than reviving an old value.
+    await f.pg.query("update visit_answers set value_number=0,value_json=$2 where id=$1", [saved.id, JSON.stringify({ raw: 0 })]);
+    await submit(f, november);
+    const december = await loadReusableSubmittedAnswers(f.visitDb, { ...novemberInput, now: new Date("2026-12-15T12:00:00Z") }, redPeriod);
+    assert.equal(Number(december.get(f.ids.question)?.answer.valueNumber), 0);
+    assert.equal((await f.pg.query<{ value_number: string }>("select value_number from visit_answers where id=$1", [original.answerId])).rows[0]!.value_number, "3");
+    assert.equal((await loadReusableSubmittedAnswers(f.visitDb, {
+      ...novemberInput, now: new Date("2026-12-31T22:59:59Z"),
+    }, redPeriod)).size, 1);
+    assert.equal((await loadReusableSubmittedAnswers(f.visitDb, {
+      ...novemberInput, now: new Date("2026-12-31T23:00:00Z"),
+    }, redPeriod)).size, 0);
+    assert.equal((await loadReusableSubmittedAnswers(f.visitDb, input(f, [f.ids.question], "2026-11-02T12:00:00Z"), redPeriod)).size, 1, "The November answer remains eligible within its own RED month");
+    assert.equal((await loadReusableSubmittedAnswers(f.visitDb, input(f, [f.ids.question], "2026-12-15T12:00:00Z"), redPeriod)).size, 0, "Other sections are not opted into quarterly reuse");
+  } finally { await f.pg.close(); }
+});
+
+test("GM Durcharbeit quarter reuse is independent of wave state and excludes invalid, draft, deleted and foreign answers", async () => {
+  const f = await visitAnswerReuseFixture();
+  try {
+    const october = await newVisit(f, "2026-10-15T12:00:00Z");
+    const original = await numericAnswer(f, october, f.ids.question, 2);
+    await submit(f, october);
+    for (const reason of ["invalid", "unanswered", "deleted-answer", "deleted-session", "draft", "other-gm", "other-market", "previous-quarter"] as const) {
+      const visit = await newVisit(f, reason === "previous-quarter" ? "2026-09-30T21:59:59Z" : "2026-10-25T12:00:00Z",
+        reason === "other-gm" ? f.ids.other : f.ids.gm, reason === "other-market" ? randomUUID() : f.ids.market);
+      const answer = await numericAnswer(f, visit, f.ids.question, 999);
+      if (reason !== "draft") await submit(f, visit);
+      if (reason === "invalid") await f.pg.query("update visit_answers set is_valid=false where id=$1", [answer.answerId]);
+      if (reason === "unanswered") await f.pg.query("update visit_answers set answer_status='unanswered' where id=$1", [answer.answerId]);
+      if (reason === "deleted-answer") await f.pg.query("update visit_answers set is_deleted=true where id=$1", [answer.answerId]);
+      if (reason === "deleted-session") await f.pg.query("update visit_sessions set is_deleted=true where id=$1", [visit.id]);
+    }
+    const snapshot = (await f.pg.query("select * from visit_answers order by id")).rows;
+    const current = { ...input(f, [f.ids.question], "2026-11-02T12:00:00Z"), quarterQuestionIds: [f.ids.question, randomUUID(), "invalid"] };
+    for (const state of ["draft", "active", "archived", "deleted"] as const) {
+      await f.pg.query("update praemien_waves set start_date='2026-10-01',end_date='2026-12-31',status=$1,is_deleted=$2", [state === "deleted" ? "active" : state, state === "deleted"]);
+      const source = (await loadReusableSubmittedAnswers(f.visitDb, current, redPeriod)).get(f.ids.question)!;
+      assert.equal(source.answer.id, original.answerId);
+      assert.equal(source.reuseScope, "calendar-quarter");
+      assert.equal(Number(source.answer.valueNumber), 2);
+      assert.equal((await loadReusableSubmittedAnswers(f.visitDb, { ...current, questionIds: [randomUUID()] }, redPeriod)).size, 0, "Opt-in IDs must belong to the actual visit");
+    }
+    assert.deepEqual((await f.pg.query("select * from visit_answers order by id")).rows, snapshot, "Loading defaults never rewrites a submitted answer or an existing draft");
+  } finally { await f.pg.close(); }
+});
 
 test("linked Flex sources: HTTP configuration → July answer → editable August carry → September carry → bonus without double count → October reset", async () => {
   const f = await visitAnswerReuseFixture();

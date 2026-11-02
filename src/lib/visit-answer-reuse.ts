@@ -16,6 +16,21 @@ const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 const isUuid = (value: string) => uuidRegex.test(value);
 const normalizeUnique = (values: string[]) => [...new Set(values.map((v) => v.trim()).filter(Boolean))];
 
+/** Use the resolved GM section, never a question label or a client-supplied flag. */
+export function durcharbeitQuarterQuestionIds(sections: ReadonlyArray<{
+  section: string;
+  questions: ReadonlyArray<{ questionId: string; type: string }>;
+}>): string[] {
+  return normalizeUnique(sections
+    .filter(section => section.section === "durcharbeit")
+    .flatMap(section => section.questions
+      // Keep the existing RED-month photo-reference behaviour. An old photo
+      // must not become a new visit's quarterly completed photo answer.
+      .filter(question => question.type !== "photo")
+      .map(question => question.questionId)))
+    .filter(isUuid);
+}
+
 export type ReusableSourceAnswer = {
   reuseScope: "red-month" | "calendar-quarter";
   answer: typeof visitAnswers.$inferSelect;
@@ -201,6 +216,8 @@ export async function loadReusableSubmittedAnswers(db: AnswerReuseDatabase, inpu
   gmUserId: string;
   marketId: string;
   questionIds: string[];
+  /** Server-resolved GM Durcharbeit questions, independent of bonus mappings. */
+  quarterQuestionIds?: string[];
   now: Date;
 }, resolveRedPeriod: RedPeriodResolver): Promise<Map<string, ReusableSourceAnswer>> {
   const questionIds = normalizeUnique(input.questionIds.filter((id) => isUuid(id)));
@@ -219,11 +236,11 @@ export async function loadReusableSubmittedAnswers(db: AnswerReuseDatabase, inpu
       ),
     );
   const overlappingWaveIds = normalizeUnique(overlappingWaves.map((row) => row.id));
-  if (overlappingWaveIds.length === 0) {
+  if (overlappingWaveIds.length === 0 && !input.quarterQuestionIds?.length) {
     return loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(db, resolveRedPeriod, { ...input, questionIds });
   }
 
-  const waveQuestionRows = await db
+  const waveQuestionRows = overlappingWaveIds.length === 0 ? [] : await db
     .select({
       questionId: praemienWaveSources.questionId,
       pillarName: praemienWavePillars.name,
@@ -246,9 +263,10 @@ export async function loadReusableSubmittedAnswers(db: AnswerReuseDatabase, inpu
       ),
     );
   const quarterQuestionIds = normalizeUnique([
+    ...(input.quarterQuestionIds ?? []),
     ...quarterPersistentQuestionIds(waveQuestionRows),
     ...await managedQuarterQuestionIds(modelDatabase(db), overlappingWaveIds, questionIds),
-  ]);
+  ]).filter(questionId => questionIds.includes(questionId));
   if (quarterQuestionIds.length === 0) {
     return loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(db, resolveRedPeriod, { ...input, questionIds });
   }
