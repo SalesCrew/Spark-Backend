@@ -10,7 +10,10 @@ import { createBriefingService } from "../src/lib/gm-briefing-service.js";
 import { createGmBriefingRouters } from "../src/routes/gm-briefings.js";
 import { isolatedModule } from "./isolated-module.js";
 import * as roles from "../src/lib/admin-role.js";
-export async function syntheticBriefingPdf(pageCount = 3) {
+export async function syntheticBriefingPdf(
+  pageCount = 3,
+  heading = "WOCHENSCHWERPUNKTE",
+) {
   const pdf = await PDFDocument.create(),
     font = await pdf.embedFont(StandardFonts.HelveticaBold),
     regular = await pdf.embedFont(StandardFonts.Helvetica);
@@ -23,7 +26,7 @@ export async function syntheticBriefingPdf(pageCount = 3) {
       height: 117,
       color: rgb(0.82, 0.07, 0.09),
     });
-    page.drawText("WOCHENSCHWERPUNKTE", {
+    page.drawText(heading, {
       x: 35,
       y: 790,
       size: 12,
@@ -79,13 +82,26 @@ export async function syntheticBriefingPdf(pageCount = 3) {
   }
   return Buffer.from(await pdf.save());
 }
-export async function createBriefingFixture() {
+export async function createBriefingFixture(
+  options: { apiOrigin?: string; webOrigins?: string[] } = {},
+) {
   if (
     process.env.DATABASE_URL ||
     process.env.SUPABASE_URL ||
     process.env.SUPABASE_SERVICE_ROLE_KEY
   )
     throw new Error("Production configuration forbidden");
+  const apiOrigin = options.apiOrigin ?? "http://127.0.0.1:4037";
+  const webOrigins = options.webOrigins ?? [
+    "http://127.0.0.1:3037",
+    "http://localhost:3037",
+  ];
+  if (
+    [apiOrigin, ...webOrigins].some(
+      (origin) => !/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin),
+    )
+  )
+    throw new Error("Synthetic fixture requires loopback origins");
   const pg = new PGlite(),
     database = drizzle(pg, { schema });
   await pg.exec(
@@ -104,6 +120,15 @@ export async function createBriefingFixture() {
     await readFile(
       new URL(
         "../supabase/migrations/20261020134423_gm_briefing_500mb_upload_limit.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  await pg.exec(
+    await readFile(
+      new URL(
+        "../supabase/migrations/20261102141400_gm_action_briefings.sql",
         import.meta.url,
       ),
       "utf8",
@@ -135,13 +160,19 @@ export async function createBriefingFixture() {
     },
     async sign(path: string) {
       if (!objects.has(path)) throw new Error("Missing synthetic file");
-      return `http://127.0.0.1:4037/synthetic-pdf/${encodeURIComponent(path)}`;
+      return `${apiOrigin}/synthetic-pdf/${encodeURIComponent(path)}`;
     },
   };
   const service = createBriefingService(
     database as unknown as Parameters<typeof createBriefingService>[0],
     storage,
     () => current,
+  );
+  const actionService = createBriefingService(
+    database as unknown as Parameters<typeof createBriefingService>[0],
+    storage,
+    () => current,
+    "action",
   );
   const permissionModule = await isolatedModule<{
     requireKundeAdminPermission: RequestHandler;
@@ -189,11 +220,18 @@ export async function createBriefingFixture() {
     auth,
     permissionModule.requireKundeAdminPermission,
   );
+  const actionRouters = createGmBriefingRouters(
+    actionService,
+    auth,
+    permissionModule.requireKundeAdminPermission,
+  );
   const app = express();
-  app.use(cors({ origin: ["http://127.0.0.1:3037", "http://localhost:3037"] }));
+  app.use(cors({ origin: webOrigins }));
   app.use(express.json());
   app.use("/admin/gm-briefings", routers.admin);
   app.use("/gm/briefings", routers.gm);
+  app.use("/admin/gm-action-briefings", actionRouters.admin);
+  app.use("/gm/action-briefings", actionRouters.gm);
   app.get("/synthetic-pdf/:path", (req, res) => {
     const bytes = objects.get(req.params.path);
     if (!bytes) {
@@ -209,6 +247,7 @@ export async function createBriefingFixture() {
     app,
     pg,
     service,
+    actionService,
     objects,
     admin,
     gm,

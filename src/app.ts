@@ -1,6 +1,6 @@
 import { createGmBriefingRouters } from './routes/gm-briefings.js';
 import { createBriefingService } from './lib/gm-briefing-service.js';
-import { BRIEFING_BUCKET } from './lib/gm-briefings.js';
+import { BRIEFING_BUCKET, ACTION_BRIEFING_BUCKET } from './lib/gm-briefings.js';
 import { db } from './lib/db.js';
 import { supabaseAdmin } from './lib/supabase.js';
 import { requireAuth } from './middleware/auth.js';
@@ -74,6 +74,12 @@ function createApp() {
     async remove(path) { const { error } = await briefingStorage.remove([path]); if (error) throw error; },
     async sign(path) { const { data, error } = await briefingStorage.createSignedUrl(path, 90); if (error || !data) throw new Error('PDF konnte nicht geladen werden. Bitte erneut versuchen.'); return data.signedUrl; },
   }), requireAuth, requireKundeAdminPermission);
+  const actionBriefingStorage = supabaseAdmin.storage.from(ACTION_BRIEFING_BUCKET);
+  const actionBriefingRouters = createGmBriefingRouters(createBriefingService(db, {
+    async upload(path, bytes) { const { error } = await actionBriefingStorage.upload(path, bytes, { contentType: 'application/pdf', upsert: false, cacheControl: '0' }); if (error) throw new Error('PDF konnte nicht gespeichert werden. Bitte erneut versuchen.'); },
+    async remove(path) { const { error } = await actionBriefingStorage.remove([path]); if (error) throw error; },
+    async sign(path) { const { data, error } = await actionBriefingStorage.createSignedUrl(path, 90); if (error || !data) throw new Error('PDF konnte nicht geladen werden. Bitte erneut versuchen.'); return data.signedUrl; },
+  }, undefined, "action"), requireAuth, requireKundeAdminPermission);
   const normalizeOrigin = (value: string) => value.trim().replace(/\/+$/, "");
   const allowedOrigins = env.CORS_ORIGIN.split(",")
     .map((entry) => normalizeOrigin(entry))
@@ -153,6 +159,8 @@ function createApp() {
   app.use(express.json({ limit: "1000mb" }));
   app.use('/admin/gm-briefings', briefingRouters.admin);
   app.use('/gm/briefings', briefingRouters.gm);
+  app.use('/admin/gm-action-briefings', actionBriefingRouters.admin);
+  app.use('/gm/action-briefings', actionBriefingRouters.gm);
 
   app.use((err: unknown, req: express.Request, _res: express.Response, next: express.NextFunction) => {
     const parseError = err as { type?: unknown };

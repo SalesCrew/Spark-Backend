@@ -11,6 +11,7 @@ export type KundePermissionAction = (typeof KUNDE_PERMISSION_ACTIONS)[number];
 export const KUNDE_ADMIN_PAGE_KEYS = [
   "gm_dashboard",
   "wochenschwerpunkte",
+  "aktionsbriefings",
   "ipp_berechnung",
   "praemien",
   "fragebogen",
@@ -188,6 +189,7 @@ export function resolveKundeAdminRequirement(req: Request): {
     const sharedPage = resolveSharedQuestionnairePage(req);
     return { pageKey: sharedPage ?? "fotoarchiv", action };
   }
+  if (routeStartsWith(originalPath, "/admin/gm-action-briefings")) return { pageKey: "aktionsbriefings", action };
   if (routeStartsWith(originalPath, "/admin/gm-briefings")) return { pageKey: "wochenschwerpunkte", action };
   if (routeStartsWith(pathname, "/gm-dashboard") || routeStartsWith(originalPath, "/admin/gm-dashboard")) return { pageKey: "gm_dashboard", action: "read" };
   if (routeStartsWith(pathname, "/ipp") || routeStartsWith(originalPath, "/admin/ipp")) return { pageKey: "ipp_berechnung", action };

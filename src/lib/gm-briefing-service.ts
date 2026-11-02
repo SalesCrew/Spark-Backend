@@ -2,9 +2,12 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq, isNull, lte, sql } from "drizzle-orm";
 import type { db as appDatabase } from "./db.js";
 import {
-  gmWeeklyBriefings as drafts,
-  gmWeeklyBriefingPublications as publications,
-  gmWeeklyBriefingReads as reads,
+  gmWeeklyBriefings,
+  gmWeeklyBriefingPublications,
+  gmWeeklyBriefingReads,
+  gmActionBriefings,
+  gmActionBriefingPublications,
+  gmActionBriefingReads,
 } from "./schema.js";
 import {
   briefingError,
@@ -23,10 +26,19 @@ export function createBriefingService(
   database: Database,
   storage: BriefingStorage,
   clock: () => Date = () => new Date(),
+  channel: "weekly" | "action" = "weekly",
 ) {
+  const drafts = channel === "action" ? gmActionBriefings : gmWeeklyBriefings;
+  const publications =
+    channel === "action"
+      ? gmActionBriefingPublications
+      : gmWeeklyBriefingPublications;
+  const reads =
+    channel === "action" ? gmActionBriefingReads : gmWeeklyBriefingReads;
+  const label = channel === "action" ? "Aktionsbriefing" : "Wochenschwerpunkt";
   async function get(id: string) {
     const [row] = await database.select().from(drafts).where(eq(drafts.id, id));
-    if (!row) throw briefingError("Wochenschwerpunkt nicht gefunden.", 404);
+    if (!row) throw briefingError(`${label} nicht gefunden.`, 404);
     return row;
   }
   async function list() {
@@ -126,7 +138,11 @@ export function createBriefingService(
                 title: "",
                 description: "",
               })),
-              title: file.name.replace(/\.pdf$/i, "").trim() || "Wochenschwerpunkte",
+              title:
+                file.name.replace(/\.pdf$/i, "").trim() ||
+                (channel === "action"
+                  ? "Aktionsbriefing"
+                  : "Wochenschwerpunkte"),
               createdByUserId: actor,
               createdAt: clock(),
               updatedAt: clock(),
@@ -167,8 +183,7 @@ export function createBriefingService(
         .from(drafts)
         .where(eq(drafts.id, id))
         .for("update");
-      if (!current)
-        throw briefingError("Wochenschwerpunkt nicht gefunden.", 404);
+      if (!current) throw briefingError(`${label} nicht gefunden.`, 404);
       if (current.draftRevision !== input.expectedRevision)
         throw briefingError(
           "Der Entwurf wurde inzwischen geändert. Bitte neu laden.",
@@ -206,8 +221,7 @@ export function createBriefingService(
         .from(drafts)
         .where(eq(drafts.id, id))
         .for("update");
-      if (!current)
-        throw briefingError("Wochenschwerpunkt nicht gefunden.", 404);
+      if (!current) throw briefingError(`${label} nicht gefunden.`, 404);
       const [prior] = await tx
         .select()
         .from(publications)
@@ -230,6 +244,13 @@ export function createBriefingService(
         throw briefingError(
           "Der Entwurf wurde inzwischen geändert. Bitte neu laden.",
           409,
+        );
+      if (
+        channel === "action" &&
+        (!current.visibleFrom || !current.visibleUntil)
+      )
+        throw briefingError(
+          "Bitte den vollständigen Anzeigezeitraum festlegen.",
         );
       const visibleFrom = current.visibleFrom ?? viennaDate(clock());
       if (current.visibleUntil && current.visibleUntil < visibleFrom)
@@ -296,7 +317,9 @@ export function createBriefingService(
     const row = (await active()).find((p) => p.id === id);
     if (!row)
       throw briefingError(
-        "Dieser Wochenschwerpunkt ist derzeit nicht verfügbar.",
+        channel === "action"
+          ? "Dieses Aktionsbriefing ist derzeit nicht verfügbar."
+          : "Dieser Wochenschwerpunkt ist derzeit nicht verfügbar.",
         404,
       );
     return row;

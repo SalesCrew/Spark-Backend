@@ -3905,3 +3905,29 @@ export const gmWeeklyBriefingReads = pgTable('gm_weekly_briefing_reads', {
   seenPages: integer('seen_pages').array().notNull().default(sql`'{}'::integer[]`), readAt: timestamp('read_at', { withTimezone: true }),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, t => [primaryKey({ columns: [t.publicationId, t.gmUserId] }), index('gm_weekly_briefing_reader_idx').on(t.gmUserId)]);
+
+// GM Aktionsbriefings: editable drafts, immutable publications and per-GM page receipts.
+export const gmActionBriefings = pgTable('gm_action_briefings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  title: text('title').notNull(), description: text('description').notNull().default(''),
+  file: jsonb('file').$type<import('./gm-briefings.js').BriefingFile>().notNull(),
+  pages: jsonb('pages').$type<import('./gm-briefings.js').BriefingPage[]>().notNull(),
+  visibleFrom: date('visible_from'), visibleUntil: date('visible_until'),
+  draftRevision: integer('draft_revision').notNull().default(1), archivedAt: timestamp('archived_at', { withTimezone: true }),
+  createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [index('gm_action_briefings_creator_idx').on(t.createdByUserId)]);
+export const gmActionBriefingPublications = pgTable('gm_action_briefing_publications', {
+  id: uuid('id').primaryKey().defaultRandom(), briefingId: uuid('briefing_id').notNull().references(() => gmActionBriefings.id, { onDelete: 'restrict' }),
+  version: integer('version').notNull(), sourceDraftRevision: integer('source_draft_revision').notNull(),
+  snapshot: jsonb('snapshot').$type<import('./gm-briefings.js').BriefingSnapshot>().notNull(),
+  visibleFrom: date('visible_from').notNull(), visibleUntil: date('visible_until'), operationId: uuid('operation_id').notNull().unique(),
+  publishedByUserId: uuid('published_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  publishedAt: timestamp('published_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [uniqueIndex('gm_action_briefing_version_idx').on(t.briefingId, t.version), index('gm_action_briefing_publisher_idx').on(t.publishedByUserId), index('gm_action_briefing_schedule_idx').on(t.visibleFrom)]);
+export const gmActionBriefingReads = pgTable('gm_action_briefing_reads', {
+  publicationId: uuid('publication_id').notNull().references(() => gmActionBriefingPublications.id, { onDelete: 'restrict' }),
+  gmUserId: uuid('gm_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  seenPages: integer('seen_pages').array().notNull().default(sql`'{}'::integer[]`), readAt: timestamp('read_at', { withTimezone: true }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [primaryKey({ columns: [t.publicationId, t.gmUserId] }), index('gm_action_briefing_reader_idx').on(t.gmUserId)]);
