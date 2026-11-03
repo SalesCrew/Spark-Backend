@@ -31,6 +31,27 @@ export function durcharbeitQuarterQuestionIds(sections: ReadonlyArray<{
     .filter(isUuid);
 }
 
+/** Standard/Flex Distribution is independent of the manually entered bonus metric.
+ * Use the server-resolved module's explicit quarter designation, never answer wording.
+ * The same name is retained in existing visit snapshots. Other modules stay monthly.
+ */
+export function gmQuarterQuestionIds(sections: ReadonlyArray<{
+  section: string;
+  questions: ReadonlyArray<{ questionId: string; type: string; moduleName?: string }>;
+}>, at: Date): string[] {
+  const local = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Vienna", year: "numeric", month: "numeric" }).formatToParts(at);
+  const year = Number(local.find(part => part.type === "year")?.value);
+  const quarter = Math.ceil(Number(local.find(part => part.type === "month")?.value) / 3);
+  return normalizeUnique([
+    ...durcharbeitQuarterQuestionIds(sections),
+    ...sections.filter(section => ["standard", "flex", "billa"].includes(section.section)).flatMap(section => section.questions
+      .filter(question => {
+        const designation = /^Distributionsziel\s+Q([1-4])\s*\/\s*(\d{4})$/i.exec(question.moduleName?.trim() ?? "");
+        return question.type !== "photo" && Number(designation?.[1]) === quarter && Number(designation?.[2]) === year;
+      }).map(question => question.questionId)),
+  ]).filter(isUuid);
+}
+
 export type ReusableSourceAnswer = {
   reuseScope: "red-month" | "calendar-quarter";
   answer: typeof visitAnswers.$inferSelect;
@@ -274,7 +295,7 @@ export async function loadReusableSubmittedAnswers(db: AnswerReuseDatabase, inpu
   const quarterQuestionIdSet = new Set(quarterQuestionIds);
   const redMonthQuestionIds = questionIds.filter((questionId) => !quarterQuestionIdSet.has(questionId));
   const [redMonthAnswers, quarterAnswers] = await Promise.all([
-    loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(db, resolveRedPeriod, {
+    redMonthQuestionIds.length === 0 ? Promise.resolve(new Map<string, ReusableSourceAnswer>()) : loadLatestSubmittedAnswersByQuestionIdInCurrentRedMonth(db, resolveRedPeriod, {
       ...input,
       questionIds: redMonthQuestionIds,
     }),

@@ -2545,6 +2545,7 @@ test("fragebogen update soft-deletes old module links and spezial rows", async (
   assert.ok(fragebogenId);
 
   const patchFragebogenRes = await request(app).patch(`/admin/fragebogen/main/${fragebogenId}`).send({
+    updatedAt: createFragebogenRes.body.fragebogen.updatedAt,
     name: `FB ${uniq}`,
     description: "",
     moduleIds: [],
@@ -2679,6 +2680,7 @@ test("spezialfrage answer edits write answer history entry", async (t) => {
   assert.ok(spezialId);
 
   const patchRes = await request(app).patch(`/admin/fragebogen/main/${fragebogenId}`).send({
+    updatedAt: createFragebogenRes.body.fragebogen.updatedAt,
     name: `FB ${uniq}`,
     description: "",
     moduleIds: [],

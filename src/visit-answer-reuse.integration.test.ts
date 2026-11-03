@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { visitAnswerReuseFixture } from "./lib/visit-answer-reuse-test-fixture.js";
-import { copyReusableAnswer, durcharbeitQuarterQuestionIds, loadReusableSubmittedAnswers } from "./lib/visit-answer-reuse.js";
+import { copyReusableAnswer, durcharbeitQuarterQuestionIds, gmQuarterQuestionIds, loadReusableSubmittedAnswers } from "./lib/visit-answer-reuse.js";
 import { modelTemplate } from "./praemien-model.shared.js";
 import { createPraemienWorkspaceRouter } from "./routes/praemien-workspace.js";
 
@@ -66,6 +66,19 @@ test("only resolved GM Durcharbeit answer questions opt in, leaving other sectio
   ] });
   assert.deepEqual(durcharbeitQuarterQuestionIds(sections), [included]);
   assert.deepEqual(durcharbeitQuarterQuestionIds([]), []);
+});
+
+test("server-designated Standard/Flex/Billa Distribution modules are quarterly without bonus mappings; other modules and photos stay unchanged", () => {
+  const id = randomUUID(), photo = randomUUID();
+  for (const section of ["standard", "flex", "billa"]) {
+    assert.deepEqual(gmQuarterQuestionIds([{ section, questions: [
+      { questionId: id, type: "numeric", moduleName: "Distributionsziel Q4/2026" },
+      { questionId: photo, type: "photo", moduleName: "Distributionsziel Q4/2026" },
+      { questionId: randomUUID(), type: "numeric", moduleName: "POS Material Q4/2026" },
+    ] }], new Date("2026-11-03T10:00:00Z")), [id]);
+  }
+  assert.deepEqual(gmQuarterQuestionIds([{ section: "standard", questions: [{ questionId: id, type: "numeric", moduleName: "Distributionsziel Q4/2026" }] }], new Date("2027-01-01T00:00:00Z")), []);
+  assert.deepEqual(gmQuarterQuestionIds([{ section: "sm", questions: [{ questionId: id, type: "numeric", moduleName: "Distributionsziel Q4/2026" }] }], new Date("2026-11-03T10:00:00Z")), []);
 });
 
 test("GM Durcharbeit retains October answers in November without a bonus wave, saves edits separately and resets in January", async () => {

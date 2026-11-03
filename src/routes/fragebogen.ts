@@ -213,7 +213,7 @@ const fragebogenSchema = z
     id: z.string().optional(),
     name: z.string().min(1),
     description: z.string().default(""),
-    moduleIds: z.array(z.string()).default([]),
+    moduleIds: z.array(z.string()),
     scheduleType: z.enum(["always", "scheduled"]).default("always"),
     startDate: z.string().optional(),
     endDate: z.string().optional(),
@@ -222,8 +222,14 @@ const fragebogenSchema = z
     nurEinmalAusfuellbar: z.boolean().default(false),
     spezialfragen: z.array(questionSchema).default([]),
     createdAt: z.string().optional(),
+    updatedAt: z.string().datetime().optional(),
+    moduleRemovalConfirmed: z.boolean().optional(),
   })
   .strict();
+
+class FragebogenWriteConflict extends Error {
+  constructor(public code: string, message: string) { super(message); }
+}
 
 type Scope = z.infer<typeof scopeSchema>;
 type MainSection = z.infer<typeof mainSectionSchema>;
@@ -1931,6 +1937,7 @@ export async function fetchFragebogenUi(scope: Scope, ids?: string[]): Promise<U
     startDate: row.startDate ? String(row.startDate) : undefined,
     endDate: row.endDate ? String(row.endDate) : undefined,
     createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
     status: row.status,
     sectionKeywords: scope === "main" ? ((row as typeof fragebogenMain.$inferSelect).sectionKeywords ?? ["standard"]) : undefined,
     nurEinmalAusfuellbar: Boolean(row.nurEinmalAusfuellbar),
@@ -2978,19 +2985,30 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id", async (req, res, next) => 
       return;
     }
     const now = new Date();
+    let assignmentAudit: { before: string[]; after: string[] } | undefined;
     const schedule = normalizeSchedule(parsed.data);
     await db.transaction(async (tx) => {
       await validateModuleIdsExist(tx, scope, parsed.data.moduleIds);
       const cfg = pickScopeConfig(scope);
 
       const [existing] = await tx
-        .select({ id: (cfg.fbTable as typeof fragebogenMain).id, isDeleted: (cfg.fbTable as typeof fragebogenMain).isDeleted })
+        .select({ id: (cfg.fbTable as typeof fragebogenMain).id, isDeleted: (cfg.fbTable as typeof fragebogenMain).isDeleted, updatedAt: (cfg.fbTable as typeof fragebogenMain).updatedAt })
         .from(cfg.fbTable as typeof fragebogenMain)
         .where(eq((cfg.fbTable as typeof fragebogenMain).id, req.params.id))
-        .limit(1);
+        .limit(1).for("update");
       if (!existing || existing.isDeleted) {
         throw new Error("Fragebogen nicht gefunden.");
       }
+      if (!parsed.data.updatedAt || parsed.data.updatedAt !== existing.updatedAt.toISOString()) {
+        throw new FragebogenWriteConflict("fragebogen_stale_version", "Der Fragebogen wurde inzwischen geändert. Bitte die Seite neu laden und den Fragebogen erneut öffnen.");
+      }
+      const currentLinks = await tx.select({ moduleId: (cfg.fbModuleLink as typeof fragebogenMainModule).moduleId })
+        .from(cfg.fbModuleLink as typeof fragebogenMainModule)
+        .where(and(eq((cfg.fbModuleLink as typeof fragebogenMainModule).fragebogenId, req.params.id), eq((cfg.fbModuleLink as typeof fragebogenMainModule).isDeleted, false)));
+      if (currentLinks.length && !parsed.data.moduleIds.length && !parsed.data.moduleRemovalConfirmed) {
+        throw new FragebogenWriteConflict("fragebogen_module_removal_unconfirmed", "Die Modulzuordnung wurde nicht gespeichert. Bitte die Seite neu laden und Module gezielt entfernen.");
+      }
+      assignmentAudit = { before: currentLinks.map(link => link.moduleId), after: [...new Set(parsed.data.moduleIds)] };
 
       await tx
         .update(cfg.fbTable as typeof fragebogenMain)
@@ -3010,7 +3028,7 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id", async (req, res, next) => 
           scheduleType: schedule.scheduleType,
           startDate: schedule.startDate,
           endDate: schedule.endDate,
-          updatedAt: now,
+          updatedAt: new Date(Math.max(now.getTime(), existing.updatedAt.getTime() + 1)),
         } as Partial<typeof fragebogenMain.$inferInsert>)
         .where(eq((cfg.fbTable as typeof fragebogenMain).id, req.params.id));
 
@@ -3059,6 +3077,8 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id", async (req, res, next) => 
       await saveSharedSpezialfragenTx(tx, scope, req.params.id, parsed.data.spezialfragen);
     });
 
+    logAction("info", "fragebogen_module_assignments_saved", { req, action: "fragebogen_modules", result: "success", statusCode: 200,
+      details: { scope, fragebogenId: req.params.id, beforeModuleIds: assignmentAudit?.before, afterModuleIds: assignmentAudit?.after } });
     const [fragebogen] = await fetchFragebogenUi(scope, [req.params.id]);
     if (!fragebogen) {
       res.status(404).json({ error: "Fragebogen nicht gefunden." });
@@ -3066,6 +3086,10 @@ adminFragebogenRouter.patch("/fragebogen/:scope/:id", async (req, res, next) => 
     }
     res.status(200).json({ fragebogen });
   } catch (error) {
+    if (error instanceof FragebogenWriteConflict) {
+      res.status(409).json({ error: error.message, code: error.code });
+      return;
+    }
     if (error instanceof Error && (error.message.includes("Modul") || error.message.includes("Fragebogen"))) {
       res.status(error.message.includes("nicht gefunden") ? 404 : 400).json({ error: error.message });
       return;

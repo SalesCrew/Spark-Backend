@@ -16,9 +16,11 @@ import * as moduleCatalog from '../src/lib/module-catalog-state.js';
 import * as sessionSync from '../src/lib/spezialfragen-session-sync.js';
 import * as answerValidation from '../src/lib/visit-session-answer-validation.js';
 import { modelDatabase } from '../src/lib/praemien-workspace.js';
+import * as answerReuse from '../src/lib/visit-answer-reuse.js';
+import * as quarterRecovery from '../src/lib/visit-quarter-recovery.js';
 import { isolatedModule } from './isolated-module.js';
 
-export async function spezialfragenPeriodFixture(initialTime?: Date, withCampaigns = false) {
+export async function spezialfragenPeriodFixture(initialTime?: Date, withCampaigns = false, withAnswerReuse = false) {
   if (process.env.DATABASE_URL || process.env.SUPABASE_URL || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NODE_ENV === 'production') throw new Error('Production configuration is forbidden');
   const pg = new PGlite(), database = drizzle(pg, { schema }), dialect = new PgDialect();
   const quote = (v: string) => '"' + v.replaceAll('"', '""') + '"';
@@ -97,8 +99,14 @@ export async function spezialfragenPeriodFixture(initialTime?: Date, withCampaig
     ...await replacementsFor('../src/routes/gm-visit-sessions.ts'), './fragebogen.js': authoring,
     '../lib/spezialfragen-session-sync.js': sessionSync, '../lib/visit-session-answer-validation.js': answerValidation,
     '../lib/day-session.js': { DEFAULT_TIMEZONE: 'Europe/Vienna', ensureGmSubmissionGate: async () => ({ ok: true }) },
-    '../lib/visit-answer-reuse.js': { loadReusableSubmittedAnswers: async () => new Map() },
-    '../lib/zeiterfassung-validation.js': { validateGmTimelineStartPoint: async () => {}, respondTimelineValidationError: () => false },
+    '../lib/visit-answer-reuse.js': withAnswerReuse ? answerReuse : { ...answerReuse, loadReusableSubmittedAnswers: async () => new Map() },
+    '../lib/visit-quarter-recovery.js': quarterRecovery,
+    '../lib/red-month-periods.js': {
+      resolveCurrentRedPeriod: async (at: Date) => ({ start: new Date(at.getFullYear(), at.getMonth(), 1), end: new Date(at.getFullYear(), at.getMonth() + 1, 0) }),
+      resolveRedPeriodForDate: async (at: Date) => ({ start: new Date(at.getFullYear(), at.getMonth(), 1), end: new Date(at.getFullYear(), at.getMonth() + 1, 0) }),
+    },
+    '../lib/zeiterfassung-validation.js': { validateGmTimelineStartPoint: async () => {}, validateGmTimelineInterval: async () => {}, respondTimelineValidationError: () => false },
+    ...(withAnswerReuse ? { '../lib/bonus-finalizer.js': { finalizeBonusForSubmittedVisitSessionTx: async () => {} }, '../lib/ipp-finalizer.js': { enqueueIppRecalcForDate: async () => {} }, '../lib/gm-kpi-cache.js': { recomputeGmKpiCache: async () => {} } } : {}),
   }, Clock as typeof Date);
   const app = express(); app.use(express.json()); app.use('/admin', authoring.adminFragebogenRouter); app.use(visits.gmVisitSessionsRouter);
   if (withCampaigns) {

@@ -8,7 +8,8 @@ import {
 import { ensureAndGetGmKpiCache, recomputeGmKpiCache } from "../lib/gm-kpi-cache.js";
 import { fetchFragebogenUi, fetchModulesUi } from "./fragebogen.js";
 import { db } from "../lib/db.js";
-import { copyReusableAnswer, durcharbeitQuarterQuestionIds, loadReusableSubmittedAnswers } from "../lib/visit-answer-reuse.js";
+import { copyReusableAnswer, gmQuarterQuestionIds, loadReusableSubmittedAnswers } from "../lib/visit-answer-reuse.js";
+import { recoverQuarterlyDraftAnswers } from "../lib/visit-quarter-recovery.js";
 import { DEFAULT_TIMEZONE, ensureGmSubmissionGate, gmSubmissionGateError } from "../lib/day-session.js";
 import { enqueueIppRecalcForDate } from "../lib/ipp-finalizer.js";
 import { planGmPhotoCommit } from "../lib/gm-photo-commit.js";
@@ -1967,6 +1968,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
           res.status(409).json({ error: "Bestehende Session verweist auf einen nicht mehr verfügbaren Markt." });
           return;
         }
+        await recoverQuarterlyDraftAnswers(db, existingByToken.id, gmUserId);
         const existingSections = await loadStartSectionsFromSession(existingByToken.id);
         res.status(200).json({
           session: {
@@ -1995,6 +1997,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       kuehlerUnitId: resolvedKuehlerUnitId,
     });
     if (existingDraft) {
+      await recoverQuarterlyDraftAnswers(db, existingDraft.id, gmUserId);
       const existingPayload = await buildVisitStartPayloadFromSession(existingDraft);
       if (!existingPayload) {
         res.status(409).json({ error: "Bestehende Session verweist auf einen nicht mehr verfügbaren Markt." });
@@ -2062,7 +2065,7 @@ gmVisitSessionsRouter.post("/gm/visit-sessions", async (req: AuthedRequest, res,
       gmUserId,
       marketId: market.id,
       questionIds: sessionQuestionIds,
-      quarterQuestionIds: durcharbeitQuarterQuestionIds(sections),
+      quarterQuestionIds: gmQuarterQuestionIds(sections, startValidationNow),
       now: new Date(),
     });
     const hasAvailabilityTypeSnapshotColumn = await ensureVisitSessionQuestionAvailabilityTypeSnapshotColumnReady();
@@ -3151,6 +3154,18 @@ gmVisitSessionsRouter.get("/gm/visit-sessions/delete-requests", async (req: Auth
   }
 });
 
+gmVisitSessionsRouter.post("/gm/visit-sessions/:sessionId/resume-quarter-answers", async (req: AuthedRequest, res, next) => {
+  try {
+    const gmUserId = req.authUser?.appUserId;
+    const sessionId = String(req.params.sessionId);
+    if (!gmUserId) { res.status(401).json({ error: "Nicht eingeloggt." }); return; }
+    if (!isUuid(sessionId)) { res.status(400).json({ error: "Ungültige Session-ID." }); return; }
+    const result = await recoverQuarterlyDraftAnswers(db, sessionId, gmUserId);
+    if (!result.found) { res.status(404).json({ error: "Session nicht gefunden." }); return; }
+    res.status(200).json({ ok: true, recoveredAnswers: result.recoveredAnswers });
+  } catch (error) { next(error); }
+});
+
 gmVisitSessionsRouter.get("/gm/visit-sessions/:sessionId", async (req: AuthedRequest, res, next) => {
   try {
     const gmUserId = req.authUser?.appUserId;
@@ -3633,7 +3648,7 @@ gmVisitSessionsRouter.patch("/gm/visit-sessions/:sessionId/answers", async (req:
       }
 
       await tx.execute(
-        sql`SELECT id FROM ${visitSessionQuestions} WHERE ${inArray(visitSessionQuestions.id, siblingQuestionIds)} FOR UPDATE`,
+        sql`SELECT id FROM ${visitSessionQuestions} WHERE ${inArray(visitSessionQuestions.id, siblingQuestionIds)} ORDER BY id FOR UPDATE`,
       );
 
       const existingAnswers = await tx
