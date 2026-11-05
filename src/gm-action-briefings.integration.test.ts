@@ -33,6 +33,8 @@ async function publish(
       description: "",
       visibleFrom: from,
       visibleUntil: until,
+      actionFrom: from,
+      actionUntil: until,
       pages: uploaded.body.pages,
     })
     .expect(200);
@@ -304,4 +306,96 @@ test("new admin page permissions are independent of WSP; worker roles and direct
   } finally {
     await f.close();
   }
+});
+
+test("action dates are independent of early visibility, versioned on publish, and preserved by older clients and PDF replacement", async () => {
+  const f = await createBriefingFixture();
+  try {
+    f.setNow("2026-11-05T12:00:00Z");
+    const { draft, publication } = await publish(f, "Weihnachtsaktion", "2026-11-05", "2026-11-30");
+    const changed = await request(f.app).patch("/admin/gm-action-briefings/" + draft.id).set(admin).send({
+      expectedRevision: draft.draftRevision, title: draft.title, description: "",
+      visibleFrom: "2026-11-05", visibleUntil: "2026-11-30",
+      actionFrom: "2026-11-16", actionUntil: "2026-11-22", pages: draft.pages,
+    }).expect(200);
+    // Saving the draft cannot change what the GM sees.
+    assert.equal((await f.actionService.inbox(f.gm)).items[0]!.actionFrom, "2026-11-05");
+    const second = await request(f.app).post("/admin/gm-action-briefings/" + draft.id + "/publish").set(admin)
+      .send({ expectedRevision: changed.body.draftRevision, operationId: randomUUID() }).expect(200);
+    assert.equal(second.body.actionFrom, "2026-11-16");
+    const inbox = await request(f.app).get("/gm/action-briefings").set(gm).expect(200);
+    assert.equal(inbox.body.items[0].visibleFrom, "2026-11-05");
+    assert.equal(inbox.body.items[0].actionFrom, "2026-11-16");
+    assert.equal(inbox.body.items[0].actionUntil, "2026-11-22");
+    assert.equal(inbox.body.items[0].id, second.body.id);
+    assert.equal((await f.pg.query<{ snapshot: any }>("select snapshot from gm_action_briefing_publications where id=$1", [publication.id])).rows[0]!.snapshot.actionFrom, "2026-11-05");
+
+    const oldClient = await request(f.app).patch("/admin/gm-action-briefings/" + draft.id).set(admin).send({
+      expectedRevision: changed.body.draftRevision, title: draft.title, description: "Edited by an older client",
+      visibleFrom: "2026-11-05", visibleUntil: "2026-11-30", pages: draft.pages,
+    }).expect(200);
+    assert.equal(oldClient.body.actionFrom, "2026-11-16");
+    assert.equal(oldClient.body.actionUntil, "2026-11-22");
+    const replaced = await f.actionService.upload(await syntheticBriefingPdf(2), "replacement.pdf", f.admin, randomUUID(), { id: draft.id, expectedRevision: oldClient.body.draftRevision });
+    assert.equal("actionFrom" in replaced && replaced.actionFrom, "2026-11-16");
+    const listed = (await f.actionService.list()).find(item => item.id === draft.id)!;
+    assert.equal(listed.publications[0]!.actionFrom, "2026-11-16");
+    f.setNow("2026-11-15T23:00:00Z");
+    assert.equal((await f.actionService.inbox(f.gm)).items[0]!.actionFrom, "2026-11-16");
+    f.setNow("2026-11-30T23:00:00Z");
+    assert.equal((await f.actionService.inbox(f.gm)).items.length, 0);
+  } finally { await f.close(); }
+});
+
+test("incomplete action dates may be saved, but publication requires both and rejects invalid or reversed dates", async () => {
+  const f = await createBriefingFixture();
+  try {
+    f.setNow("2026-11-05T12:00:00Z");
+    const draft = await f.actionService.upload(await syntheticBriefingPdf(1), "Draft.pdf", f.admin, randomUUID());
+    const input = { expectedRevision: draft.draftRevision, title: "Draft", description: "", visibleFrom: "2026-11-05", visibleUntil: "2026-11-30", pages: draft.pages };
+    for (const dates of [
+      { actionFrom: "2026-11-22", actionUntil: "2026-11-16" },
+      { actionFrom: "2026-02-30", actionUntil: "2026-11-16" },
+    ]) {
+      await request(f.app).patch("/admin/gm-action-briefings/" + draft.id).set(admin).send({ ...input, ...dates }).expect(400);
+    }
+    const partial = await request(f.app).patch("/admin/gm-action-briefings/" + draft.id).set(admin)
+      .send({ ...input, actionFrom: "2026-11-16", actionUntil: null }).expect(200);
+    await request(f.app).post("/admin/gm-action-briefings/" + draft.id + "/publish").set(admin)
+      .send({ expectedRevision: partial.body.draftRevision, operationId: randomUUID() }).expect(400);
+    const complete = await request(f.app).patch("/admin/gm-action-briefings/" + draft.id).set(admin)
+      .send({ ...input, expectedRevision: partial.body.draftRevision, actionFrom: "2026-11-16", actionUntil: "2026-11-16" }).expect(200);
+    const operationId = randomUUID();
+    const body = { expectedRevision: complete.body.draftRevision, operationId };
+    const published = await request(f.app).post("/admin/gm-action-briefings/" + draft.id + "/publish").set(admin).send(body).expect(200);
+    const replay = await request(f.app).post("/admin/gm-action-briefings/" + draft.id + "/publish").set(admin).send(body).expect(200);
+    assert.equal(published.body.id, replay.body.id);
+    assert.equal(replay.body.actionUntil, "2026-11-16");
+    await assert.rejects(f.pg.query("update gm_action_briefings set action_until='2026-11-15' where id=$1", [draft.id]), /gm_action_briefing_action_dates_order/);
+  } finally { await f.close(); }
+});
+
+test("migration leaves legacy publications, PDFs and receipts intact and does not invent action dates from visibility", async () => {
+  const f = await createBriefingFixture({ actionDates: false });
+  try {
+    const id = randomUUID(), publicationId = randomUUID();
+    const file = { path: "legacy.pdf", name: "Legacy.pdf", sha256: "synthetic", byteSize: 123, pageCount: 1, dimensions: [{ width: 595, height: 842 }] };
+    const snapshot = { title: "Legacy action", description: "", file, pages: [{ pageNumber: 1, title: "", description: "" }] };
+    await f.pg.query("insert into gm_action_briefings(id,title,file,pages,visible_from,visible_until,created_by_user_id) values($1,$2,$3::jsonb,$4::jsonb,'2026-11-01','2026-11-30',$5)", [id, snapshot.title, JSON.stringify(file), JSON.stringify(snapshot.pages), f.admin]);
+    await f.pg.query("insert into gm_action_briefing_publications(id,briefing_id,version,source_draft_revision,snapshot,visible_from,visible_until,operation_id) values($1,$2,1,1,$3::jsonb,'2026-11-01','2026-11-30',$4)", [publicationId, id, JSON.stringify(snapshot), randomUUID()]);
+    await f.pg.query("insert into gm_action_briefing_reads(publication_id,gm_user_id,seen_pages,read_at) values($1,$2,'{1}',now())", [publicationId, f.gm]);
+    const before = (await f.pg.query("select * from gm_action_briefing_publications")).rows;
+    const receipts = (await f.pg.query("select * from gm_action_briefing_reads")).rows;
+    const { readFile } = await import("node:fs/promises");
+    await f.pg.exec(await readFile(new URL("../supabase/migrations/20261105141824_gm_action_briefing_action_dates.sql", import.meta.url), "utf8"));
+    assert.deepEqual((await f.pg.query("select * from gm_action_briefing_publications")).rows, before);
+    assert.deepEqual((await f.pg.query("select * from gm_action_briefing_reads")).rows, receipts);
+    f.setNow("2026-11-05T12:00:00Z");
+    const item = (await f.actionService.inbox(f.gm)).items[0]!;
+    assert.equal(item.actionFrom, null);
+    assert.equal(item.actionUntil, null);
+    assert.equal(item.seenPages[0], 1);
+    assert.ok(item.readAt);
+    assert.equal((await f.actionService.get(id)).file.path, "legacy.pdf");
+  } finally { await f.close(); }
 });

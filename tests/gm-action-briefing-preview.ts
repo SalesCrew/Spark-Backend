@@ -5,10 +5,9 @@ import {
 } from "./gm-briefing-fixture.js";
 import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
-const f = await createBriefingFixture({
-  apiOrigin: "http://127.0.0.1:4038",
-  webOrigins: ["http://127.0.0.1:3038", "http://localhost:3038"],
-});
+const apiOrigin = process.env.ACTION_BRIEFING_API_ORIGIN ?? "http://127.0.0.1:4038";
+const webOrigin = process.env.ACTION_BRIEFING_WEB_ORIGIN ?? "http://127.0.0.1:3038";
+const f = await createBriefingFixture({ apiOrigin, webOrigins: [webOrigin] });
 f.setNow(new Date().toISOString());
 const bytes = await syntheticBriefingPdf(3);
 await writeFile("/tmp/coke-wsp-synthetic.pdf", bytes);
@@ -70,6 +69,8 @@ for (const [title, start, end] of [
     description: "",
     visibleFrom: start,
     visibleUntil: end,
+    actionFrom: today,
+    actionUntil: end,
     pages: d.pages,
   });
   await f.actionService.publish(
@@ -279,8 +280,8 @@ f.app.use((req, res) => {
   console.info(`Unimplemented synthetic endpoint: ${req.method} ${req.path}`);
   res.status(404).json({ error: "Not provided in synthetic preview" });
 });
-f.app.listen(4038, "127.0.0.1", () =>
+f.app.listen(Number(new URL(apiOrigin).port), "127.0.0.1", () =>
   console.info(
-    "Synthetic Aktionsbriefings + WSP API on 4038; preview login admin@preview.invalid / gm@preview.invalid (any password)",
+    `Synthetic Aktionsbriefings + WSP API on ${apiOrigin}; preview login admin@preview.invalid / gm@preview.invalid (any password)`,
   ),
 );

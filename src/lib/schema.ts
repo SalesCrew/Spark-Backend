@@ -3913,6 +3913,7 @@ export const gmActionBriefings = pgTable('gm_action_briefings', {
   file: jsonb('file').$type<import('./gm-briefings.js').BriefingFile>().notNull(),
   pages: jsonb('pages').$type<import('./gm-briefings.js').BriefingPage[]>().notNull(),
   visibleFrom: date('visible_from'), visibleUntil: date('visible_until'),
+  actionFrom: date('action_from'), actionUntil: date('action_until'),
   draftRevision: integer('draft_revision').notNull().default(1), archivedAt: timestamp('archived_at', { withTimezone: true }),
   createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),

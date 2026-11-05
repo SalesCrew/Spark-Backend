@@ -83,7 +83,7 @@ export async function syntheticBriefingPdf(
   return Buffer.from(await pdf.save());
 }
 export async function createBriefingFixture(
-  options: { apiOrigin?: string; webOrigins?: string[] } = {},
+  options: { apiOrigin?: string; webOrigins?: string[]; actionDates?: boolean } = {},
 ) {
   if (
     process.env.DATABASE_URL ||
@@ -149,6 +149,7 @@ export async function createBriefingFixture(
   );
   let current = new Date("2026-10-19T10:00:00Z"),
     failUpload = false;
+  if (options.actionDates !== false) await pg.exec(await readFile(new URL("../supabase/migrations/20261105141824_gm_action_briefing_action_dates.sql", import.meta.url), "utf8"));
   const objects = new Map<string, Buffer>();
   const storage = {
     async upload(path: string, bytes: Buffer) {

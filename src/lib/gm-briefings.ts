@@ -20,6 +20,8 @@ export type BriefingPage = {
   description: string;
 };
 export type BriefingSnapshot = {
+  actionFrom?: string | null;
+  actionUntil?: string | null;
   title: string;
   description: string;
   file: BriefingFile;
@@ -52,6 +54,8 @@ export const briefingDraftSchema = z
     description: z.string().max(2000),
     visibleFrom: calendarDate.nullable(),
     visibleUntil: calendarDate.nullable(),
+    actionFrom: calendarDate.nullable().optional(),
+    actionUntil: calendarDate.nullable().optional(),
     pages: z
       .array(
         z
@@ -75,6 +79,10 @@ export const briefingDraftSchema = z
       message: "Das Enddatum liegt vor dem Startdatum.",
       path: ["visibleUntil"],
     },
+  )
+  .refine(
+    value => !value.actionFrom || !value.actionUntil || value.actionUntil >= value.actionFrom,
+    { message: "Das Aktionsende liegt vor dem Aktionsbeginn.", path: ["actionUntil"] },
   );
 export type BriefingDraftInput = z.infer<typeof briefingDraftSchema>;
 export async function inspectBriefingPdf(

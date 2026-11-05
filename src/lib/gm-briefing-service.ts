@@ -55,6 +55,10 @@ export function createBriefingService(
         visibleFrom: publications.visibleFrom,
         visibleUntil: publications.visibleUntil,
         publishedAt: publications.publishedAt,
+        ...(channel === "action" ? {
+          actionFrom: sql<string | null>`${publications.snapshot}->>'actionFrom'`,
+          actionUntil: sql<string | null>`${publications.snapshot}->>'actionUntil'`,
+        } : {}),
       })
       .from(publications)
       .orderBy(desc(publications.version));
@@ -196,11 +200,20 @@ export function createBriefingService(
         throw briefingError(
           "Die Seiten müssen vollständig und in PDF-Reihenfolge bleiben.",
         );
-      const { expectedRevision: _revision, ...fields } = input;
+      const { expectedRevision: _revision, actionFrom, actionUntil, ...fields } = input;
+      const actionDates = channel === "action" ? {
+        ...(actionFrom !== undefined ? { actionFrom } : {}),
+        ...(actionUntil !== undefined ? { actionUntil } : {}),
+      } : {};
+      const from = actionFrom !== undefined ? actionFrom : ("actionFrom" in current ? current.actionFrom : null);
+      const until = actionUntil !== undefined ? actionUntil : ("actionUntil" in current ? current.actionUntil : null);
+      if (channel === "action" && from && until && until < from)
+        throw briefingError("Das Aktionsende liegt vor dem Aktionsbeginn.");
       const [row] = await tx
         .update(drafts)
         .set({
           ...fields,
+          ...actionDates,
           draftRevision: current.draftRevision + 1,
           updatedAt: clock(),
         })
@@ -252,6 +265,12 @@ export function createBriefingService(
         throw briefingError(
           "Bitte den vollständigen Anzeigezeitraum festlegen.",
         );
+      const actionDates = channel === "action" ? {
+        actionFrom: "actionFrom" in current ? current.actionFrom : null,
+        actionUntil: "actionUntil" in current ? current.actionUntil : null,
+      } : {};
+      if (channel === "action" && (!actionDates.actionFrom || !actionDates.actionUntil))
+        throw briefingError("Bitte Beginn und Ende der Aktion festlegen.");
       const visibleFrom = current.visibleFrom ?? viennaDate(clock());
       if (current.visibleUntil && current.visibleUntil < visibleFrom)
         throw briefingError(
@@ -276,6 +295,7 @@ export function createBriefingService(
           visibleUntil: current.visibleUntil,
           publishedAt: clock(),
           snapshot: {
+            ...actionDates,
             title: current.title,
             description: current.description,
             file: current.file,
@@ -284,7 +304,11 @@ export function createBriefingService(
         })
         .returning();
       return publication!;
-    });
+    }).then(publication => channel === "action" ? {
+      ...publication,
+      actionFrom: publication.snapshot.actionFrom ?? null,
+      actionUntil: publication.snapshot.actionUntil ?? null,
+    } : publication);
   }
   async function archive(id: string, archived: boolean) {
     await get(id);
@@ -339,6 +363,7 @@ export function createBriefingService(
         visibleFrom: p.visibleFrom,
         visibleUntil: p.visibleUntil,
         ...content,
+        ...(channel === "action" ? { actionFrom: p.snapshot.actionFrom ?? null, actionUntil: p.snapshot.actionUntil ?? null } : {}),
         pageCount: p.snapshot.file.pageCount,
         seenPages: receipt?.seenPages ?? [],
         readAt: receipt?.readAt ?? null,
