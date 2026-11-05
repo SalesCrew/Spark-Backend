@@ -2,7 +2,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import { isFullAdminRole } from "../lib/admin-role.js";
-import { computeMarketIppForPeriod, computeMarketIppSummariesForPeriod } from "../lib/ipp.js";
+import { computeMarketIppForPeriod, computeMarketIppSummariesForPeriod, computeMarketIppSummariesForRedPeriods } from "../lib/ipp.js";
 import {
   appendIppAdjustmentEvent,
   IppAdjustmentConflictError,
@@ -187,6 +187,19 @@ async function buildArchivedIppRows(): Promise<IppListRow[]> {
           .from(ippMarketRedmonthResults)
           .where(and(eq(ippMarketRedmonthResults.isDeleted, false), eq(ippMarketRedmonthResults.isFinalized, true)))
       : [];
+  const mixed = await pgSql<{ market_id: string; period_start: string }[]>`
+    select distinct r.market_id::text,r.red_period_start::text as period_start
+    from ipp_market_redmonth_results r join visit_sessions vs on vs.market_id=r.market_id
+    join users u on u.id=vs.gm_user_id
+    where r.is_deleted=false and r.is_finalized=true and vs.is_deleted=false and vs.status='submitted'
+      and (vs.is_supplemental_gm_snapshot=true or u.is_supplemental_gm=true)
+      and vs.submitted_at >= (r.red_period_start::timestamp at time zone 'Europe/Vienna')
+      and vs.submitted_at < ((r.red_period_end+1)::timestamp at time zone 'Europe/Vienna')
+  `;
+  const mixedKeys = new Set(mixed.map(row => `${row.market_id}::${row.period_start}`));
+  const periodIds = (await loadIppPeriodCatalog()).filter(period => mixed.some(row => row.period_start === period.startDate)).map(period => period.id);
+  const regular = await computeMarketIppSummariesForRedPeriods({ redPeriodIds: periodIds, excludeSupplementalGms: true });
+  const regularByKey = new Map([...regular.values()].map(row => [`${row.marketId}::${toYmd(row.periodStart)}`, row]));
   const marketById = await loadMarketMapByIds(archivedRows.map((row) => row.marketId));
 
   const output: IppListRow[] = [];
@@ -194,6 +207,14 @@ async function buildArchivedIppRows(): Promise<IppListRow[]> {
     const market = marketById.get(row.marketId);
     if (!market) continue;
     const rowKey = `${row.marketId}::${row.redPeriodStart}`;
+    if (mixedKeys.has(rowKey)) {
+      const eligible = regularByKey.get(rowKey);
+      if (!eligible) continue;
+      row.marketIpp = String(eligible.marketIpp);
+      row.sourceSubmissionCount = eligible.sourceSubmissionCount;
+      row.contributingQuestionCount = eligible.contributingQuestionCount;
+      row.isFinalized = false;
+    }
     output.push({
       id: rowKey,
       marketId: row.marketId,
@@ -224,6 +245,7 @@ async function buildCurrentIppRows(now: Date): Promise<IppListRow[]> {
   const currentSummaries = await computeMarketIppSummariesForPeriod({
     periodStart: currentPeriod.start,
     periodEnd: currentPeriod.end,
+    excludeSupplementalGms: true,
   });
   const currentSummaryRows = Array.from(currentSummaries.values());
   const marketById = await loadMarketMapByIds(currentSummaryRows.map((row) => row.marketId));
@@ -349,7 +371,7 @@ adminIppRouter.get("/ipp/gm-periods", async (req, res, next) => {
       res.status(404).json({ error: "RED-Monat wurde nicht gefunden.", code: "red_period_not_found" });
       return;
     }
-    const rows = await loadEffectiveGmIppPeriods({ redPeriodIds: [selected.id], includeEmptyGms: true });
+    const rows = await loadEffectiveGmIppPeriods({ redPeriodIds: [selected.id], includeEmptyGms: true, excludeSupplementalGms: true });
     res.status(200).json({
       periods: catalog.map((period) => ({ ...period, isCurrent: period.startDate === current.redPeriodStart })),
       selectedPeriod: { ...selected, isCurrent: selected.startDate === current.redPeriodStart },
@@ -482,7 +504,15 @@ adminIppRouter.get("/ipp/:marketId/detail", async (req, res, next) => {
       return;
     }
 
-    if (archived && !isCurrentPeriod) {
+    const [excludedVisit] = await pgSql<{ present: boolean }[]>`
+      select true as present from visit_sessions vs join users u on u.id=vs.gm_user_id
+      where vs.market_id=${marketId}::uuid and vs.is_deleted=false and vs.status='submitted'
+        and (vs.is_supplemental_gm_snapshot=true or u.is_supplemental_gm=true)
+        and vs.submitted_at >= (${parsed.data.periodStart}::date::timestamp at time zone 'Europe/Vienna')
+        and vs.submitted_at < (((${toYmd(periodInfo.end)}::date+1)::timestamp) at time zone 'Europe/Vienna')
+      limit 1
+    `;
+    if (archived && !isCurrentPeriod && !excludedVisit) {
       const snapshotRows = Array.isArray(archived.questionRowsSnapshot)
         ? (archived.questionRowsSnapshot as unknown[])
         : [];
@@ -518,6 +548,7 @@ adminIppRouter.get("/ipp/:marketId/detail", async (req, res, next) => {
       marketId,
       periodStart,
       periodEnd,
+      excludeSupplementalGms: true,
     });
 
     const marketIpp = computed.marketIpp;

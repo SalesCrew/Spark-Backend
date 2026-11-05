@@ -1,3 +1,4 @@
+import { regularBonusGmCondition } from "./gm-reporting-scope.js";
 import { and, asc, desc, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
 import { db, sql as pgSql } from "./db.js";
 import { DEFAULT_TIMEZONE, toYmdInTimezone } from "./day-session.js";
@@ -964,7 +965,10 @@ export async function readGmActiveBonusSummary(gmUserId: string, now = new Date(
     executor: db,
     fallbackTimezone: (await resolveCurrentRedPeriod(now)).timezone || DEFAULT_TIMEZONE,
   });
-  if (!wave) {
+  const [eligibility] = wave ? await modelDatabase(db).query<{ eligible: boolean }>(
+    sql`select ${regularBonusGmCondition(sql`${gmUserId}::uuid`, sql`${wave.id}::uuid`)} as eligible`,
+  ) : [];
+  if (!wave || !eligibility?.eligible) {
     return {
       hasActiveWave: false,
       waveId: null,

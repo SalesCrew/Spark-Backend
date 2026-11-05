@@ -45,7 +45,7 @@ test("real admin CRUD defaults to regular; Zusatz remains a normal GM; frozen wo
   } finally { await f.pg.close(); }
 });
 
-test("source exclusion precedes latest-per-market, means and filters; exports retain extra work after conversion", async () => {
+test("source exclusion precedes latest-per-market, means and filters; all statistics exclude current Zusatz accounts and converted supplemental work", async () => {
   const f = await praemienFixture();
   try {
     const seeded = await installDashboardFixture(f);
@@ -58,7 +58,8 @@ test("source exclusion precedes latest-per-market, means and filters; exports re
     await f.pg.query(`insert into markets(id,name,db_name) values($1,'Zusatz Test','Zusatz-Kette')`, [separateMarket]);
     await seeded.seedVisit({ gm: f.ids.other, market: separateMarket, when: "2026-09-30T12:00:00Z", category: "Bad", weight: "Nein" });
     const clean = await loadDashboard(f.database, intervals, scope, true);
-    assert.deepEqual(clean.points, baseline.points, "supplemental answers must not change any statistic or denominator");
+    assert.equal(clean.points[0]!.visits, before.visits - baselineScoped.points[0]!.visits, "legacy regular snapshots of a current Zusatz account are also excluded");
+    assert.equal(clean.availabilityAudit?.some(answer => answer.gmId === f.ids.other), false);
     assert.equal(clean.availabilityAudit?.some(a => a.sessionId === extra), false);
     const facets = await dashboardFacets(f.database);
     assert.equal(facets.gms.some(g => g.id === f.ids.other), false);
@@ -66,9 +67,9 @@ test("source exclusion precedes latest-per-market, means and filters; exports re
     assert.equal(facets.markets.some(m => m.id === f.ids.market), true, "shared markets remain");
     await f.pg.query(`update users set is_supplemental_gm=false where id=$1`, [f.ids.other]);
     assert.deepEqual((await loadDashboard(f.database, intervals, scope)).points, baseline.points);
-    const inclusive = await loadDashboard(f.database, intervals, scope, true, true);
-    assert.ok(inclusive.points[0]!.visits > before.visits);
-    assert.equal(inclusive.availabilityAudit?.some(a => a.sessionId === extra), true);
+    const requestedInclusive = await loadDashboard(f.database, intervals, scope, true, true);
+    assert.deepEqual(requestedInclusive.points, baseline.points, "legacy inclusion flags cannot put Zusatz work back into statistics");
+    assert.equal(requestedInclusive.availabilityAudit?.some(a => a.sessionId === extra), false);
     const scoped = await loadDashboard(f.database, intervals, { ...scope, gmId: f.ids.other });
     assert.deepEqual(scoped.points, baselineScoped.points, "stale/manually submitted GM filter cannot bypass source exclusion");
     await seeded.seedVisit({ gm: f.ids.other, when: "2026-09-30T13:00:00Z", category: "Top" });
@@ -76,7 +77,7 @@ test("source exclusion precedes latest-per-market, means and filters; exports re
   } finally { await f.pg.close(); }
 });
 
-test("bonus dashboard separates complete wave totals, including closed waves and converted GMs; full workspace remains inclusive", async () => {
+test("bonus dashboard separates complete wave totals, including closed waves and converted GMs; administration and closed-wave reads use the same exclusion", async () => {
   const f = await praemienFixture();
   try {
     const full = await readWorkspace(f.database, f.ids.wave);
@@ -87,9 +88,97 @@ test("bonus dashboard separates complete wave totals, including closed waves and
     const filtered = await readDashboardWorkspace(f.database, f.ids.wave);
     assert.equal(filtered.results.some(r => r.gmId === f.ids.gm), false);
     assert.equal(filtered.entries.some(r => r.gmId === f.ids.gm), false);
-    assert.deepEqual((await readWorkspace(f.database, f.ids.wave)).results, full.results);
+    assert.deepEqual((await readWorkspace(f.database, f.ids.wave)).results, filtered.results);
     await f.pg.query(`update praemien_wave_settings set closed_snapshot=$1::jsonb,closed_at=now() where wave_id=$2`, [JSON.stringify(full), f.ids.wave]);
     assert.equal((await readDashboardWorkspace(f.database, f.ids.wave)).results.some(r => r.gmId === f.ids.gm), false);
-    assert.deepEqual((await readWorkspace(f.database, f.ids.wave)).results, JSON.parse(JSON.stringify(full.results)));
+    assert.equal((await readWorkspace(f.database, f.ids.wave)).results.some(row => row.gmId === f.ids.gm), false);
+    assert.deepEqual((await f.pg.query<{ closed_snapshot: unknown }>("select closed_snapshot from praemien_wave_settings where wave_id=$1", [f.ids.wave])).rows[0]!.closed_snapshot, JSON.parse(JSON.stringify(full)), "stored historical payouts are preserved");
+  } finally { await f.pg.close(); }
+});
+
+test("bonus HTTP, preview, stale edits, cumulative totals and frozen leaderboards exclude Zusatz GMs without deleting records", async () => {
+  const f = await praemienFixture();
+  try {
+    const express = (await import("express")).default;
+    const { createPraemienWorkspaceRouter } = await import("../src/routes/praemien-workspace.js");
+    const { createPraemienDashboardReadRouter } = await import("../src/routes/praemien-dashboard-read.js");
+    const { managedCumulative, managedGmSummary } = await import("../src/lib/praemien-workspace.js");
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).authUser = { appUserId: f.ids.admin, role: "admin" };
+      next();
+    });
+    app.use("/bonus", createPraemienWorkspaceRouter(f.database));
+    app.use("/dashboard-bonus", createPraemienDashboardReadRouter(f.database));
+    const url = `/bonus/waves/${f.ids.wave}`;
+    const full = (await request(app).get(url)).body;
+    const preservedEntries = (await f.pg.query("select * from praemien_metric_entries order by gm_user_id,pillar_key,metric_key")).rows;
+
+    // No submitted visits are required for the current account classification to apply.
+    await f.pg.query("update users set is_supplemental_gm=true where id=$1", [f.ids.gm]);
+    for (const path of [url, `/dashboard-bonus/waves/${f.ids.wave}?includeSupplementalGms=true`]) {
+      const response = await request(app).get(path);
+      assert.equal(response.status, 200, JSON.stringify(response.body));
+      assert.equal(response.body.results.some((row: any) => row.gmId === f.ids.gm), false);
+      assert.equal(response.body.entries.some((row: any) => row.gmId === f.ids.gm), false);
+      assert.equal(response.body.results.length, 2);
+    }
+    const preview = await request(app).post(url + "/preview").send({ model: f.model });
+    assert.equal(preview.status, 200, JSON.stringify(preview.body));
+    assert.equal(preview.body.results.some((row: any) => row.gmId === f.ids.gm), false);
+    const staleEntry = { gmId: f.ids.gm, pillarKey: "displays", metricKey: "percent", value: 100, target: null, note: "Stale UI" };
+    assert.equal((await request(app).post(url + "/preview").send({ model: f.model, entries: [staleEntry] })).status, 400);
+    assert.equal((await request(app).put(url).send({ revision: full.revision, type: "values", entries: [staleEntry] })).status, 400);
+    assert.deepEqual((await f.pg.query("select * from praemien_metric_entries order by gm_user_id,pillar_key,metric_key")).rows, preservedEntries);
+
+    await f.pg.query("update praemien_waves set status='active' where id=$1", [f.ids.wave]);
+    assert.equal((await managedCumulative(f.database, [f.ids.gm, f.ids.other])).totals.has(f.ids.gm), false);
+    assert.equal((await managedGmSummary(f.database, f.ids.wave, f.ids.gm)).currentRewardEur, 0);
+
+    // Exclusion applies to the frozen projection while preserving its original rewards and ranks.
+    const snapshot = structuredClone(full);
+    snapshot.results.sort((a: any, b: any) => Number(b.gmId === f.ids.gm) - Number(a.gmId === f.ids.gm));
+    snapshot.results.forEach((row: any, index: number) => { row.rank = index + 1; row.earned = 9999 - index; });
+    await f.pg.query("update praemien_wave_settings set closed_snapshot=$1::jsonb,closed_at=now() where wave_id=$2", [JSON.stringify(snapshot), f.ids.wave]);
+    const frozen = (await request(app).get(url)).body;
+    assert.equal(frozen.results.length, 2);
+    assert.equal(frozen.results[0].rank, 1);
+    const leaderboard = await request(app).get("/bonus/leaderboard");
+    assert.equal(leaderboard.status, 200, JSON.stringify(leaderboard.body));
+    assert.equal(leaderboard.body.results.length, 2);
+    assert.equal(leaderboard.body.results.some((row: any) => row.gmId === f.ids.gm), false);
+    assert.deepEqual((await f.pg.query<{ snapshot: unknown }>("select closed_snapshot as snapshot from praemien_wave_settings where wave_id=$1", [f.ids.wave])).rows[0]!.snapshot, snapshot);
+
+    // Conversion only permits new regular work; the previous Zusatz wave remains separate.
+    const visitId = randomUUID();
+    await f.pg.query("insert into visit_sessions(id,gm_user_id,market_id,status,submitted_at) values($1,$2,$3,'submitted','2026-09-15T10:00:00Z')", [visitId, f.ids.gm, f.ids.market]);
+    await f.pg.query("update users set is_supplemental_gm=false where id=$1", [f.ids.gm]);
+    assert.equal((await request(app).get(url)).body.results.some((row: any) => row.gmId === f.ids.gm), false);
+    assert.equal((await request(app).get("/bonus/leaderboard")).body.results.some((row: any) => row.gmId === f.ids.gm), false);
+    assert.equal((await f.pg.query<{ count: number }>("select count(*)::int as count from visit_sessions where id=$1", [visitId])).rows[0]!.count, 1);
+  } finally { await f.pg.close(); }
+});
+
+test("dashboard HTTP cannot opt Zusatz work back in and hides legacy visits from current supplemental accounts", async () => {
+  const f = await praemienFixture();
+  try {
+    const express = (await import("express")).default;
+    const { createGmDashboardRouter } = await import("../src/routes/gm-dashboard.js");
+    const seeded = await installDashboardFixture(f);
+    const legacyVisit = await seeded.seedVisit({ gm: f.ids.other, when: "2026-09-30T10:00:00Z", category: "Bad", weight: "Nein" });
+    await f.pg.query("update users set is_supplemental_gm=true where id=$1", [f.ids.other]);
+    const expected = await loadDashboard(f.database, intervals, scope, true);
+    assert.equal(expected.points[0]!.visits, 3);
+    const app = express();
+    app.use(express.json(), createGmDashboardRouter(f.database));
+    const response = await request(app).post("/query").send({ intervals, scope, includeAvailabilityAudit: true, includeSupplementalGms: true });
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.deepEqual(response.body.points, expected.points);
+    assert.equal(response.body.availabilityAudit.some((row: any) => row.sessionId === legacyVisit), false);
+    const filtered = await request(app).post("/query").send({ intervals, scope: { ...scope, gmId: f.ids.other }, includeSupplementalGms: true });
+    assert.equal(filtered.body.points[0].visits, 0);
+    const facets = (await request(app).get("/facets")).body;
+    assert.equal(facets.gms.some((gm: any) => gm.id === f.ids.other), false);
   } finally { await f.pg.close(); }
 });

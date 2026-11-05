@@ -1,3 +1,4 @@
+import { regularBonusGmCondition } from "./gm-reporting-scope.js";
 import { and, desc, eq, gte, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { db, sql as pgSql } from "./db.js";
 import { loadEffectiveGmIppPeriods, loadIppPeriodCatalog } from "./ipp-gm-effective.js";
@@ -87,7 +88,7 @@ async function loadBonusCumulatives(gmUserIds: string[]): Promise<Map<string, nu
   if (!(await ensureBonusTotalsTableReady())) return result;
   const rows = await database.query<{ gmId: string; total: number | string }>(sql`
     select gm_user_id as "gmId", coalesce(sum(current_reward_eur),0) as total
-    from praemien_gm_wave_totals where gm_user_id in (${sql.join(gmUserIds.map(id => sql`${id}::uuid`),sql`,`)})
+    from praemien_gm_wave_totals where ${regularBonusGmCondition(sql`praemien_gm_wave_totals.gm_user_id`, sql`praemien_gm_wave_totals.wave_id`)} and gm_user_id in (${sql.join(gmUserIds.map(id => sql`${id}::uuid`),sql`,`)})
       ${managed.waveIds.length ? sql`and wave_id not in (${sql.join(managed.waveIds.map(id => sql`${id}::uuid`),sql`,`)})` : sql``}
     group by gm_user_id`);
   for (const row of rows) result.set(row.gmId, Number(((result.get(row.gmId) ?? 0) + normalizeNumber(row.total)).toFixed(2)));

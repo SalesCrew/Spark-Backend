@@ -1,7 +1,9 @@
 import type { Responses } from "openai/resources/responses/responses";
 import { z } from "zod";
 import type { DaySessionPayload } from "./admin-zeiterfassung.js";
-import { sql as pgSql } from "./db.js";
+import { db, sql as pgSql } from "./db.js";
+import { modelDatabase } from "./praemien-workspace.js";
+import { regularGmReportingDays } from "./gm-reporting-scope.js";
 import { loadZeiterfassungDaySessions } from "./zeiterfassung-days.js";
 
 const TIMEZONE = "Europe/Vienna";
@@ -195,7 +197,7 @@ export async function executeAdminKurtiWorktimeAnalytics(raw: unknown): Promise<
   const gms = await pgSql<GmRow[]>`
     select u.id::text, concat_ws(' ', u.first_name, u.last_name) as name, coalesce(u.region, '') as region
     from users u
-    where u.role = 'gm'
+    where u.role = 'gm' and u.is_supplemental_gm=false
       and u.deleted_at is null
       and (${input.activeOnly}::boolean = false or u.is_active = true)
       and (${requestedIds.length === 0}::boolean or u.id = any(${requestedIds}::uuid[]))
@@ -216,7 +218,8 @@ export async function executeAdminKurtiWorktimeAnalytics(raw: unknown): Promise<
     includeLive: input.includeLive,
     timezone: TIMEZONE,
   });
-  const eligible = sessions.filter((session) => input.includeLive || session.status === "submitted");
+  const reportingSessions = await regularGmReportingDays(modelDatabase(db), sessions);
+  const eligible = reportingSessions.filter((session) => input.includeLive || session.status === "submitted");
   const byGmAndPeriod = new Map<string, number[]>();
   const trackedDaysByGm = new Map<string, Set<string>>();
   for (const session of eligible) {

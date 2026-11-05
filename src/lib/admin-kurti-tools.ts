@@ -16,7 +16,9 @@ import {
   executeAdminKurtiOperationalAnalytics,
 } from "./admin-kurti-operational-analytics.js";
 import { buildGmAggregates } from "./admin-zeiterfassung.js";
-import { sql as pgSql } from "./db.js";
+import { db, sql as pgSql } from "./db.js";
+import { modelDatabase } from "./praemien-workspace.js";
+import { regularGmReportingDays } from "./gm-reporting-scope.js";
 import { readGmKpiCache } from "./gm-kpi-cache.js";
 import { loadEffectiveGmIppPeriods, type EffectiveGmIppPeriodRow } from "./ipp-gm-effective.js";
 import {
@@ -671,8 +673,8 @@ async function getAdminOverview(): Promise<JsonRecord> {
     pgSql<JsonRecord[]>`
       select
         (select count(*)::int from users where role = 'admin' and is_active = true and deleted_at is null) as active_admins,
-        (select count(*)::int from users where role = 'gm' and is_active = true and deleted_at is null) as active_gms,
-        (select count(*)::int from users where role = 'gm' and (is_active = false or deleted_at is not null)) as inactive_gms,
+        (select count(*)::int from users where role = 'gm' and is_supplemental_gm=false and is_active = true and deleted_at is null) as active_gms,
+        (select count(*)::int from users where role = 'gm' and is_supplemental_gm=false and (is_active = false or deleted_at is not null)) as inactive_gms,
         (select count(*)::int from users where role = 'sm' and is_active = true and deleted_at is null) as active_sms,
         (select count(*)::int from users where role = 'kunde' and is_active = true and deleted_at is null) as active_customer_users,
         (select count(distinct gm_user_id)::int from gm_kurti_messages where expires_at > now()) as active_gm_kurti_conversations,
@@ -681,9 +683,9 @@ async function getAdminOverview(): Promise<JsonRecord> {
         (select count(*)::int from markets where is_deleted = false and universe_market = true) as universe_markets,
         (select count(*)::int from markets where is_deleted = false and market_type in ('kuehler', 'both')) as cooler_markets,
         (select count(*)::int from market_kuehler_units where is_deleted = false) as cooler_units,
-        (select count(*)::int from visit_sessions where is_deleted = false and status = 'submitted') as submitted_visits_all_time,
-        (select count(*)::int from visit_sessions where is_deleted = false and status = 'draft') as draft_visits,
-        (select count(*)::int from visit_sessions where is_deleted = false and status = 'submitted' and submitted_at >= now() - interval '7 days') as submitted_visits_last_7_days,
+        (select count(*)::int from visit_sessions where is_supplemental_gm_snapshot=false and exists (select 1 from users reporting_gm where reporting_gm.id=visit_sessions.gm_user_id and reporting_gm.is_supplemental_gm=false) and is_deleted = false and status = 'submitted') as submitted_visits_all_time,
+        (select count(*)::int from visit_sessions where is_supplemental_gm_snapshot=false and exists (select 1 from users reporting_gm where reporting_gm.id=visit_sessions.gm_user_id and reporting_gm.is_supplemental_gm=false) and is_deleted = false and status = 'draft') as draft_visits,
+        (select count(*)::int from visit_sessions where is_supplemental_gm_snapshot=false and exists (select 1 from users reporting_gm where reporting_gm.id=visit_sessions.gm_user_id and reporting_gm.is_supplemental_gm=false) and is_deleted = false and status = 'submitted' and submitted_at >= now() - interval '7 days') as submitted_visits_last_7_days,
         (select count(*)::int from visit_answer_photos where is_deleted = false) as active_photos,
         (select count(*)::int from question_bank_shared where is_deleted = false) as active_questions,
         (select count(*)::int from lager where is_deleted = false) as active_warehouses,
@@ -709,7 +711,7 @@ async function getAdminOverview(): Promise<JsonRecord> {
   const redCounts = await pgSql<JsonRecord[]>`
     select count(*)::int as submitted_visits
     from visit_sessions
-    where is_deleted = false
+    where is_supplemental_gm_snapshot=false and exists (select 1 from users reporting_gm where reporting_gm.id=visit_sessions.gm_user_id and reporting_gm.is_supplemental_gm=false) and is_deleted = false
       and status = 'submitted'
       and submitted_at is not null
       and submitted_at >= (${redRange.startYmd}::date at time zone ${VIENNA_TIMEZONE})
@@ -817,8 +819,8 @@ async function searchGms(args: unknown): Promise<JsonRecord> {
       coalesce(k.bonus_cumulative_eur, 0)::numeric as bonus_cumulative_eur,
       k.last_computed_at as kpi_last_computed_at,
       (select count(distinct cma.market_id)::int from campaign_market_assignments cma where cma.gm_user_id = u.id and cma.is_deleted = false) as assigned_markets,
-      (select count(*)::int from visit_sessions vs where vs.gm_user_id = u.id and vs.is_deleted = false and vs.status = 'submitted') as submitted_visits,
-      (select count(*)::int from visit_sessions vs where vs.gm_user_id = u.id and vs.is_deleted = false and vs.status = 'draft') as active_visit_drafts,
+      (select count(*)::int from visit_sessions vs where vs.gm_user_id = u.id and vs.is_supplemental_gm_snapshot=false and vs.is_deleted = false and vs.status = 'submitted') as submitted_visits,
+      (select count(*)::int from visit_sessions vs where vs.gm_user_id = u.id and vs.is_supplemental_gm_snapshot=false and vs.is_deleted = false and vs.status = 'draft') as active_visit_drafts,
       (select count(*)::int from gm_day_sessions ds where ds.gm_user_id = u.id and ds.is_deleted = false and ds.status in ('started', 'ended')) as open_workdays,
       (select count(*)::int from visit_answer_change_requests r where r.gm_user_id = u.id and r.is_deleted = false and r.status = 'pending') as pending_answer_changes,
       (select count(*)::int from time_entry_change_requests r where r.gm_user_id = u.id and r.is_deleted = false and r.status = 'pending') as pending_time_changes,
@@ -826,7 +828,7 @@ async function searchGms(args: unknown): Promise<JsonRecord> {
       (select max(km.created_at) from gm_kurti_messages km where km.gm_user_id = u.id and km.expires_at > now()) as latest_active_kurti_message_at
     from users u
     left join gm_kpi_cache k on k.gm_user_id = u.id and k.is_deleted = false
-    where u.role = 'gm'
+    where u.role = 'gm' and u.is_supplemental_gm=false
       and (${input.activeOnly}::boolean = false or (u.is_active = true and u.deleted_at is null))
       and (${query}::text is null or concat_ws(' ', u.first_name, u.last_name, u.email, u.region) ilike '%' || ${query} || '%')
       and (${region}::text is null or u.region ilike ${region})
@@ -1145,13 +1147,13 @@ async function getTimeContext(args: unknown): Promise<JsonRecord> {
   }).parse(args);
   const from = parseYmd(input.from, daysAgo(30));
   const to = parseYmd(input.to, new Date());
-  const sessions = await loadZeiterfassungDaySessions({
+  const sessions = await regularGmReportingDays(modelDatabase(db), await loadZeiterfassungDaySessions({
     from,
     to,
     gmUserIds: input.gmUserId ? [input.gmUserId] : [],
     includeLive: input.includeLive,
     timezone: VIENNA_TIMEZONE,
-  });
+  }));
   const aggregates = buildGmAggregates({ sessions, timezone: VIENNA_TIMEZONE, now: new Date() });
   return envelope("get_time_context", {
     range: { from, to, includeLive: input.includeLive, timezone: VIENNA_TIMEZONE },
@@ -1332,7 +1334,7 @@ async function loadIppSamples(periods: IppPeriodMeta[]): Promise<IppSample[]> {
   if (periods.length === 0) return [];
   const periodIds = periods.map((period) => period.id);
   const periodStarts = periods.map((period) => period.startDate);
-  const computed = await computeMarketIppSummariesForRedPeriods({ redPeriodIds: periodIds });
+  const computed = await computeMarketIppSummariesForRedPeriods({ redPeriodIds: periodIds, excludeSupplementalGms: true });
   const finalizedRows = await pgSql<Array<{
     red_period_id: string | null;
     red_period_start: string;
@@ -1349,7 +1351,7 @@ async function loadIppSamples(periods: IppPeriodMeta[]): Promise<IppSample[]> {
       select vs.gm_user_id
       from visit_sessions vs
       where vs.market_id = r.market_id
-        and vs.is_deleted = false
+        and vs.is_supplemental_gm_snapshot=false and exists (select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false) and vs.is_deleted = false
         and vs.status = 'submitted'
         and vs.submitted_at is not null
         and vs.submitted_at >= (r.red_period_start::timestamp at time zone 'Europe/Vienna')
@@ -1359,6 +1361,13 @@ async function loadIppSamples(periods: IppPeriodMeta[]): Promise<IppSample[]> {
     ) latest on true
     where r.is_deleted = false
       and r.is_finalized = true
+      and not exists (
+        select 1 from visit_sessions extra where extra.market_id=r.market_id and extra.is_deleted=false and extra.status='submitted'
+          and (extra.is_supplemental_gm_snapshot=true or exists (
+            select 1 from users reporting_gm where reporting_gm.id=extra.gm_user_id and reporting_gm.is_supplemental_gm=true))
+          and extra.submitted_at >= (r.red_period_start::timestamp at time zone 'Europe/Vienna')
+          and extra.submitted_at < ((r.red_period_end+1)::timestamp at time zone 'Europe/Vienna')
+      )
       and r.red_period_start::text = any(${periodStarts}::text[])
   `;
 
@@ -1525,7 +1534,7 @@ async function getIppGmAnalytics(args: unknown): Promise<JsonRecord> {
   const selectedPeriods = catalog.filter((period) => periodIds.has(period.id));
   const [allSamples, allEffectiveRows] = await Promise.all([
     loadIppSamples(selectedPeriods),
-    loadEffectiveGmIppPeriods({ redPeriodIds: selectedPeriods.map((period) => period.id), includeEmptyGms: false }),
+    loadEffectiveGmIppPeriods({ redPeriodIds: selectedPeriods.map((period) => period.id), includeEmptyGms: false, excludeSupplementalGms: true }),
   ]);
   const region = input.region?.trim().toLocaleLowerCase("de") || null;
   const filtered = allSamples.filter((sample) =>
@@ -1684,7 +1693,7 @@ async function getIppVisitAnalytics(args: unknown): Promise<JsonRecord> {
       join users u on u.id = vs.gm_user_id
       join markets m on m.id = vs.market_id
       left join visit_session_sections s on s.visit_session_id = vs.id and s.is_deleted = false
-      where vs.id = ${input.visitSessionId}::uuid and vs.is_deleted = false
+      where vs.is_supplemental_gm_snapshot=false and exists (select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false) and vs.id = ${input.visitSessionId}::uuid and vs.is_deleted = false
       group by vs.id, u.id, m.id
       limit 1
     `
@@ -1697,7 +1706,7 @@ async function getIppVisitAnalytics(args: unknown): Promise<JsonRecord> {
       join users u on u.id = vs.gm_user_id
       join markets m on m.id = vs.market_id
       left join visit_session_sections s on s.visit_session_id = vs.id and s.is_deleted = false
-      where vs.is_deleted = false
+      where vs.is_supplemental_gm_snapshot=false and exists (select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false) and vs.is_deleted = false
         and vs.status = 'submitted'
         and vs.submitted_at is not null
         and vs.submitted_at >= (${fromDate}::date::timestamp at time zone 'Europe/Vienna')
@@ -1784,10 +1793,10 @@ async function getIppContext(args: unknown): Promise<JsonRecord> {
   const range = redMonthPeriodToYmd(period);
   if (input.marketId) {
     const [market] = await pgSql<JsonRecord[]>`select id, name, db_name as chain, standard_market_number, region, current_gm_name from markets where id = ${input.marketId} and is_deleted = false limit 1`;
-    const computation = await computeMarketIppForPeriod({ marketId: input.marketId, periodStart: period.start, periodEnd: period.end });
+    const computation = await computeMarketIppForPeriod({ marketId: input.marketId, periodStart: period.start, periodEnd: period.end, excludeSupplementalGms: true });
     return envelope("get_ipp_context", { market: market ?? null, redPeriod: { label: period.label, ...range }, computation }, { marketId: input.marketId });
   }
-  const summaries = Array.from((await computeMarketIppSummariesForPeriod({ periodStart: period.start, periodEnd: period.end })).values())
+  const summaries = Array.from((await computeMarketIppSummariesForPeriod({ periodStart: period.start, periodEnd: period.end, excludeSupplementalGms: true })).values())
     .sort((a, b) => b.marketIpp - a.marketIpp)
     .slice(0, input.limit);
   const ids = summaries.map((row) => row.marketId);
@@ -1805,7 +1814,10 @@ async function getBonusContext(args: unknown): Promise<JsonRecord> {
            (select count(*)::int from praemien_wave_thresholds t where t.wave_id = w.id and t.is_deleted = false) as threshold_count,
            (select count(*)::int from praemien_wave_pillars p where p.wave_id = w.id and p.is_deleted = false) as pillar_count,
            (select count(*)::int from praemien_wave_sources s where s.wave_id = w.id and s.is_deleted = false) as source_count,
-           (select count(*)::int from praemien_gm_wave_totals gt where gt.wave_id = w.id) as gm_total_count
+           (select count(*)::int from praemien_gm_wave_totals gt join users u on u.id=gt.gm_user_id where gt.wave_id = w.id
+             and u.is_supplemental_gm=false and not exists (
+               select 1 from visit_sessions v where v.gm_user_id=u.id and v.is_supplemental_gm_snapshot=true and v.is_deleted=false and v.status='submitted'
+                 and (v.submitted_at at time zone 'Europe/Vienna')::date between w.start_date and w.end_date)) as gm_total_count
     from praemien_waves w
     where w.is_deleted = false and (${input.waveId}::uuid is null or w.id = ${input.waveId}::uuid)
     order by w.year desc, w.quarter desc
@@ -1819,7 +1831,12 @@ async function getBonusContext(args: unknown): Promise<JsonRecord> {
     pgSql<JsonRecord[]>`
       select gt.*, concat_ws(' ', u.first_name, u.last_name) as gm_name, u.region
       from praemien_gm_wave_totals gt join users u on u.id = gt.gm_user_id
-      where (${input.waveId}::uuid is null or gt.wave_id = ${input.waveId}::uuid)
+      where u.is_supplemental_gm=false and not exists (
+        select 1 from visit_sessions reporting_visit join praemien_waves reporting_wave on reporting_wave.id=gt.wave_id
+        where reporting_visit.gm_user_id=u.id and reporting_visit.is_supplemental_gm_snapshot=true
+          and reporting_visit.is_deleted=false and reporting_visit.status='submitted'
+          and (reporting_visit.submitted_at at time zone 'Europe/Vienna')::date between reporting_wave.start_date and reporting_wave.end_date
+      ) and (${input.waveId}::uuid is null or gt.wave_id = ${input.waveId}::uuid)
         and (${input.gmUserId}::uuid is null or gt.gm_user_id = ${input.gmUserId}::uuid)
       order by gt.current_reward_eur desc, gt.total_points desc
       limit ${input.limit}
@@ -1829,7 +1846,12 @@ async function getBonusContext(args: unknown): Promise<JsonRecord> {
       from praemien_gm_wave_pillar_totals pt
       join praemien_wave_pillars p on p.id = pt.pillar_id
       join users u on u.id = pt.gm_user_id
-      where (${input.waveId}::uuid is null or pt.wave_id = ${input.waveId}::uuid)
+      where u.is_supplemental_gm=false and not exists (
+        select 1 from visit_sessions reporting_visit join praemien_waves reporting_wave on reporting_wave.id=pt.wave_id
+        where reporting_visit.gm_user_id=u.id and reporting_visit.is_supplemental_gm_snapshot=true
+          and reporting_visit.is_deleted=false and reporting_visit.status='submitted'
+          and (reporting_visit.submitted_at at time zone 'Europe/Vienna')::date between reporting_wave.start_date and reporting_wave.end_date
+      ) and (${input.waveId}::uuid is null or pt.wave_id = ${input.waveId}::uuid)
         and (${input.gmUserId}::uuid is null or pt.gm_user_id = ${input.gmUserId}::uuid)
       order by pt.wave_id, pt.gm_user_id, p.order_index
       limit ${input.limit}
@@ -1837,13 +1859,23 @@ async function getBonusContext(args: unknown): Promise<JsonRecord> {
     pgSql<JsonRecord[]>`
       select q.*, concat_ws(' ', u.first_name, u.last_name) as gm_name
       from praemien_wave_quality_scores q join users u on u.id = q.gm_user_id
-      where q.is_deleted = false and (${input.waveId}::uuid is null or q.wave_id = ${input.waveId}::uuid) and (${input.gmUserId}::uuid is null or q.gm_user_id = ${input.gmUserId}::uuid)
+      where u.is_supplemental_gm=false and not exists (
+        select 1 from visit_sessions reporting_visit join praemien_waves reporting_wave on reporting_wave.id=q.wave_id
+        where reporting_visit.gm_user_id=u.id and reporting_visit.is_supplemental_gm_snapshot=true
+          and reporting_visit.is_deleted=false and reporting_visit.status='submitted'
+          and (reporting_visit.submitted_at at time zone 'Europe/Vienna')::date between reporting_wave.start_date and reporting_wave.end_date
+      ) and q.is_deleted = false and (${input.waveId}::uuid is null or q.wave_id = ${input.waveId}::uuid) and (${input.gmUserId}::uuid is null or q.gm_user_id = ${input.gmUserId}::uuid)
       limit ${input.limit}
     `,
     pgSql<JsonRecord[]>`
       select f.*, concat_ws(' ', u.first_name, u.last_name) as gm_name
       from praemien_wave_flex_scores f join users u on u.id = f.gm_user_id
-      where f.is_deleted = false and (${input.waveId}::uuid is null or f.wave_id = ${input.waveId}::uuid) and (${input.gmUserId}::uuid is null or f.gm_user_id = ${input.gmUserId}::uuid)
+      where u.is_supplemental_gm=false and not exists (
+        select 1 from visit_sessions reporting_visit join praemien_waves reporting_wave on reporting_wave.id=f.wave_id
+        where reporting_visit.gm_user_id=u.id and reporting_visit.is_supplemental_gm_snapshot=true
+          and reporting_visit.is_deleted=false and reporting_visit.status='submitted'
+          and (reporting_visit.submitted_at at time zone 'Europe/Vienna')::date between reporting_wave.start_date and reporting_wave.end_date
+      ) and f.is_deleted = false and (${input.waveId}::uuid is null or f.wave_id = ${input.waveId}::uuid) and (${input.gmUserId}::uuid is null or f.gm_user_id = ${input.gmUserId}::uuid)
       limit ${input.limit}
     `,
   ]);
@@ -2180,7 +2212,7 @@ async function getEvaluationContext(args: unknown): Promise<JsonRecord> {
     join visit_session_questions q on q.id = a.visit_session_question_id and q.is_deleted = false
     join visit_session_sections s on s.id = a.visit_session_section_id and s.is_deleted = false
     join visit_sessions vs on vs.id = a.visit_session_id and vs.is_deleted = false
-    where a.is_deleted = false
+    where vs.is_supplemental_gm_snapshot=false and exists (select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false) and a.is_deleted = false
       and (${input.questionId}::uuid is null or q.question_id = ${input.questionId})
       and (${input.moduleId}::uuid is null or q.module_id = ${input.moduleId})
       and (${input.questionnaireId}::uuid is null or s.fragebogen_id = ${input.questionnaireId})
@@ -2292,7 +2324,7 @@ async function getEvaluationContext(args: unknown): Promise<JsonRecord> {
     join users u on u.id = vs.gm_user_id
     join markets m on m.id = vs.market_id
     left join campaigns c on c.id = s.campaign_id
-    where a.is_deleted = false
+    where vs.is_supplemental_gm_snapshot=false and exists (select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false) and a.is_deleted = false
       and (${input.questionId}::uuid is null or q.question_id = ${input.questionId})
       and (${input.moduleId}::uuid is null or q.module_id = ${input.moduleId})
       and (${input.questionnaireId}::uuid is null or s.fragebogen_id = ${input.questionnaireId})

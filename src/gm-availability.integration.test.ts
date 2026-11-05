@@ -81,7 +81,7 @@ test("campaign export HTTP selects the same Vienna visit-date boundaries, even a
   const f = await praemienFixture();
   try {
     const fixture = await installDashboardFixture(f), campaign = randomUUID();
-    await f.pg.exec("create table campaigns(id uuid primary key,is_deleted boolean default false); update visit_sessions set is_deleted=true");
+    await f.pg.exec("create table if not exists campaigns(id uuid primary key,is_deleted boolean default false); update visit_sessions set is_deleted=true");
     await f.pg.query("insert into campaigns(id) values($1)", [campaign]);
     const late = await fixture.seedVisit({ when: "2026-09-21T08:00:00+02:00", startedAt: "2026-09-20T23:59:00+02:00", category: "Top", mixed: true });
     const monday = await fixture.seedVisit({ when: "2026-09-21T08:00:00+02:00", startedAt: "2026-09-20T22:00:00Z", category: "Bad" });

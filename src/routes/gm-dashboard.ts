@@ -93,10 +93,10 @@ export function createGmDashboardRouter(
         input.data.intervals,
         input.data.scope,
         input.data.includeAvailabilityAudit ?? false,
-        input.data.includeSupplementalGms ?? false,
+        false,
       );
       if (effectiveIpp)
-        await effectiveIpp(input.data.intervals, input.data.scope, data, input.data.includeSupplementalGms ?? false);
+        await effectiveIpp(input.data.intervals, input.data.scope, data, false);
       res.set("Cache-Control", "private, no-store").json(data);
     } catch (error) {
       if (error instanceof SyntaxError) {

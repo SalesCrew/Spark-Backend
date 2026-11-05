@@ -40,6 +40,7 @@ export async function praemienFixture() {
       "utf8",
     ),
   );
+  await pg.exec(await readFile(new URL("../../supabase/migrations/20261029184231_gm_supplemental_budget.sql", import.meta.url), "utf8"));
   const database = modelDatabase(drizzle(pg));
   const ids = {
     admin: randomUUID(),
@@ -54,7 +55,7 @@ export async function praemienFixture() {
     catalogCampaign: randomUUID(),
   };
   await pg.query(
-    `insert into users values($1,'Lokal','Admin','admin',true),($2,'GM Test','Nord','gm',true),($3,'GM Test','Süd','gm',true),($4,'GM Test','Historie','gm',false)`,
+    `insert into users(id,first_name,last_name,role,is_active) values($1,'Lokal','Admin','admin',true),($2,'GM Test','Nord','gm',true),($3,'GM Test','Süd','gm',true),($4,'GM Test','Historie','gm',false)`,
     [ids.admin, ids.gm, ids.other, ids.inactive],
   );
   await pg.query(
@@ -121,6 +122,6 @@ export async function praemienFixture() {
     { id: ids.admin, name: "Lokal Admin" },
     { type: "values", entries: values },
   );
-  await pg.exec(await readFile(new URL("../../supabase/migrations/20261029184231_gm_supplemental_budget.sql", import.meta.url), "utf8"));
+
   return { pg, database, ids, workspace, model };
 }

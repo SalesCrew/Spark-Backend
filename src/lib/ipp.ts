@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, lt } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { addDays, startOfDay } from "./red-monat.js";
 import { db, sql as pgSql } from "./db.js";
 import {
@@ -350,6 +350,7 @@ async function buildQuestionRowsFromLatestAnswers(latestAnswers: LatestAnswerRow
 export async function computeMarketIppSummariesForPeriod(input: {
   periodStart: Date;
   periodEnd: Date;
+  excludeSupplementalGms?: boolean;
 }): Promise<Map<string, IppMarketPeriodSummary>> {
   const { start, endExclusive } = toPeriodBounds(input.periodStart, input.periodEnd);
   const periodEnd = addDays(endExclusive, -1);
@@ -362,6 +363,9 @@ export async function computeMarketIppSummariesForPeriod(input: {
       (array_agg(vs.gm_user_id::text order by vs.submitted_at desc))[1] as latest_gm_user_id
     from visit_sessions vs
     where vs.is_deleted = false
+      and (${!input.excludeSupplementalGms} or (vs.is_supplemental_gm_snapshot=false and exists (
+        select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false
+      )))
       and vs.status = 'submitted'
       and vs.submitted_at is not null
       and vs.submitted_at >= ${startIso}::timestamptz
@@ -404,6 +408,9 @@ export async function computeMarketIppSummariesForPeriod(input: {
       on vss.id = va.visit_session_section_id
       and vss.is_deleted = false
     where vs.is_deleted = false
+      and (${!input.excludeSupplementalGms} or (vs.is_supplemental_gm_snapshot=false and exists (
+        select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false
+      )))
       and vs.status = 'submitted'
       and vs.submitted_at is not null
       and vs.submitted_at >= ${startIso}::timestamptz
@@ -474,7 +481,9 @@ export async function computeMarketIppSummariesForRedPeriods(input: {
       and vs.submitted_at < ((p.end_date + 1)::timestamp at time zone 'Europe/Vienna')
       and vs.is_deleted = false
       and vs.status = 'submitted'
-      and (${!input.excludeSupplementalGms} or vs.is_supplemental_gm_snapshot = false)
+      and (${!input.excludeSupplementalGms} or (vs.is_supplemental_gm_snapshot = false and exists (
+        select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false
+      )))
     where p.id = any(${redPeriodIds}::uuid[])
       and p.is_deleted = false
     group by p.id, p.label, p.red_year, p.period_index, p.start_date, p.end_date, vs.market_id
@@ -513,7 +522,9 @@ export async function computeMarketIppSummariesForRedPeriods(input: {
       and vs.submitted_at < ((p.end_date + 1)::timestamp at time zone 'Europe/Vienna')
       and vs.is_deleted = false
       and vs.status = 'submitted'
-      and (${!input.excludeSupplementalGms} or vs.is_supplemental_gm_snapshot = false)
+      and (${!input.excludeSupplementalGms} or (vs.is_supplemental_gm_snapshot = false and exists (
+        select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false
+      )))
     join visit_answers va on va.visit_session_id = vs.id and va.is_deleted = false
     join visit_session_questions vsq on vsq.id = va.visit_session_question_id and vsq.is_deleted = false
     join visit_session_sections vss on vss.id = va.visit_session_section_id and vss.is_deleted = false
@@ -555,6 +566,7 @@ export async function computeMarketIppForPeriod(input: {
   marketId: string;
   periodStart: Date;
   periodEnd: Date;
+  excludeSupplementalGms?: boolean;
 }): Promise<IppMarketPeriodComputation> {
   const { start, endExclusive } = toPeriodBounds(input.periodStart, input.periodEnd);
 
@@ -567,6 +579,9 @@ export async function computeMarketIppForPeriod(input: {
     .where(
       and(
         eq(visitSessions.marketId, input.marketId),
+        input.excludeSupplementalGms ? sql`visit_sessions.is_supplemental_gm_snapshot=false and exists (
+          select 1 from users reporting_gm where reporting_gm.id=visit_sessions.gm_user_id and reporting_gm.is_supplemental_gm=false
+        )` : undefined,
         eq(visitSessions.isDeleted, false),
         eq(visitSessions.status, "submitted"),
         isNotNull(visitSessions.submittedAt),

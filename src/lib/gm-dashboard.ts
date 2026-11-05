@@ -1,3 +1,4 @@
+import { regularGmVisitSql } from "./gm-reporting-scope.js";
 import { sql } from "drizzle-orm";
 import type { ModelDatabase } from "./praemien-workspace.js";
 import { loadAvailabilityAudit } from "./gm-availability.js";
@@ -228,7 +229,7 @@ export async function dashboardMetadata(database: ModelDatabase) {
       select (min(least(coalesce(s.started_at,s.submitted_at),s.submitted_at)) at time zone 'Europe/Vienna')::date::text as "firstEntryDate"
       from visit_sessions s join markets m on m.id=s.market_id
       where s.is_deleted=false and s.status='submitted' and s.submitted_at is not null
-        and s.is_supplemental_gm_snapshot=false
+        and ${sql.raw(regularGmVisitSql("s"))}
         and s.submitted_at < (((now() at time zone 'Europe/Vienna')::date+1)::timestamp at time zone 'Europe/Vienna')
     `);
   return { firstEntryDate: firstEntries[0]?.firstEntryDate ?? null };
@@ -239,7 +240,7 @@ export async function dashboardFacets(
 ): Promise<DashboardFacets> {
   const [markets, gms, firstEntries] = await Promise.all([
     database.query<DashboardFacets["markets"][number]>(
-      sql`select id,concat_ws(' · ',nullif(name,''),nullif(address,''),nullif(concat_ws(' ',postal_code,city),'')) as label,coalesce(nullif(region,''),'Unbekannt') as region,'' as "gmName",coalesce(db_name,'') as chain,concat_ws(' ',name,db_name,address,postal_code,city,region,flex_number,standard_market_number,coke_master_number) as "searchText" from markets m where is_deleted=false and (not exists(select 1 from visit_sessions v where v.market_id=m.id and v.is_deleted=false and v.status='submitted' and v.is_supplemental_gm_snapshot=true) or exists(select 1 from visit_sessions v where v.market_id=m.id and v.is_deleted=false and v.status='submitted' and v.is_supplemental_gm_snapshot=false)) order by name,address,id`,
+      sql`select id,concat_ws(' · ',nullif(name,''),nullif(address,''),nullif(concat_ws(' ',postal_code,city),'')) as label,coalesce(nullif(region,''),'Unbekannt') as region,'' as "gmName",coalesce(db_name,'') as chain,concat_ws(' ',name,db_name,address,postal_code,city,region,flex_number,standard_market_number,coke_master_number) as "searchText" from markets m where is_deleted=false and (not exists(select 1 from visit_sessions v where v.market_id=m.id and v.is_deleted=false and v.status='submitted' and not ${sql.raw(regularGmVisitSql("v"))}) or exists(select 1 from visit_sessions v where v.market_id=m.id and v.is_deleted=false and v.status='submitted' and ${sql.raw(regularGmVisitSql("v"))})) order by name,address,id`,
     ),
     database.query<DashboardFacets["gms"][number]>(
       sql`select id,concat_ws(' ',first_name,last_name) || case when is_active=false then ' (inaktiv)' else '' end as label,coalesce(nullif(region,''),'Unbekannt') as region from users where role='gm' and is_supplemental_gm=false order by first_name,last_name,id`,
@@ -272,7 +273,7 @@ export async function loadDashboard(
       select p.id as interval_id,s.* from periods p join visit_sessions s on s.submitted_at>=p.lo and s.submitted_at<p.hi
       join markets m on m.id=s.market_id
       where s.is_deleted=false and s.status='submitted'
-        and (${includeSupplementalGms} or s.is_supplemental_gm_snapshot=false)
+        and ${sql.raw(regularGmVisitSql("s"))}
         and (${scope.stc}::text is null or m.visit_frequency_per_year between ${stcFrequency?.[0] ?? 0} and ${stcFrequency?.[1] ?? 0})
         and (${scope.gmId}::uuid is null or s.gm_user_id=${scope.gmId}::uuid)
         and (${scope.marketId}::uuid is null or m.id=${scope.marketId}::uuid)
@@ -330,7 +331,7 @@ export async function loadDashboard(
       ) k join question_scoring sc on sc.question_id=q.question_id and sc.score_key=k.key and sc.is_deleted=false
     ) weights on true
     order by s.interval_id,s.submitted_at,a.changed_at,a.id
-  `), loadAvailabilityAudit(database, intervals, scope, !includeSupplementalGms)]);
+  `), loadAvailabilityAudit(database, intervals, scope, true)]);
   const data = aggregateDashboard(intervals, rows, scope);
   for (const point of data.points) Object.assign(point, summarizeAvailability(audit, point.id));
   if (includeAvailabilityAudit) data.availabilityAudit = audit;

@@ -189,7 +189,9 @@ async function loadMarketSamples(periods: IppPeriodMeta[], excludeSupplementalGm
       where vs.market_id = r.market_id
         and vs.is_deleted = false
         and vs.status = 'submitted'
-        and (${!excludeSupplementalGms} or vs.is_supplemental_gm_snapshot = false)
+        and (${!excludeSupplementalGms} or (vs.is_supplemental_gm_snapshot = false and exists (
+        select 1 from users reporting_gm where reporting_gm.id=vs.gm_user_id and reporting_gm.is_supplemental_gm=false
+      )))
         and vs.submitted_at is not null
         and vs.submitted_at >= (r.red_period_start::timestamp at time zone 'Europe/Vienna')
         and vs.submitted_at < ((r.red_period_end + 1)::timestamp at time zone 'Europe/Vienna')
@@ -203,7 +205,9 @@ async function loadMarketSamples(periods: IppPeriodMeta[], excludeSupplementalGm
       and (${!excludeSupplementalGms} or not exists (
         select 1 from visit_sessions extra where extra.market_id=r.market_id
           and extra.status='submitted' and extra.is_deleted=false
-          and extra.is_supplemental_gm_snapshot=true
+          and (extra.is_supplemental_gm_snapshot=true or exists (
+            select 1 from users reporting_gm where reporting_gm.id=extra.gm_user_id and reporting_gm.is_supplemental_gm=true
+          ))
           and extra.submitted_at >= (r.red_period_start::timestamp at time zone 'Europe/Vienna')
           and extra.submitted_at < ((r.red_period_end+1)::timestamp at time zone 'Europe/Vienna')
       ))
@@ -286,7 +290,7 @@ export async function loadEffectiveGmIppPeriods(input: {
   const gmRows = await db
     .select({ id: users.id, firstName: users.firstName, lastName: users.lastName, region: users.region, isActive: users.isActive })
     .from(users)
-    .where(and(eq(users.role, "gm"), isNull(users.deletedAt)));
+    .where(and(eq(users.role, "gm"), isNull(users.deletedAt), input.excludeSupplementalGms ? eq(users.isSupplementalGm, false) : undefined));
   const eligibleGms = gmRows.filter((gm) => !requestedGmIds || requestedGmIds.has(gm.id));
   const gmById = new Map(eligibleGms.map((gm) => [gm.id, gm]));
   const samplesByKey = new Map<string, MarketSample[]>();
@@ -308,8 +312,12 @@ export async function loadEffectiveGmIppPeriods(input: {
       and v.submitted_at < ((p.end_date+1)::timestamp at time zone 'Europe/Vienna')
     where p.id=any(${requestedPeriodIds}::uuid[]) and v.is_deleted=false
       and v.status='submitted' and (v.is_supplemental_gm_snapshot=true or exists (
+        select 1 from users reporting_gm where reporting_gm.id=v.gm_user_id and reporting_gm.is_supplemental_gm=true
+      ) or exists (
         select 1 from visit_sessions extra where extra.market_id=v.market_id
-          and extra.is_deleted=false and extra.status='submitted' and extra.is_supplemental_gm_snapshot=true
+          and extra.is_deleted=false and extra.status='submitted' and (extra.is_supplemental_gm_snapshot=true or exists (
+            select 1 from users reporting_gm where reporting_gm.id=extra.gm_user_id and reporting_gm.is_supplemental_gm=true
+          ))
           and extra.submitted_at >= (p.start_date::timestamp at time zone 'Europe/Vienna')
           and extra.submitted_at < ((p.end_date+1)::timestamp at time zone 'Europe/Vienna')
       ))

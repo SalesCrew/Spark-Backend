@@ -246,12 +246,8 @@ async function observations(
     numeric: r.numeric === null ? null : Number(r.numeric),
   }));
 }
-/** Whole-wave rewards cannot be split by individual visit. Separate the entire
- * GM/wave when it contains supplemental work, including after conversion. This
- * only filters the dashboard read; original bonus records/exports stay intact. */
-export async function readDashboardWorkspace(database: ModelDatabase, id: string): Promise<Workspace> {
-  if (!(await workspaceReady(database))) throw new ModelError(503, "Prämien noch nicht eingerichtet.");
-  const wave = await waveInfo(database, id);
+/** Shared by bonus administration, dashboard, exports and frozen-wave reads. */
+export async function excludedBonusGmIds(database: ModelDatabase, wave: WaveInfo): Promise<Set<string>> {
   const excluded = await database.query<{ id: string }>(sql`
     select u.id from users u where u.role='gm' and (u.is_supplemental_gm=true or exists (
       select 1 from visit_sessions v where v.gm_user_id=u.id
@@ -259,9 +255,10 @@ export async function readDashboardWorkspace(database: ModelDatabase, id: string
         and (v.submitted_at at time zone 'Europe/Vienna')::date between ${wave.startDate}::date and ${wave.endDate}::date
     ))
   `);
-  // Fetch with the excluded roster removed BEFORE model evaluation; do not
-  // filter already-calculated sums/means. Frozen waves are stored per GM.
-  return readWorkspace(database, id, undefined, new Set(excluded.map(r => r.id)));
+  return new Set(excluded.map(row => row.id));
+}
+export async function readDashboardWorkspace(database: ModelDatabase, id: string): Promise<Workspace> {
+  return readWorkspace(database, id);
 }
 export async function readWorkspace(
   database: ModelDatabase,
@@ -275,6 +272,7 @@ export async function readWorkspace(
       "Prämien-Erweiterung noch nicht eingerichtet. Die vorbereitete Migration muss zuerst in der jeweiligen Umgebung angewendet werden.",
     );
   const wave = await waveInfo(database, id);
+  excludedGmIds = new Set([...excludedGmIds, ...await excludedBonusGmIds(database, wave)]);
   const config = await settings(database, id);
   if (config?.snapshot) {
     const history = !gmId
@@ -282,11 +280,19 @@ export async function readWorkspace(
           sql`select id,revision,event_type as type,actor_name as actor,created_at::text as at,payload from praemien_wave_events where wave_id=${id} order by created_at desc,id desc limit 100`,
         )
       : [];
+    let lastEarned: number | undefined, rank = 0;
+    const results = config.snapshot.results.filter(row => !excludedGmIds.has(row.gmId))
+      .map((row, index) => {
+        if (row.earned !== lastEarned) rank = index + 1;
+        lastEarned = row.earned;
+        return { ...row, rank };
+      });
     return {
       ...config.snapshot,
+      ...(config.snapshot.legacyTotals ? { legacyTotals: config.snapshot.legacyTotals.filter(row => !excludedGmIds.has(row.gmId)) } : {}),
       results: gmId
-        ? config.snapshot.results.filter((r) => r.gmId === gmId && !excludedGmIds.has(r.gmId))
-        : config.snapshot.results.filter(r => !excludedGmIds.has(r.gmId)),
+        ? results.filter((r) => r.gmId === gmId)
+        : results,
       entries: gmId
         ? config.snapshot.entries.filter((e) => e.gmId === gmId && !excludedGmIds.has(e.gmId))
         : config.snapshot.entries.filter(e => !excludedGmIds.has(e.gmId)),
@@ -458,7 +464,8 @@ export async function mutateWorkspace(
               )})`,
             )
           : [];
-        if (known.length !== gmIds.length)
+        const excluded = await excludedBonusGmIds(tx, wave);
+        if (known.length !== gmIds.length || gmIds.some(gmId => excluded.has(gmId)))
           throw new ModelError(400, "Ungültiger GM.");
         if (
           new Set(entries.map((e) => `${e.gmId}/${e.pillarKey}/${e.metricKey}`))
@@ -558,7 +565,9 @@ export async function simulateWorkspace(
   workspace.model = model;
   if (proposedEntries) {
     const entries = z.array(entrySchema).max(2000).parse(proposedEntries);
+    const excluded = await excludedBonusGmIds(database, workspace.wave);
     for (const entry of entries) {
+      if (excluded.has(entry.gmId)) throw new ModelError(400, "Zusatz-GMs sind von der Prämienauswertung ausgeschlossen.");
       const metric = model.pillars
         .find((p) => p.key === entry.pillarKey)
         ?.metrics.find((m) => m.key === entry.metricKey);
@@ -592,9 +601,11 @@ export async function simulateWorkspace(
   }>(
     sql`select id as "gmId", trim(first_name || ' ' || last_name) as name, is_active as active from users where role='gm'`,
   );
+  const excludedGmIds = await excludedBonusGmIds(database, workspace.wave);
+  workspace.entries = workspace.entries.filter(entry => !excludedGmIds.has(entry.gmId));
   workspace.results = evaluateModel(
     model,
-    roster,
+    roster.filter(gm => !excludedGmIds.has(gm.gmId)),
     workspace.entries,
     await observations(database, workspace.wave, model),
   );

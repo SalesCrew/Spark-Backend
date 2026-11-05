@@ -1,3 +1,4 @@
+import { regularBonusGmCondition } from "../lib/gm-reporting-scope.js";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { type Response, Router } from "express";
 import { z } from "zod";
@@ -473,7 +474,7 @@ async function loadWaveGraph(waveId: string) {
       })
       .from(praemienWaveQualityScores)
       .innerJoin(users, eq(users.id, praemienWaveQualityScores.gmUserId))
-      .where(and(eq(praemienWaveQualityScores.waveId, waveId), eq(praemienWaveQualityScores.isDeleted, false)))
+      .where(and(eq(praemienWaveQualityScores.waveId, waveId), eq(praemienWaveQualityScores.isDeleted, false), regularBonusGmCondition(sql`users.id`, sql`praemien_wave_quality_scores.wave_id`)))
       .orderBy(asc(users.lastName), asc(users.firstName)),
     db
       .select({
@@ -489,7 +490,7 @@ async function loadWaveGraph(waveId: string) {
       })
       .from(praemienWaveFlexScores)
       .innerJoin(users, eq(users.id, praemienWaveFlexScores.gmUserId))
-      .where(and(eq(praemienWaveFlexScores.waveId, waveId), eq(praemienWaveFlexScores.isDeleted, false)))
+      .where(and(eq(praemienWaveFlexScores.waveId, waveId), eq(praemienWaveFlexScores.isDeleted, false), regularBonusGmCondition(sql`users.id`, sql`praemien_wave_flex_scores.wave_id`)))
       .orderBy(asc(users.lastName), asc(users.firstName)),
     db
       .select({
@@ -507,6 +508,7 @@ async function loadWaveGraph(waveId: string) {
       .where(and(
         eq(praemienWavePillarOverrides.waveId, waveId),
         eq(praemienWavePillarOverrides.isDeleted, false),
+        regularBonusGmCondition(sql`users.id`, sql`praemien_wave_pillar_overrides.wave_id`),
       ))
       .orderBy(asc(users.lastName), asc(users.firstName), asc(praemienWavePillarOverrides.pillarId)),
   ]);
@@ -1050,7 +1052,7 @@ async function replaceQualityScoresTx(tx: Tx, waveId: string, qualityScores: z.i
     ? await tx
         .select({ id: users.id, role: users.role })
         .from(users)
-        .where(and(inArray(users.id, gmIds), eq(users.role, "gm"), sql`${users.deletedAt} is null`))
+        .where(and(inArray(users.id, gmIds), eq(users.role, "gm"), sql`${users.deletedAt} is null`, regularBonusGmCondition(sql`${users.id}`, sql`${waveId}::uuid`)))
     : [];
   const validGmIdSet = new Set(gmUsers.map((entry) => entry.id));
   for (const entry of qualityScores) {
@@ -1062,7 +1064,7 @@ async function replaceQualityScoresTx(tx: Tx, waveId: string, qualityScores: z.i
   await tx
     .update(praemienWaveQualityScores)
     .set({ isDeleted: true, deletedAt: now, updatedAt: now })
-    .where(and(eq(praemienWaveQualityScores.waveId, waveId), eq(praemienWaveQualityScores.isDeleted, false)));
+    .where(and(eq(praemienWaveQualityScores.waveId, waveId), eq(praemienWaveQualityScores.isDeleted, false), regularBonusGmCondition(sql`${praemienWaveQualityScores.gmUserId}`, sql`${waveId}::uuid`)));
 
   for (const entry of qualityScores) {
     const totalPoints = Math.round((entry.zeiterfassung + entry.reporting + entry.accuracy) / 3);
@@ -1090,7 +1092,7 @@ async function replaceFlexScoresTx(tx: Tx, waveId: string, flexScores: z.infer<t
     ? await tx
         .select({ id: users.id, role: users.role })
         .from(users)
-        .where(and(inArray(users.id, gmIds), eq(users.role, "gm"), sql`${users.deletedAt} is null`))
+        .where(and(inArray(users.id, gmIds), eq(users.role, "gm"), sql`${users.deletedAt} is null`, regularBonusGmCondition(sql`${users.id}`, sql`${waveId}::uuid`)))
     : [];
   const validGmIdSet = new Set(gmUsers.map((entry) => entry.id));
   for (const entry of flexScores) {
@@ -1102,7 +1104,7 @@ async function replaceFlexScoresTx(tx: Tx, waveId: string, flexScores: z.infer<t
   await tx
     .update(praemienWaveFlexScores)
     .set({ isDeleted: true, deletedAt: now, updatedAt: now })
-    .where(and(eq(praemienWaveFlexScores.waveId, waveId), eq(praemienWaveFlexScores.isDeleted, false)));
+    .where(and(eq(praemienWaveFlexScores.waveId, waveId), eq(praemienWaveFlexScores.isDeleted, false), regularBonusGmCondition(sql`${praemienWaveFlexScores.gmUserId}`, sql`${waveId}::uuid`)));
 
   for (const entry of flexScores) {
     await tx.insert(praemienWaveFlexScores).values({
@@ -1149,7 +1151,7 @@ async function replacePillarOverridesTx(
           .where(and(
             inArray(users.id, gmIds),
             eq(users.role, "gm"),
-            sql`${users.deletedAt} is null`,
+            sql`${users.deletedAt} is null`, regularBonusGmCondition(sql`${users.id}`, sql`${waveId}::uuid`),
           ))
       : [],
     pillarIds.length
@@ -1186,6 +1188,7 @@ async function replacePillarOverridesTx(
     .where(and(
       eq(praemienWavePillarOverrides.waveId, waveId),
       eq(praemienWavePillarOverrides.isDeleted, false),
+      regularBonusGmCondition(sql`${praemienWavePillarOverrides.gmUserId}`, sql`${waveId}::uuid`),
     ));
 
   for (const entry of pillarOverrides) {

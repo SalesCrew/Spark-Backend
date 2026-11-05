@@ -132,17 +132,8 @@ export function createPraemienWorkspaceRouter(database: ModelDatabase) {
   });
   router.get("/leaderboard", async (_req, res, next) => {
     try {
-      const snapshots = await database.query<{
-        snapshot: {
-          results: {
-            gmId: string;
-            name: string;
-            active: boolean;
-            earned: number;
-          }[];
-        };
-      }>(
-        sql`select closed_snapshot as snapshot from praemien_wave_settings where closed_snapshot is not null`,
+      const waves = await database.query<{ id: string }>(
+        sql`select s.wave_id as id from praemien_wave_settings s join praemien_waves w on w.id=s.wave_id where s.closed_snapshot is not null and w.is_deleted=false`,
       );
       const totals = new Map<
         string,
@@ -154,13 +145,15 @@ export function createPraemienWorkspaceRouter(database: ModelDatabase) {
           quarters: number;
         }
       >();
-      for (const row of snapshots)
-        for (const gm of row.snapshot.results) {
+      for (const wave of waves) {
+        const workspace = await readWorkspace(database, wave.id);
+        for (const gm of workspace.results) {
           const old = totals.get(gm.gmId) ?? { ...gm, earned: 0, quarters: 0 };
           old.earned = Math.round((old.earned + gm.earned) * 100) / 100;
           old.quarters++;
           totals.set(gm.gmId, old);
         }
+      }
       res.json({
         results: [...totals.values()].sort(
           (a, b) => b.earned - a.earned || a.name.localeCompare(b.name, "de"),
