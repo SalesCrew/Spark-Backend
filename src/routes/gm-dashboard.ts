@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { dashboardFacets, dashboardMetadata, loadDashboard } from "../lib/gm-dashboard.js";
 import type { ModelDatabase } from "../lib/praemien-workspace.js";
+import { createDashboardReportsRouter } from "./gm-dashboard-reports.js";
 import type {
   DashboardData,
   DashboardInterval,
@@ -46,8 +47,10 @@ export function createGmDashboardRouter(
     data: DashboardData,
     includeSupplementalGms: boolean,
   ) => Promise<void>,
+  reportPhotos?: Parameters<typeof createDashboardReportsRouter>[1],
 ) {
   const router = Router();
+  router.use(createDashboardReportsRouter(database, reportPhotos));
   router.get("/metadata", async (_req, res, next) => {
     try {
       res.set("Cache-Control", "private, no-store").json(await dashboardMetadata(database));

@@ -1,6 +1,9 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
-import { requireKundeAdminPermission } from "../lib/kunde-access.js";
+import { requireKundeAdminPermission, getKundePermissionsForUser, hasKundePermission } from "../lib/kunde-access.js";
+import { isFullAdminRole } from "../lib/admin-role.js";
+import type { AuthedRequest } from "../middleware/auth.js";
+import { supabaseAdmin } from "../lib/supabase.js";
 import { db } from "../lib/db.js";
 import { modelDatabase } from "../lib/praemien-workspace.js";
 import { loadEffectiveGmIppPeriods } from "../lib/ipp-gm-effective.js";
@@ -54,5 +57,16 @@ adminGmDashboardRouter.use(
       );
       point.ippSource = "effective_red";
     }
+  }, {
+    canRead: async req => {
+      const user = (req as AuthedRequest).authUser;
+      if (!user) return false;
+      if (isFullAdminRole(user.role)) return true;
+      return user.role === "kunde" && hasKundePermission(await getKundePermissionsForUser(user.appUserId), "fotoarchiv", "read");
+    },
+    sign: async photo => {
+      const result = await supabaseAdmin.storage.from(photo.bucket).createSignedUrl(photo.path, 15 * 60);
+      return result.error ? null : result.data.signedUrl;
+    },
   }),
 );
