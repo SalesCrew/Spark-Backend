@@ -50,6 +50,7 @@ import { adminPhotosRouter } from "./routes/admin-photos.js";
 import { adminSmPhotoArchiveRouter } from "./routes/sm-photo-archive.js";
 import { adminPraemienRouter } from "./routes/praemien.js";
 import { adminRedMonthRouter, redMonthRouter } from "./routes/red-month.js";
+import { timeEntryPhotoRouter } from "./lib/time-entry-photos-runtime.js";
 import { timeTrackingRouter } from "./routes/time-tracking.js";
 import { adminTimeEntryChangeRequestsRouter, gmTimeEntryChangeRequestsRouter } from "./routes/time-entry-change-requests.js";
 
@@ -209,6 +210,8 @@ function createApp() {
   app.use("/admin/sm-smdurcharbeit-campaigns", adminSMDurcharbeitCampaignsRouter);
   app.use("/sm/smdurcharbeit-times", SMDurcharbeitTimesRouter);
   app.use("/admin/sm-smdurcharbeit-times", adminSMDurcharbeitTimesRouter);
+  // Photo attachments remain accessible after a day ends or while another visit is active.
+  app.use("/time-tracking", timeEntryPhotoRouter);
   app.use("/time-tracking", timeTrackingRouter);
   app.use("/telemetry", clientTelemetryRouter);
   app.use("/red-month", redMonthRouter);

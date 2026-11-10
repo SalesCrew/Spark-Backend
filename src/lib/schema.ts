@@ -3932,3 +3932,38 @@ export const gmActionBriefingReads = pgTable('gm_action_briefing_reads', {
   seenPages: integer('seen_pages').array().notNull().default(sql`'{}'::integer[]`), readAt: timestamp('read_at', { withTimezone: true }),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, t => [primaryKey({ columns: [t.publicationId, t.gmUserId] }), index('gm_action_briefing_reader_idx').on(t.gmUserId)]);
+
+// Optional work photos attached to the same Sondereinsatz; separate from questionnaire and medical photos.
+export const timeTrackingEntryPhotos = pgTable("time_tracking_entry_photos", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  entryId: uuid("entry_id").notNull().references(() => timeTrackingEntries.id, { onDelete: "restrict" }),
+  storageBucket: text("storage_bucket").notNull().default("gm-time-entry-photos"),
+  storagePath: text("storage_path").notNull(),
+  originalFileName: text("original_file_name").notNull(),
+  mimeType: text("mime_type").notNull(), byteSize: integer("byte_size").notNull(), sha256: text("sha256").notNull(),
+  revision: integer("revision").notNull().default(1),
+  uploadedByUserId: uuid("uploaded_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  uploadedAt: timestamp("uploaded_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  isDeleted: boolean("is_deleted").notNull().default(false),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  deletedByUserId: uuid("deleted_by_user_id").references(() => users.id, { onDelete: "set null" }),
+}, table => [
+  uniqueIndex("time_tracking_entry_photos_storage_path_unique").on(table.storagePath),
+  index("time_tracking_entry_photos_entry_idx").on(table.entryId, table.uploadedAt).where(sql`${table.isDeleted} = false`),
+  index("time_tracking_entry_photos_uploader_idx").on(table.uploadedByUserId),
+  index("time_tracking_entry_photos_deleter_idx").on(table.deletedByUserId),
+]);
+export const timeTrackingEntryPhotoTags = pgTable("time_tracking_entry_photo_tags", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  photoId: uuid("photo_id").notNull().references(() => timeTrackingEntryPhotos.id, { onDelete: "restrict" }),
+  photoTagId: uuid("photo_tag_id").references(() => photoTags.id, { onDelete: "set null" }),
+  labelSnapshot: text("label_snapshot").notNull(), isDeleted: boolean("is_deleted").notNull().default(false),
+  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+}, table => [
+  uniqueIndex("time_tracking_entry_photo_tags_active_idx").on(table.photoId, table.photoTagId).where(sql`${table.isDeleted} = false`),
+  index("time_tracking_entry_photo_tags_tag_idx").on(table.photoTagId),
+  index("time_tracking_entry_photo_tags_creator_idx").on(table.createdByUserId),
+]);
