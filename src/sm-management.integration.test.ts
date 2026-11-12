@@ -12,6 +12,8 @@ import request from "supertest";
 import * as adminRoles from "./lib/admin-role.js";
 import { isolatedModule } from "../tests/isolated-module.js";
 import * as management from "./sm-management.js";
+import * as managementList from "./sm-management-list.shared.js";
+import * as managementReport from "./sm-management-report.shared.js";
 import * as planning from "./sm-planning.shared.js";
 import * as visitShared from "./sm-visit.shared.js";
 import * as visitTimeShared from "./sm-visit-time.shared.js";
@@ -177,7 +179,8 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     });
     const route = await isolatedModule<typeof import("./routes/sm-management.js")>(new URL("./routes/sm-management.ts", import.meta.url), {
       "../sm-basic-activity.shared.js": basicActivity, "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
-      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../sm-management.js": management, "../lib/kunde-access.js": kundeAccess,
+      "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../sm-management.js": management,
+      "../sm-management-list.shared.js": managementList, "../sm-management-report.shared.js": managementReport, "../lib/kunde-access.js": kundeAccess,
       "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visitShared, "../middleware/auth.js": authMock,
       "../config/env.js": { env: { JWT_SECRET: "isolated-test-only-key-never-used-outside-this-process" } },
       "../lib/supabase.js": { supabaseAdmin: { storage: { from: (bucket: string) => {
@@ -199,7 +202,26 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
       if (req.method === "OPTIONS") { res.sendStatus(204); return; } next();
     });
+    if (process.env.SM_REPORT_BROWSER_FIXTURE === "1") app.use((req, res, next) => {
+      res.setHeader("Access-Control-Allow-Origin", req.header("Origin") === "http://127.0.0.1:3063" ? "http://127.0.0.1:3063" : "http://127.0.0.1:3062");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Customer-Page-Key, X-Kunde-Page-Key, x-coke-spark-page-key");
+      res.setHeader("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS");
+      if (req.method === "OPTIONS") { res.sendStatus(204); return; }
+      if (req.header("Authorization") === "Bearer isolated-sm-report-preview") req.headers["x-local-role"] = "sm_admin";
+      next();
+    });
+    if (process.env.SM_REPORT_BROWSER_FIXTURE === "1") {
+      app.get(/^\/admin\/(modules|fragebogen)\//, (_req, res) => res.json({ modules: [], fragebogen: [] }));
+      app.get("/admin/markets/chains", (_req, res) => res.json({ chains: [] }));
+      app.get("/admin/sm-activity/requests", (_req, res) => res.json({ answerRequests: [], deleteRequests: [], timeRequests: [] }));
+      app.get("/admin/kurti/layout", (_req, res) => res.json({ layout: null }));
+      app.put("/admin/kurti/layout", (_req, res) => res.json({ layout: null }));
+      app.get("/__synthetic/identity", (_req, res) => res.json({ synthetic: true, feature: "sm-management-report" }));
+      app.get("/red-month/current", (_req, res) => res.json({ current: { id: "synthetic", label: "RED 11", start: "2026-11-01", end: "2026-11-30", year: 2026, isCurrent: true }, config: { anchorStart: "2026-01-01", cycleWeeks: [4,4,5], timezone: "Europe/Vienna", updatedAt: null } }));
+      app.post("/telemetry/events", (_req, res) => res.sendStatus(204));
+    }
     app.use(express.json()); app.use("/completed", route.adminSmManagementRouter);
+    app.use("/admin/sm-activity/completed", route.adminSmManagementRouter);
     app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => { res.status(500).json({ error: error.message }); });
     const http = (method: "get" | "post", path: string) => request(app)[method](`/completed${path}`).set("x-local-role", "sm_admin");
 
@@ -439,6 +461,74 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       assert.equal((await http("get", `${range}&smUserId=${randomUUID()}`).expect(200)).body.visits.length, 0);
     });
 
+    await t.test("complete report exports every matching visit across pages, frozen snapshots and owned photos without writes", async () => {
+      const fixture = await seed(), source = fixture.submission;
+      const start = new Date("2026-11-10T08:15:00Z"), end = new Date("2026-11-10T09:15:00Z");
+      const label = "Report · synthetischer Standardfragebogen";
+      await database.update(schema.smQuestionnaireSubmissions).set({ questionnaireNameSnapshot: label,
+        visitStartedAt: start, visitCompletedAt: end, submittedAt: end }).where(eq(schema.smQuestionnaireSubmissions.id, source.id));
+      const sections = await database.select().from(schema.smQuestionnaireSubmissionSections).where(eq(schema.smQuestionnaireSubmissionSections.submissionId, source.id));
+      const clones = Array.from({ length: 104 }, () => ({ ...source, id: randomUUID(), clientSubmissionToken: randomUUID(),
+        questionnaireNameSnapshot: label, visitStartedAt: start, visitCompletedAt: end, submittedAt: end }));
+      await database.insert(schema.smQuestionnaireSubmissions).values(clones);
+      const sectionClones = clones.map(visit => ({ ...sections[0]!, id: randomUUID(), submissionId: visit.id }));
+      await database.insert(schema.smQuestionnaireSubmissionSections).values(sectionClones);
+      const questionClones = sectionClones.map(section => ({ ...fixture.questions[0]!, id: randomUUID(), submissionId: section.submissionId, submissionSectionId: section.id }));
+      await database.insert(schema.smQuestionnaireSubmissionQuestions).values(questionClones);
+      await database.insert(schema.smQuestionAnswers).values(questionClones.map(question => ({ ...fixture.answer, id: randomUUID(), submissionId: question.submissionId, submissionQuestionId: question.id })));
+      await apply(source.id, await input(source.id, [{ questionId: fixture.questions[0]!.id, answer: { kind: "choice", optionCode: "no", comment: "Originalkommentar" } }, { questionId: fixture.questions[1]!.id, answer: { kind: "text", value: "=1+1" } }]));
+      const [photoAnswer] = await database.insert(schema.smQuestionAnswers).values({ submissionId: source.id, submissionQuestionId: fixture.questions[2]!.id,
+        answerVersion: 1, answerState: "answered", valueJson: { kind: "photo", fileIds: [randomUUID()] }, answeredByUserId: employee, answeredAt: end }).returning();
+      const [photo] = await database.insert(schema.smQuestionAnswerFiles).values({ answerId: photoAnswer!.id, storageBucket: "sm-visit-photos",
+        storagePath: "synthetic/private-photo.png", originalFileName: "Regal vorher.png", mimeType: "image/png", byteSize: 42 }).returning();
+      await database.insert(schema.smQuestionAnswers).values({ submissionId: source.id, submissionQuestionId: fixture.questions[3]!.id,
+        answerVersion: 1, answerState: "answered", valueJson: { kind: "number", value: 0 }, valueNumber: "0", answeredByUserId: employee, answeredAt: end });
+      const unavailable = await seed();
+      await database.update(schema.smQuestionnaireSubmissions).set({ questionnaireNameSnapshot: label, status: "draft", visitStartedAt: start, visitCompletedAt: end, submittedAt: end }).where(eq(schema.smQuestionnaireSubmissions.id, unavailable.submission.id));
+      const snapshot = async () => JSON.stringify(await pg.query("select (select jsonb_agg(s order by id) from sm_questionnaire_submissions s) as submissions,(select jsonb_agg(a order by id) from sm_question_answers a) as answers,(select jsonb_agg(f order by id) from sm_question_answer_files f) as photos"));
+      const before = await snapshot();
+      const query = "?from=2026-11-01&to=2026-11-30&SMDurcharbeitCatalogScope=standard&search=" + encodeURIComponent(label);
+      const response = await http("get", `/report${query}`);
+      assert.equal(response.status, 200, JSON.stringify(response.body));
+      assert.equal(response.headers["cache-control"], "private, no-store");
+      assert.equal(response.body.visits.length, 105); assert.equal(new Set(response.body.visits.map((visit: {id:string})=>visit.id)).size, 105);
+      assert.equal(response.body.answers.length, 108);
+      const visit = response.body.visits.find((visit: {id:string}) => visit.id === source.id);
+      assert.equal(visit.smName, "Original SM"); assert.equal(visit.actualMinutes, 60); assert.equal(visit.travelMinutes, 25);
+      assert.equal(visit.workDate, "2026-11-10"); assert.equal(visit.startedAt, start.toISOString());
+      const text = response.body.answers.find((row: {question:{id:string}}) => row.question.id === fixture.questions[1]!.id);
+      assert.equal(text.answer.valueJson.value, "=1+1"); assert.equal(text.answer.answeredByName, "Local Admin");
+      assert.equal(response.body.answers.find((row: {question:{id:string}}) => row.question.id === fixture.questions[0]!.id).answer.valueJson.comment, "Originalkommentar");
+      assert.equal(text.question.questionTextSnapshot, "Ursprüngliche Frage 2");
+      const image = response.body.answers.find((row: {question:{id:string}}) => row.question.id === fixture.questions[2]!.id);
+      assert.deepEqual(image.answer.valueJson.fileIds, [photo!.id]); assert.equal(image.photos[0].fileName, "Regal vorher.png");
+      assert.equal(image.answer.answeredByName, "Original SM");
+      assert.equal(image.photos[0].storagePath, undefined); assert.equal(image.photos[0].signedUrl, undefined);
+      assert.equal(JSON.stringify(response.body).includes("synthetic/private-photo"), false);
+      assert.equal(await snapshot(), before);
+      assert.equal((await http("get", `/report${query}&smUserId=${randomUUID()}`).expect(200)).body.visits.length, 0);
+      assert.equal((await http("get", `/report${query}&marketId=${randomUUID()}`).expect(200)).body.visits.length, 0);
+      assert.equal((await http("get", `/report${query}&questionnaireId=${randomUUID()}`).expect(200)).body.visits.length, 0);
+      await http("get", `/report${query}&limit=1`).expect(400);
+      await http("get", `/report${query}&cursorId=${source.id}`).expect(400);
+      await http("get", "/report?from=2026-01-01&to=2026-12-31").expect(400);
+      await http("get", "/report?from=2026-11-30&to=2026-11-01").expect(400);
+      await http("get", `/report${query}&marketId=wrong`).expect(400);
+      await request(app).get(`/completed/report${query}`).expect(401);
+      for (const role of ["gm", "sm"]) await request(app).get(`/completed/report${query}`).set("x-local-role", role).expect(403);
+      const kunde = randomUUID();
+      await pg.query("insert into users(id,first_name,last_name,role) values ($1,'Test','Kunde','kunde')", [kunde]);
+      await pg.query("insert into kunde_users(user_id,page_permissions) values ($1,$2)", [kunde, JSON.stringify({ sm_fbmanagement: { read: false } })]);
+      await request(app).get(`/admin/sm-activity/completed/report${query}`).set("x-local-role", "kunde").set("x-local-actor", kunde).set("x-coke-spark-page-key", "sm_fbmanagement").expect(403);
+      await pg.query("update kunde_users set page_permissions=$2 where user_id=$1", [kunde, JSON.stringify({ sm_fbmanagement: ["read"] })]);
+      await request(app).get(`/admin/sm-activity/completed/report${query}`).set("x-local-role", "kunde").set("x-local-actor", kunde).set("x-coke-spark-page-key", "sm_fbmanagement").expect(200);
+      // A local artifact lets workbook and browser tests verify the exact serialized route response.
+      if (process.env.SM_REPORT_ARTIFACT) {
+        const { writeFile } = await import("node:fs/promises");
+        await writeFile(process.env.SM_REPORT_ARTIFACT, JSON.stringify(response.body));
+      }
+    });
+
     await t.test("real correction/detail/history endpoints preserve versions and reject stale or wrong visits", async () => {
       const fixture = await seed(), id = fixture.submission.id, questionId = fixture.questions[1]!.id;
       const before = await http("get", `/${id}`);
@@ -518,6 +608,10 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       const tables = await pg.query<{ tablename: string }>("select tablename from pg_tables where schemaname='public'");
       assert.ok(tables.rows.every(row => row.tablename === "users" || row.tablename === "kunde_users" || row.tablename.startsWith("sm_")));
     });
+    if (process.env.SM_REPORT_BROWSER_FIXTURE === "1") {
+      const server = app.listen(4062, "127.0.0.1", () => console.log("Synthetic SM report API: http://127.0.0.1:4062"));
+      await new Promise<void>(resolve => process.once("SIGINT", () => { server.close(); resolve(); }));
+    }
     if (process.env.SM_MANAGEMENT_BROWSER_FIXTURE === "1") {
       app.put("/fixture-upload", express.raw({ type: ["image/png", "image/jpeg", "image/webp"], limit: "20mb" }), (req, res) => {
         const path = String(req.query.path);

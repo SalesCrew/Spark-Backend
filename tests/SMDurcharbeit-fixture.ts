@@ -18,6 +18,8 @@ import * as profile from "../src/sm-profile.shared.js";
 import * as holidaysShared from "../src/sm-holidays.shared.js";
 import * as seriesShared from "../src/sm-series.shared.js";
 import * as managementShared from "../src/sm-management.js";
+import * as managementList from "../src/sm-management-list.shared.js";
+import * as managementReport from "../src/sm-management-report.shared.js";
 import * as sync from "../src/sm-market-user-sync.shared.js";
 import * as weekly from "../src/sm-market-weekly-planning.shared.js";
 import { z } from "zod";
@@ -135,7 +137,7 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
     "../sm-holiday-planning.js": holidays, "../sm-planning.shared.js": planning,
   });
   const managed = await isolatedModule<typeof import("../src/routes/sm-management.js")>(new URL("../src/routes/sm-management.ts", import.meta.url), {
-    ...base, "../sm-management.js": managementShared, "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visit,
+    ...base, "../sm-management.js": managementShared, "../sm-management-list.shared.js": managementList, "../sm-management-report.shared.js": managementReport, "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visit,
     "../config/env.js": { env: { JWT_SECRET: "synthetic-only-local-secret" } },
     "../lib/supabase.js": { supabaseAdmin: { storage: options.photoStorage ?? { from: () => ({ createSignedUrl: async () => ({ data: { signedUrl: null }, error: null }) }) } } },
   });
