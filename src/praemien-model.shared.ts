@@ -264,6 +264,7 @@ function automaticValue(
   observations: Observation[],
   values: Map<string, MetricResult>,
   target: number | null,
+  personalAnswerTarget = false,
 ) {
   let counted = 0,
     excluded = 0;
@@ -318,7 +319,13 @@ function automaticValue(
         counted,
         excluded,
       };
-    return { value: total, counted, excluded };
+    return {
+      value: personalAnswerTarget && target && target > 0
+        ? (total / target) * 100
+        : total,
+      counted,
+      excluded,
+    };
   }
   const inputs = m.inputs.map((k) => values.get(k)?.value ?? null);
   if (inputs.some((v) => v === null)) return { value: null, counted, excluded };
@@ -373,6 +380,11 @@ export function evaluateModel(
             observations,
             results,
             target,
+            // Only an explicitly saved personal target opts this legacy
+            // points-backed percentage into normalization. Other sums and
+            // previously unused model-level targets retain their meaning.
+            p.kind === "displays" && m.method === "answer_sum" &&
+              m.unit === "percent" && entry?.target != null,
           );
           const manualValue = m.readOnly ? null : entry?.value;
           const rawValue = manualValue ?? auto.value;
