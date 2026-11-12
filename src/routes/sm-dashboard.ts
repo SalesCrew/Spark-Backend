@@ -244,45 +244,23 @@ function standardMarketCondition(): SQL {
   )`;
 }
 
-/** Directory choices include unvisited markets; SM links also preserve period-specific historical visitors. */
+/** Only actual reportable visits supply choices; each facet still ignores its own selection. */
 export async function loadSmDashboardFilterOptions(input: z.infer<typeof querySchema>, executor: Pick<typeof db, "execute"> = db) {
-  const scope = input.SMDurcharbeitCatalogScope ?? "standard";
-  const marketCondition = scope === "standard" ? standardMarketCondition() : sql`true`;
+  const scopedWhere = whereClause(scopeConditions({
+    from: input.from,
+    to: input.to,
+    SMDurcharbeitCatalogScope: input.SMDurcharbeitCatalogScope ?? "standard",
+  }));
   const contextsResult = await executor.execute(sql<FilterContextRow>`
-    with eligible_markets as (
-      select m.id, m.name, m.postal_code, m.city, m.region, m.chain, m.assigned_sm_user_id
-      from sm_markets m where m.is_deleted = false and ${marketCondition}
-    ), people as (
-      select m.id as market_id, u.id as sm_user_id,
-        btrim(concat_ws(' ', u.first_name, u.last_name)) as sm_name, 0 as priority
-      from eligible_markets m inner join users u on u.id = m.assigned_sm_user_id
-      where u.role = 'sm' and u.deleted_at is null
-      union all
-      select coalesce(a.replacement_sm_market_id, a.original_sm_market_id), u.id,
-        btrim(concat_ws(' ', u.first_name, u.last_name)), 1
-      from sm_assignments a
-      inner join eligible_markets m on m.id = coalesce(a.replacement_sm_market_id, a.original_sm_market_id)
-      inner join users u on u.id = coalesce(a.replacement_sm_user_id, a.original_sm_user_id)
-      left join sm_questionnaire_versions v on v.id = coalesce(a.questionnaire_version_id, a.smdurcharbeit_questionnaire_override_version_id)
-      left join sm_questionnaire_templates t on t.id = v.questionnaire_template_id
-      where a.is_deleted = false and a.status <> 'cancelled' and u.role = 'sm' and u.deleted_at is null
-        and coalesce(a.replacement_work_date, a.original_work_date) between ${input.from}::date and ${input.to}::date
-        and (case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${scope}
-      union all
-      select s.sm_market_id, s.sm_user_id, s.sm_name_snapshot, 2
-      from sm_questionnaire_submissions s
-      inner join eligible_markets m on m.id = s.sm_market_id
-      left join sm_questionnaire_templates t on t.id = s.questionnaire_template_id
-      where s.status = 'submitted' and s.is_current = true and s.is_deleted = false and s.reporting_available_at is not null
-        and s.submitted_at >= (${input.from}::date::timestamp at time zone ${VIENNA_TIMEZONE})
-        and s.submitted_at < (((${input.to}::date + 1)::timestamp) at time zone ${VIENNA_TIMEZONE})
-        and (case when starts_with(t.stable_code, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${scope}
-    )
-    select m.id::text as value,
+    select distinct on (m.id, s.sm_user_id)
+      m.id::text as value,
       concat_ws(' · ', m.name, nullif(concat_ws(' ', m.postal_code, m.city), '')) as label,
-      m.region, m.chain, p.sm_user_id::text as "smUserId", p.sm_name as "smName"
-    from eligible_markets m left join people p on p.market_id = m.id
-    order by m.chain, m.name, m.postal_code, m.id, p.priority, p.sm_name, p.sm_user_id
+      m.region, m.chain, s.sm_user_id::text as "smUserId", s.sm_name_snapshot as "smName"
+    from sm_questionnaire_submissions s
+    inner join sm_markets m on m.id = s.sm_market_id
+    left join sm_questionnaire_templates t on t.id = s.questionnaire_template_id
+    where ${scopedWhere}
+    order by m.id, s.sm_user_id, s.submitted_at desc, s.id desc
   `);
   const byMarket = new Map<string, MarketContext>();
   for (const row of contextsResult as unknown as FilterContextRow[]) {

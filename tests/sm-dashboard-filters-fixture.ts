@@ -23,7 +23,7 @@ export async function createSmDashboardFiltersFixture(options: { overviewPreview
       { id: markets.sharedWeekly, name: "Geteilter Stammmarkt · Wochenplan", chain: "Billa", region: "Süd", assignedSmUserId: second, mondayHours: "2" },
       { id: markets.sharedHistory, name: "Geteilter Stammmarkt · Historie", chain: "Spar", region: "Süd", assignedSmUserId: second },
       { id: markets.sharedPlan, name: "Geteilter Stammmarkt · Einsatz", chain: "Spar", region: "Nord", assignedSmUserId: f.employee },
-      { id: markets.unvisited, name: "Neuer Stammmarkt ohne Besuch", chain: "Billa", region: "Nord", assignedSmUserId: f.employee },
+      { id: markets.unvisited, name: "Neuer Stammmarkt ohne Besuch", chain: "Ohne Ergebnis", region: "Ohne Ergebnis", assignedSmUserId: daOnlySm },
     ].map(row => ({ ...row, address: "Vorschauweg 1", postalCode: "1010", city: "Vorschaustadt", internalMarketId: `SYNTHETIC-${row.id}` })));
     const admin = (path: string, scope = "standard") => request(f.app).post(`${path}?scope=${scope}`).auth("synthetic-sm-admin", { type: "bearer" });
     async function questionnaire(scope: string) {
