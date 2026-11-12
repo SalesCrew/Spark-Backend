@@ -74,6 +74,7 @@ export type MetricEntry = {
   value: number | null;
   target: number | null;
   note: string;
+  rawPoints?: number | null | undefined;
   actorName?: string;
   updatedAt?: string;
 };
@@ -88,6 +89,13 @@ export type MetricResult = {
   note: string;
   counted: number;
   excluded: number;
+  provisional?: boolean | undefined;
+  sourceCoverage?: { answered: number; total: number } | undefined;
+  missingSources?: { questionId: string; label: string }[] | undefined;
+  rawPoints?: number | null | undefined;
+  automaticPoints?: number | null | undefined;
+  manualPoints?: number | null | undefined;
+  missingTarget?: boolean | undefined;
   actorName?: string | undefined;
   updatedAt?: string | undefined;
 };
@@ -258,19 +266,33 @@ function sourceValue(row: Observation, source: ModelSource): number {
     : 0;
 }
 
+export function supportsDisplayPoints(p: ModelPillar, m: ModelMetric): boolean {
+  return p.kind === "displays" && m.method === "answer_sum" && m.unit === "percent";
+}
+
+type AutomaticResult = {
+  value: number | null;
+  counted: number;
+  excluded: number;
+  provisional?: boolean;
+  rawPoints?: number | null;
+  sourceCoverage?: { answered: number; total: number };
+  missingSources?: { questionId: string; label: string }[];
+};
+
 function automaticValue(
   m: ModelMetric,
   gmId: string,
   observations: Observation[],
   values: Map<string, MetricResult>,
   target: number | null,
-  personalAnswerTarget = false,
-) {
+): AutomaticResult {
   let counted = 0,
     excluded = 0;
   if (m.method === "manual") return { value: null, counted, excluded };
   if (m.method === "answer_sum" || m.method === "availability") {
-    let total = 0;
+    let total = 0, answered = 0, hasKnownValue = false;
+    const missingSources: { questionId: string; label: string }[] = [];
     for (const s of m.sources) {
       const eligible = observations.filter(
         (r) =>
@@ -295,14 +317,13 @@ function automaticValue(
       }
       counted += byMarket.size;
       excluded += eligible.length - byMarket.size;
-      // No observation is not a measured zero. A source missing for this GM
-      // must remain open instead of quietly lowering or paying their bonus.
-      if (
-        !byMarket.size ||
-        (s.factor && [...byMarket.values()].some((row) => row.numeric === null))
-      )
-        return { value: null, counted, excluded };
-      total += [...byMarket.values()].reduce(
+      const selected = [...byMarket.values()];
+      const known = selected.filter((row) => !s.factor || row.numeric !== null);
+      if (known.length) hasKnownValue = true;
+      if (known.length && known.length === selected.length) answered++;
+      if (!selected.length || known.length !== selected.length)
+        missingSources.push({ questionId: s.questionId, label: s.label });
+      total += known.reduce(
         (sum, row) =>
           sum +
           (m.method === "availability"
@@ -313,28 +334,47 @@ function automaticValue(
         0,
       );
     }
+    const coverage = {
+      provisional: missingSources.length > 0,
+      sourceCoverage: { answered, total: m.sources.length },
+      missingSources,
+    };
     if (m.method === "availability")
       return {
-        value: target && target > 0 ? (total / target) * 100 : null,
+        // Availability denominators retain their strict completeness contract.
+        value: !coverage.provisional && hasKnownValue && target && target > 0 ? (total / target) * 100 : null,
         counted,
         excluded,
+        ...coverage,
       };
     return {
-      value: personalAnswerTarget && target && target > 0
-        ? (total / target) * 100
-        : total,
+      value: hasKnownValue ? total : null,
+      rawPoints: hasKnownValue ? total : null,
       counted,
       excluded,
+      ...coverage,
     };
   }
+  const dependencies = m.inputs.map((k) => values.get(k));
+  const coverage = {
+    provisional: dependencies.some((r) => r?.provisional),
+    ...(dependencies.some((r) => r?.sourceCoverage) ? {
+      sourceCoverage: dependencies.reduce((sum, r) => ({
+        answered: sum.answered + (r?.sourceCoverage?.answered ?? 0),
+        total: sum.total + (r?.sourceCoverage?.total ?? 0),
+      }), { answered: 0, total: 0 }),
+      missingSources: dependencies.flatMap((r) => r?.missingSources ?? []),
+    } : {}),
+  };
   const inputs = m.inputs.map((k) => values.get(k)?.value ?? null);
-  if (inputs.some((v) => v === null)) return { value: null, counted, excluded };
+  if (inputs.some((v) => v === null)) return { value: null, counted, excluded, ...coverage };
   const numbers = inputs as number[];
   if (m.method === "ratio")
     return {
       value: target && target > 0 ? (numbers[0]! / target) * 100 : null,
       counted,
       excluded,
+      ...coverage,
     };
   if (m.method === "steps")
     return {
@@ -345,14 +385,16 @@ function automaticValue(
           .at(-1)?.value ?? 0,
       counted,
       excluded,
+      ...coverage,
     };
   if (m.method === "difference")
-    return { value: numbers[0]! - numbers[1]!, counted, excluded };
+    return { value: numbers[0]! - numbers[1]!, counted, excluded, ...coverage };
   const sum = numbers.reduce((s, n, i) => s + n * (m.method === "weighted_sum" ? m.weights?.[m.inputs[i]!] ?? 0 : 1), 0);
   return {
     value: m.method === "average" ? sum / numbers.length : sum,
     counted,
     excluded,
+    ...coverage,
   };
 }
 
@@ -374,20 +416,24 @@ export function evaluateModel(
         for (const m of p.metrics) {
           const entry = entryMap.get(`${gm.gmId}/${p.key}/${m.key}`);
           const target = entry?.target ?? m.target;
+          const pointsMetric = supportsDisplayPoints(p, m);
           const auto = automaticValue(
             m,
             gm.gmId,
             observations,
             results,
             target,
-            // Only an explicitly saved personal target opts this legacy
-            // points-backed percentage into normalization. Other sums and
-            // previously unused model-level targets retain their meaning.
-            p.kind === "displays" && m.method === "answer_sum" &&
-              m.unit === "percent" && entry?.target != null,
           );
+          const manualPoints = pointsMetric ? entry?.rawPoints ?? null : null;
+          const rawPoints = pointsMetric ? manualPoints ?? auto.rawPoints ?? null : undefined;
+          // A legacy percentage override remains a percentage. Points have
+          // separate storage and cannot silently replace that override.
+          const calculated = pointsMetric
+            ? rawPoints != null && entry?.target != null && entry.target > 0
+              ? rawPoints / entry.target * 100 : null
+            : auto.value;
           const manualValue = m.readOnly ? null : entry?.value;
-          const rawValue = manualValue ?? auto.value;
+          const rawValue = manualValue ?? calculated;
           const value = rawValue !== null && manualValue == null &&
             ((m.minValue !== undefined && rawValue < m.minValue) || (m.maxValue !== undefined && rawValue > m.maxValue) || (m.integerOnly && !Number.isInteger(rawValue))) ? null : rawValue;
           results.set(m.key, {
@@ -395,10 +441,10 @@ export function evaluateModel(
             label: m.label,
             unit: m.unit,
             value,
-            automatic: auto.value,
+            automatic: calculated,
             target,
             origin:
-              manualValue != null
+              manualValue != null || manualPoints != null
                 ? "manual"
                 : value === null
                   ? "pending"
@@ -406,6 +452,15 @@ export function evaluateModel(
             note: entry?.note ?? "",
             counted: auto.counted,
             excluded: auto.excluded,
+            provisional: manualValue == null && manualPoints == null && !!auto.provisional,
+            sourceCoverage: auto.sourceCoverage,
+            missingSources: auto.missingSources,
+            ...(pointsMetric ? {
+              rawPoints,
+              automaticPoints: auto.rawPoints ?? null,
+              manualPoints,
+              missingTarget: entry?.target == null,
+            } : {}),
             actorName: entry?.actorName,
             updatedAt: entry?.updatedAt,
           });
@@ -469,7 +524,7 @@ export function evaluateModel(
           maximum: p.maxRewardEur,
           pending: p.payoutMode === "manual"
             ? p.metrics.some(m => m.manualRewardCap !== undefined && results.get(m.key)?.value === null)
-            : p.tiers.length === 0 || [...used].some((k) => results.get(k)?.value === null),
+            : p.tiers.length === 0 || [...used].some((k) => results.get(k)?.value === null || results.get(k)?.provisional),
           metrics: [...results.values()],
           achieved,
           next,

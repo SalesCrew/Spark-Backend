@@ -38,11 +38,12 @@ test("personal answer-sum target: HTTP preview, save, reread, GM projection and 
       value: null, target: 90, note: "Basis-Soll 100, 20 Arbeitstage, 2 Abwesenheitstage" };
     const metric = (workspace: any, gm = f.ids.gm) => workspace.results.find((r: any) => r.gmId === gm).pillars[0].metrics[0];
     let revision = wave.revision;
-    assert.equal(metric((await request(app).get(path)).body).value, 80);
+    assert.equal(metric((await request(app).get(path)).body).value, null);
+    assert.equal(metric((await request(app).get(path)).body).rawPoints, 80);
     const preview = await request(app).post(`${path}/preview`).send({ model, entries: [entry] });
     assert.equal(preview.status, 200);
     assert.equal(metric(preview.body).value, 80 / 90 * 100);
-    assert.equal(metric((await request(app).get(path)).body).value, 80, "preview is not a save");
+    assert.equal(metric((await request(app).get(path)).body).value, null, "preview is not a save");
     for (const target of [0, -1]) {
       const invalid = await request(app).put(path).send({ revision, type: "values", entries: [{ ...entry, target }] });
       assert.equal(invalid.status, 400);
@@ -52,7 +53,7 @@ test("personal answer-sum target: HTTP preview, save, reread, GM projection and 
     const reread = (await request(app).get(path)).body;
     assert.equal(metric(reread).value, 80 / 90 * 100);
     assert.equal(metric(reread).target, 90);
-    assert.equal(metric(reread, f.ids.other).value, 80);
+    assert.equal(metric(reread, f.ids.other).value, null);
     assert.deepEqual(reread.model, model, "rules and question mappings are untouched");
     assert.equal(reread.entries.find((e: any) => e.gmId === f.ids.gm && e.pillarKey === "displays").note, entry.note);
     assert.equal((await managedGmSummary(f.database, f.ids.wave, f.ids.gm)).goals[0]!.metricValues[m.key], 80 / 90 * 100);
@@ -60,7 +61,8 @@ test("personal answer-sum target: HTTP preview, save, reread, GM projection and 
     assert.equal(stale.status, 409);
     const cleared = await request(app).put(path).send({ revision, type: "values", entries: [{ ...entry, target: null, note: "" }] });
     assert.equal(cleared.status, 200);
-    assert.equal(metric(cleared.body).value, 80);
+    assert.equal(metric(cleared.body).value, null);
+    assert.equal(metric(cleared.body).rawPoints, 80);
     assert.deepEqual((await f.pg.query("select * from visit_answers order by id")).rows, answers);
   } finally { await f.pg.close(); }
 });

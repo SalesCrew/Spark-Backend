@@ -4,6 +4,7 @@ import {
   evaluateModel,
   modelTemplate,
   validateModel,
+  supportsDisplayPoints,
   type GmResult,
   type MetricEntry,
   type ModelMetric,
@@ -141,7 +142,28 @@ export const entrySchema = z.object({
   value: number.nullable(),
   target: positive.nullable(),
   note: z.string().max(1000),
+  rawPoints: number.nullable().optional(),
 });
+
+// Input-only rows use a namespace that cannot collide with configured metric
+// keys. The existing numeric store/RLS/audit are reused without reinterpreting
+// any saved percentage or changing the schema.
+const pointInputKey = (metricKey: string) => `points:${metricKey}`;
+function decodePointEntries(stored: MetricEntry[]): MetricEntry[] {
+  const identity = (e: MetricEntry) => `${e.gmId}/${e.pillarKey}/${e.metricKey}`;
+  const entries = new Map(stored.filter((e) => !e.metricKey.startsWith("points:")).map((e) => [identity(e), e]));
+  for (const e of stored.filter((e) => e.metricKey.startsWith("points:"))) {
+    const metricKey = e.metricKey.slice(7);
+    const key = identity({ ...e, metricKey });
+    const parent = entries.get(key) ?? { ...e, metricKey, value: null, target: null };
+    entries.set(key, { ...parent, rawPoints: e.value });
+  }
+  return [...entries.values()];
+}
+function validatePointInput(pillar: WaveModel["pillars"][number], metric: ModelMetric, entry: MetricEntry) {
+  if (entry.rawPoints !== undefined && (!supportsDisplayPoints(pillar, metric) || metric.readOnly))
+    throw new ModelError(400, "Ist-Punkte sind nur für eine bearbeitbare Schütten-/Displays-Punkteberechnung zulässig.");
+}
 export type WaveInfo = {
   id: string;
   name: string;
@@ -306,15 +328,16 @@ export async function readWorkspace(
   }>(
     sql`select id as "gmId", trim(first_name || ' ' || last_name) as name, is_active as active from users where role='gm' ${gmId ? sql`and id=${gmId}::uuid` : sql``} order by first_name,last_name`,
   );
-  const entries = config
+  const storedEntries = config
     ? await database.query<MetricEntry>(
         sql`select gm_user_id as "gmId", pillar_key as "pillarKey", metric_key as "metricKey", value, target, note, actor_name as "actorName", updated_at::text as "updatedAt" from praemien_metric_entries where wave_id=${id} ${gmId ? sql`and gm_user_id=${gmId}::uuid` : sql``}`,
       )
     : [];
-  entries.forEach((e) => {
+  storedEntries.forEach((e) => {
     e.value = e.value === null ? null : Number(e.value);
     e.target = e.target === null ? null : Number(e.target);
   });
+  const entries = decodePointEntries(storedEntries);
   const results = config
     ? evaluateModel(
         config.model,
@@ -435,13 +458,15 @@ export async function mutateWorkspace(
           sql`select pillar_key as "pillarKey", metric_key as "metricKey" from praemien_metric_entries where wave_id=${id}`,
         );
         for (const e of oldEntries) {
+          const inputOnly = e.metricKey.startsWith("points:");
+          const metricKey = inputOnly ? e.metricKey.slice(7) : e.metricKey;
           const before = config.model.pillars
             .find((p) => p.key === e.pillarKey)
-            ?.metrics.find((m) => m.key === e.metricKey);
-          const after = model.pillars
-            .find((p) => p.key === e.pillarKey)
-            ?.metrics.find((m) => m.key === e.metricKey);
-          if (!after || (before && before.unit !== after.unit))
+            ?.metrics.find((m) => m.key === metricKey);
+          const pillar = model.pillars.find((p) => p.key === e.pillarKey);
+          const after = pillar?.metrics.find((m) => m.key === metricKey);
+          if (!after || (before && before.unit !== after.unit) ||
+            (inputOnly && (!pillar || !supportsDisplayPoints(pillar, after) || after.readOnly)))
             throw new ModelError(
               400,
               "Messgrößen mit erfassten Werten dürfen nicht entfernt oder in eine andere Einheit umgedeutet werden. Zuerst Bewertungen entfernen.",
@@ -473,11 +498,11 @@ export async function mutateWorkspace(
         )
           throw new ModelError(400, "Messwerte doppelt.");
         for (const e of entries) {
-          const metric = config.model.pillars
-            .find((p) => p.key === e.pillarKey)
-            ?.metrics.find((m) => m.key === e.metricKey);
-          if (!metric) throw new ModelError(400, "Unbekannte Messgröße.");
+          const pillar = config.model.pillars.find((p) => p.key === e.pillarKey);
+          const metric = pillar?.metrics.find((m) => m.key === e.metricKey);
+          if (!metric || !pillar) throw new ModelError(400, "Unbekannte Messgröße.");
           validateEntryValue(metric, e);
+          validatePointInput(pillar, metric, e);
           if (
             e.value !== null &&
             metric.unit === "percent" &&
@@ -495,6 +520,14 @@ export async function mutateWorkspace(
             await tx.query(
               sql`insert into praemien_metric_entries(wave_id,gm_user_id,pillar_key,metric_key,value,target,note,actor_id,actor_name) values(${id},${e.gmId},${e.pillarKey},${e.metricKey},${e.value},${e.target},${e.note},${actor.id},${actor.name}) on conflict(wave_id,gm_user_id,pillar_key,metric_key) do update set value=excluded.value,target=excluded.target,note=excluded.note,actor_id=excluded.actor_id,actor_name=excluded.actor_name,updated_at=now()`,
             );
+          // Omitted by old clients means unchanged; explicit null clears only
+          // the point input. Neither operation converts the percentage field.
+          if (e.rawPoints !== undefined) {
+            if (e.rawPoints === null)
+              await tx.query(sql`delete from praemien_metric_entries where wave_id=${id} and gm_user_id=${e.gmId} and pillar_key=${e.pillarKey} and metric_key=${pointInputKey(e.metricKey)}`);
+            else
+              await tx.query(sql`insert into praemien_metric_entries(wave_id,gm_user_id,pillar_key,metric_key,value,target,note,actor_id,actor_name) values(${id},${e.gmId},${e.pillarKey},${pointInputKey(e.metricKey)},${e.rawPoints},null,${e.note},${actor.id},${actor.name}) on conflict(wave_id,gm_user_id,pillar_key,metric_key) do update set value=excluded.value,note=excluded.note,actor_id=excluded.actor_id,actor_name=excluded.actor_name,updated_at=now()`);
+          }
         }
       } else if (command.type === "activate") {
         if (config.model.pillars.some((p) => p.payoutMode !== "manual" && !p.tiers.length))
@@ -568,11 +601,11 @@ export async function simulateWorkspace(
     const excluded = await excludedBonusGmIds(database, workspace.wave);
     for (const entry of entries) {
       if (excluded.has(entry.gmId)) throw new ModelError(400, "Zusatz-GMs sind von der Prämienauswertung ausgeschlossen.");
-      const metric = model.pillars
-        .find((p) => p.key === entry.pillarKey)
-        ?.metrics.find((m) => m.key === entry.metricKey);
-      if (!metric) throw new ModelError(400, "Unbekannte Messgröße.");
+      const pillar = model.pillars.find((p) => p.key === entry.pillarKey);
+      const metric = pillar?.metrics.find((m) => m.key === entry.metricKey);
+      if (!metric || !pillar) throw new ModelError(400, "Unbekannte Messgröße.");
       validateEntryValue(metric, entry);
+      validatePointInput(pillar, metric, entry);
       if (
         metric.unit === "percent" &&
         entry.value !== null &&
@@ -582,6 +615,8 @@ export async function simulateWorkspace(
           400,
           "Prozentwert muss zwischen 0 und 1000 liegen.",
         );
+      const previous = workspace.entries.find(e => e.gmId === entry.gmId && e.pillarKey === entry.pillarKey && e.metricKey === entry.metricKey);
+      const next = { ...entry, rawPoints: entry.rawPoints === undefined ? previous?.rawPoints : entry.rawPoints };
       workspace.entries = workspace.entries.filter(
         (e) =>
           !(
@@ -590,8 +625,8 @@ export async function simulateWorkspace(
             e.metricKey === entry.metricKey
           ),
       );
-      if (entry.value !== null || entry.target !== null)
-        workspace.entries.push(entry);
+      if (next.value !== null || next.target !== null || next.rawPoints != null)
+        workspace.entries.push(next);
     }
   }
   const roster = await database.query<{

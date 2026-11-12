@@ -33,16 +33,19 @@ function example() {
   return { model, p, m, observations, entry, run, metric };
 }
 
-test("38 display sources keep legacy totals until a personal target is supplied", () => {
+test("38 display sources expose raw points and require an explicit personal target for percentages", () => {
   const f = example(), sources = structuredClone(f.m.sources);
   f.m.target = 200; // A previously ignored model target must remain ignored.
-  assert.equal(f.metric().value, 80);
+  assert.equal(f.metric().value, null);
+  assert.equal(f.metric().rawPoints, 80);
+  assert.equal(f.metric().missingTarget, true);
   const result = f.run([f.entry]);
   assert.equal(result[0]!.pillars[0]!.metrics[0]!.value, 80 / 90 * 100);
   assert.equal(result[0]!.pillars[0]!.metrics[0]!.counted, 38);
-  assert.equal(result[1]!.pillars[0]!.metrics[0]!.value, 80);
+  assert.equal(result[1]!.pillars[0]!.metrics[0]!.value, null);
+  assert.equal(result[1]!.pillars[0]!.metrics[0]!.rawPoints, 80);
   assert.deepEqual(f.m.sources, sources);
-  assert.equal(f.metric([{ ...f.entry, target: null }]).value, 80);
+  assert.equal(f.metric([{ ...f.entry, target: null }]).value, null);
 });
 
 test("explicit manual percentages including zero remain authoritative, not divided again", () => {
@@ -69,13 +72,17 @@ test("raw point/count sums and non-display percentages retain their calculation"
 test("personal targets preserve missing versus zero and allow achievement above 100 percent", () => {
   const f = example();
   f.observations[0]!.numeric = null;
-  assert.equal(f.metric([f.entry]).value, null);
+  assert.equal(f.metric([f.entry]).value, 0, "other explicitly measured zeros form a provisional subtotal");
+  assert.equal(f.metric([f.entry]).provisional, true);
   f.observations[0]!.numeric = 0;
   assert.equal(f.metric([f.entry]).value, 0);
   f.observations[0]!.numeric = 120;
   assert.equal(f.metric([f.entry]).value, 120 / 90 * 100);
   f.observations.splice(1, 1);
-  assert.equal(f.metric([f.entry]).value, null);
+  assert.equal(f.metric([f.entry]).value, 120 / 90 * 100);
+  assert.equal(f.metric([f.entry]).provisional, true);
+  f.observations.splice(0, f.observations.length);
+  assert.equal(f.metric([f.entry]).value, null, "no observations must not become a measured zero");
 });
 
 test("a personal target does not change visit deduplication or source eligibility", () => {
