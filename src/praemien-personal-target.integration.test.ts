@@ -50,7 +50,10 @@ test("personal answer-sum target: HTTP preview, save, reread, GM projection and 
     }
     const saved = await request(app).put(path).send({ revision, type: "values", entries: [entry] });
     assert.equal(saved.status, 200); revision = saved.body.revision;
-    const reread = (await request(app).get(path)).body;
+    const fresh = await request(app).get(path);
+    assert.equal(fresh.headers["cache-control"], "private, no-store");
+    assert.equal((await request(app).get("/admin/praemien/workspace/waves")).headers["cache-control"], "private, no-store");
+    const reread = fresh.body;
     assert.equal(metric(reread).value, 80 / 90 * 100);
     assert.equal(metric(reread).target, 90);
     assert.equal(metric(reread, f.ids.other).value, null);

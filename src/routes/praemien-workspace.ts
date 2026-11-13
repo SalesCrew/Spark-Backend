@@ -18,6 +18,10 @@ import { activeBonusQuestions } from "../lib/praemien-active-questions.js";
 // The same router is mounted behind synthetic authentication only in local tests.
 export function createPraemienWorkspaceRouter(database: ModelDatabase) {
   const router = Router();
+  router.use((_req, res, next) => {
+    res.set("Cache-Control", "private, no-store");
+    next();
+  });
   // Feature detection is a normal read, not an error on an unmigrated database.
   router.get("/status", async (_req, res, next) => {
     try {
