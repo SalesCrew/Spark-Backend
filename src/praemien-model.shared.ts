@@ -40,6 +40,8 @@ export type ModelMetric = {
   integerOnly?: boolean | undefined;
   confirmation?: boolean | undefined;
   manualRewardCap?: number | undefined;
+  /** Explicit, wave-local exception; all other employees retain the source's area. */
+  sourceSectionOverrides?: { gmId: string; sections: ("standard" | "flex" | "billa")[] }[] | undefined;
 };
 export type ModelTier = {
   key: string;
@@ -150,6 +152,18 @@ export function validateModel(model: WaveModel): string[] {
       errors.push(`${p.name}: Stufenschlüssel doppelt.`);
     const available = new Set<string>();
     for (const m of p.metrics) {
+      if (m.sourceSectionOverrides?.length) {
+        if (!supportsDisplayPoints(p, m) || m.sources.some(s => s.section !== "standard"))
+          errors.push(`${m.label}: Besuchsbereich-Ausnahmen sind nur für Standard-Fragequellen einer Schütten-/Displays-Prozentberechnung zulässig.`);
+        if (!unique(m.sourceSectionOverrides.map(o => o.gmId)))
+          errors.push(`${m.label}: Besuchsbereich-Ausnahme für einen Mitarbeiter doppelt.`);
+        for (const o of m.sourceSectionOverrides) {
+          if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(o.gmId)
+            || o.sections.length < 2 || o.sections.length > 3 || !unique(o.sections)
+            || !o.sections.includes("standard") || o.sections.some(s => !["standard", "flex", "billa"].includes(s)))
+            errors.push(`${m.label}: Besuchsbereich-Ausnahme benötigt einen gültigen Mitarbeiter und Standard mit Flex und/oder BILLA.`);
+        }
+      }
       if (m.inputs.some((key) => !available.has(key)))
         errors.push(
           `${p.name}/${m.label}: Eingaben müssen vorher definiert sein (keine Zyklen).`,
@@ -293,17 +307,20 @@ function automaticValue(
   if (m.method === "answer_sum" || m.method === "availability") {
     let total = 0, answered = 0, hasKnownValue = false;
     const missingSources: { questionId: string; label: string }[] = [];
+    const override = m.sourceSectionOverrides?.find(o => o.gmId === gmId);
     for (const s of m.sources) {
       const eligible = observations.filter(
         (r) =>
           r.gmId === gmId &&
           r.questionId === s.questionId &&
-          r.section === s.section &&
+          (override ? override.sections.some(section => section === r.section) : r.section === s.section) &&
           r.frequency >= s.minFrequency &&
           (!s.chains.length ||
             s.chains.some((c) => normalized(c) === normalized(r.chain))),
       );
       const byMarket = new Map<string, Observation>();
+      // An explicit exception chooses once across its allowed areas.
+      // Source weights and the reporting quarter remain unchanged.
       for (const row of eligible) {
         const previous = byMarket.get(row.marketId);
         // Snapshot time, not edit time: editing an old visit cannot replace a newer visit.

@@ -81,6 +81,10 @@ export const modelSchema = z.object({
               minValue: number.optional(), maxValue: number.optional(),
               integerOnly: z.boolean().optional(), confirmation: z.boolean().optional(),
               manualRewardCap: positive.optional(),
+              sourceSectionOverrides: z.array(z.object({
+                gmId: z.string().uuid(),
+                sections: z.array(z.enum(["standard", "flex", "billa"])).min(2).max(3),
+              })).max(100).optional(),
               inputs: z.array(key).max(40),
               target: positive.nullable(),
               steps: z.array(z.object({ at: number, value: number })).max(30),
@@ -144,6 +148,18 @@ export const entrySchema = z.object({
   note: z.string().max(1000),
   rawPoints: number.nullable().optional(),
 });
+
+function parseModel(input: WaveModel, previous?: WaveModel): WaveModel {
+  const model = modelSchema.parse(input);
+  // Older clients may omit this additive setting. Explicit [] clears it;
+  // omission must not silently undo a saved, audited employee exception.
+  for (const p of model.pillars) for (const m of p.metrics) {
+    const saved = previous?.pillars.find(x => x.key === p.key)?.metrics.find(x => x.key === m.key)?.sourceSectionOverrides;
+    if (m.sourceSectionOverrides === undefined && saved !== undefined)
+      m.sourceSectionOverrides = saved.map(o => ({ ...o, sections: [...o.sections] }));
+  }
+  return model;
+}
 
 // Input-only rows use a namespace that cannot collide with configured metric
 // keys. The existing numeric store/RLS/audit are reused without reinterpreting
@@ -386,6 +402,12 @@ export async function readWorkspace(
   };
 }
 async function validateSources(database: ModelDatabase, model: WaveModel) {
+  const gmIds = [...new Set(model.pillars.flatMap(p => p.metrics.flatMap(m => m.sourceSectionOverrides?.map(o => o.gmId) ?? [])))];
+  if (gmIds.length) {
+    const known = await database.query<{ id: string }>(sql`select id from users where role='gm' and is_supplemental_gm=false and id in (${sql.join(gmIds.map(id => sql`${id}::uuid`), sql`,` )})`);
+    if (known.length !== gmIds.length)
+      throw new ModelError(400, "Besuchsbereich-Ausnahmen benötigen bekannte reguläre Gebietsmanager.");
+  }
   const sources = model.pillars.flatMap((p) =>
     p.metrics.flatMap((m) => m.sources),
   );
@@ -449,7 +471,7 @@ export async function mutateWorkspace(
         "Zwischenzeitlich geändert. Bitte neu laden; deine Eingaben wurden nicht überschrieben.",
       );
     if (command.type === "rules") {
-      const model = modelSchema.parse(command.model);
+      const model = parseModel(command.model, config?.model);
       const errors = validateModel(model);
       if (errors.length) throw new ModelError(400, errors.join(" "));
       await validateSources(tx, model);
@@ -588,11 +610,11 @@ export async function simulateWorkspace(
   proposed: WaveModel,
   proposedEntries?: MetricEntry[],
 ): Promise<Workspace> {
-  const model = modelSchema.parse(proposed);
+  const workspace = await readWorkspace(database, id);
+  const model = parseModel(proposed, workspace.model ?? undefined);
   const errors = validateModel(model);
   if (errors.length) throw new ModelError(400, errors.join(" "));
   await validateSources(database, model);
-  const workspace = await readWorkspace(database, id);
   if (workspace.closedAt)
     throw new ModelError(409, "Abgeschlossene Quartale sind eingefroren.");
   workspace.model = model;
