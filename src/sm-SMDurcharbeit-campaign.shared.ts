@@ -8,6 +8,7 @@ import { smSMDurcharbeitCampaigns as campaigns, smSMDurcharbeitCampaignMarkets a
   smSMDurcharbeitTimeRevisions as times, smQuestionnaireVersions, smQuestionnaireTemplates,
   smMarkets, smSMDurcharbeitMarkets, users, smQuestionnaireVersionModules, smModuleVersions, smModuleVersionQuestions, smQuestionVersions } from "./lib/schema.js";
 import { isIsoDate } from "./sm-planning.shared.js";
+import { lockSmPlanning } from "./sm-planning-lock.js";
 
 export type SMDurcharbeitTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 export type SMDurcharbeitExecutor = typeof db | SMDurcharbeitTx;
@@ -111,11 +112,12 @@ export async function assertSMDurcharbeitAvailable(executor: SMDurcharbeitExecut
   if (context.target.eligibility !== "required" || !context.market.isActive || context.market.isDeleted) return fail("smdurcharbeit_target_unavailable", "Dieser Markt ist derzeit nicht für Durcharbeit freigegeben.");
   return user;
 }
-export async function loadSMDurcharbeitVersion(executor: SMDurcharbeitExecutor, versionId: string) {
+export async function loadSMDurcharbeitVersion(executor: SMDurcharbeitExecutor, versionId: string, options: { allowInactiveTemplate?: boolean } = {}) {
   const [row] = await executor.select({ version: smQuestionnaireVersions, template: smQuestionnaireTemplates }).from(smQuestionnaireVersions)
     .innerJoin(smQuestionnaireTemplates,eq(smQuestionnaireTemplates.id,smQuestionnaireVersions.questionnaireTemplateId))
     .where(eq(smQuestionnaireVersions.id,versionId)).limit(1);
-  if (!row || !row.template.stableCode.startsWith("smdurcharbeit_") || row.version.status !== "published" || row.version.isDeleted || row.template.isDeleted || row.template.status !== "active") return fail("smdurcharbeit_version_unavailable", "Bitte einen aktiven veröffentlichten Durcharbeit-Fragebogen auswählen.");
+  if (!row || !row.template.stableCode.startsWith("smdurcharbeit_") || row.version.status !== "published" || row.version.isDeleted || row.template.isDeleted
+    || !(row.template.status === "active" || (options.allowInactiveTemplate && row.template.status === "inactive"))) return fail("smdurcharbeit_version_unavailable", "Bitte einen verfügbaren Durcharbeit-Fragebogen auswählen.");
   const [question] = await executor.select({ id: smQuestionVersions.id }).from(smQuestionnaireVersionModules)
     .innerJoin(smModuleVersions, eq(smModuleVersions.id, smQuestionnaireVersionModules.moduleVersionId))
     .innerJoin(smModuleVersionQuestions, eq(smModuleVersionQuestions.moduleVersionId, smModuleVersions.id))
@@ -127,10 +129,23 @@ export async function loadSMDurcharbeitVersion(executor: SMDurcharbeitExecutor, 
   return row.version;
 }
 
+/** Explicit campaign publication releases a saved copy; draft selection never activates it. */
+export async function activateSMDurcharbeitQuestionnaire(tx: SMDurcharbeitTx, versionId: string, actorId: string) {
+  await lockSmPlanning(tx);
+  const version = await loadSMDurcharbeitVersion(tx, versionId, { allowInactiveTemplate: true });
+  const changed = await tx.update(smQuestionnaireTemplates).set({ status: "active", updatedByUserId: actorId, updatedAt: new Date() })
+    .where(and(eq(smQuestionnaireTemplates.id, version.questionnaireTemplateId), eq(smQuestionnaireTemplates.status, "inactive"), eq(smQuestionnaireTemplates.isDeleted, false)))
+    .returning({ id: smQuestionnaireTemplates.id });
+  await loadSMDurcharbeitVersion(tx, versionId);
+  return changed.length > 0;
+}
+
 export async function SMDurcharbeitPublicationPreview(executor: SMDurcharbeitExecutor, campaignId: string) {
   const [campaign] = await executor.select().from(campaigns).where(eq(campaigns.id,campaignId)).limit(1);
   if (!campaign) return fail("smdurcharbeit_campaign_missing","Kampagne nicht gefunden.",404);
-  const version = await loadSMDurcharbeitVersion(executor,campaign.questionnaireVersionId);
+  const version = await loadSMDurcharbeitVersion(executor,campaign.questionnaireVersionId, { allowInactiveTemplate: true });
+  const [template] = await executor.select({ status: smQuestionnaireTemplates.status }).from(smQuestionnaireTemplates).where(eq(smQuestionnaireTemplates.id, version.questionnaireTemplateId)).limit(1);
+  const questionnaireRequiresActivation = template?.status === "inactive";
   const months = SMDurcharbeitMonths(campaign.startDate,campaign.endDate);
   if (!campaign.rosterDraft.length || campaign.rosterDraft.length > 5000 || new Set(campaign.rosterDraft.map(r=>r.smMarketId)).size !== campaign.rosterDraft.length) return fail("smdurcharbeit_roster_invalid","Bitte unterschiedliche Durcharbeit-Märkte auswählen (maximal 5000).",400);
   const marketIds = campaign.rosterDraft.map(row=>row.smMarketId);
@@ -150,10 +165,11 @@ export async function SMDurcharbeitPublicationPreview(executor: SMDurcharbeitExe
     from sm_assignments where not is_deleted and status in ('planned','confirmed','open','in_progress')
       and ${inArray(sql`coalesce(replacement_sm_market_id,original_sm_market_id)`,marketIds)}
       and coalesce(replacement_work_date,original_work_date) between ${campaign.startDate}::date and ${campaign.endDate}::date order by id`);
-  const previewToken = createHash("sha256").update(JSON.stringify({campaign,versionId:version.id,markets,people,months,overlapping,legacy})).digest("hex");
-  return { campaign,version,months,marketCount:markets.length,targetCount:markets.length*months.length,unresolved,overlapping,legacy,previewToken,markets,roster };
+  const previewToken = createHash("sha256").update(JSON.stringify({campaign,versionId:version.id,questionnaireRequiresActivation,markets,people,months,overlapping,legacy})).digest("hex");
+  return { campaign,version,questionnaireRequiresActivation,months,marketCount:markets.length,targetCount:markets.length*months.length,unresolved,overlapping,legacy,previewToken,markets,roster };
 }
 export async function publishSMDurcharbeitCampaign(tx: SMDurcharbeitTx, id: string, actorId: string, input: {expectedRevision:number;previewToken:string;confirmOverlap?:boolean | undefined}) {
+  await lockSmPlanning(tx);
   const [locked] = await tx.select({rosterDraft:campaigns.rosterDraft}).from(campaigns).where(eq(campaigns.id,id)).for("update");
   if (locked?.rosterDraft.length) await tx.select({id:smSMDurcharbeitMarkets.smMarketId}).from(smSMDurcharbeitMarkets)
     .where(inArray(smSMDurcharbeitMarkets.smMarketId,locked.rosterDraft.map(row=>row.smMarketId))).orderBy(asc(smSMDurcharbeitMarkets.smMarketId)).for("share");
@@ -162,6 +178,7 @@ export async function publishSMDurcharbeitCampaign(tx: SMDurcharbeitTx, id: stri
   if (preview.campaign.revision !== input.expectedRevision || preview.previewToken !== input.previewToken) return fail("smdurcharbeit_preview_stale","Die Vorschau wurde geändert. Bitte erneut prüfen.");
   if (preview.unresolved.length) return fail("smdurcharbeit_roster_unassigned","Ein Markt hat keine gültige SM-ID im Durcharbeit-Marktbestand. Bitte dort die Verplanung prüfen.");
   if ((preview.overlapping.length || preview.legacy.length) && !input.confirmOverlap) return fail("smdurcharbeit_roster_overlap","Es gibt bereits Kampagnen oder offene datierte Einsätze für diese Märkte. Bitte die Überschneidung ausdrücklich bestätigen.");
+  const questionnaireActivated = await activateSMDurcharbeitQuestionnaire(tx, preview.version.id, actorId);
   const memberRows = preview.markets.map(({market})=>({id:randomUUID(),campaignId:id,smMarketId:market.id}));
   const periodRows = preview.months.map(month=>({id:randomUUID(),campaignId:id,month,questionnaireVersionId:preview.version.id}));
   await tx.insert(memberships).values(memberRows); await tx.insert(periods).values(periodRows);
@@ -177,7 +194,7 @@ export async function publishSMDurcharbeitCampaign(tx: SMDurcharbeitTx, id: stri
     }));
   }
   await tx.update(campaigns).set({status:"published",rosterDraft:preview.roster,revision:sql`${campaigns.revision}+1`,updatedByUserId:actorId,updatedAt:new Date()}).where(eq(campaigns.id,id));
-  await SMDurcharbeitEvent(tx,{campaignId:id,actorUserId:actorId,action:"published",reason:"Monatliche Durcharbeit veröffentlicht",afterState:{months:preview.months,marketCount:preview.marketCount}});
+  await SMDurcharbeitEvent(tx,{campaignId:id,actorUserId:actorId,action:"published",reason:"Monatliche Durcharbeit veröffentlicht",afterState:{months:preview.months,marketCount:preview.marketCount,questionnaireActivated,questionnaireTemplateId:preview.version.questionnaireTemplateId}});
 }
 
 export async function listSMDurcharbeitTargets(executor: SMDurcharbeitExecutor, input:{month:string;campaignId?:string;smUserId?:string;employeeVisible?:boolean}) {

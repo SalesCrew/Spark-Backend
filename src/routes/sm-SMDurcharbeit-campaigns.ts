@@ -15,6 +15,8 @@ import { SMDurcharbeitCampaignError, SMDurcharbeitToday, SMDurcharbeitMonth, SMD
   assertSMDurcharbeitAvailable, assertSMDurcharbeitEmployeeVisible, loadSMDurcharbeitVersion, editSMDurcharbeitTarget, changeSMDurcharbeitMonthOwner, resolveSMDurcharbeitRoster, SMDurcharbeitEffectiveOwner } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { initializeSMDurcharbeitVisit, cancelSMDurcharbeitDraft, cleanupSMDurcharbeitDraftPhotos } from "./sm-visits.js";
 import { isIsoDate } from "../sm-planning.shared.js";
+import { lockSmPlanning } from "../sm-planning-lock.js";
+import { activateSMDurcharbeitQuestionnaire } from "../sm-SMDurcharbeit-campaign.shared.js";
 import { loadSMDurcharbeitReport } from "../sm-SMDurcharbeit-report.shared.js";
 import { applySMDurcharbeitMarketEdit, previewSMDurcharbeitMarketEdit } from "../sm-SMDurcharbeit-market-edit.shared.js";
 import { applySMDurcharbeitCampaignOwners, previewSMDurcharbeitCampaignOwners } from "../sm-SMDurcharbeit-owner-bulk.shared.js";
@@ -53,8 +55,14 @@ export const adminSMDurcharbeitCampaignsRouter = Router();
 adminSMDurcharbeitCampaignsRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
 adminSMDurcharbeitCampaignsRouter.use(requireKundeAdminPermission);
 adminSMDurcharbeitCampaignsRouter.use("/:campaignId/review/:reviewMonth", createSmManagementRouter(true));
-adminSMDurcharbeitCampaignsRouter.get("/options", async (_req, res, next) => {
+adminSMDurcharbeitCampaignsRouter.get("/options", async (req, res, next) => {
   try {
+    const { selectedVersionId } = z.object({ selectedVersionId: uuid.optional() }).strict().parse(req.query);
+    const selection = { id: smQuestionnaireVersions.id, templateId: smQuestionnaireTemplates.id, name: smQuestionnaireVersions.name, versionNumber: smQuestionnaireVersions.versionNumber,
+      effectiveFrom: smQuestionnaireVersions.effectiveFrom, effectiveTo: smQuestionnaireVersions.effectiveTo, templateStatus: smQuestionnaireTemplates.status };
+    const available = and(sql`${smQuestionnaireTemplates.stableCode} like ${"smdurcharbeit\\_%"} escape ${"\\"}`,
+      inArray(smQuestionnaireTemplates.status, ["active", "inactive"]), eq(smQuestionnaireTemplates.isDeleted, false),
+      eq(smQuestionnaireVersions.status, "published"), eq(smQuestionnaireVersions.isDeleted, false));
     const [markets, people, questionnaires] = await Promise.all([
       db.select({ id: smMarkets.id, name: smMarkets.name, address: smMarkets.address, postalCode: smMarkets.postalCode, city: smMarkets.city,
         region: smMarkets.region, chain: smMarkets.chain,
@@ -63,13 +71,15 @@ adminSMDurcharbeitCampaignsRouter.get("/options", async (_req, res, next) => {
         .from(smSMDurcharbeitMarkets).innerJoin(smMarkets, eq(smMarkets.id, smSMDurcharbeitMarkets.smMarketId))
         .where(and(eq(smMarkets.isDeleted, false), eq(smMarkets.isActive, true))).orderBy(asc(smMarkets.name), asc(smMarkets.id)),
       db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName }).from(users).where(and(eq(users.role, "sm"), eq(users.isActive, true), isNull(users.deletedAt))).orderBy(asc(users.lastName), asc(users.id)),
-      db.select({ id: smQuestionnaireVersions.id, templateId: smQuestionnaireTemplates.id, name: smQuestionnaireVersions.name, versionNumber: smQuestionnaireVersions.versionNumber,
-        effectiveFrom: smQuestionnaireVersions.effectiveFrom, effectiveTo: smQuestionnaireVersions.effectiveTo })
+      db.selectDistinctOn([smQuestionnaireTemplates.id], selection)
         .from(smQuestionnaireVersions).innerJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, smQuestionnaireVersions.questionnaireTemplateId))
-        .where(and(sql`${smQuestionnaireTemplates.stableCode} like ${"smdurcharbeit\\_%"} escape ${"\\"}`, eq(smQuestionnaireTemplates.status, "active"), eq(smQuestionnaireTemplates.isDeleted, false),
-          eq(smQuestionnaireVersions.status, "published"), eq(smQuestionnaireVersions.isDeleted, false))).orderBy(asc(smQuestionnaireVersions.name), desc(smQuestionnaireVersions.versionNumber)),
+        .where(available).orderBy(asc(smQuestionnaireTemplates.id), desc(smQuestionnaireVersions.versionNumber)),
     ]);
-    res.json({ markets, people, questionnaires });
+    const selectedQuestionnaire = selectedVersionId ? (await db.select(selection).from(smQuestionnaireVersions)
+      .innerJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, smQuestionnaireVersions.questionnaireTemplateId))
+      .where(and(available, eq(smQuestionnaireVersions.id, selectedVersionId))).limit(1))[0] ?? null : null;
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json({ markets, people, questionnaires: questionnaires.sort((a, b) => a.name.localeCompare(b.name, "de-AT") || a.templateId.localeCompare(b.templateId)), selectedQuestionnaire });
   } catch (error) { if (!errorResponse(error, res)) next(error); }
 });
 adminSMDurcharbeitCampaignsRouter.get("/", async (_req, res, next) => {
@@ -94,7 +104,7 @@ adminSMDurcharbeitCampaignsRouter.post("/", async (req: AuthedRequest, res, next
   try {
     const input = draftSchema.parse(req.body); SMDurcharbeitMonths(input.startDate, input.endDate);
     const created = await db.transaction(async tx => {
-      await loadSMDurcharbeitVersion(tx, input.questionnaireVersionId);
+      await loadSMDurcharbeitVersion(tx, input.questionnaireVersionId, { allowInactiveTemplate: true });
       const rosterDraft = await resolveSMDurcharbeitRoster(tx, input.rosterDraft);
       const [campaign] = await tx.insert(campaigns).values({ ...input, rosterDraft, createdByUserId: actor(req), updatedByUserId: actor(req) }).returning();
       await SMDurcharbeitEvent(tx, { campaignId: campaign!.id, actorUserId: actor(req), action: "draft_created", reason: "Kampagnenentwurf erstellt" });
@@ -109,7 +119,7 @@ adminSMDurcharbeitCampaignsRouter.patch("/:campaignId", async (req: AuthedReques
     const result = await db.transaction(async tx => {
       const campaign = await lockedCampaign(tx, id(req, "campaignId"), expectedRevision);
       if (campaign.status !== "draft") throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_campaign_not_draft", "Veröffentlichte Kampagnen werden über ihre Monatsziele bearbeitet.");
-      await loadSMDurcharbeitVersion(tx, input.questionnaireVersionId);
+      await loadSMDurcharbeitVersion(tx, input.questionnaireVersionId, { allowInactiveTemplate: true });
       const rosterDraft = await resolveSMDurcharbeitRoster(tx, input.rosterDraft);
       const [updated] = await tx.update(campaigns).set({ ...input, rosterDraft, revision: expectedRevision + 1, updatedByUserId: actor(req), updatedAt: new Date() }).where(eq(campaigns.id, campaign.id)).returning();
       await SMDurcharbeitEvent(tx, { campaignId: campaign.id, actorUserId: actor(req), action: "draft_updated", reason: "Kampagnenentwurf bearbeitet" });
@@ -239,14 +249,15 @@ adminSMDurcharbeitCampaignsRouter.patch("/:campaignId/periods/:periodId/question
   try {
     const input = z.object({ expectedRevision: z.number().int().positive(), questionnaireVersionId: uuid, reason: z.string().trim().min(3).max(1000) }).strict().parse(req.body);
     await db.transaction(async tx => {
+      await lockSmPlanning(tx);
       const campaign = await lockedCampaign(tx, id(req, "campaignId"), input.expectedRevision);
       const [period] = await tx.select().from(periods).where(and(eq(periods.id, id(req, "periodId")), eq(periods.campaignId, campaign.id))).limit(1);
       const [started] = period ? await tx.select({ id: visits.id }).from(visits).innerJoin(targets, eq(targets.id, visits.targetId)).where(eq(targets.periodId, period.id)).limit(1) : [];
-      if (!period || period.month <= SMDurcharbeitMonth() || started) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_period_frozen", "Nur zukünftige, noch nicht gestartete Monate können einen neuen Fragebogen erhalten.");
-      await loadSMDurcharbeitVersion(tx, input.questionnaireVersionId);
+      if (!["published", "paused"].includes(campaign.status) || !period || period.month <= SMDurcharbeitMonth() || started) throw new SMDurcharbeitCampaignError(409, "smdurcharbeit_period_frozen", "Nur zukünftige, noch nicht gestartete Monate können einen neuen Fragebogen erhalten.");
+      const questionnaireActivated = await activateSMDurcharbeitQuestionnaire(tx, input.questionnaireVersionId, actor(req));
       await tx.update(periods).set({ questionnaireVersionId: input.questionnaireVersionId }).where(eq(periods.id, period.id));
       await tx.update(campaigns).set({ revision: input.expectedRevision + 1, updatedAt: new Date(), updatedByUserId: actor(req) }).where(eq(campaigns.id, campaign.id));
-      await SMDurcharbeitEvent(tx, { campaignId: campaign.id, actorUserId: actor(req), action: "future_questionnaire_changed", reason: input.reason, beforeState: { periodId: period.id, versionId: period.questionnaireVersionId }, afterState: { versionId: input.questionnaireVersionId } });
+      await SMDurcharbeitEvent(tx, { campaignId: campaign.id, actorUserId: actor(req), action: "future_questionnaire_changed", reason: input.reason, beforeState: { periodId: period.id, versionId: period.questionnaireVersionId }, afterState: { versionId: input.questionnaireVersionId, questionnaireActivated } });
     }); res.json({ updated: true });
   } catch (error) { if (!errorResponse(error, res)) next(error); }
 });
