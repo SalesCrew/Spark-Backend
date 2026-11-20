@@ -1,10 +1,10 @@
 import { z } from "zod";
-import { smCommentMissing, smCommentTriggerKey, SM_COMMENT_MAX_LENGTH } from "./sm-comment.shared.js";
+import { smCommentMissing, smCommentTriggerKey, smOptionalCommentsAllowed, SM_COMMENT_MAX_LENGTH } from "./sm-comment.shared.js";
 
 const comment = z.string().trim().max(SM_COMMENT_MAX_LENGTH).optional();
 
 export const smVisitAnswerSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("empty") }).strict(),
+  z.object({ kind: z.literal("empty"), comment }).strict(),
   z.object({ kind: z.literal("choice"), optionCode: z.string().trim().min(1).max(300), comment }).strict(),
   z.object({ kind: z.literal("multi"), optionCodes: z.array(z.string().trim().min(1).max(300)).max(500), comment }).strict(),
   z.object({
@@ -30,6 +30,7 @@ export const smVisitAnswerSchema = z.discriminatedUnion("kind", [
 export type SmVisitAnswerPayload = z.infer<typeof smVisitAnswerSchema>;
 
 export type SmVisitQuestionSnapshot = {
+  optionalCommentEnabled?: boolean;
   type: "single" | "yesno" | "yesnomulti" | "multiple" | "likert" | "text" | "numeric" | "slider" | "photo" | "matrix";
   config: Record<string, unknown>;
   options: Array<{ code: string; label: string }>;
@@ -62,10 +63,9 @@ export function normalizeSmVisitAnswer(
   const parsed = smVisitAnswerSchema.safeParse(raw);
   if (!parsed.success) throw new SmVisitAnswerValidationError("Die Antwort hat ein ungültiges Format.");
   const normalized = normalizeSmVisitAnswerValue(snapshot, parsed.data);
-  if (normalized.kind === "empty") return normalized;
   const { comment: _discard, ...base } = normalized;
-  const text = parsed.data.kind === "empty" ? "" : parsed.data.comment?.trim();
-  return text && smCommentTriggerKey(snapshot, base) ? { ...base, comment: text } : base;
+  const text = parsed.data.comment?.trim();
+  return text && (smOptionalCommentsAllowed(snapshot) || smCommentTriggerKey(snapshot, base)) ? { ...base, comment: text } : base;
 }
 
 function normalizeSmVisitAnswerValue(

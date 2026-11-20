@@ -8,6 +8,18 @@ export type SmCommentTrigger = { mode: "answered" } | { mode: "options"; optionC
 type Question = { type: string; config: Record<string, unknown>; options: Array<{ code: string; label: string }> };
 type Answer = { kind: string; comment?: string | undefined; optionCode?: string; optionCodes?: string[]; value?: string | number; fileIds?: string[]; cells?: Array<{ columnCode: string; selected: boolean }> };
 
+/** The server supplies this capability from the submission’s questionnaire scope. */
+export function smOptionalCommentsAllowed(question: { optionalCommentEnabled?: boolean }): boolean {
+  return question.optionalCommentEnabled === true;
+}
+
+export function smNextAnswerWithComment<T extends Answer>(question: Question & { optionalCommentEnabled?: boolean }, previous: Answer, next: T): T {
+  const previousKey = smCommentTriggerKey(question, previous), nextKey = smCommentTriggerKey(question, next);
+  const { comment: _discard, ...base } = next;
+  const preserve = previous.comment && previousKey === nextKey && (Boolean(nextKey) || smOptionalCommentsAllowed(question));
+  return (preserve ? { ...base, comment: previous.comment } : base) as T;
+}
+
 export function getSmCommentTrigger(config: Record<string, unknown>): SmCommentTrigger | null {
   const raw = config.commentTrigger;
   if (!raw || typeof raw !== "object") return null;

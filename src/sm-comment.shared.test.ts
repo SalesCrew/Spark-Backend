@@ -21,7 +21,8 @@ test("only the exact configured option triggers; comment is required but draft i
 test("blank comments, overlong content and unrelated payload fields do not bypass validation", () => {
   assert.equal(isCompleteSmVisitAnswer(question, { kind: "choice", optionCode: "option_4", comment: " \n " }), false);
   assert.equal(smVisitAnswerSchema.safeParse({ kind: "choice", optionCode: "option_4", comment: "x".repeat(2001) }).success, false);
-  assert.equal(smVisitAnswerSchema.safeParse({ kind: "empty", comment: "x" }).success, false);
+  assert.equal(smVisitAnswerSchema.safeParse({ kind: "empty", comment: "x" }).success, true);
+  assert.deepEqual(normalizeSmVisitAnswer(question, { kind: "empty", comment: "x" }), { kind: "empty" });
   assert.equal(smVisitAnswerSchema.safeParse({ kind: "choice", optionCode: "option_4", unexpected: true }).success, false);
 });
 test("non-trigger answers discard stale comments; empty optional questions have no comment requirement", () => {

@@ -101,7 +101,7 @@ export async function loadSMDurcharbeitReport(executor: SMDurcharbeitExecutor, i
     // Access withdrawal affects report access, never the original stored answer.
     const answer = row.answer && value?.kind === "photo" ? { ...row.answer, valueJson: { ...value,
       fileIds: value.fileIds.filter(id => fileIdsByAnswer.get(row.answer!.id)?.has(id)) } } : row.answer;
-    return { ...row, answer };
+    return { ...row, question: { ...row.question, optionalCommentEnabled: true }, answer };
   });
   const answerRows = sanitizePhotos(questionRows);
   const completed = required.filter(target => target.completed).length;

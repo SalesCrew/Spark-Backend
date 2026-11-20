@@ -80,6 +80,7 @@ export async function loadSmManagementReport(tx: SmManagementTx, input: SmManage
     };
   });
   const visitIds = new Set(ids);
+  const optionalBySubmission = new Map(visits.map(visit => [visit.id, Boolean(visit.SMDurcharbeitContext) || visit.SMDurcharbeitCatalogScope === "SMDurcharbeit"]));
   const reportAnswers = questionRows.sort((a, b) => a.submissionId.localeCompare(b.submissionId)
     || (sectionMap.get(a.submissionSectionId)?.order ?? 0) - (sectionMap.get(b.submissionSectionId)?.order ?? 0)
     || a.orderIndex - b.orderIndex || a.id.localeCompare(b.id)).map(question => {
@@ -91,7 +92,7 @@ export async function loadSmManagementReport(tx: SmManagementTx, input: SmManage
     const valueJson = rawValue?.kind === "photo" ? { ...rawValue, fileIds: answerPhotos.map(photo => photo.id) } : rawValue;
     if (!visitIds.has(question.submissionId)) throw new Error("Answer outside the report selection");
     return { module: sectionMap.get(question.submissionSectionId)?.title ?? "",
-      question: { id: question.id, submissionId: question.submissionId, questionVersionId: question.questionVersionId,
+      question: { optionalCommentEnabled: optionalBySubmission.get(question.submissionId) ?? false, id: question.id, submissionId: question.submissionId, questionVersionId: question.questionVersionId,
         questionCodeSnapshot: question.questionCodeSnapshot, questionTypeSnapshot: question.questionTypeSnapshot,
         questionTextSnapshot: question.questionTextSnapshot, answerOptionsSnapshot: question.answerOptionsSnapshot,
         configSnapshot: question.configSnapshot, isApplicable: question.isApplicable, applicabilityReason: question.applicabilityReason },

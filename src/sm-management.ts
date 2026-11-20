@@ -1,3 +1,4 @@
+import { smOptionalCommentsForSubmission } from "./sm-comment-context.shared.js";
 import { smBasicActivityCode } from "./sm-basic-activity.shared.js";
 import { smQuestionnaireCatalogScope } from "./sm-SMDurcharbeit-catalog.shared.js";
 import { smQuestionnaireTemplates } from "./lib/schema.js";
@@ -61,8 +62,9 @@ function canonical(value: unknown): unknown {
   return value;
 }
 export function smManagementHash(value: unknown): string { return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex"); }
-export function smManagementQuestionSnapshot(question: Question): SmVisitQuestionSnapshot {
+export function smManagementQuestionSnapshot(question: Question, optionalCommentEnabled = false): SmVisitQuestionSnapshot {
   return {
+    optionalCommentEnabled,
     type: question.questionTypeSnapshot, config: question.configSnapshot,
     options: question.answerOptionsSnapshot.filter(option => typeof option.code === "string" && typeof option.label === "string")
       .map(option => ({ code: option.code as string, label: option.label as string, marksNotApplicable: option.marksNotApplicable === true })),
@@ -91,7 +93,7 @@ export async function loadSmManagementState(tx: SmManagementTx, id: string, writ
       : value);
   }
   const version = smManagementHash({ submission, questions: questionRows, answers: answerRows, photos: photoRows });
-  return { submission, questions: questionRows, answers: answerRows, photos: photoRows, values, version };
+  return { submission, questions: questionRows, answers: answerRows, photos: photoRows, values, version, optionalCommentEnabled: await smOptionalCommentsForSubmission(tx, submission) };
 }
 export type SmManagementState = Awaited<ReturnType<typeof loadSmManagementState>>;
 
@@ -186,7 +188,7 @@ export async function applySmAdminCorrection(tx: SmManagementTx, submissionId: s
   const normalized = input.changes.map(change => {
     const question = state.questions.find(row => row.id === change.questionId);
     if (!question) return fail(400, "sm_management_question_forbidden", "Eine Frage gehört nicht zu diesem Fragebogen.");
-    const answer = normalizeSmVisitAnswer(smManagementQuestionSnapshot(question), change.answer);
+    const answer = normalizeSmVisitAnswer(smManagementQuestionSnapshot(question, state.optionalCommentEnabled), change.answer);
     values.set(question.id, answer);
     return { question, answer };
   });
@@ -251,6 +253,7 @@ export async function smManagementDetail(tx: SmManagementTx, id: string, options
       submittedAt: submission.submittedAt?.toISOString() ?? null, travelMinutes: SMDurcharbeitTime?.travelMinutes ?? submission.travelMinutes, updatedAt: submission.updatedAt.toISOString() },
     sections: sectionRows.map(section => ({ id: section.id, title: section.moduleNameSnapshot, description: section.moduleDescriptionSnapshot,
       questions: state.questions.filter(question => question.submissionSectionId === section.id).map(question => ({
+        optionalCommentEnabled: state.optionalCommentEnabled,
         id: question.id, questionCode: question.questionCodeSnapshot, text: question.questionTextSnapshot, type: question.questionTypeSnapshot,
         config: question.configSnapshot, options: question.answerOptionsSnapshot, rules: question.logicRulesSnapshot,
         required: question.requiredSnapshot, applicable: question.isApplicable, applicabilityReason: question.applicabilityReason,

@@ -4,6 +4,7 @@ import { assertSMDurcharbeitOverride, loadSMDurcharbeitSelectionCatalog, resolve
 import { and, asc, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
+import { smOptionalCommentsForSubmission } from "../sm-comment-context.shared.js";
 import { smAnswerComment, smCommentMissing } from "../sm-comment.shared.js";
 import { SMDurcharbeitCampaignError, loadSMDurcharbeitOwnedVisit, loadSMDurcharbeitTarget, lockSMDurcharbeitTarget,
   assertSMDurcharbeitAvailable, assertSMDurcharbeitEmployeeVisible, loadSMDurcharbeitVersion, SMDurcharbeitToday, SMDurcharbeitMonth,
@@ -570,6 +571,7 @@ async function loadVisitPayload(assignment: VisitExecution, smUserId: string) {
       questions: (questionsBySection.get(section.id) ?? []).map((question) => ({
         id: question.id,
         questionCode: question.questionCodeSnapshot,
+        optionalCommentEnabled: selection?.catalogScope === "SMDurcharbeit",
         type: question.questionTypeSnapshot,
         text: question.questionTextSnapshot,
         required: question.requiredSnapshot,
@@ -777,7 +779,7 @@ async function removeSMDurcharbeitPhoto(tx: DbTx, execution: SMDurcharbeitExecut
   const remaining = await SMDurcharbeitAnswerFiles(tx, [answer.id]);
   await tx.update(smQuestionAnswers).set({ answerState: remaining.length ? "answered" : "unanswered",
     metricOutcomeCode: remaining.length ? answer.metricOutcomeCode : null,
-    valueJson: { kind: "photo", fileIds: remaining.map(photo => photo.id), ...(remaining.length && smAnswerComment(answer.valueJson) ? { comment: smAnswerComment(answer.valueJson) } : {}) },
+    valueJson: { ...(remaining.length ? { kind: "photo", fileIds: remaining.map(photo => photo.id) } : { kind: "empty" }), ...(smAnswerComment(answer.valueJson) ? { comment: smAnswerComment(answer.valueJson) } : {}) },
     answeredAt: remaining.length ? now : null, updatedAt: now }).where(eq(smQuestionAnswers.id, answer.id));
   await tx.insert(smQuestionAnswerEvents).values({ answerId: answer.id, submissionId: submission.id, eventType: remaining.length ? "set" : "clear", answerVersion: answer.answerVersion,
     payload: { removedFileId: file.id, SMDurcharbeitInherited: file.SMDurcharbeitInherited }, actorUserId: actorId });
@@ -1252,10 +1254,12 @@ smVisitsRouter.delete("/:assignmentId/photos/:fileId", async (req: AuthedRequest
         eq(smQuestionAnswerFiles.answerId, file.answerId),
         eq(smQuestionAnswerFiles.isDeleted, false),
       ));
+      const [scope] = await tx.select().from(smQuestionnaireSubmissions).where(eq(smQuestionnaireSubmissions.id, file.submissionId)).limit(1);
+      const optionalComment = scope ? await smOptionalCommentsForSubmission(tx, scope) : false;
       await tx.update(smQuestionAnswers).set({
         answerState: remaining.length ? "answered" : "unanswered",
         metricOutcomeCode: remaining.length ? file.metricOutcomeCode : null,
-        valueJson: { kind: "photo", fileIds: remaining.map((photo) => photo.id), ...(remaining.length && smAnswerComment(file.valueJson) ? { comment: smAnswerComment(file.valueJson) } : {}) },
+        valueJson: { ...(remaining.length || !optionalComment ? { kind: "photo", fileIds: remaining.map(photo => photo.id) } : { kind: "empty" }), ...((remaining.length || optionalComment) && smAnswerComment(file.valueJson) ? { comment: smAnswerComment(file.valueJson) } : {}) },
         answeredAt: remaining.length ? now : null,
         updatedAt: now,
       }).where(eq(smQuestionAnswers.id, file.answerId));
@@ -1321,7 +1325,9 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
       if (!question) throw new SmVisitError(404, "sm_visit_question_not_found", "Die Frage wurde nicht gefunden.");
       if (!question.isApplicable) throw new SmVisitError(409, "sm_visit_question_hidden", "Diese Frage ist aufgrund einer vorherigen Antwort nicht relevant.");
       const options = optionSnapshot(question.answerOptionsSnapshot);
+      const optionalCommentEnabled = await smOptionalCommentsForSubmission(tx, submission);
       const normalized = normalizeSmVisitAnswer({
+        optionalCommentEnabled,
         type: question.questionTypeSnapshot,
         config: question.configSnapshot,
         options,
@@ -1348,17 +1354,20 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
         const files = current && isSMDurcharbeitExecution(assignment) ? await SMDurcharbeitAnswerFiles(tx, [current.id]) : current ? await tx.select({ id: smQuestionAnswerFiles.id }).from(smQuestionAnswerFiles).where(and(
           eq(smQuestionAnswerFiles.answerId, current.id), eq(smQuestionAnswerFiles.isDeleted, false),
         )) : [];
-        if (!current || normalized.kind !== "photo" || files.length !== normalized.fileIds.length || files.some((file) => !normalized.fileIds.includes(file.id))) {
-          throw new SmVisitError(409, "sm_visit_photo_upload_required", "Bitte speichere zuerst alle Fotos, bevor du den Kommentar ergänzt.");
+        const noteWithoutPhotos = optionalCommentEnabled && normalized.kind === "empty" && files.length === 0;
+        if (!noteWithoutPhotos) {
+          if (!current || normalized.kind !== "photo" || files.length !== normalized.fileIds.length || files.some((file) => !normalized.fileIds.includes(file.id))) {
+            throw new SmVisitError(409, "sm_visit_photo_upload_required", "Bitte speichere zuerst alle Fotos, bevor du den Kommentar ergänzt.");
+          }
+          await tx.update(smQuestionAnswers).set({ metricOutcomeCode: smBasicActivityCode({ type: question.questionTypeSnapshot, config: question.configSnapshot, options }, normalized), valueJson: normalized, answerVersion: version, updatedAt: now }).where(eq(smQuestionAnswers.id, current.id));
+          await tx.insert(smQuestionAnswerEvents).values({
+            answerId: current.id, submissionId: submission.id, eventType: "set", answerVersion: version,
+            payload: { clientMutationToken: input.clientMutationToken, changeKind: "comment", before: current.valueJson, after: normalized },
+            actorUserId: actor.appUserId,
+          });
+          await recomputeApplicability(tx, submission.id, actor.appUserId);
+          return { saved: true, answerVersion: version };
         }
-        await tx.update(smQuestionAnswers).set({ metricOutcomeCode: smBasicActivityCode({ type: question.questionTypeSnapshot, config: question.configSnapshot, options }, normalized), valueJson: normalized, answerVersion: version, updatedAt: now }).where(eq(smQuestionAnswers.id, current.id));
-        await tx.insert(smQuestionAnswerEvents).values({
-          answerId: current.id, submissionId: submission.id, eventType: "set", answerVersion: version,
-          payload: { clientMutationToken: input.clientMutationToken, changeKind: "comment", before: current.valueJson, after: normalized },
-          actorUserId: actor.appUserId,
-        });
-        await recomputeApplicability(tx, submission.id, actor.appUserId);
-        return { saved: true, answerVersion: version };
       }
       if (current) await tx.update(smQuestionAnswers).set({ isCurrent: false, updatedAt: now }).where(eq(smQuestionAnswers.id, current.id));
       const answerId = randomUUID();
@@ -1409,7 +1418,7 @@ smVisitsRouter.put("/:assignmentId/answers/:submissionQuestionId", async (req: A
       await tx.insert(smQuestionAnswerEvents).values({
         answerId,
         submissionId: submission.id,
-        eventType: isAnswered ? "set" : "clear",
+        eventType: isAnswered || smAnswerComment(normalized) ? "set" : "clear",
         answerVersion: version,
         payload: { clientMutationToken: input.clientMutationToken },
         actorUserId: actor.appUserId,

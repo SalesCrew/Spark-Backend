@@ -1,3 +1,4 @@
+import * as optionalComments from "../src/sm-comment-context.shared.js";
 import * as basicActivity from "../src/sm-basic-activity.shared.js";
 import * as overview from "../src/sm-dashboard-overview.shared.js";
 import { randomUUID } from "node:crypto";
@@ -102,7 +103,7 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   const monthly = await isolatedModule<typeof import("../src/sm-SMDurcharbeit-campaign.shared.js")>(new URL("../src/sm-SMDurcharbeit-campaign.shared.ts", import.meta.url), {
     "./lib/schema.js": schema, "./sm-planning.shared.js": planning, "./sm-planning-lock.js": lock,
   }, options.clock ?? Date);
-  const base = { "../sm-basic-activity.shared.js": basicActivity, "../sm-dashboard-overview.shared.js": overview, "../lib/kunde-access.js": kundeAccess, "../sm-SMDurcharbeit-campaign.shared.js": monthly, "../sm-SMDurcharbeit-answer-reuse.shared.js": monthlyAnswerReuse,
+  const base = { "../sm-comment-context.shared.js": optionalComments, "./sm-comment-context.shared.js": optionalComments, "../sm-basic-activity.shared.js": basicActivity, "../sm-dashboard-overview.shared.js": overview, "../lib/kunde-access.js": kundeAccess, "../sm-SMDurcharbeit-campaign.shared.js": monthly, "../sm-SMDurcharbeit-answer-reuse.shared.js": monthlyAnswerReuse,
     "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection, "../sm-planning-lock.js": lock, "../sm-SMDurcharbeit-catalog.shared.js": SMDurcharbeitCatalog, "../lib/db.js": { db: dbForRoutes }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": auth };
   const marketEdit = await isolatedModule<typeof import("../src/sm-SMDurcharbeit-market-edit.shared.js")>(new URL("../src/sm-SMDurcharbeit-market-edit.shared.ts", import.meta.url), {
     "./lib/schema.js": schema, "./sm-SMDurcharbeit-campaign.shared.js": monthly,

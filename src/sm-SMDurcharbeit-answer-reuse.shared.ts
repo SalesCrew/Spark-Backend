@@ -34,7 +34,7 @@ export async function copySMDurcharbeitMonthlyAnswers(tx:SMDurcharbeitTx,input:{
     const old=sourceQuestionById.get(source.submissionQuestionId);
     const next=old?newQuestionByVersion.get(`${old.questionVersionId}:${old.questionCodeSnapshot}`):undefined;
     if(!next) continue;
-    const snapshot={type:next.questionTypeSnapshot,config:next.configSnapshot,options:(next.answerOptionsSnapshot as Array<{code:string;label:string}>)??[]};
+    const snapshot={optionalCommentEnabled:true,type:next.questionTypeSnapshot,config:next.configSnapshot,options:(next.answerOptionsSnapshot as Array<{code:string;label:string}>)??[]};
     const normalized=normalizeSmVisitAnswer(snapshot,source.valueJson??{kind:"empty"});
     const availableFiles=new Set(sourceFiles.filter(file=>file.answerId===source.id).map(file=>file.id));
     const value=normalized.kind==="photo"?{...normalized,fileIds:normalized.fileIds.filter(id=>availableFiles.has(id))}:normalized;

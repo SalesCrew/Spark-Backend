@@ -1,3 +1,4 @@
+import { smOptionalCommentsForSubmission } from "../sm-comment-context.shared.js";
 import { smBasicActivityCode } from "../sm-basic-activity.shared.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
 import { randomUUID } from "node:crypto";
@@ -33,6 +34,7 @@ import {
   smQuestionnaireSubmissionQuestions,
   smQuestionnaireSubmissionSections,
   smQuestionnaireSubmissions,
+  smQuestionnaireTemplates,
   users,
 } from "../lib/schema.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
@@ -104,8 +106,9 @@ function optionSnapshot(value: unknown): Array<{ code: string; label: string; ma
   });
 }
 
-function questionSnapshot(question: typeof smQuestionnaireSubmissionQuestions.$inferSelect): SmVisitQuestionSnapshot {
+function questionSnapshot(question: typeof smQuestionnaireSubmissionQuestions.$inferSelect, optionalCommentEnabled = false): SmVisitQuestionSnapshot {
   return {
+    optionalCommentEnabled,
     type: question.questionTypeSnapshot,
     config: question.configSnapshot,
     options: optionSnapshot(question.answerOptionsSnapshot),
@@ -236,6 +239,7 @@ async function publicAnswerRequests(smUserId?: string) {
   const rows = await db.select({
     request: smAnswerChangeRequests,
     questionType: smQuestionnaireSubmissionQuestions.questionTypeSnapshot,
+    questionnaireStableCode: smQuestionnaireTemplates.stableCode,
     questionConfig: smQuestionnaireSubmissionQuestions.configSnapshot,
     questionOptions: smQuestionnaireSubmissionQuestions.answerOptionsSnapshot,
     required: smQuestionnaireSubmissionQuestions.requiredSnapshot,
@@ -258,6 +262,7 @@ async function publicAnswerRequests(smUserId?: string) {
   }).from(smAnswerChangeRequests)
     .innerJoin(smQuestionnaireSubmissions, eq(smQuestionnaireSubmissions.id, smAnswerChangeRequests.submissionId))
     .innerJoin(smQuestionnaireSubmissionQuestions, eq(smQuestionnaireSubmissionQuestions.id, smAnswerChangeRequests.submissionQuestionId))
+    .innerJoin(smQuestionnaireTemplates, eq(smQuestionnaireTemplates.id, smQuestionnaireSubmissions.questionnaireTemplateId))
     .innerJoin(smQuestionnaireSubmissionSections, eq(smQuestionnaireSubmissionSections.id, smQuestionnaireSubmissionQuestions.submissionSectionId))
     .innerJoin(users, eq(users.id, smAnswerChangeRequests.smUserId))
     .innerJoin(smMarkets, eq(smMarkets.id, smAnswerChangeRequests.smMarketId))
@@ -274,7 +279,7 @@ async function publicAnswerRequests(smUserId?: string) {
           autoApplicable = false;
           autoApplicabilityError = "Die gespeicherte Antwort hat sich seit der Anfrage geändert.";
         } else {
-          const normalized = normalizeSmVisitAnswer({ type: row.questionType, config: row.questionConfig, options: optionSnapshot(row.questionOptions) }, row.request.requestedAnswerPayload);
+          const normalized = normalizeSmVisitAnswer({ optionalCommentEnabled: row.questionnaireStableCode.startsWith("smdurcharbeit_"), type: row.questionType, config: row.questionConfig, options: optionSnapshot(row.questionOptions) }, row.request.requestedAnswerPayload);
           const conditional = await validateConditionalResult(db, row.request.submissionId, row.request.submissionQuestionId, normalized);
           if (conditional.missingRequired.length) {
             autoApplicable = false;
@@ -496,7 +501,8 @@ smActivityRouter.post("/submissions/:submissionId/questions/:questionId/change-r
           throw new SmActivityError(409, "sm_activity_request_token_conflict", "Dieser Anfrage-Token wurde bereits für eine andere Antwort verwendet.");
         }
         const [replayQuestion] = await tx.select().from(smQuestionnaireSubmissionQuestions).where(and(eq(smQuestionnaireSubmissionQuestions.id, questionId), eq(smQuestionnaireSubmissionQuestions.submissionId, submissionId))).limit(1);
-        const normalizedReplay = replayQuestion ? normalizeSmVisitAnswer(questionSnapshot(replayQuestion), input.answer) : input.answer;
+        const [replaySubmission] = await tx.select().from(smQuestionnaireSubmissions).where(eq(smQuestionnaireSubmissions.id, submissionId)).limit(1);
+        const normalizedReplay = replayQuestion ? normalizeSmVisitAnswer(questionSnapshot(replayQuestion, replaySubmission ? await smOptionalCommentsForSubmission(tx, replaySubmission) : false), input.answer) : input.answer;
         if (stableSmVisitAnswer(replayed.requestedAnswerPayload as SmVisitAnswerPayload) !== stableSmVisitAnswer(normalizedReplay) || replayed.requestReason !== input.reason) {
           throw new SmActivityError(409, "sm_activity_request_token_conflict", "Dieser Anfrage-Token wurde bereits mit anderen Änderungsdaten verwendet.");
         }
@@ -508,7 +514,7 @@ smActivityRouter.post("/submissions/:submissionId/questions/:questionId/change-r
       if (!question) throw new SmActivityError(404, "sm_activity_question_not_found", "Die Frage wurde nicht gefunden oder ist nicht anwendbar.");
       const [pending] = await tx.select().from(smAnswerChangeRequests).where(and(eq(smAnswerChangeRequests.submissionQuestionId, question.id), eq(smAnswerChangeRequests.status, "pending"), eq(smAnswerChangeRequests.isDeleted, false))).limit(1).for("update");
       if (pending) return { row: pending, replayed: true };
-      const normalized = normalizeSmVisitAnswer(questionSnapshot(question), input.answer);
+      const normalized = normalizeSmVisitAnswer(questionSnapshot(question, await smOptionalCommentsForSubmission(tx, submission)), input.answer);
       if (question.requiredSnapshot && !isCompleteSmVisitAnswer(questionSnapshot(question), normalized)) throw new SmActivityError(400, "sm_activity_required_answer_empty", "Eine Pflichtfrage kann nicht geleert werden.");
       const original = await currentAnswer(tx, question.id, true);
       const originalValue = (original?.valueJson ?? { kind: "empty" }) as SmVisitAnswerPayload;
@@ -650,7 +656,7 @@ adminSmActivityRouter.post("/answer-change-requests/:requestId/approve", async (
       if (!question) throw new SmActivityError(409, "sm_activity_question_stale", "Die Frage ist nicht mehr anwendbar.");
       const current = await currentAnswer(tx, question.id, true);
       if ((current?.id ?? null) !== request.originalAnswerId) throw new SmActivityError(409, "sm_activity_request_stale", "Die gespeicherte Antwort hat sich seit der Anfrage geändert. Bitte lehne die veraltete Anfrage ab.");
-      const normalized = normalizeSmVisitAnswer(questionSnapshot(question), request.requestedAnswerPayload);
+      const normalized = normalizeSmVisitAnswer(questionSnapshot(question, await smOptionalCommentsForSubmission(tx, submission)), request.requestedAnswerPayload);
       if (question.requiredSnapshot && !isCompleteSmVisitAnswer(questionSnapshot(question), normalized)) throw new SmActivityError(400, "sm_activity_required_answer_empty", "Eine Pflichtfrage kann nicht geleert werden.");
       const conditional = await validateConditionalResult(tx, submission.id, question.id, normalized);
       if (conditional.missingRequired.length) throw new SmActivityError(409, "sm_activity_request_required_side_effect", "Die Änderung würde eine Pflichtfrage unbeantwortet lassen.", { questionIds: conditional.missingRequired.map((row) => row.id) });
