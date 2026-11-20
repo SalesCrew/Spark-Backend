@@ -1,7 +1,7 @@
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { smQuestionnaireSubmissions as submissions, smQuestionnaireSubmissionSections as sections,
-  smQuestionnaireSubmissionQuestions as questions, smQuestionAnswers as answers, users,
+  smQuestionnaireSubmissionQuestions as questions, smQuestionVersions as questionVersions, smQuestionAnswers as answers, users,
   smSMDurcharbeitTimeRevisions as timeRevisions } from "./lib/schema.js";
 import { listSmManagedVisits, smManagementListSchema } from "./sm-management-list.shared.js";
 import { SMDurcharbeitAnswerFiles } from "./sm-SMDurcharbeit-answer-reuse.shared.js";
@@ -41,7 +41,9 @@ export async function loadSmManagementReport(tx: SmManagementTx, input: SmManage
   const submissionRows = await tx.select().from(submissions).where(inArray(submissions.id, ids));
   const sectionRows = await tx.select({ id: sections.id, title: sections.moduleNameSnapshot, order: sections.orderIndex })
     .from(sections).where(and(inArray(sections.submissionId, ids), eq(sections.isDeleted, false)));
-  const questionRows = await tx.select().from(questions).where(and(inArray(questions.submissionId, ids), eq(questions.isDeleted, false)))
+  const questionRows = await tx.select({ ...getTableColumns(questions), questionVersionNumber: questionVersions.versionNumber })
+    .from(questions).innerJoin(questionVersions, eq(questionVersions.id, questions.questionVersionId))
+    .where(and(inArray(questions.submissionId, ids), eq(questions.isDeleted, false)))
     .orderBy(asc(questions.submissionId), asc(questions.orderIndex), asc(questions.id)).limit(maxQuestions + 1);
   const answerRows = await tx.select().from(answers).where(and(inArray(answers.submissionId, ids), eq(answers.isCurrent, true), eq(answers.isDeleted, false)))
     .limit(maxQuestions + 1);
@@ -92,7 +94,7 @@ export async function loadSmManagementReport(tx: SmManagementTx, input: SmManage
     const valueJson = rawValue?.kind === "photo" ? { ...rawValue, fileIds: answerPhotos.map(photo => photo.id) } : rawValue;
     if (!visitIds.has(question.submissionId)) throw new Error("Answer outside the report selection");
     return { module: sectionMap.get(question.submissionSectionId)?.title ?? "",
-      question: { optionalCommentEnabled: optionalBySubmission.get(question.submissionId) ?? false, id: question.id, submissionId: question.submissionId, questionVersionId: question.questionVersionId,
+      question: { optionalCommentEnabled: optionalBySubmission.get(question.submissionId) ?? false, id: question.id, submissionId: question.submissionId, questionVersionId: question.questionVersionId, questionVersionNumber: question.questionVersionNumber,
         questionCodeSnapshot: question.questionCodeSnapshot, questionTypeSnapshot: question.questionTypeSnapshot,
         questionTextSnapshot: question.questionTextSnapshot, answerOptionsSnapshot: question.answerOptionsSnapshot,
         configSnapshot: question.configSnapshot, isApplicable: question.isApplicable, applicabilityReason: question.applicabilityReason },

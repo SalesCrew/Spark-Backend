@@ -1,13 +1,13 @@
-import { and, asc, desc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, inArray, isNotNull } from "drizzle-orm";
 import { smQuestionAnswers as answers, smQuestionnaireSubmissionQuestions as questions,
-  smQuestionnaireSubmissionSections as sections,
+  smQuestionnaireSubmissionSections as sections, smQuestionVersions as questionVersions,
   smQuestionnaireSubmissions as submissions, smSMDurcharbeitVisits as visits,
   smSMDurcharbeitTimeRevisions as times, smSMDurcharbeitAnswerProvenance as provenance } from "./lib/schema.js";
 import { isAnsweredSmVisitPayload, type SmVisitAnswerPayload } from "./sm-visit.shared.js";
 import { SMDurcharbeitAnswerFiles } from "./sm-SMDurcharbeit-answer-reuse.shared.js";
 import { listSMDurcharbeitTargets, SMDurcharbeitCampaignError, type SMDurcharbeitExecutor } from "./sm-SMDurcharbeit-campaign.shared.js";
 
-type Question = typeof questions.$inferSelect;
+type Question = typeof questions.$inferSelect & { questionVersionNumber?: number };
 type Answer = typeof answers.$inferSelect;
 export type SMDurcharbeitReportAnswer = {
   question: Question; answer: Answer | null; targetId: string; smName: string;
@@ -18,10 +18,11 @@ async function loadReportAnswers(executor: SMDurcharbeitExecutor, submissionIds:
   const rows: SMDurcharbeitReportAnswer[] = [];
   // Bounded parameters and one batch per group, never one query per market.
   for (let offset = 0; offset < submissionIds.length; offset += 1000) {
-    const batch = await executor.select({ question: questions, answer: answers,
+    const batch = await executor.select({ question: { ...getTableColumns(questions), questionVersionNumber: questionVersions.versionNumber }, answer: answers,
       targetId: submissions.SMDurcharbeitTargetId, smName: submissions.smNameSnapshot,
       sourceSubmissionId: provenance.sourceSubmissionId, sourceAnswerId: provenance.sourceAnswerId })
       .from(questions).innerJoin(submissions, eq(submissions.id, questions.submissionId))
+      .innerJoin(questionVersions, eq(questionVersions.id, questions.questionVersionId))
       .innerJoin(sections, eq(sections.id, questions.submissionSectionId))
       .leftJoin(answers, and(eq(answers.submissionQuestionId, questions.id), eq(answers.isCurrent, true), eq(answers.isDeleted, false)))
       .leftJoin(provenance, eq(provenance.answerId, answers.id))
