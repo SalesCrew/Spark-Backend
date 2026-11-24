@@ -21,6 +21,8 @@ import { loadSMDurcharbeitReport } from "../sm-SMDurcharbeit-report.shared.js";
 import { applySMDurcharbeitMarketEdit, previewSMDurcharbeitMarketEdit } from "../sm-SMDurcharbeit-market-edit.shared.js";
 import { applySMDurcharbeitCampaignOwners, previewSMDurcharbeitCampaignOwners } from "../sm-SMDurcharbeit-owner-bulk.shared.js";
 import { applySMDurcharbeitQuestionnaireUpdate, previewSMDurcharbeitQuestionnaireUpdate } from "../sm-SMDurcharbeit-questionnaire-update.shared.js";
+import { SMDurcharbeitExportSchema, SMDurcharbeitExportOptions, SMDurcharbeitExportPreview, SMDurcharbeitExportReport } from "../sm-SMDurcharbeit-export.shared.js";
+import { SmManagementError } from "../sm-management.js";
 
 const date = z.string().refine(isIsoDate, "Ungültiges Datum.");
 const uuid = z.string().uuid();
@@ -42,6 +44,7 @@ function actor(req: AuthedRequest) { if (!req.authUser) throw new SMDurcharbeitC
 function errorResponse(error: unknown, res: Response) {
   if (error instanceof z.ZodError) { res.status(400).json({ error: "Bitte die Eingaben prüfen.", code: "smdurcharbeit_input_invalid", details: { issues: error.issues } }); return true; }
   if (error instanceof SMDurcharbeitCampaignError) { res.status(error.statusCode).json({ error: error.message, code: error.code }); return true; }
+  if (error instanceof SmManagementError) { res.status(error.status).json({ error: error.message, code: error.code }); return true; }
   return false;
 }
 async function lockedCampaign(tx: Parameters<Parameters<typeof db.transaction>[0]>[0], campaignId: string, revision: number) {
@@ -54,6 +57,21 @@ async function lockedCampaign(tx: Parameters<Parameters<typeof db.transaction>[0
 export const adminSMDurcharbeitCampaignsRouter = Router();
 adminSMDurcharbeitCampaignsRouter.use(requireAuth(["admin", "sm_admin", "kunde"]));
 adminSMDurcharbeitCampaignsRouter.use(requireKundeAdminPermission);
+for (const mode of ["options", "preview", "report"] as const) {
+  adminSMDurcharbeitCampaignsRouter.get(`/export/${mode}`, async (req, res, next) => {
+    res.setHeader("Cache-Control", "private, no-store");
+    try {
+      const input = SMDurcharbeitExportSchema.parse(req.query);
+      if (mode === "options") z.object({}).strict().parse(req.query);
+      const result = await db.transaction(async tx => {
+        await tx.execute(sql`set local statement_timeout = '20s'`);
+        return mode === "options" ? SMDurcharbeitExportOptions(tx)
+          : mode === "preview" ? SMDurcharbeitExportPreview(tx, input) : SMDurcharbeitExportReport(tx, input);
+      }, { isolationLevel: "repeatable read", accessMode: "read only" });
+      res.json(result);
+    } catch (error) { if (!errorResponse(error, res)) next(error); }
+  });
+}
 adminSMDurcharbeitCampaignsRouter.use("/:campaignId/review/:reviewMonth", createSmManagementRouter(true));
 adminSMDurcharbeitCampaignsRouter.get("/options", async (req, res, next) => {
   try {

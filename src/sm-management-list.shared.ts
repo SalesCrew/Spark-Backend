@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, lte, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { smQuestionnaireSubmissions as submissions, smAssignments, smQuestionAnswers as answers,
   smQuestionnaireSubmissionQuestions as questions, smQuestionnaireTemplates,
@@ -18,14 +18,16 @@ export const smManagementListSchema = z.object({
 }).strict().refine(input => isoDateToEpochDay(input.to) >= isoDateToEpochDay(input.from) && isoDateToEpochDay(input.to) - isoDateToEpochDay(input.from) < 93, "Zeitraum maximal 93 Tage.")
   .refine(input => Boolean(input.cursorDate) === Boolean(input.cursorId), "Ungültiger Seitencursor.");
 
-const workDate = sql<string>`coalesce((${SMDurcharbeitTimes.startedAt} at time zone 'Europe/Vienna')::date, (${submissions.visitStartedAt} at time zone 'Europe/Vienna')::date,
+export const smManagedWorkDate = sql<string>`coalesce((${SMDurcharbeitTimes.startedAt} at time zone 'Europe/Vienna')::date, (${submissions.visitStartedAt} at time zone 'Europe/Vienna')::date,
   ${smAssignments.replacementWorkDate}, ${smAssignments.originalWorkDate}, (${submissions.submittedAt} at time zone 'Europe/Vienna')::date)`;
+const workDate = smManagedWorkDate;
 
-export async function listSmManagedVisits(tx: SmManagementTx, input: z.infer<typeof smManagementListSchema>, campaignMonthOnly = false, includeFacets = true) {
+export async function listSmManagedVisits(tx: SmManagementTx, input: z.infer<typeof smManagementListSchema>, campaignMonthOnly = false, includeFacets = true, additionalScope?: SQL) {
   if (campaignMonthOnly && (!input.SMDurcharbeitCampaignId || !input.SMDurcharbeitMonth)) {
     throw new SmManagementError(400, "sm_review_scope_required", "Kampagne und Kalendermonat sind erforderlich.");
   }
   const scope = [eq(submissions.isDeleted, false), eq(submissions.isCurrent, true), eq(submissions.status, "submitted"),
+    ...(additionalScope ? [additionalScope] : []),
     ...(campaignMonthOnly ? [] : [gte(workDate, input.from), lte(workDate, input.to)])];
   if (input.SMDurcharbeitCatalogScope) scope.push(sql`(case when starts_with(${smQuestionnaireTemplates.stableCode}, 'smdurcharbeit_') then 'SMDurcharbeit' else 'standard' end) = ${input.SMDurcharbeitCatalogScope}`);
   if (input.SMDurcharbeitCampaignId) scope.push(eq(SMDurcharbeitCampaigns.id, input.SMDurcharbeitCampaignId));

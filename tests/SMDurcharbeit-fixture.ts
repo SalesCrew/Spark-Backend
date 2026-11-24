@@ -21,6 +21,7 @@ import * as seriesShared from "../src/sm-series.shared.js";
 import * as managementShared from "../src/sm-management.js";
 import * as managementList from "../src/sm-management-list.shared.js";
 import * as managementReport from "../src/sm-management-report.shared.js";
+import * as planningExport from "../src/sm-SMDurcharbeit-export.shared.js";
 import * as sync from "../src/sm-market-user-sync.shared.js";
 import * as weekly from "../src/sm-market-weekly-planning.shared.js";
 import { z } from "zod";
@@ -173,6 +174,8 @@ export async function createSMDurcharbeitFixture(options: { photoStorage?: { fro
   app.use("/sm/visits", runtime.smVisitsRouter);
   app.use("/sm/smdurcharbeit/visits", runtime.SMDurcharbeitVisitsRouter);
   const campaignRoutes = await isolatedModule<typeof import("../src/routes/sm-SMDurcharbeit-campaigns.js")>(new URL("../src/routes/sm-SMDurcharbeit-campaigns.ts", import.meta.url), {
+    "../sm-SMDurcharbeit-export.shared.js": planningExport,
+    "../sm-management.js": managementShared,
     "../sm-SMDurcharbeit-questionnaire-update.shared.js": await isolatedModule<typeof import("../src/sm-SMDurcharbeit-questionnaire-update.shared.js")>(new URL("../src/sm-SMDurcharbeit-questionnaire-update.shared.ts", import.meta.url), {
       "./lib/schema.js": schema, "./sm-planning-lock.js": lock, "./sm-SMDurcharbeit-campaign.shared.js": monthly,
     }, options.clock ?? Date),

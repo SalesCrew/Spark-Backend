@@ -1,4 +1,4 @@
-import { and, asc, eq, getTableColumns, inArray } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { smQuestionnaireSubmissions as submissions, smQuestionnaireSubmissionSections as sections,
   smQuestionnaireSubmissionQuestions as questions, smQuestionVersions as questionVersions, smQuestionAnswers as answers, users,
@@ -25,12 +25,12 @@ function tooLarge(): never {
 }
 
 /** Pure read DTO. The caller supplies a repeatable-read, read-only transaction. */
-export async function loadSmManagementReport(tx: SmManagementTx, input: SmManagementReportQuery) {
+export async function loadSmManagementReport(tx: SmManagementTx, input: SmManagementReportQuery, additionalScope?: SQL) {
   const visits: Awaited<ReturnType<typeof listSmManagedVisits>>["visits"] = [];
   let cursor: { date: string; id: string } | null = null;
   do {
     const page = await listSmManagedVisits(tx, { ...input, limit: 100,
-      ...(cursor ? { cursorDate: cursor.date, cursorId: cursor.id } : {}) }, false, false);
+      ...(cursor ? { cursorDate: cursor.date, cursorId: cursor.id } : {}) }, false, false, additionalScope);
     visits.push(...page.visits);
     if (visits.length > maxVisits || (visits.length === maxVisits && page.nextCursor)) tooLarge();
     cursor = page.nextCursor;

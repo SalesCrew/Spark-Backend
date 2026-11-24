@@ -4,11 +4,11 @@ import request from "supertest";
 import { createSMDurcharbeitFixture } from "./SMDurcharbeit-fixture.js";
 
 /** Disposable real-route setup. No environment files, application entrypoint or cloud storage. */
-export async function createQuestionnaireUpdateFixture() {
+export async function createQuestionnaireUpdateFixture(additionalSmUsers: Array<{ id: string; token: string }> = []) {
   let now = Date.parse("2026-10-19T10:00:00Z");
   class Clock extends Date { constructor(value?: string | number | Date) { super(value === undefined ? now : value instanceof Date ? value.getTime() : value); } static now() { return now; } }
   const objects = new Set<string>(), reader = randomUUID(), editor = randomUUID(), wrongEditor = randomUUID();
-  const f = await createSMDurcharbeitFixture({ clock: Clock as typeof Date,
+  const f = await createSMDurcharbeitFixture({ additionalSmUsers, clock: Clock as typeof Date,
     customerUsers: [{ id: reader, token: "synthetic-reader", permissions: { sm_durcharbeit_verplanung: ["read"] } },
       { id: editor, token: "synthetic-editor", permissions: { sm_durcharbeit_verplanung: ["read", "update"] } },
       { id: wrongEditor, token: "synthetic-normal-editor", permissions: { sm_verplanung: ["read", "update"] } }],
@@ -21,14 +21,14 @@ export async function createQuestionnaireUpdateFixture() {
     }) } });
   try {
     const admin = (method: "get" | "post" | "patch", path: string, token = "synthetic-sm-admin") => request(f.app)[method](path).auth(token, { type: "bearer" });
-    const sm = (method: "get" | "post" | "put", path: string) => request(f.app)[method](path).auth("synthetic-sm", { type: "bearer" });
+    const sm = (method: "get" | "post" | "put", path: string, token = "synthetic-sm") => request(f.app)[method](path).auth(token, { type: "bearer" });
     const root = "/admin/sm-smdurcharbeit-campaigns", employeeRoot = "/sm/smdurcharbeit/targets", visitRoot = "/sm/smdurcharbeit/visits";
     const marketIds = [f.market, randomUUID(), randomUUID()];
     await f.database.insert(f.schema.smMarkets).values(marketIds.slice(1).map((id, index) => ({ id, internalMarketId: `SYNTHETIC-UPDATE-${index}`, name: `Vorschau Markt ${index + 2}`, chain: "Spar", address: "Vorschauweg 1", postalCode: "1010", city: "Wien", region: "Ost" })));
     await f.database.insert(f.schema.smSMDurcharbeitMarkets).values(marketIds.map(smMarketId => ({ smMarketId, SMDurcharbeitSmUserId: f.employee })));
     const moduleRoot = "/admin/sm-questionnaires/modules?scope=SMDurcharbeit", formRoot = "/admin/sm-questionnaires/questionnaires?scope=SMDurcharbeit";
     const question = (text: string, type = "yesno") => ({ id: `new-${randomUUID()}`, text, type, required: false, options: ["Ja", "Nein"], config: {}, rules: [] });
-    const originalModule = (await admin("post", moduleRoot).send({ id: `new-${randomUUID()}`, name: "SPAR Durcharbeit · Vorschau", description: "Synthetische Fragen", questions: [question("Bestand geprüft"), question("Notiz", "text"), question("Regalfoto", "photo"), ...[1, 2, 3, 4].map(index => question(`Entfernte Frage ${index}`))] }).expect(201)).body.module;
+    const originalModule = (await admin("post", moduleRoot).send({ id: `new-${randomUUID()}`, name: "SPAR Durcharbeit · Vorschau", description: "Synthetische Fragen", questions: [question("Bestand geprüft"), question("Notiz", "text"), question("Regalfoto", "photo"), ...[1, 2, 3, 4].map(index => question(`Entfernte Frage ${index}`))] }).expect(response => { if (response.status !== 201) throw new Error(`Synthetic module setup: ${response.status} ${JSON.stringify(response.body)}`); })).body.module;
     const form = (await admin("post", formRoot).send({ id: `new-${randomUUID()}`, name: "SPAR DA · Tour 1", description: "Vorschau", status: "active", moduleIds: [originalModule.id] }).expect(201)).body.questionnaire;
     const [version] = await f.database.select().from(f.schema.smQuestionnaireVersions).where(eq(f.schema.smQuestionnaireVersions.questionnaireTemplateId, form.id));
     async function publish(name: string) {
@@ -38,10 +38,10 @@ export async function createQuestionnaireUpdateFixture() {
       return (await admin("get", root).expect(200)).body.campaigns.find((row: { id: string }) => row.id === campaign.id);
     }
     const campaign = await publish("SPAR DA Tour 1 · Vorschau"), otherCampaign = await publish("Weitere Tour · unverändert");
-    const list = async () => (await sm("get", `${employeeRoot}?month=2026-10-01`).expect(200)).body.targets;
-    const start = async (targetId: string, followUp = false) => {
-      const target = (await list()).find((row: { id: string }) => row.id === targetId);
-      return (await sm("post", `${employeeRoot}/${targetId}/start`).send({ expectedRevision: target.revision, followUp, mode: "manual", clientSubmissionToken: randomUUID() }).expect(201)).body;
+    const list = async (token = "synthetic-sm") => (await sm("get", `${employeeRoot}?month=2026-10-01`, token).expect(200)).body.targets;
+    const start = async (targetId: string, followUp = false, token = "synthetic-sm") => {
+      const target = (await list(token)).find((row: { id: string }) => row.id === targetId);
+      return (await sm("post", `${employeeRoot}/${targetId}/start`, token).send({ expectedRevision: target.revision, followUp, mode: "manual", clientSubmissionToken: randomUUID() }).expect(201)).body;
     };
     const targets = (await list()).filter((row: { campaignId: string }) => row.campaignId === campaign.id);
     const completed = await start(targets[0].id), draft = await start(targets[1].id);
