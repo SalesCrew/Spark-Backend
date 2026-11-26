@@ -9,8 +9,9 @@ import { createTimeEntryPhotoService } from "../src/lib/time-entry-photos.js";
 import { createTimeEntryPhotoRouter } from "../src/routes/time-entry-photos.js";
 import { isolatedModule } from "./isolated-module.js";
 import * as roles from "../src/lib/admin-role.js";
+import * as timeline from "../src/lib/admin-zeiterfassung.js";
 export const syntheticPhoto=()=>Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jkAAAAABJRU5ErkJggg==','base64');
-export async function createTimeEntryPhotoFixture(apiOrigin="http://127.0.0.1:4038") {
+export async function createTimeEntryPhotoFixture(apiOrigin="http://127.0.0.1:4038", options: { realTimeline?: boolean } = {}) {
   if(process.env.DATABASE_URL||process.env.SUPABASE_URL||process.env.SUPABASE_SERVICE_ROLE_KEY||process.env.SUPABASE_SECRET_KEY)throw Error("Production configuration forbidden");
   const pg=new PGlite(),database=drizzle(pg,{schema});
   await pg.exec(`create role anon; create role authenticated; create schema storage;
@@ -27,10 +28,10 @@ export async function createTimeEntryPhotoFixture(apiOrigin="http://127.0.0.1:40
   for(const [name,role] of [['gm','gm'],['gm2','gm'],['admin','admin'],['kunde','kunde'],['sm','sm']] as const)await pg.query('insert into users values($1,$2)',[ids[name],role]);
   for(const [id,gm,type,status] of [[ids.entry,ids.gm,'sonderaufgabe','draft'],[ids.entry2,ids.gm2,'sonderaufgabe','submitted'],[ids.other,ids.gm,'lager','draft'],[ids.cancelled,ids.gm,'sonderaufgabe','cancelled']])await pg.query('insert into time_tracking_entries(id,gm_user_id,activity_type,status,start_at,end_at)values($1,$2,$3,$4,now()-interval \'30 minutes\',now())',[id,gm,type,status]);
   await pg.query('insert into photo_tags(id,label)values($1,\'Display\'),($2,\'Nachher\')',[ids.tag,ids.tag2]);
-  const objects=new Map<string,Buffer>();let failAfterPut=false;
+  const objects=new Map<string,Buffer>();let failAfterPut=false, failSigning=false, unavailablePhoto: string | undefined, failUploads=false;
   const service=createTimeEntryPhotoService(database as unknown as Parameters<typeof createTimeEntryPhotoService>[0],{
-    async put(path,bytes){const prior=objects.get(path);if(prior&&!prior.equals(bytes))throw Error('Immutable bytes must not be overwritten');objects.set(path,Buffer.from(bytes));if(failAfterPut){failAfterPut=false;throw Object.assign(Error('Synthetic network failure'),{status:503});}},
-    async sign(path){if(!objects.has(path))throw Error('Missing synthetic image');return `${apiOrigin}/__synthetic/photos/${encodeURIComponent(path)}`;}
+    async put(path,bytes){if(failUploads)throw Object.assign(Error('Foto konnte nicht gespeichert werden. Bitte erneut versuchen.'),{status:503});const prior=objects.get(path);if(prior&&!prior.equals(bytes))throw Error('Immutable bytes must not be overwritten');objects.set(path,Buffer.from(bytes));if(failAfterPut){failAfterPut=false;throw Object.assign(Error('Synthetic network failure'),{status:503});}},
+    async sign(path){if(failSigning&&(!unavailablePhoto||path.includes(unavailablePhoto)))throw Object.assign(Error('Foto konnte nicht geöffnet werden. Bitte erneut versuchen.'),{status:503});if(!objects.has(path))throw Error('Missing synthetic image');return `${apiOrigin}/__synthetic/photos/${encodeURIComponent(path)}`;}
   });
   const auth:(roles:("gm"|"admin")[])=>RequestHandler=allowed=>(req,res,next)=>{
     const token=req.header('Authorization')?.replace('Bearer synthetic-','')??'';const name=token as keyof typeof ids;
@@ -38,15 +39,23 @@ export async function createTimeEntryPhotoFixture(apiOrigin="http://127.0.0.1:40
     if(!allowed.includes(role as 'gm'|'admin')||!ids[name]){res.status(403).json({error:'Synthetic authorization denied'});return;}
     Object.assign(req,{authUser:{appUserId:ids[name],role}});next();
   };
-  const app=express();app.use(cors({origin:["http://127.0.0.1:3038","http://localhost:3038"]}));app.use(express.json());app.use('/time-tracking',createTimeEntryPhotoRouter(service,auth));
+  const app=express();app.use(cors({origin:["http://127.0.0.1:3037","http://localhost:3037","http://127.0.0.1:3038","http://localhost:3038"]}));app.use(express.json());app.use('/time-tracking',createTimeEntryPhotoRouter(service,auth));
+  let validation: Record<string,unknown> = {respondTimelineValidationError:()=>false,validateGmTimelineInterval:async()=>{},validateGmTimelineStartPoint:async()=>{}};
+  if(options.realTimeline){
+    await pg.exec(`create table gm_day_sessions(id uuid primary key,gm_user_id uuid,work_date date,timezone text,status text,day_started_at timestamptz,day_ended_at timestamptz,is_deleted boolean default false);
+      create table gm_day_session_pauses(id uuid primary key,gm_user_id uuid,day_session_id uuid,pause_started_at timestamptz,pause_ended_at timestamptz,is_deleted boolean default false);
+      create table visit_sessions(id uuid primary key,gm_user_id uuid,status text,started_at timestamptz,submitted_at timestamptz,is_deleted boolean default false);`);
+    await pg.query(`insert into gm_day_sessions values($1,$2,current_date,'Europe/Vienna','started',now()-interval '5 hours',null,false)`,[randomUUID(),ids.gm]);
+    validation=await isolatedModule(new URL('../src/lib/zeiterfassung-validation.ts',import.meta.url),{'./db.js':{db:database},'./schema.js':schema,'./admin-zeiterfassung.js':timeline});
+  }
   const tracking=await isolatedModule<{timeTrackingRouter:express.Router}>(new URL('../src/routes/time-tracking.ts',import.meta.url),{
     '../lib/admin-role.js':roles,'../lib/logger.js':{logAction(){},startActionTimer(){return 0n;}},'../middleware/auth.js':{requireAuth:auth},'../lib/db.js':{db:database},
     '../lib/day-session.js':{ensureGmSubmissionGate:async()=>({ok:true}),gmSubmissionGateError:()=>({error:'Synthetic gate'})},'../lib/supabase.js':{supabaseAdmin:{}},
-    '../lib/zeiterfassung-validation.js':{respondTimelineValidationError:()=>false,validateGmTimelineInterval:async()=>{},validateGmTimelineStartPoint:async()=>{}},'../lib/schema.js':schema,
+    '../lib/zeiterfassung-validation.js':validation,'../lib/schema.js':schema,
   });
   app.use('/time-tracking',tracking.timeTrackingRouter);
   app.get('/__synthetic/identity',(_req,res)=>res.json({synthetic:true,feature:'time-entry-photos',database:'Disposable PGlite'}));
   app.get('/__synthetic/photos/:path',(req,res)=>{const bytes=objects.get(req.params.path);if(!bytes){res.sendStatus(404);return;}res.type(req.params.path.endsWith('.png')?'image/png':'image/jpeg').send(bytes);});
   app.use((error:any,_req:unknown,res:express.Response,_next:unknown)=>res.status(error.status??(error.name==='ZodError'?400:500)).json({error:error.message}));
-  return{app,pg,database,service,ids,objects,failAfterPutOnce(){failAfterPut=true;},close:()=>pg.close()};
+  return{app,pg,database,service,ids,objects,failAfterPutOnce(){failAfterPut=true;},failSigning(value=true,photoId?:string){failSigning=value;unavailablePhoto=photoId;},failUploads(value=true){failUploads=value;},close:()=>pg.close()};
 }

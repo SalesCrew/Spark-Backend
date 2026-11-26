@@ -41,8 +41,14 @@ export function createTimeEntryPhotoService(database: typeof appDatabase, storag
       rows.length ? database.select().from(links).where(and(inArray(links.photoId,rows.map(r=>r.id)),eq(links.isDeleted,false))) : Promise.resolve([]),
       availableTags(),
     ]);
-    return { photos: await Promise.all(rows.map(async row => ({ id: row.id, name: row.originalFileName, url: await storage.sign(row.storagePath), uploadedAt: row.uploadedAt.toISOString(), revision: row.revision,
-      tags: tagRows.filter(t=>t.photoId===row.id).map(t=>({ id:t.photoTagId ?? t.id, label:t.labelSnapshot })) }))), availableTags: pool, canEdit: true, entry: { id:context.id,status:context.status } };
+    return { photos: await Promise.all(rows.map(async row => {
+      // Preview availability is independent of the committed photo and time entry.
+      let url: string | null = null;
+      try { url = await storage.sign(row.storagePath); } catch { /* Retain the metadata and permit an explicit preview retry. */ }
+      return { id: row.id, name: row.originalFileName, url, ...(url ? {} : { previewError: "Die Vorschau ist derzeit nicht verfügbar. Bitte erneut laden." }),
+        uploadedAt: row.uploadedAt.toISOString(), revision: row.revision,
+        tags: tagRows.filter(t=>t.photoId===row.id).map(t=>({ id:t.photoTagId ?? t.id, label:t.labelSnapshot })) };
+    })), availableTags: pool, canEdit: true, entry: { id:context.id,status:context.status } };
   }
   async function upload(entryId: string, actor: PhotoActor, id: string, bytes: Buffer, fileName: string) {
     await entry(entryId,actor);

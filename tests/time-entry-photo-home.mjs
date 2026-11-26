@@ -32,7 +32,7 @@ function preparationInbox(){
 const headers={'Content-Type':'application/json','Cache-Control':'no-store','Access-Control-Allow-Origin':'http://127.0.0.1:3038','Access-Control-Allow-Methods':'GET,POST,PATCH,PUT,DELETE,OPTIONS','Access-Control-Allow-Headers':'Content-Type,Authorization,Range','Access-Control-Expose-Headers':'Content-Length,Content-Range'};
 export function createHomeHandler(readEntries, gmId) { return async(req,res)=>{
  const entryRows=await readEntries();const entries=new Map(entryRows.map(e=>[e.id,e]));user.id=gmId;
- const origin=req.headers.origin;if(origin&&!['http://localhost:3038','http://127.0.0.1:3038','http://localhost:3038','http://localhost:3038'].includes(origin)){res.writeHead(403);return res.end();}
+ const origin=req.headers.origin;if(origin&&!['http://localhost:3037','http://127.0.0.1:3037','http://localhost:3038','http://127.0.0.1:3038'].includes(origin)){res.writeHead(403);return res.end();}
  const h={...headers,...(origin?{'Access-Control-Allow-Origin':origin}:{})};if(req.method==='OPTIONS'){res.writeHead(204,h);return res.end();}
  const url=new URL(req.url,'http://127.0.0.1:4038'),p=url.pathname;let b={};
  try{if(req.method!=='GET'&&req.method!=='HEAD'){let body='';for await(const part of req){body+=part;if(body.length>20000000)throw Error('too big');}b=body?JSON.parse(body):{};}
@@ -51,7 +51,7 @@ export function createHomeHandler(readEntries, gmId) { return async(req,res)=>{
  if(p==='/day-session/current')return send({session:day,gate});
 
  const hhmm=value=>new Date(value).toLocaleTimeString('de-AT',{hour:'2-digit',minute:'2-digit',timeZone:'Europe/Vienna'});
- const timeline=entryRows.filter(e=>e.status==='submitted').map(e=>({id:e.id,kind:'zusatzzeit',subtype:e.activityType,start:hhmm(e.startAt),end:hhmm(e.endAt),durationMin:30,title:'Sondereinsatz',subtitle:e.comment??'',comment:e.comment??''}));
+ const timeline=entryRows.filter(e=>e.status==='submitted').map(e=>({id:e.id,kind:'zusatzzeit',subtype:e.activityType,start:hhmm(e.startAt),end:hhmm(e.endAt),durationMin:Math.floor((new Date(e.endAt)-new Date(e.startAt))/60000),title:'Sondereinsatz',subtitle:e.comment??'',comment:e.comment??''}));
  if(p==='/day-session/today-submissions')return send({items:[],timeline,stats:{pureWorkDurationMin:204,totalKm:42},session:{id:day.id,date:today,status:'started',startTime:hhmm(day.dayStartedAt),endTime:'',startKm:day.startKm,endKm:null}});
  if(p==='/day-session/time-change-requests')return send({requests:[]});
  if(p==='/day-session/zeiterfassung')return send({sessions:timeline.length?[{id:day.id,date:today,gmId:gmId,gmName:'Max Mustermann',region:'Sued',status:'started',isLive:true,timezone:'Europe/Vienna',startTime:hhmm(day.dayStartedAt),endTime:'',startKm:day.startKm,endKm:null,entries:timeline.map(t=>({...t,startTime:t.start,endTime:t.end})),timeline,stats:{arbeitstag:204,pauseMin:0,reineArbeitszeit:204,kmGefahren:42,marktbesuche:0,zusatz:timeline.length}}]:[],aggregate:{totalKmDriven:42,privatnutzungKm:0,averageWorkdayMin:204,currentKwReineArbeitszeitMin:204},meta:{from:today,to:today,timezone:'Europe/Vienna',includeLive:true,totalSessions:timeline.length?1:0}});

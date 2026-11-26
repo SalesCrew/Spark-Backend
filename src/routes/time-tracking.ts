@@ -674,6 +674,10 @@ timeTrackingRouter.post("/entries/:id/submit", async (req: AuthedRequest, res, n
       res.status(403).json({ error: "Keine Berechtigung für diesen Eintrag." });
       return;
     }
+    if (entry.status === "submitted") {
+      res.status(200).json({ entry: serializeEntry(entry) });
+      return;
+    }
     if (entry.status !== "draft") {
       res.status(409).json({ error: "Nur Entwürfe können gespeichert werden." });
       return;
@@ -827,6 +831,20 @@ timeTrackingRouter.get("/entries/draft/active", async (req: AuthedRequest, res, 
   } catch (error) {
     next(error);
   }
+});
+
+// Read the entry state without fetching or signing optional photo previews.
+timeTrackingRouter.get("/entries/:id", async (req: AuthedRequest, res, next) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  try {
+    const id = uuidSchema.safeParse(req.params.id);
+    if (!id.success) { res.status(400).json({ error: "Ungültige Eintrags-ID." }); return; }
+    const [entry] = await db.select().from(timeTrackingEntries).where(and(eq(timeTrackingEntries.id,id.data),eq(timeTrackingEntries.isDeleted,false))).limit(1);
+    if (!entry) { res.status(404).json({ error: "Eintrag nicht gefunden." }); return; }
+    if (!canAccessEntry(req,entry.gmUserId)) { res.status(403).json({ error: "Keine Berechtigung für diesen Eintrag." }); return; }
+    if (entry.status === "cancelled") { res.status(409).json({ error: "Dieser Eintrag wurde abgebrochen." }); return; }
+    res.json({ entry: serializeEntry(entry) });
+  } catch(error) { next(error); }
 });
 
 export { timeTrackingRouter, normalizeActivityType };
