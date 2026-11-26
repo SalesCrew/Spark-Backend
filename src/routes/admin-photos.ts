@@ -1,15 +1,19 @@
 import { ZipArchive, type Archiver, type ArchiverError } from "archiver";
-import { and, count, desc, eq, ilike, inArray, isNotNull, or, sql, type SQL } from "drizzle-orm";
+import { and, count, desc, eq, ilike, inArray, isNotNull, or, sql, type SQL, type AnyColumn } from "drizzle-orm";
 import { Router } from "express";
 import { Readable } from "node:stream";
 import { z } from "zod";
 import { isFullAdminRole } from "../lib/admin-role.js";
 import { db } from "../lib/db.js";
 import { requireKundeAdminPermission } from "../lib/kunde-access.js";
+import { timeEntryPhotoService } from "../lib/time-entry-photos-runtime.js";
 import { shouldExcludeMhdPhotos } from "../lib/photo-archive-access.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import {
+  timeTrackingEntries,
+  timeTrackingEntryPhotos,
+  timeTrackingEntryPhotoTags,
   campaigns,
   markets,
   photoTags,
@@ -25,8 +29,9 @@ import {
 const adminPhotosRouter = Router();
 adminPhotosRouter.use(requireAuth(["admin", "kunde"]));
 adminPhotosRouter.use(requireKundeAdminPermission);
+adminPhotosRouter.use("/photos", (_req,res,next)=>{res.setHeader("Cache-Control","private, no-store");res.vary("X-Photo-Archive-Version");next();});
 
-const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit"]);
+const campaignSectionSchema = z.enum(["standard", "flex", "billa", "kuehler", "mhd", "durcharbeit", "sonderaufgabe"]);
 const photoSignVariantSchema = z.enum(["preview", "original"]);
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SIGNED_URL_TTL_SECONDS = 15 * 60;
@@ -66,7 +71,9 @@ type PhotoFilterQuery = PhotoListQuery & {
   tagLabels?: string[] | undefined;
 };
 type PhotoSignVariant = z.infer<typeof photoSignVariantSchema>;
-type PhotoAccessScope = { excludeMhd: boolean };
+type PhotoAccessScope = { excludeMhd: boolean; includeSpecialAssignments?: boolean };
+// Older open clients only understand campaign-backed photos. Opt in to the extended contract.
+const archiveAccess = (req: AuthedRequest): PhotoAccessScope => ({ excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role), includeSpecialAssignments: isFullAdminRole(req.authUser?.role) && req.get("X-Photo-Archive-Version") === "2" });
 
 const photoSignedUrlsBodySchema = z.object({
   photoIds: z.array(z.string().regex(uuidRegex)).min(1).max(40),
@@ -86,12 +93,17 @@ const photoExportBodySchema = z.object({
 
 const photoTagsUpdateBodySchema = z.object({
   photoTagIds: z.array(z.string().regex(uuidRegex)).max(80),
+  expectedRevision: z.number().int().positive().optional(),
 });
 
 type PhotoRow = {
   id: string;
-  visitAnswerId: string;
-  visitSessionId: string;
+  source: "visit" | "special_assignment";
+  entryId: string | null;
+  revision: number | null;
+  endedAt: Date | null;
+  visitAnswerId: string | null;
+  visitSessionId: string | null;
   storageBucket: string;
   storagePath: string;
   mimeType: string | null;
@@ -100,19 +112,19 @@ type PhotoRow = {
   heightPx: number | null;
   sha256: string | null;
   uploadedAt: Date;
-  questionId: string;
-  visitQuestionId: string;
+  questionId: string | null;
+  visitQuestionId: string | null;
   questionText: string;
   moduleId: string | null;
   moduleName: string;
   sectionName: string;
   fragebogenName: string;
-  campaignId: string;
+  campaignId: string | null;
   campaignName: string;
-  campaignType: "standard" | "flex" | "billa" | "kuehler" | "mhd" | "durcharbeit";
+  campaignType: "standard" | "flex" | "billa" | "kuehler" | "mhd" | "durcharbeit" | "sonderaufgabe";
   campaignStartDate: string | null;
   campaignEndDate: string | null;
-  marketId: string;
+  marketId: string | null;
   marketName: string;
   marketStandardMarketNumber: string | null;
   marketCokeMasterNumber: string | null;
@@ -125,7 +137,7 @@ type PhotoRow = {
   gmUserId: string;
   gmFirstName: string;
   gmLastName: string;
-  startedAt: Date;
+  startedAt: Date | null;
   submittedAt: Date;
   durationMinutes: number | null;
   comment: string | null;
@@ -247,6 +259,7 @@ function photoFileExtension(row: PhotoRow): string {
 }
 
 function campaignTypeLabel(value: PhotoRow["campaignType"]): string {
+  if (value === "sonderaufgabe") return "Sondereinsatz";
   if (value === "standard") return "Standard";
   if (value === "flex") return "Flex";
   if (value === "billa") return "Billa";
@@ -257,6 +270,10 @@ function campaignTypeLabel(value: PhotoRow["campaignType"]): string {
 }
 
 function uniquePhotoExportName(row: PhotoRow, usedNames: Map<string, number>): string {
+  if (row.source === "special_assignment") {
+    const base = `Sondereinsatz.${exportFilePart(`${row.gmFirstName}_${row.gmLastName}`, "GM")}.${(row.startedAt ?? row.uploadedAt).toLocaleDateString("sv-SE",{timeZone:"Europe/Vienna"})}.${row.id}`;
+    return `${base}.${photoFileExtension(row)}`;
+  }
   const stammnr = exportFilePart(
     row.marketCokeMasterNumber || row.marketKuehlerStammnr || row.marketStandardMarketNumber,
     "",
@@ -364,7 +381,8 @@ function buildPhotoWhere(
   if (access.excludeMhd) conditions.push(sql`${campaigns.section} <> 'mhd'`);
   if (photoId) conditions.push(eq(visitAnswerPhotos.id, photoId));
   if (input.campaignId) conditions.push(eq(campaigns.id, input.campaignId));
-  if (input.campaignType) conditions.push(eq(campaigns.section, input.campaignType));
+  if (input.campaignType === "sonderaufgabe") conditions.push(sql`false`);
+  else if (input.campaignType) conditions.push(eq(campaigns.section, input.campaignType));
   if (input.marketId) conditions.push(eq(markets.id, input.marketId));
   if (input.gmUserId) conditions.push(eq(users.id, input.gmUserId));
   if (input.questionId) conditions.push(eq(visitSessionQuestions.questionId, input.questionId));
@@ -451,9 +469,14 @@ function buildPhotoWhere(
   return and(...conditions) ?? sql`true`;
 }
 
+function aliasPhotoFields<T extends Record<string, AnyColumn | SQL>>(fields: T): { [K in keyof T]: SQL.Aliased<unknown> } {
+  return Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, sql`${value}`.as(key)])) as { [K in keyof T]: SQL.Aliased<unknown> };
+}
+
 function basePhotoSelect(where: SQL) {
   return db
-    .select({
+    .select(aliasPhotoFields({
+      source: sql`'visit'::text`, entryId: sql`null::uuid`, revision: sql`null::int`, endedAt: sql`null::timestamptz`,
       id: visitAnswerPhotos.id,
       visitAnswerId: visitAnswerPhotos.visitAnswerId,
       visitSessionId: visitSessions.id,
@@ -470,11 +493,11 @@ function basePhotoSelect(where: SQL) {
       questionText: visitSessionQuestions.questionTextSnapshot,
       moduleId: visitSessionQuestions.moduleId,
       moduleName: visitSessionQuestions.moduleNameSnapshot,
-      sectionName: visitSessionSections.section,
+      sectionName: sql`${visitSessionSections.section}::text`,
       fragebogenName: visitSessionSections.fragebogenNameSnapshot,
       campaignId: campaigns.id,
       campaignName: campaigns.name,
-      campaignType: campaigns.section,
+      campaignType: sql`${campaigns.section}::text`,
       campaignStartDate: campaigns.startDate,
       campaignEndDate: campaigns.endDate,
       marketId: markets.id,
@@ -504,7 +527,7 @@ function basePhotoSelect(where: SQL) {
         order by vqc.updated_at desc, vqc.created_at desc
         limit 1
       )`,
-    })
+    }))
     .from(visitAnswerPhotos)
     .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
     .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
@@ -516,9 +539,55 @@ function basePhotoSelect(where: SQL) {
     .where(where);
 }
 
+function specialPhotoWhere(input: PhotoFilterQuery, access: PhotoAccessScope, photoId?: string): SQL {
+  const p = timeTrackingEntryPhotos, e = timeTrackingEntries;
+  const conditions: SQL[] = [eq(p.isDeleted,false), eq(e.isDeleted,false), eq(e.activityType,"sonderaufgabe"), eq(e.status,"submitted"), isNotNull(e.submittedAt)];
+  if (!access.includeSpecialAssignments || input.campaignType && input.campaignType !== "sonderaufgabe" || input.campaignId || input.marketId || input.region || input.city || input.postalCode || input.chain || input.chains?.length || input.questionId || input.moduleId) conditions.push(sql`false`);
+  if (photoId) conditions.push(eq(p.id,photoId));
+  if (input.gmUserId) conditions.push(eq(e.gmUserId,input.gmUserId));
+  // Sondereinsätze belong to their actual work date, including photos uploaded later.
+  if (input.dateFrom) conditions.push(sql`${e.startAt} >= (${input.dateFrom}::date::timestamp at time zone 'Europe/Vienna')`);
+  if (input.dateTo) conditions.push(sql`${e.startAt} < ((${input.dateTo}::date + interval '1 day')::timestamp at time zone 'Europe/Vienna')`);
+  if (input.week) conditions.push(sql`to_char(${e.startAt} at time zone 'Europe/Vienna', 'IYYY-"W"IW') = ${input.week}`);
+  const tags = sql`select 1 from time_tracking_entry_photo_tags t where t.photo_id=${p.id} and t.is_deleted=false`;
+  if(input.tagId) conditions.push(sql`exists (${tags} and t.photo_tag_id=${input.tagId})`);
+  if(input.tagLabel) conditions.push(sql`exists (${tags} and t.label_snapshot ilike ${`%${input.tagLabel}%`})`);
+  if(input.tagIds?.length || input.tagLabels?.length) {
+    const ids=input.tagIds?.length?sql`t.photo_tag_id in (${sql.join(input.tagIds.map(id=>sql`${id}`),sql`, `)})`:sql`false`;
+    const labels=input.tagLabels?.length?sql`lower(t.label_snapshot) in (${sql.join(input.tagLabels.map(label=>sql`lower(${label})`),sql`, `)})`:sql`false`;
+    conditions.push(sql`exists (${tags} and (${ids} or ${labels}))`);
+  }
+  if(input.search) {
+    const needle=`%${input.search}%`;
+    conditions.push(or(ilike(users.firstName,needle),ilike(users.lastName,needle),ilike(e.comment,needle),ilike(p.originalFileName,needle),sql`'Sondereinsatz Sonderaufgabe' ilike ${needle}`,sql`exists (${tags} and t.label_snapshot ilike ${needle})`)!);
+  }
+  return and(...conditions)!;
+}
+
+function specialPhotoSelect(where: SQL) {
+  const p=timeTrackingEntryPhotos,e=timeTrackingEntries;
+  return db.select(aliasPhotoFields({
+    source:sql`'special_assignment'::text`,entryId:e.id,revision:p.revision,endedAt:e.endAt,
+    id:p.id,visitAnswerId:sql`null::uuid`,visitSessionId:sql`null::uuid`,storageBucket:p.storageBucket,storagePath:p.storagePath,
+    mimeType:p.mimeType,byteSize:p.byteSize,widthPx:sql`null::int`,heightPx:sql`null::int`,sha256:p.sha256,uploadedAt:p.uploadedAt,
+    questionId:sql`null::uuid`,visitQuestionId:sql`null::uuid`,questionText:sql`''::text`,moduleId:sql`null::uuid`,moduleName:sql`''::text`,sectionName:sql`''::text`,fragebogenName:sql`''::text`,
+    campaignId:sql`null::uuid`,campaignName:sql`'Sondereinsatz'::text`,campaignType:sql`'sonderaufgabe'::text`,campaignStartDate:sql`null::date`,campaignEndDate:sql`null::date`,
+    marketId:sql`null::uuid`,marketName:sql`''::text`,marketStandardMarketNumber:sql`null::text`,marketCokeMasterNumber:sql`null::text`,marketKuehlerStammnr:sql`null::text`,marketAddress:sql`''::text`,marketPostalCode:sql`''::text`,marketCity:sql`''::text`,marketRegion:sql`''::text`,marketChain:sql`''::text`,
+    gmUserId:users.id,gmFirstName:users.firstName,gmLastName:users.lastName,startedAt:e.startAt,submittedAt:e.submittedAt,
+    durationMinutes:sql`case when ${e.startAt} is null or ${e.endAt} is null then null else greatest(0,round(extract(epoch from (${e.endAt}-${e.startAt}))/60))::int end`,comment:e.comment,
+  })).from(p).innerJoin(e,eq(e.id,p.entryId)).innerJoin(users,eq(users.id,e.gmUserId)).where(where);
+}
+
+function archiveQuery(input: PhotoFilterQuery, access: PhotoAccessScope, photoId?: string) {
+  return basePhotoSelect(buildPhotoWhere(input,photoId,access)).unionAll(specialPhotoSelect(specialPhotoWhere(input,access,photoId))).as("archive");
+}
+function normalizePhotoRows(rows: unknown[]): PhotoRow[] {
+  return (rows as PhotoRow[]).map(row=>({...row,uploadedAt:new Date(row.uploadedAt),startedAt:row.startedAt?new Date(row.startedAt):null,submittedAt:new Date(row.submittedAt),endedAt:row.endedAt?new Date(row.endedAt):null}));
+}
+
 async function loadTagsByPhotoId(photoIds: string[]): Promise<Map<string, PhotoTagRow[]>> {
   if (photoIds.length === 0) return new Map();
-  const rows = await db
+  const visitRows = await db
     .select({
       id: visitAnswerPhotoTags.id,
       visitAnswerPhotoId: visitAnswerPhotoTags.visitAnswerPhotoId,
@@ -528,6 +597,8 @@ async function loadTagsByPhotoId(photoIds: string[]): Promise<Map<string, PhotoT
     .from(visitAnswerPhotoTags)
     .where(and(eq(visitAnswerPhotoTags.isDeleted, false), inArray(visitAnswerPhotoTags.visitAnswerPhotoId, photoIds)));
 
+  const specialRows = await db.select({id:timeTrackingEntryPhotoTags.id,visitAnswerPhotoId:timeTrackingEntryPhotoTags.photoId,photoTagId:timeTrackingEntryPhotoTags.photoTagId,label:timeTrackingEntryPhotoTags.labelSnapshot}).from(timeTrackingEntryPhotoTags).where(and(eq(timeTrackingEntryPhotoTags.isDeleted,false),inArray(timeTrackingEntryPhotoTags.photoId,photoIds)));
+  const rows=[...visitRows,...specialRows];
   const byPhotoId = new Map<string, PhotoTagRow[]>();
   for (const row of rows) {
     const bucket = byPhotoId.get(row.visitAnswerPhotoId) ?? [];
@@ -551,6 +622,9 @@ async function mapPhotoRows(rows: PhotoRow[], options: { signOriginal?: boolean 
         : { signedUrl: null, expiresAt: new Date(Date.now() + SIGNED_URL_TTL_SECONDS * 1000).toISOString() };
       return {
         id: row.id,
+        source: row.source,
+        revision: row.revision,
+        timeEntry: row.entryId ? { id:row.entryId, endAt:toIso(row.endedAt) } : null,
         visitAnswerId: row.visitAnswerId,
         visitSessionId: row.visitSessionId,
         storageBucket: row.storageBucket,
@@ -611,83 +685,17 @@ async function mapPhotoRows(rows: PhotoRow[], options: { signOriginal?: boolean 
 }
 
 async function loadFacets(access: PhotoAccessScope) {
-  const baseWhere = buildPhotoWhere({ page: 1, pageSize: 1 }, undefined, access);
-  const [campaignRows, gmRows, tagRows, regionRows, chainRows] = await Promise.all([
-    db
-      .selectDistinct({ id: campaigns.id, name: campaigns.name, type: campaigns.section })
-      .from(visitAnswerPhotos)
-      .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
-      .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
-      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswers.visitSessionSectionId))
-      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
-      .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
-      .innerJoin(markets, eq(markets.id, visitSessions.marketId))
-      .innerJoin(users, eq(users.id, visitSessions.gmUserId))
-      .where(baseWhere)
-      .orderBy(campaigns.name),
-    db
-      .selectDistinct({ id: users.id, firstName: users.firstName, lastName: users.lastName })
-      .from(visitAnswerPhotos)
-      .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
-      .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
-      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswers.visitSessionSectionId))
-      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
-      .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
-      .innerJoin(markets, eq(markets.id, visitSessions.marketId))
-      .innerJoin(users, eq(users.id, visitSessions.gmUserId))
-      .where(baseWhere)
-      .orderBy(users.lastName, users.firstName),
-    db
-      .selectDistinct({
-        id: visitAnswerPhotoTags.photoTagId,
-        label: visitAnswerPhotoTags.photoTagLabelSnapshot,
-      })
-      .from(visitAnswerPhotoTags)
-      .innerJoin(visitAnswerPhotos, eq(visitAnswerPhotos.id, visitAnswerPhotoTags.visitAnswerPhotoId))
-      .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
-      .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
-      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswers.visitSessionSectionId))
-      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
-      .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
-      .innerJoin(markets, eq(markets.id, visitSessions.marketId))
-      .innerJoin(users, eq(users.id, visitSessions.gmUserId))
-      .where(and(baseWhere, eq(visitAnswerPhotoTags.isDeleted, false)))
-      .orderBy(visitAnswerPhotoTags.photoTagLabelSnapshot),
-    db
-      .selectDistinct({ region: markets.region })
-      .from(visitAnswerPhotos)
-      .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
-      .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
-      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswers.visitSessionSectionId))
-      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
-      .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
-      .innerJoin(markets, eq(markets.id, visitSessions.marketId))
-      .innerJoin(users, eq(users.id, visitSessions.gmUserId))
-      .where(baseWhere)
-      .orderBy(markets.region),
-    db
-      .selectDistinct({ chain: marketChainExpression() })
-      .from(visitAnswerPhotos)
-      .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
-      .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
-      .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswers.visitSessionSectionId))
-      .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
-      .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
-      .innerJoin(markets, eq(markets.id, visitSessions.marketId))
-      .innerJoin(users, eq(users.id, visitSessions.gmUserId))
-      .where(baseWhere)
-      .orderBy(marketChainExpression()),
+  const a=archiveQuery({page:1,pageSize:1},access);
+  const [campaignRows,gmRows,regionRows,chainRows,tagRows,specialTags]=await Promise.all([
+    db.selectDistinct({id:a.campaignId,name:a.campaignName,type:a.campaignType}).from(a).where(isNotNull(a.campaignId)).orderBy(a.campaignName),
+    db.selectDistinct({id:a.gmUserId,firstName:a.gmFirstName,lastName:a.gmLastName}).from(a).orderBy(a.gmLastName,a.gmFirstName),
+    db.selectDistinct({region:a.marketRegion}).from(a).where(isNotNull(a.marketId)).orderBy(a.marketRegion),
+    db.selectDistinct({chain:a.marketChain}).from(a).where(isNotNull(a.marketId)).orderBy(a.marketChain),
+    db.selectDistinct({id:visitAnswerPhotoTags.photoTagId,label:visitAnswerPhotoTags.photoTagLabelSnapshot}).from(visitAnswerPhotoTags).innerJoin(a,sql`"archive"."id" = ${visitAnswerPhotoTags.visitAnswerPhotoId}`).where(eq(visitAnswerPhotoTags.isDeleted,false)),
+    db.selectDistinct({id:timeTrackingEntryPhotoTags.photoTagId,label:timeTrackingEntryPhotoTags.labelSnapshot}).from(timeTrackingEntryPhotoTags).innerJoin(a,sql`"archive"."id" = ${timeTrackingEntryPhotoTags.photoId}`).where(eq(timeTrackingEntryPhotoTags.isDeleted,false)),
   ]);
-
-  return {
-    campaigns: campaignRows,
-    gms: gmRows.map((row) => ({ id: row.id, name: `${row.firstName} ${row.lastName}`.trim() })),
-    tags: tagRows
-      .filter((row) => row.label.trim().length > 0)
-      .map((row) => ({ id: row.id, label: row.label })),
-    regions: regionRows.map((row) => row.region).filter(Boolean),
-    chains: chainRows.map((row) => row.chain).filter(Boolean),
-  };
+  const tags=new Map([...tagRows,...specialTags].filter(row=>row.label.trim()).map(row=>[`${row.id}:${row.label}`,row]));
+  return {campaigns:campaignRows,gms:gmRows.map(row=>({id:row.id,name:`${row.firstName} ${row.lastName}`.trim()})),tags:[...tags.values()].sort((a,b)=>a.label.localeCompare(b.label,"de")),regions:regionRows.map(row=>row.region).filter(Boolean),chains:chainRows.map(row=>row.chain).filter(Boolean)};
 }
 
 adminPhotosRouter.get("/photos", async (req: AuthedRequest, res, next) => {
@@ -699,41 +707,15 @@ adminPhotosRouter.get("/photos", async (req: AuthedRequest, res, next) => {
     }
 
     const filters = parsed.data;
-    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
-    const where = buildPhotoWhere(filters, undefined, access);
-    const offset = (filters.page - 1) * filters.pageSize;
-
-    const [rows, totalRows, statsRows] = await Promise.all([
-      basePhotoSelect(where)
-        .orderBy(desc(visitSessions.submittedAt), desc(visitAnswerPhotos.uploadedAt))
-        .limit(filters.pageSize)
-        .offset(offset) as Promise<PhotoRow[]>,
-      db
-        .select({ value: count() })
-        .from(visitAnswerPhotos)
-        .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
-        .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
-        .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswers.visitSessionSectionId))
-        .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
-        .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
-        .innerJoin(markets, eq(markets.id, visitSessions.marketId))
-        .innerJoin(users, eq(users.id, visitSessions.gmUserId))
-        .where(where),
-      db
-        .select({
-          visitedMarkets: sql<number>`count(distinct ${markets.id})::int`,
-          campaigns: sql<number>`count(distinct ${campaigns.id})::int`,
-        })
-        .from(visitAnswerPhotos)
-        .innerJoin(visitAnswers, eq(visitAnswers.id, visitAnswerPhotos.visitAnswerId))
-        .innerJoin(visitSessionQuestions, eq(visitSessionQuestions.id, visitAnswers.visitSessionQuestionId))
-        .innerJoin(visitSessionSections, eq(visitSessionSections.id, visitAnswers.visitSessionSectionId))
-        .innerJoin(visitSessions, eq(visitSessions.id, visitAnswers.visitSessionId))
-        .innerJoin(campaigns, eq(campaigns.id, visitSessionSections.campaignId))
-        .innerJoin(markets, eq(markets.id, visitSessions.marketId))
-        .innerJoin(users, eq(users.id, visitSessions.gmUserId))
-        .where(where),
+    const access = archiveAccess(req);
+    const a=archiveQuery(filters,access);
+    const offset=(filters.page-1)*filters.pageSize;
+    const [rawRows,totalRows,statsRows]=await Promise.all([
+      db.select().from(a).orderBy(desc(a.submittedAt),desc(a.uploadedAt),a.id).limit(filters.pageSize).offset(offset),
+      db.select({value:count()}).from(a),
+      db.select({visitedMarkets:sql<number>`count(distinct ${a.marketId})::int`,campaigns:sql<number>`count(distinct ${a.campaignId})::int`}).from(a),
     ]);
+    const rows=normalizePhotoRows(rawRows);
 
     res.status(200).json({
       photos: await mapPhotoRows(rows),
@@ -752,7 +734,7 @@ adminPhotosRouter.get("/photos", async (req: AuthedRequest, res, next) => {
 
 adminPhotosRouter.get("/photos/facets", async (req: AuthedRequest, res, next) => {
   try {
-    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
+    const access = archiveAccess(req);
     res.status(200).json({ facets: await loadFacets(access) });
   } catch (error) {
     next(error);
@@ -768,12 +750,9 @@ adminPhotosRouter.post("/photos/signed-urls", async (req: AuthedRequest, res, ne
     }
 
     const uniquePhotoIds = Array.from(new Set(parsed.data.photoIds));
-    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
-    const where = and(
-      buildPhotoWhere({ page: 1, pageSize: 1 }, undefined, access),
-      inArray(visitAnswerPhotos.id, uniquePhotoIds),
-    ) ?? sql`false`;
-    const rows = (await basePhotoSelect(where)) as PhotoRow[];
+    const access = archiveAccess(req);
+    const a=archiveQuery({page:1,pageSize:1},access);
+    const rows=normalizePhotoRows(await db.select().from(a).where(inArray(a.id,uniquePhotoIds)));
     const urls = await Promise.all(
       rows.map(async (row) => {
         const signed = await createSignedReadUrl({
@@ -808,20 +787,14 @@ adminPhotosRouter.post("/photos/export", async (req: AuthedRequest, res, next) =
       return;
     }
 
-    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
+    const access = archiveAccess(req);
     const filters: PhotoFilterQuery = {
       ...parsed.data.filters,
       page: 1,
       pageSize: 1,
     };
-    const rows = (await basePhotoSelect(buildPhotoWhere(filters, undefined, access))
-      .orderBy(
-        markets.name,
-        users.lastName,
-        users.firstName,
-        campaigns.name,
-        visitAnswerPhotos.id,
-      )) as PhotoRow[];
+    const a=archiveQuery(filters,access);
+    const rows=normalizePhotoRows(await db.select().from(a).orderBy(a.marketName,a.gmLastName,a.gmFirstName,a.campaignName,a.id));
 
     if (rows.length === 0) {
       res.status(404).json({
@@ -893,6 +866,7 @@ adminPhotosRouter.post("/photos/export", async (req: AuthedRequest, res, next) =
         "",
         "Dateiname:",
         "StammnrMarkt.VornameGM-Kampagne.Sektion.Dateiendung",
+        "Sondereinsätze: Sondereinsatz.GM.Arbeitsdatum.Foto-ID.Dateiendung",
         "",
         failures.length ? `Fehlerhafte Fotos: ${failures.length}` : "Alle Fotos wurden exportiert.",
       ].join("\r\n"),
@@ -932,11 +906,18 @@ adminPhotosRouter.patch("/photos/:photoId/tags", async (req: AuthedRequest, res,
       return;
     }
 
-    const where = buildPhotoWhere({ page: 1, pageSize: 1 }, photoId);
-    const photoRows = (await basePhotoSelect(where).limit(1)) as PhotoRow[];
+    const a=archiveQuery({page:1,pageSize:1},archiveAccess(req),photoId);
+    const photoRows=normalizePhotoRows(await db.select().from(a).limit(1));
     if (!photoRows[0]) {
       res.status(404).json({ error: "Foto nicht gefunden.", code: "photo_not_found" });
       return;
+    }
+
+    if(photoRows[0].source === "special_assignment") {
+      if(parsed.data.expectedRevision===undefined){res.status(409).json({error:"Bitte das Foto erneut öffnen, bevor du die Tags speicherst.",code:"photo_revision_required"});return;}
+      await timeEntryPhotoService.setTags(photoRows[0].entryId!,photoId,{id:req.authUser!.appUserId!,role:"admin"},parsed.data.expectedRevision,parsed.data.photoTagIds);
+      const tags=(await loadTagsByPhotoId([photoId])).get(photoId)??[];
+      res.json({ok:true,revision:parsed.data.expectedRevision+1,tags:tags.map(tag=>({id:tag.id,photoTagId:tag.photoTagId,label:tag.label}))});return;
     }
 
     const requestedTagIds = Array.from(new Set(parsed.data.photoTagIds));
@@ -1006,9 +987,9 @@ adminPhotosRouter.get("/photos/:photoId", async (req: AuthedRequest, res, next) 
       return;
     }
 
-    const access = { excludeMhd: shouldExcludeMhdPhotos(req.authUser?.role) };
-    const where = buildPhotoWhere({ page: 1, pageSize: 1 }, photoId, access);
-    const rows = (await basePhotoSelect(where).limit(1)) as PhotoRow[];
+    const access = archiveAccess(req);
+    const a=archiveQuery({page:1,pageSize:1},access,photoId);
+    const rows=normalizePhotoRows(await db.select().from(a).limit(1));
     if (!rows[0]) {
       res.status(404).json({ error: "Foto nicht gefunden.", code: "photo_not_found" });
       return;

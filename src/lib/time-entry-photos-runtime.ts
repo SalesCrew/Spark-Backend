@@ -6,7 +6,7 @@ import { createTimeEntryPhotoRouter } from "../routes/time-entry-photos.js";
 import { createTimeEntryPhotoService, TIME_ENTRY_PHOTO_BUCKET, photoError } from "./time-entry-photos.js";
 
 const storage = supabaseAdmin.storage.from(TIME_ENTRY_PHOTO_BUCKET);
-export const timeEntryPhotoRouter = createTimeEntryPhotoRouter(createTimeEntryPhotoService(db, {
+export const timeEntryPhotoService = createTimeEntryPhotoService(db, {
   async put(path,bytes,mime) {
     const { error } = await storage.upload(path,bytes,{contentType:mime,upsert:false});
     if (!error) return;
@@ -21,4 +21,5 @@ export const timeEntryPhotoRouter = createTimeEntryPhotoRouter(createTimeEntryPh
     if(error||!data?.signedUrl)throw photoError("Foto konnte nicht geöffnet werden. Bitte erneut versuchen.",503);
     return data.signedUrl;
   },
-}),requireAuth);
+});
+export const timeEntryPhotoRouter = createTimeEntryPhotoRouter(timeEntryPhotoService,requireAuth);
