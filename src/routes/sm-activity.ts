@@ -79,6 +79,8 @@ const uuidSchema = z.string().uuid();
 const listSchema = z.object({ limit: z.coerce.number().int().min(1).max(120).default(80) }).partial();
 const answerRequestSchema = z.object({
   answer: smVisitAnswerSchema,
+  commentOnly: z.boolean().optional(),
+  expectedAnswerVersion: z.number().int().min(0).optional(),
   requestedAnswerSummary: z.string().trim().max(1_000).optional(),
   reason: z.string().trim().min(2).max(2_000),
   clientRequestToken: z.string().trim().min(8).max(300),
@@ -117,7 +119,7 @@ function questionSnapshot(question: typeof smQuestionnaireSubmissionQuestions.$i
 
 function answerSummary(answer: SmVisitAnswerPayload, options: Array<{ code: string; label: string }>): string {
   const base = answerSummaryValue(answer, options);
-  return answer.kind !== "empty" && answer.comment ? `${base}\nKommentar: ${answer.comment}` : base;
+  return answer.comment ? `${base}\nKommentar: ${answer.comment}` : base;
 }
 
 function answerSummaryValue(answer: SmVisitAnswerPayload, options: Array<{ code: string; label: string }>): string {
@@ -502,8 +504,11 @@ smActivityRouter.post("/submissions/:submissionId/questions/:questionId/change-r
         }
         const [replayQuestion] = await tx.select().from(smQuestionnaireSubmissionQuestions).where(and(eq(smQuestionnaireSubmissionQuestions.id, questionId), eq(smQuestionnaireSubmissionQuestions.submissionId, submissionId))).limit(1);
         const [replaySubmission] = await tx.select().from(smQuestionnaireSubmissions).where(eq(smQuestionnaireSubmissions.id, submissionId)).limit(1);
-        const normalizedReplay = replayQuestion ? normalizeSmVisitAnswer(questionSnapshot(replayQuestion, replaySubmission ? await smOptionalCommentsForSubmission(tx, replaySubmission) : false), input.answer) : input.answer;
-        if (stableSmVisitAnswer(replayed.requestedAnswerPayload as SmVisitAnswerPayload) !== stableSmVisitAnswer(normalizedReplay) || replayed.requestReason !== input.reason) {
+        const replayContext = replayQuestion ? questionSnapshot(replayQuestion, replaySubmission ? await smOptionalCommentsForSubmission(tx, replaySubmission) : false) : null;
+        const normalizedReplay = replayContext ? normalizeSmVisitAnswer(replayContext, input.answer) : input.answer;
+        // JSONB key order differs from normalized payloads; normalize both sides before comparing.
+        const normalizedStored = replayContext ? normalizeSmVisitAnswer(replayContext, replayed.requestedAnswerPayload) : replayed.requestedAnswerPayload as SmVisitAnswerPayload;
+        if (stableSmVisitAnswer(normalizedStored) !== stableSmVisitAnswer(normalizedReplay) || replayed.requestReason !== input.reason) {
           throw new SmActivityError(409, "sm_activity_request_token_conflict", "Dieser Anfrage-Token wurde bereits mit anderen Änderungsdaten verwendet.");
         }
         return { row: replayed, replayed: true };
@@ -512,12 +517,30 @@ smActivityRouter.post("/submissions/:submissionId/questions/:questionId/change-r
       if (!submission) throw new SmActivityError(404, "sm_activity_submission_not_found", "Der abgeschlossene Fragebogen wurde nicht gefunden.");
       const [question] = await tx.select().from(smQuestionnaireSubmissionQuestions).where(and(eq(smQuestionnaireSubmissionQuestions.id, questionId), eq(smQuestionnaireSubmissionQuestions.submissionId, submission.id), eq(smQuestionnaireSubmissionQuestions.isApplicable, true), eq(smQuestionnaireSubmissionQuestions.isDeleted, false))).limit(1).for("update");
       if (!question) throw new SmActivityError(404, "sm_activity_question_not_found", "Die Frage wurde nicht gefunden oder ist nicht anwendbar.");
+      const optionalCommentEnabled = await smOptionalCommentsForSubmission(tx, submission);
+      if (input.commentOnly && (!optionalCommentEnabled || input.expectedAnswerVersion === undefined)) {
+        throw new SmActivityError(400, "sm_activity_comment_request_invalid", "Bitte den abgeschlossenen Durcharbeit-Fragebogen erneut öffnen.");
+      }
+      const normalized = normalizeSmVisitAnswer(questionSnapshot(question, optionalCommentEnabled), input.answer);
       const [pending] = await tx.select().from(smAnswerChangeRequests).where(and(eq(smAnswerChangeRequests.submissionQuestionId, question.id), eq(smAnswerChangeRequests.status, "pending"), eq(smAnswerChangeRequests.isDeleted, false))).limit(1).for("update");
-      if (pending) return { row: pending, replayed: true };
-      const normalized = normalizeSmVisitAnswer(questionSnapshot(question, await smOptionalCommentsForSubmission(tx, submission)), input.answer);
+      if (pending) {
+        if (input.commentOnly && (stableSmVisitAnswer(normalizeSmVisitAnswer(questionSnapshot(question, optionalCommentEnabled), pending.requestedAnswerPayload)) !== stableSmVisitAnswer(normalized) || pending.requestReason !== input.reason)) {
+          throw new SmActivityError(409, "sm_activity_comment_request_pending", "Zu dieser Frage gibt es bereits eine offene Anfrage. Dein Kommentar wurde noch nicht eingereicht.");
+        }
+        return { row: pending, replayed: true };
+      }
       if (question.requiredSnapshot && !isCompleteSmVisitAnswer(questionSnapshot(question), normalized)) throw new SmActivityError(400, "sm_activity_required_answer_empty", "Eine Pflichtfrage kann nicht geleert werden.");
       const original = await currentAnswer(tx, question.id, true);
-      const originalValue = (original?.valueJson ?? { kind: "empty" }) as SmVisitAnswerPayload;
+      const originalValue = normalizeSmVisitAnswer(questionSnapshot(question, optionalCommentEnabled), original?.valueJson ?? { kind: "empty" });
+      if (input.commentOnly) {
+        if ((original?.answerVersion ?? 0) !== input.expectedAnswerVersion) {
+          throw new SmActivityError(409, "sm_activity_comment_request_stale", "Die Antwort wurde inzwischen geändert. Dein Kommentar bleibt im Dialog erhalten. Bitte prüfe den aktuellen Stand, bevor du ihn erneut einreichst.");
+        }
+        const withoutComment = (value: SmVisitAnswerPayload) => { const { comment: _comment, ...base } = value; return base as SmVisitAnswerPayload; };
+        if (stableSmVisitAnswer(withoutComment(originalValue)) !== stableSmVisitAnswer(withoutComment(normalized))) {
+          throw new SmActivityError(400, "sm_activity_comment_request_answer_changed", "Eine Kommentaranfrage darf die gespeicherte Antwort und Fotos nicht ändern.");
+        }
+      }
       if (stableSmVisitAnswer(originalValue) === stableSmVisitAnswer(normalized)) throw new SmActivityError(400, "sm_activity_answer_unchanged", "Die gewünschte Antwort ist bereits gespeichert.");
       if (normalized.kind === "photo") {
         const currentFiles = original ? await SMDurcharbeitAnswerFiles(tx, [original.id]) : [];

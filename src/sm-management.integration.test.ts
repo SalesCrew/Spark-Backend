@@ -1,3 +1,4 @@
+import * as commentContext from "./sm-comment-context.shared.js";
 import * as basicActivity from "./sm-basic-activity.shared.js";
 import * as overview from "./sm-dashboard-overview.shared.js";
 import assert from "node:assert/strict";
@@ -178,7 +179,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       "./db.js": { db: database }, "./schema.js": schema, "./admin-role.js": adminRoles,
     });
     const route = await isolatedModule<typeof import("./routes/sm-management.js")>(new URL("./routes/sm-management.ts", import.meta.url), {
-      "../sm-basic-activity.shared.js": basicActivity, "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
+      "../sm-comment-context.shared.js": commentContext, "../sm-basic-activity.shared.js": basicActivity, "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
       "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../sm-management.js": management,
       "../sm-management-list.shared.js": managementList, "../sm-management-report.shared.js": managementReport, "../lib/kunde-access.js": kundeAccess,
       "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visitShared, "../middleware/auth.js": authMock,
@@ -226,7 +227,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
     const http = (method: "get" | "post", path: string) => request(app)[method](`/completed${path}`).set("x-local-role", "sm_admin");
 
     const activityRoute = await isolatedModule<typeof import("./routes/sm-activity.js")>(new URL("./routes/sm-activity.ts", import.meta.url), {
-      "../sm-basic-activity.shared.js": basicActivity, "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
+      "../sm-comment-context.shared.js": commentContext, "../sm-basic-activity.shared.js": basicActivity, "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
       "../lib/db.js": { db: database }, "../lib/schema.js": schema, "./sm-management.js": route, "../lib/kunde-access.js": kundeAccess,
       "../lib/conditional-visibility.js": conditionalVisibility, "../sm-comment.shared.js": comments,
       "../sm-planning.shared.js": planning, "../sm-visit.shared.js": visitShared, "../middleware/auth.js": authMock,
@@ -249,7 +250,7 @@ test("SM management: real SM schema, immutable history and atomic corrections", 
       "../sm-holiday-planning.js": holidays, "../sm-series-management.js": { smSeriesManagementRouter: express.Router() },
     });
     const visitRoute = await isolatedModule<typeof import("./routes/sm-visits.js")>(new URL("./routes/sm-visits.ts", import.meta.url), {
-      "../sm-basic-activity.shared.js": basicActivity, "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
+      "../sm-comment-context.shared.js": commentContext, "../sm-basic-activity.shared.js": basicActivity, "../sm-SMDurcharbeit-campaign.shared.js": SMDurcharbeitCampaigns, "../sm-SMDurcharbeit-answer-reuse.shared.js": SMDurcharbeitReuse,
       "../sm-SMDurcharbeit-selection.shared.js": SMDurcharbeitSelection,
       "../lib/db.js": { db: database }, "../lib/schema.js": schema, "../lib/logger.js": harmlessLogger, "../middleware/auth.js": authMock, "../lib/kunde-access.js": kundeAccess,
       "../lib/conditional-visibility.js": conditionalVisibility, "../sm-comment.shared.js": comments, "../sm-visit.shared.js": visitShared,
